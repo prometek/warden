@@ -275,6 +275,227 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
     );
 }
 
+/// M2: a coder that exits non-zero must short-circuit the cycle — the run
+/// is persisted as `Failed` (write-ahead, before the CLI process exits) and
+/// review/test must never run at all, not just "run but be ignored". Proven
+/// here by checking the reviewer's worktree was never created under
+/// `--warden-home`, since `run_review_and_test` is only reached after a
+/// successful coder run.
+#[tokio::test]
+async fn e2e_failing_coder_marks_run_failed_and_never_reaches_review() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        "#!/bin/sh\necho 'boom: build failed' >&2\nexit 1\n",
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "coder will fail",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .failure();
+
+    // A fresh --warden-home was used solely for this run, so exactly one
+    // row exists; no db.rs getter lists all runs, so a direct query is used
+    // here rather than adding production API surface just for a test.
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let (run_id,): (String,) = sqlx::query_as("SELECT id FROM runs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        RunState::Failed,
+        "a non-zero coder exit must persist the run as Failed"
+    );
+
+    let reviewer_worktree = warden_home
+        .path()
+        .join("worktrees")
+        .join(&run_id)
+        .join("reviewer");
+    assert!(
+        !reviewer_worktree.exists(),
+        "reviewer must never run once the coder has failed the cycle (no short-circuit)"
+    );
+}
+
+/// M4: the commit a cycle's coder produces must (a) be persisted and
+/// retrievable from SQLite (`cycles.coder_commit_sha`,
+/// `runs.converged_commit_sha`), (b) be protected by a local ref in the
+/// *main* repository so it survives worktree removal / `git gc`, and (c)
+/// never mutate the main repo's current branch, HEAD, or working tree — the
+/// ref write is metadata-only, the same category of change
+/// `git worktree add/remove` already makes.
+#[tokio::test]
+async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_branch() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let (coder, reviewer, tester) = always_converging_scripts(scripts_dir.path());
+
+    let original_head_ref = String::from_utf8_lossy(
+        &SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let original_commit_sha = String::from_utf8_lossy(
+        &SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "single converging cycle",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    // The main repo's current branch/HEAD must be exactly what it was
+    // before `warden run` — writing `refs/warden/...` must never touch
+    // `refs/heads/...` or move HEAD.
+    let after_head_ref = String::from_utf8_lossy(
+        &SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(after_head_ref, original_head_ref);
+    let after_commit_sha = String::from_utf8_lossy(
+        &SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        after_commit_sha, original_commit_sha,
+        "main repo's checked-out commit must be unchanged by `warden run`"
+    );
+    let status = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        status.stdout.is_empty(),
+        "main repo working tree must stay clean"
+    );
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    let converged_sha = run
+        .converged_commit_sha
+        .expect("a Converged run must have a persisted converged_commit_sha");
+    assert_eq!(
+        converged_sha.len(),
+        40,
+        "expected a full SHA-1 hex commit id"
+    );
+    assert_ne!(
+        converged_sha, original_commit_sha,
+        "converged commit must be the coder's new commit, not the repo's original HEAD"
+    );
+
+    // No `db.rs` getter exposes a single cycle's row yet, so this reads the
+    // column directly — a test-only convenience, not new production API.
+    let (cycle_sha,): (Option<String>,) =
+        sqlx::query_as("SELECT coder_commit_sha FROM cycles WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cycle_sha.as_deref(),
+        Some(converged_sha.as_str()),
+        "cycles.coder_commit_sha must match the run's converged_commit_sha for a single-cycle run"
+    );
+
+    // M4: the commit must be reachable via a local ref in the *main* repo
+    // (never the now-removed coder worktree) so it survives `git gc`.
+    let ref_name = format!("refs/warden/runs/{run_id}/cycle-1");
+    let ref_lookup = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", &ref_name])
+        .output()
+        .unwrap();
+    assert!(
+        ref_lookup.status.success(),
+        "expected protective ref {ref_name} to exist in the main repo"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ref_lookup.stdout).trim(),
+        converged_sha,
+        "the protective ref must point at the same commit persisted in SQLite"
+    );
+}
+
 /// A malformed `--coder-cmd` (empty string) must be a clean CLI error, not a
 /// panic — realistic misuse from a human typo or a bad config file.
 #[test]
