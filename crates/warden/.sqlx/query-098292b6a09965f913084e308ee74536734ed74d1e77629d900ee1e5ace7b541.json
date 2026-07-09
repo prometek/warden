@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT agent_processes.id as \"id!\", agent_processes.pid as \"pid!\", agent_processes.pid_started_at_unix as \"pid_started_at_unix!\"\n        FROM agent_processes\n        JOIN cycles ON cycles.id = agent_processes.cycle_id\n        WHERE cycles.run_id = ? AND agent_processes.ended_at IS NULL\n        ORDER BY agent_processes.started_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_processes",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "pid!",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "agent_processes",
+            "name": "pid"
+          }
+        }
+      },
+      {
+        "name": "pid_started_at_unix!",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "agent_processes",
+            "name": "pid_started_at_unix"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "098292b6a09965f913084e308ee74536734ed74d1e77629d900ee1e5ace7b541"
+}

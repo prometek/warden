@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cycles SET tester_worktree_path = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b916dc8a0251d30d19122d98ce93eaf7f60d19f12833f3852ef609c2e6b51482"
+}

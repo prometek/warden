@@ -5,3 +5,11 @@
 
 # docs = symlink local vers le vault Obsidian, hors repo
 /docs
+
+# Warden's own runtime state (SQLite db, worktrees) when run locally out of
+# a checkout — never committed. Throwaway dev DBs used only to regenerate
+# `.sqlx/` (which *is* committed, see code-standards.md "SQLite & sqlx").
+.warden/
+*.db
+*.db-shm
+*.db-wal

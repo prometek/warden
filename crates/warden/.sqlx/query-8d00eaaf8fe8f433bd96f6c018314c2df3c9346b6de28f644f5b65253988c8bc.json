@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "source",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "findings",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "name": "severity",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "findings",
+            "name": "severity"
+          }
+        }
+      },
+      {
+        "name": "file",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "findings",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "name": "description",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "findings",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "name": "action",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "findings",
+            "name": "action"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "8d00eaaf8fe8f433bd96f6c018314c2df3c9346b6de28f644f5b65253988c8bc"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE cycles SET coder_commit_sha = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2dc148acfcc6ea09609150968498c6bf59b058ed3a484e5d4bc7ebba4a4bbdaa"
+}
