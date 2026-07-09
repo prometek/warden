@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/warden-core", "crates/warden"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+# Phase 1 scope: only `warden-core` (pure logic) and `warden` (orchestrator
+# binary) are built. `warden-gated` (Phase 3) and `warden-tui` (Phase 8) will
+# join this workspace as their own members when their phases start — no
+# stub crates are added ahead of time.

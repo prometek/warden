@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_processes SET ended_at = ?, exit_code = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "31e3675f9a61a6108dfadfa6eca6ba8d43fc92bfdfd57928d7b4a25533da231b"
+}
