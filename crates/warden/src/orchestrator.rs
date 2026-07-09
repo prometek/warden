@@ -1,8 +1,9 @@
 //! The convergence loop: coder -> review/test -> reboucle if findings
-//! (Architecture.md §5.1). Phase 1 runs reviewer and tester **sequentially**
-//! — real parallelism is Phase 2 (`tokio::join!`, ADR-0003). Every
-//! [`RunState`] transition is written to SQLite *before* the action it
-//! authorizes, per ADR-0004.
+//! (Architecture.md §5.1). Reviewer and tester run **in parallel**
+//! (`tokio::join!`, ADR-0003), each synced onto the coder's commit in its
+//! own worktree (see [`WorktreeManager::create`], keyed by role, so the two
+//! never share a directory). Every [`RunState`] transition is written to
+//! SQLite *before* the action it authorizes, per ADR-0004.
 
 use std::path::{Path, PathBuf};
 
@@ -256,6 +257,15 @@ impl Orchestrator {
         Ok(new_commit)
     }
 
+    /// Runs reviewer and tester **concurrently** (ADR-0003) via
+    /// `tokio::join!`, each against its own worktree synced onto `commit`
+    /// (`WorktreeManager::create` paths worktrees by `<run_id>/<role>`, so
+    /// the two agents never touch the same directory — no shared mutable
+    /// state between the two concurrent branches, per code-standards.md
+    /// "Async & concurrence"). `tokio::join!` always awaits both branches to
+    /// completion before this returns, even if one finishes with an error,
+    /// so a failing reviewer never leaves the tester's worktree/process
+    /// bookkeeping half-done.
     async fn run_review_and_test(
         &self,
         run_id: &str,
@@ -265,9 +275,8 @@ impl Orchestrator {
         commit: &str,
         cancel: CancellationToken,
     ) -> Result<Vec<Finding>> {
-        // Sequential in Phase 1 (no parallelism yet, see ADR-0003 / Phase 2).
-        let reviewer_findings = self
-            .run_finding_agent(FindingAgentInvocation {
+        let (reviewer_result, tester_result) = tokio::join!(
+            self.run_finding_agent(FindingAgentInvocation {
                 run_id,
                 cycle_id,
                 role: AgentRole::Reviewer,
@@ -275,10 +284,8 @@ impl Orchestrator {
                 worktree_manager,
                 commit,
                 cancel: cancel.clone(),
-            })
-            .await?;
-        let tester_findings = self
-            .run_finding_agent(FindingAgentInvocation {
+            }),
+            self.run_finding_agent(FindingAgentInvocation {
                 run_id,
                 cycle_id,
                 role: AgentRole::Tester,
@@ -287,10 +294,10 @@ impl Orchestrator {
                 commit,
                 cancel,
             })
-            .await?;
+        );
 
-        let mut findings = reviewer_findings;
-        findings.extend(tester_findings);
+        let mut findings = reviewer_result?;
+        findings.extend(tester_result?);
         Ok(findings)
     }
 
