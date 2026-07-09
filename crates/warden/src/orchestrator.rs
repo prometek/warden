@@ -36,6 +36,19 @@ pub struct RunConfig {
     pub tester_command: AgentCommand,
 }
 
+/// Parameters for a single coder invocation. Grouped into a struct (rather
+/// than passed positionally) purely to keep `run_coder`'s signature
+/// readable — it has no behaviour of its own.
+struct CoderInvocation<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    config: &'a RunConfig,
+    worktree_manager: &'a WorktreeManager,
+    base_commit: &'a str,
+    cancel: CancellationToken,
+}
+
 /// Parameters for a single reviewer/tester invocation. Grouped into a
 /// struct (rather than passed positionally) purely to keep
 /// `run_finding_agent`'s signature readable — it has no behaviour of its
@@ -58,6 +71,25 @@ pub struct Orchestrator {
 impl Orchestrator {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Validates and persists a state transition by re-reading the run's
+    /// *currently persisted* state first, rather than trusting an
+    /// in-memory value the caller already believes is correct (L5: a
+    /// transition validated against a hardcoded `from` constant can never
+    /// fail, even if the database has drifted from what the loop assumes).
+    /// Write-ahead of intention (ADR-0004): the new state is durable before
+    /// this returns, and before the caller acts on it.
+    async fn transition(&self, run_id: &str, to: RunState) -> Result<()> {
+        let run =
+            db::get_run(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| WardenError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })?;
+        run.state.validate_transition(to)?;
+        db::update_run_state(&self.pool, run_id, to).await?;
+        Ok(())
     }
 
     /// Runs a full convergence loop for one intent: opens a run, then
@@ -85,8 +117,7 @@ impl Orchestrator {
 
         // Write-ahead: the run is about to launch the coder, so record the
         // intent to do so before actually spawning anything (ADR-0004).
-        RunState::Pending.validate_transition(RunState::CoderRunning)?;
-        db::update_run_state(&self.pool, &run_id, RunState::CoderRunning).await?;
+        self.transition(&run_id, RunState::CoderRunning).await?;
 
         let mut base_commit = "HEAD".to_string();
         let mut cycle_number: u32 = 1;
@@ -97,19 +128,20 @@ impl Orchestrator {
             db::set_run_current_cycle(&self.pool, &run_id, cycle_number).await?;
 
             base_commit = self
-                .run_coder(
-                    &run_id,
-                    &cycle_id,
-                    &config,
-                    &worktree_manager,
-                    &base_commit,
-                    cancel.clone(),
-                )
+                .run_coder(CoderInvocation {
+                    run_id: &run_id,
+                    cycle_id: &cycle_id,
+                    cycle_number,
+                    config: &config,
+                    worktree_manager: &worktree_manager,
+                    base_commit: &base_commit,
+                    cancel: cancel.clone(),
+                })
                 .await?;
 
             // Write-ahead: about to launch reviewer + tester.
-            RunState::CoderRunning.validate_transition(RunState::AwaitingReviewTest)?;
-            db::update_run_state(&self.pool, &run_id, RunState::AwaitingReviewTest).await?;
+            self.transition(&run_id, RunState::AwaitingReviewTest)
+                .await?;
 
             let findings = self
                 .run_review_and_test(
@@ -129,8 +161,13 @@ impl Orchestrator {
             db::close_cycle(&self.pool, &cycle_id).await?;
 
             let next_state = decide_next_state(&findings, cycle_number, config.max_cycles);
-            RunState::AwaitingReviewTest.validate_transition(next_state)?;
-            db::update_run_state(&self.pool, &run_id, next_state).await?;
+            if next_state == RunState::Converged {
+                // M4: record the commit the run converged on before
+                // persisting the state transition, so a reader that
+                // observes `Converged` can never see a missing SHA.
+                db::set_run_converged_commit(&self.pool, &run_id, &base_commit).await?;
+            }
+            self.transition(&run_id, next_state).await?;
 
             match next_state {
                 RunState::CoderRunning => {
@@ -144,15 +181,17 @@ impl Orchestrator {
         Ok((run_id, final_state))
     }
 
-    async fn run_coder(
-        &self,
-        run_id: &str,
-        cycle_id: &str,
-        config: &RunConfig,
-        worktree_manager: &WorktreeManager,
-        base_commit: &str,
-        cancel: CancellationToken,
-    ) -> Result<String> {
+    async fn run_coder(&self, invocation: CoderInvocation<'_>) -> Result<String> {
+        let CoderInvocation {
+            run_id,
+            cycle_id,
+            cycle_number,
+            config,
+            worktree_manager,
+            base_commit,
+            cancel,
+        } = invocation;
+
         let worktree = worktree_manager
             .create(run_id, AgentRole::Coder.as_str(), base_commit)
             .await?;
@@ -164,16 +203,51 @@ impl Orchestrator {
         )
         .await?;
 
-        self.run_agent(
-            cycle_id,
-            AgentRole::Coder,
-            &config.coder_command,
-            worktree.path(),
-            cancel,
-        )
-        .await?;
+        let outcome = self
+            .run_agent(
+                cycle_id,
+                AgentRole::Coder,
+                &config.coder_command,
+                worktree.path(),
+                cancel,
+            )
+            .await?;
+
+        // M2: a coder that exits non-zero has not reliably produced a
+        // commit worth reviewing — `read_head_commit` below would just
+        // return the unchanged base commit, silently making the loop look
+        // like a no-op success. Fail the run explicitly instead.
+        if outcome.exit_code != 0 {
+            tracing::warn!(
+                run_id,
+                cycle_id,
+                exit_code = outcome.exit_code,
+                stderr = %outcome.stderr,
+                "coder exited with a non-zero status; failing the run"
+            );
+            // Write-ahead (ADR-0004): persist Failed before returning the
+            // error to the caller.
+            self.transition(run_id, RunState::Failed).await?;
+            if let Err(error) = worktree.remove().await {
+                tracing::warn!(%error, "failed to clean up coder worktree after a failed coder run");
+            }
+            return Err(WardenError::CoderFailed {
+                run_id: run_id.to_string(),
+                cycle_id: cycle_id.to_string(),
+                exit_code: outcome.exit_code,
+                stderr: truncate_for_error(&outcome.stderr),
+            });
+        }
 
         let new_commit = read_head_commit(worktree.path()).await?;
+
+        // M4: protect the commit from `git gc` (worktrees share the main
+        // repo's object store, so this commit becomes unreachable garbage
+        // the moment its worktree is removed) and persist its SHA so it
+        // stays discoverable — both purely local git/DB operations, no
+        // push, no remote (that's Phase 3's git gate).
+        protect_cycle_commit(&config.repo_path, run_id, cycle_number, &new_commit).await?;
+        db::set_cycle_commit_sha(&self.pool, cycle_id, &new_commit).await?;
 
         if let Err(error) = worktree.remove().await {
             tracing::warn!(%error, "failed to clean up coder worktree after cycle");
@@ -284,7 +358,16 @@ impl Orchestrator {
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
         let child = process::spawn(command, cwd)?;
-        let pid = child.id().unwrap_or(0);
+        // H1: never persist pid 0. A missing `Child::id()` right after
+        // spawn is a typed error, not a silent fallback — a persisted pid
+        // 0 would make `is_process_alive` misreport this run as having a
+        // live process forever (POSIX `kill(0, ...)` semantics), defeating
+        // crash recovery.
+        let pid = child
+            .id()
+            .ok_or_else(|| crate::error::ProcessError::MissingPid {
+                command: command.program.clone(),
+            })?;
         let process_id = Uuid::new_v4().to_string();
 
         db::insert_agent_process(
@@ -304,8 +387,37 @@ impl Orchestrator {
         };
         db::mark_agent_process_ended(&self.pool, &process_id, exit_code_for_db).await?;
 
+        // L1: log stderr on the success path too — previously only ever
+        // surfaced when findings-parsing failed, so a noisy-but-successful
+        // agent (warnings, debug chatter) left no trace anywhere.
+        if let Ok(outcome) = &outcome_result {
+            if !outcome.stderr.trim().is_empty() {
+                tracing::debug!(cycle_id, ?role, stderr = %outcome.stderr, "agent stderr output");
+            }
+        }
+
         Ok(outcome_result?)
     }
+}
+
+/// Bounds how much of an agent's stderr is embedded in an error message —
+/// full output is already logged via `tracing` before this is constructed;
+/// this is just what surfaces in `Display`/CLI output.
+const MAX_ERROR_STDERR_LEN: usize = 2000;
+
+fn truncate_for_error(stderr: &str) -> String {
+    if stderr.len() <= MAX_ERROR_STDERR_LEN {
+        return stderr.to_string();
+    }
+    // Truncate on a char boundary — stderr is arbitrary agent output and
+    // may contain multi-byte UTF-8, so a byte-offset slice could panic.
+    let boundary = stderr
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= MAX_ERROR_STDERR_LEN)
+        .last()
+        .unwrap_or(0);
+    format!("{}… (truncated)", &stderr[..boundary])
 }
 
 fn role_to_finding_source(role: AgentRole) -> warden_core::FindingSource {
@@ -336,11 +448,53 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Creates a local ref pointing at `commit_sha` in the main repository
+/// (M4), so the commit produced by a cycle's coder stays reachable — and
+/// therefore safe from `git gc` — after its worktree is removed. Worktrees
+/// share the main repo's object store, so a commit with nothing pointing
+/// at it becomes ordinary unreachable garbage the moment its worktree is
+/// gone.
+///
+/// This only ever writes to `.git/refs/...` (repository metadata), never to
+/// the main repo's checked-out working tree files, index, or current
+/// branch — the same category of write `git worktree add/remove` already
+/// makes to `.git/worktrees/...`. It is a purely local git operation: no
+/// push, no remote, no interaction with `origin` — that boundary belongs to
+/// Phase 3's git gate.
+async fn protect_cycle_commit(
+    main_repo_path: &Path,
+    run_id: &str,
+    cycle_number: u32,
+    commit_sha: &str,
+) -> Result<()> {
+    let ref_name = format!("refs/warden/runs/{run_id}/cycle-{cycle_number}");
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(main_repo_path)
+        .args(["update-ref", &ref_name, commit_sha])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(WardenError::Worktree(WorktreeError::GitCommandFailed {
+            command: format!(
+                "git -C {} update-ref {ref_name} {commit_sha}",
+                main_repo_path.display()
+            ),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
+    }
+
+    Ok(())
+}
+
 /// Crash recovery (Architecture.md §6, "Règle de récupération" / §9
 /// Disaster Recovery): any run left in an intermediate state
 /// ([`RunState::is_intermediate`]) with no live process associated is
-/// marked `Failed`. A run whose latest agent process is still alive is left
-/// untouched — Phase 1 does not attempt to re-attach to it.
+/// marked `Failed`. A run whose latest agent process is still alive — same
+/// PID *and* same recorded start time, see `process::is_process_alive` and
+/// H1 — is left untouched; Phase 1 does not attempt to re-attach to it.
 ///
 /// Returns the ids of runs that were marked `Failed`.
 pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
@@ -350,7 +504,7 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
     for run in intermediate_runs {
         let open_process = db::latest_open_agent_process_for_run(pool, &run.id).await?;
         let has_live_process = open_process
-            .map(|p| process::is_process_alive(p.pid))
+            .map(|p| process::is_process_alive(p.pid, p.pid_started_at_unix))
             .unwrap_or(false);
 
         if has_live_process {
@@ -416,6 +570,9 @@ mod tests {
         )
     }
 
+    /// NDJSON wire format (code-standards.md "Agent Subprocess Protocol",
+    /// M3): one finding object per line, no wrapping `{"findings": [...]}`.
+    /// "No findings" is simply no stdout at all.
     fn status_gated_reviewer() -> AgentCommand {
         AgentCommand::new(
             "sh",
@@ -423,9 +580,7 @@ mod tests {
                 "-c",
                 r#"
                 if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
-                    echo '{"findings":[{"source":"reviewer","severity":"blocking","description":"status is broken"}]}'
-                else
-                    echo '{"findings":[]}'
+                    echo '{"source":"reviewer","severity":"blocking","description":"status is broken"}'
                 fi
                 "#,
             ],
@@ -433,7 +588,7 @@ mod tests {
     }
 
     fn always_passing_tester() -> AgentCommand {
-        AgentCommand::new("sh", ["-c", r#"echo '{"findings":[]}'"#])
+        AgentCommand::new("sh", ["-c", "true"])
     }
 
     #[tokio::test]
@@ -497,7 +652,7 @@ mod tests {
             "sh",
             [
                 "-c",
-                r#"echo '{"findings":[{"source":"reviewer","severity":"blocking","description":"never happy"}]}'"#,
+                r#"echo '{"source":"reviewer","severity":"blocking","description":"never happy"}'"#,
             ],
         );
         let noop_coder = AgentCommand::new(

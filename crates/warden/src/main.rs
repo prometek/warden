@@ -46,8 +46,9 @@ enum Commands {
         branch: String,
 
         /// Maximum number of coder/review/test cycles before giving up
-        /// (`RunState::MaxCyclesExceeded`).
-        #[arg(long, default_value_t = 5)]
+        /// (`RunState::MaxCyclesExceeded`). Must be at least 1 — a budget
+        /// of 0 could never let the coder run at all.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_cycles: u32,
 
         /// Warden's own state directory (SQLite db + worktrees). Defaults

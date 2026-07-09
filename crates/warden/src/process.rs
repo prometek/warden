@@ -130,26 +130,70 @@ pub async fn spawn_and_wait(
     wait(child, &command.program, cancel).await
 }
 
-/// Checks whether `pid` still refers to a live process, without sending a
-/// real signal (`kill(pid, 0)` semantics). Used by crash recovery to decide
-/// whether a run left in an intermediate state genuinely still has an agent
-/// working on it.
-#[cfg(unix)]
-pub fn is_process_alive(pid: u32) -> bool {
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
+/// Sentinel meaning "no process start time was recorded for this row" —
+/// used for historical rows written before start-time tracking existed.
+/// `0` is never a real Unix start time in practice (that would be 1970).
+pub const UNKNOWN_START_TIME: i64 = 0;
 
-    kill(Pid::from_raw(pid as i32), None).is_ok()
+/// Returns the OS-reported start time (seconds since the Unix epoch) of
+/// `pid`, or `None` if no such process exists right now.
+///
+/// This is what lets [`is_process_alive`] tell a still-running process
+/// apart from an unrelated process that happens to have reused the same PID
+/// after a reboot: PIDs are a small, wrapping namespace recycled by the OS,
+/// so a bare "does this PID exist" check is not sufficient for correctness
+/// over the lifetime of a persisted run (H1 / crash recovery, Architecture
+/// §9). A process's start time is immutable for its whole lifetime, so
+/// re-reading it later and comparing against a value captured right after
+/// spawn reliably detects PID reuse.
+pub fn process_start_time(pid: u32) -> Option<i64> {
+    if pid == 0 {
+        return None;
+    }
+    // A single-PID refresh (not `ProcessesToUpdate::All`) keeps this cheap
+    // enough to call synchronously from an async context — it's invoked at
+    // most once per agent invocation, never in a hot loop.
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+    system
+        .process(sysinfo::Pid::from_u32(pid))
+        .map(|process| process.start_time() as i64)
 }
 
-#[cfg(not(unix))]
-pub fn is_process_alive(_pid: u32) -> bool {
-    // Phase 1 targets Unix (see Architecture.md — local, mono-utilisateur
-    // tool). A non-Unix liveness check would need a different primitive
-    // (e.g. OpenProcess on Windows); until that's implemented, treat any
-    // recorded PID as not-alive so crash recovery fails safe towards
-    // `Failed` rather than leaving a run stuck as "in progress" forever.
-    false
+/// Checks whether `pid` still refers to the *same* process that was
+/// recorded with `expected_start_time` (seconds since epoch), not merely
+/// whether some process with that PID currently exists.
+///
+/// `pid == 0` is always reported not-alive: POSIX `kill(0, ...)` signals
+/// the caller's entire process group rather than a single process, so a
+/// naive `kill(pid, None)` liveness check against a pid-0 sentinel always
+/// (mis)reports "alive" regardless of whether an agent is actually running
+/// — this was H1, a real bug in the previous implementation.
+///
+/// If `expected_start_time` is [`UNKNOWN_START_TIME`] (no start time was
+/// ever recorded for this row), falls back to a plain existence check —
+/// strictly less safe against PID reuse, and logged as such.
+pub fn is_process_alive(pid: u32, expected_start_time: i64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    let Some(actual_start_time) = process_start_time(pid) else {
+        return false;
+    };
+
+    if expected_start_time == UNKNOWN_START_TIME {
+        tracing::warn!(
+            pid,
+            "checking process liveness without a recorded start time; cannot rule out PID reuse"
+        );
+        return true;
+    }
+
+    actual_start_time == expected_start_time
 }
 
 #[cfg(test)]
@@ -186,7 +230,8 @@ mod tests {
         let pid = child
             .id()
             .expect("pid available for a freshly spawned child");
-        assert!(is_process_alive(pid));
+        let start_time = process_start_time(pid).expect("start time available for a live process");
+        assert!(is_process_alive(pid, start_time));
         wait(child, "sh", CancellationToken::new()).await.unwrap();
     }
 
@@ -207,7 +252,10 @@ mod tests {
 
     #[test]
     fn current_process_is_reported_alive() {
-        assert!(is_process_alive(std::process::id()));
+        let pid = std::process::id();
+        let start_time =
+            process_start_time(pid).expect("start time available for the current process");
+        assert!(is_process_alive(pid, start_time));
     }
 
     #[test]
@@ -215,6 +263,44 @@ mod tests {
         // Real PIDs are far smaller than this on both Linux (< 2^22 by
         // default) and macOS (< 100_000); used purely as a deterministic
         // "not alive" fixture, well within the valid positive pid_t range.
-        assert!(!is_process_alive(999_999_999));
+        assert!(!is_process_alive(999_999_999, UNKNOWN_START_TIME));
+    }
+
+    #[test]
+    fn a_wrong_start_time_is_reported_not_alive_even_though_the_pid_exists() {
+        // The core PID-reuse defence (H1): a PID that genuinely exists
+        // right now must still be reported not-alive if the start time we
+        // recorded for it doesn't match the process currently holding that
+        // PID — that mismatch is exactly what happens when the original
+        // process died and the OS handed its PID to something else later.
+        let pid = std::process::id();
+        let real_start_time = process_start_time(pid).unwrap();
+        let bogus_start_time = real_start_time + 1_000_000;
+        assert!(!is_process_alive(pid, bogus_start_time));
+    }
+
+    #[test]
+    fn no_recorded_start_time_falls_back_to_plain_existence_check() {
+        // Historical/degraded case: UNKNOWN_START_TIME means we never
+        // captured a fingerprint for this row, so we can't rule out PID
+        // reuse — but we also shouldn't refuse to ever recover such rows,
+        // so we fall back to "does a process with this PID exist at all".
+        let pid = std::process::id();
+        assert!(is_process_alive(pid, UNKNOWN_START_TIME));
+    }
+
+    /// Regression test for H1: POSIX `kill(pid=0, ...)` signals every
+    /// process in the caller's own process group, so a naive liveness check
+    /// against a pid-0 sentinel always misreported "alive" regardless of
+    /// whether pid 0 referred to a real agent — silently defeating the
+    /// crash-detection acceptance criterion in issue #1. `pid == 0` is now
+    /// an explicit sentinel that is never alive, and
+    /// `orchestrator::run_agent` no longer persists pid 0 at all (a missing
+    /// `Child::id()` is a typed `ProcessError::MissingPid`, not a silent
+    /// fallback to 0).
+    #[test]
+    fn pid_zero_is_never_reported_alive() {
+        assert!(!is_process_alive(0, UNKNOWN_START_TIME));
+        assert!(!is_process_alive(0, 12345));
     }
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE runs SET converged_commit_sha = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "39ff8c71faad3c0247c4d274e582f27ed7bedcb650c1b04603c8a7dbb4aafa08"
+}

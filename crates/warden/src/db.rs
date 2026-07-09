@@ -24,7 +24,13 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        // Explicit rather than relying on sqlx's default: the `cycles`,
+        // `findings`, and `agent_processes` tables all declare `REFERENCES`
+        // clauses (see migrations/0001_initial.sql) that are otherwise
+        // decorative — SQLite does not enforce foreign keys unless this
+        // pragma is on for the connection.
+        .foreign_keys(true);
 
     let pool = SqlitePoolOptions::new().connect_with(options).await?;
 
@@ -35,6 +41,16 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// Converts a `INTEGER` column value into a `u32`, returning a typed error
+/// instead of silently clamping/defaulting on overflow (code-standards.md:
+/// "no silent fallback"). Every row written by this module comes from a
+/// `u32` in the first place, so failure here means the stored value was
+/// corrupted or written by something other than this code — worth
+/// surfacing, not hiding.
+fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| WardenError::InvalidStoredValue { column, value })
 }
 
 /// A `runs` row, with `state` already validated into [`RunState`].
@@ -49,6 +65,9 @@ pub struct Run {
     pub current_cycle: u32,
     pub created_at: String,
     pub updated_at: String,
+    /// The commit SHA the run converged on (see `set_run_converged_commit`,
+    /// M4) — `None` until the run reaches `RunState::Converged`.
+    pub converged_commit_sha: Option<String>,
 }
 
 pub async fn insert_run(
@@ -119,6 +138,27 @@ pub async fn set_run_current_cycle(
     Ok(())
 }
 
+/// Records the commit SHA a run converged on (M4). Called once, when the
+/// run transitions to `RunState::Converged` — Phase 3's git gate reads this
+/// column to know what to push, without needing the (by then removed)
+/// coder worktree.
+pub async fn set_run_converged_commit(
+    pool: &SqlitePool,
+    run_id: &str,
+    commit_sha: &str,
+) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query!(
+        "UPDATE runs SET converged_commit_sha = ?, updated_at = ? WHERE id = ?",
+        commit_sha,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Raw shape of a `runs` row as decoded by sqlx, before `state` has been
 /// validated into a [`RunState`]. Kept private: [`Run`] is the only form
 /// that ever leaves this module.
@@ -132,6 +172,7 @@ struct RunRow {
     current_cycle: i64,
     created_at: String,
     updated_at: String,
+    converged_commit_sha: Option<String>,
 }
 
 fn row_to_run(row: RunRow) -> Result<Run> {
@@ -141,17 +182,18 @@ fn row_to_run(row: RunRow) -> Result<Run> {
         branch: row.branch,
         intent: row.intent,
         state: RunState::parse(&row.state)?,
-        max_cycles: row.max_cycles.try_into().unwrap_or(0),
-        current_cycle: row.current_cycle.try_into().unwrap_or(0),
+        max_cycles: checked_u32(row.max_cycles, "runs.max_cycles")?,
+        current_cycle: checked_u32(row.current_cycle, "runs.current_cycle")?,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        converged_commit_sha: row.converged_commit_sha,
     })
 }
 
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -169,7 +211,7 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at
+        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha
         FROM runs
         WHERE state IN ('coder_running', 'awaiting_review_test', 'awaiting_ci')
         "#
@@ -194,6 +236,24 @@ pub async fn insert_cycle(
         run_id,
         cycle_number,
         now,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Records the commit SHA the coder produced during this cycle (M4). Called
+/// right after the orchestrator reads the coder worktree's HEAD, so the SHA
+/// stays discoverable even after that worktree is removed.
+pub async fn set_cycle_commit_sha(
+    pool: &SqlitePool,
+    cycle_id: &str,
+    commit_sha: &str,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE cycles SET coder_commit_sha = ? WHERE id = ?",
+        commit_sha,
+        cycle_id,
     )
     .execute(pool)
     .await?;
@@ -290,6 +350,13 @@ pub async fn list_findings_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Resul
         .collect::<std::result::Result<Vec<_>, WardenError>>()
 }
 
+/// Persists an agent process record, capturing the OS-reported start time
+/// of `pid` *at insert time* (H1: PID-reuse hardening). This is what lets
+/// `recover_crashed_runs` later tell this exact process instance apart from
+/// an unrelated process that reuses the same PID after a reboot — see
+/// `process::is_process_alive`. The caller doesn't supply the start time
+/// directly: it's derived here, right when the PID is freshest, so callers
+/// can't accidentally pass a stale or fabricated value.
 pub async fn insert_agent_process(
     pool: &SqlitePool,
     id: &str,
@@ -300,13 +367,16 @@ pub async fn insert_agent_process(
 ) -> Result<()> {
     let now = now_rfc3339();
     let role = role.as_str();
+    let pid_started_at_unix =
+        crate::process::process_start_time(pid).unwrap_or(crate::process::UNKNOWN_START_TIME);
     let pid = i64::from(pid);
     sqlx::query!(
-        "INSERT INTO agent_processes (id, cycle_id, role, pid, worktree_path, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO agent_processes (id, cycle_id, role, pid, pid_started_at_unix, worktree_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id,
         cycle_id,
         role,
         pid,
+        pid_started_at_unix,
         worktree_path,
         now,
     )
@@ -332,10 +402,12 @@ pub async fn mark_agent_process_ended(pool: &SqlitePool, id: &str, exit_code: i3
 /// The most recent agent process associated with `run_id` that was never
 /// marked as ended — i.e. the process the orchestrator was waiting on when
 /// it last wrote to the database. Used by crash recovery: if this process's
-/// PID is no longer alive, the run is stuck and must be marked `Failed`.
+/// PID is no longer alive (or has been reused by an unrelated process, per
+/// `pid_started_at_unix`), the run is stuck and must be marked `Failed`.
 pub struct OpenAgentProcess {
     pub id: String,
     pub pid: u32,
+    pub pid_started_at_unix: i64,
 }
 
 pub async fn latest_open_agent_process_for_run(
@@ -344,7 +416,7 @@ pub async fn latest_open_agent_process_for_run(
 ) -> Result<Option<OpenAgentProcess>> {
     let row = sqlx::query!(
         r#"
-        SELECT agent_processes.id as "id!", agent_processes.pid as "pid!"
+        SELECT agent_processes.id as "id!", agent_processes.pid as "pid!", agent_processes.pid_started_at_unix as "pid_started_at_unix!"
         FROM agent_processes
         JOIN cycles ON cycles.id = agent_processes.cycle_id
         WHERE cycles.run_id = ? AND agent_processes.ended_at IS NULL
@@ -356,10 +428,14 @@ pub async fn latest_open_agent_process_for_run(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| OpenAgentProcess {
-        id: r.id,
-        pid: r.pid as u32,
-    }))
+    row.map(|r| {
+        Ok(OpenAgentProcess {
+            id: r.id,
+            pid: checked_u32(r.pid, "agent_processes.pid")?,
+            pid_started_at_unix: r.pid_started_at_unix,
+        })
+    })
+    .transpose()
 }
 
 #[cfg(test)]
@@ -478,6 +554,55 @@ mod tests {
         assert_eq!(findings[0], finding);
 
         close_cycle(&pool, "cycle-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_run_returns_none_for_an_unknown_id() {
+        let (_dir, pool) = test_pool().await;
+        let run = get_run(&pool, "does-not-exist").await.unwrap();
+        assert!(run.is_none());
+    }
+
+    #[tokio::test]
+    async fn inserting_a_run_with_a_duplicate_id_is_a_typed_error_not_a_panic() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let result = insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent again", 3).await;
+        assert!(matches!(result, Err(WardenError::Database(_))));
+
+        // The original row must be untouched by the failed duplicate insert.
+        let run = get_run(&pool, "dup-run").await.unwrap().unwrap();
+        assert_eq!(run.intent, "intent");
+    }
+
+    #[tokio::test]
+    async fn list_findings_for_cycle_with_no_findings_is_empty_not_an_error() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-empty", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-empty", "run-empty", 1)
+            .await
+            .unwrap();
+
+        let findings = list_findings_for_cycle(&pool, "cycle-empty").await.unwrap();
+        assert!(findings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn latest_open_agent_process_is_none_when_run_has_no_processes() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-no-proc", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let open = latest_open_agent_process_for_run(&pool, "run-no-proc")
+            .await
+            .unwrap();
+        assert!(open.is_none());
     }
 
     #[tokio::test]

@@ -182,6 +182,48 @@ mod tests {
     }
 
     #[test]
+    fn converged_can_only_move_to_pushed() {
+        assert!(RunState::Converged
+            .validate_transition(RunState::Pushed)
+            .is_ok());
+        assert!(RunState::Converged
+            .validate_transition(RunState::Done)
+            .is_err());
+        assert!(RunState::Converged
+            .validate_transition(RunState::CoderRunning)
+            .is_err());
+    }
+
+    #[test]
+    fn pushed_can_only_move_to_awaiting_ci() {
+        assert!(RunState::Pushed
+            .validate_transition(RunState::AwaitingCi)
+            .is_ok());
+        assert!(RunState::Pushed
+            .validate_transition(RunState::Done)
+            .is_err());
+    }
+
+    #[test]
+    fn awaiting_ci_covers_all_post_push_outcomes() {
+        let from = RunState::AwaitingCi;
+        assert!(from.validate_transition(RunState::Done).is_ok());
+        assert!(from.validate_transition(RunState::CoderRunning).is_ok());
+        assert!(from.validate_transition(RunState::Failed).is_ok());
+        assert!(from.validate_transition(RunState::Converged).is_err());
+    }
+
+    #[test]
+    fn max_cycles_exceeded_can_only_move_to_failed() {
+        assert!(RunState::MaxCyclesExceeded
+            .validate_transition(RunState::Failed)
+            .is_ok());
+        assert!(RunState::MaxCyclesExceeded
+            .validate_transition(RunState::CoderRunning)
+            .is_err());
+    }
+
+    #[test]
     fn intermediate_states_match_recovery_rule() {
         assert!(RunState::CoderRunning.is_intermediate());
         assert!(RunState::AwaitingReviewTest.is_intermediate());
