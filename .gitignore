@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# docs = symlink local vers le vault Obsidian, hors repo
+/docs

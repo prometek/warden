@@ -7,5 +7,5 @@ des agents.
 
 ## Documentation
 
-Le dossier [`docs/`](docs/) est un lien symbolique vers le dossier d'architecture
-maintenu dans le vault Obsidian. Voir [`docs/Architecture.md`](docs/Architecture.md).
+Le dossier d'architecture est maintenu dans un vault Obsidian, hors dépôt. En local,
+`docs/` est un lien symbolique vers ce dossier (non versionné, cf. `.gitignore`).
