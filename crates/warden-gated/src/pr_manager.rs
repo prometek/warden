@@ -304,17 +304,11 @@ pub struct OpenDraftRequest<'a> {
     pub intent: &'a str,
 }
 
-/// The well-known, content-addressed sha of git's empty tree object --
-/// identical in every repository, since it's hashed from fixed content
-/// (`tree\0` with no entries). Used as the comparison point when
-/// `base_branch` doesn't exist on `origin` yet (e.g. the very first run
-/// against a brand-new repo): in that case the only content-free skeleton
-/// is one whose own tree is also empty.
-const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-
 /// Independently determines whether `skeleton_commit_sha` changes anything
 /// relative to `base_branch`'s current tip on `origin`. Returns the list of
-/// changed file paths (empty means content-free).
+/// changed file paths across the *whole* range that would actually be
+/// transferred by `git push {skeleton}:refs/heads/{branch}` (empty means
+/// content-free).
 ///
 /// `open_draft` must never trust a caller-supplied sha to truly be "just a
 /// branch skeleton" (issue #4 review, finding #1) -- this re-derives that
@@ -323,29 +317,54 @@ const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// `origin` is a read-only operation already within the access
 /// `warden-gated` holds (it can already push there) -- no new credential
 /// exposure.
+///
+/// Checking only the *endpoint* diff (skeleton tip tree vs. base tip tree)
+/// is not enough (issue #4 review, follow-up finding): `git push` transfers
+/// every commit's objects in the pushed range, not just the net difference
+/// between the two ends. A skeleton whose tip tree matches base, but whose
+/// history contains an intermediate commit that adds a business file and a
+/// later one that removes it again, would pass an endpoint-only check while
+/// still landing those blobs on `origin`, reachable forever via `git
+/// log`/`git show`. So every commit that would be pushed is checked
+/// individually, against its own parent (or the empty tree, for a root
+/// commit) -- not just the range's net effect.
 async fn skeleton_diff_against_base(
     bare_repo_path: &Path,
     base_branch: &str,
     skeleton_commit_sha: &str,
 ) -> Result<Vec<String>> {
-    let compare_from = match remote_branch_head(bare_repo_path, "origin", base_branch).await? {
+    let base_sha = match remote_branch_head(bare_repo_path, "origin", base_branch).await? {
         Some(base_sha) => {
             fetch_branch(bare_repo_path, "origin", base_branch).await?;
-            merge_base(bare_repo_path, &base_sha, skeleton_commit_sha).await?
+            Some(base_sha)
         }
-        // `base_branch` doesn't exist on `origin` yet -- the only
-        // content-free skeleton in that case has a genuinely empty tree.
-        None => EMPTY_TREE_SHA.to_string(),
+        // `base_branch` doesn't exist on `origin` yet -- there's nothing to
+        // exclude, so every commit reachable from the skeleton is in scope.
+        None => None,
     };
 
-    diff_name_only(bare_repo_path, &compare_from, skeleton_commit_sha).await
+    let pushed_commits =
+        commits_in_range(bare_repo_path, base_sha.as_deref(), skeleton_commit_sha).await?;
+
+    let mut offending_files = Vec::new();
+    for commit in &pushed_commits {
+        offending_files.extend(commit_own_diff(bare_repo_path, commit).await?);
+    }
+    offending_files.sort();
+    offending_files.dedup();
+    Ok(offending_files)
 }
 
 /// The sha `base_branch` currently points to on `remote`, or `None` if that
-/// branch doesn't exist there yet. Uses `ls-remote --exit-code`, whose
-/// documented exit code `2` means "no matching ref" -- distinguished here
-/// from any other (genuine) failure, which is still surfaced as an error
-/// rather than silently treated as "branch absent".
+/// branch doesn't exist there yet.
+///
+/// Lists *every* head and matches the ref column exactly against
+/// `refs/heads/{branch}`, rather than handing `branch` to `git ls-remote` as
+/// a pattern: `git ls-remote --heads <remote> <branch>` matches any ref
+/// whose path ends in `/branch` (e.g. `refs/heads/feat/main` alongside
+/// `refs/heads/main`), and taking the first output line unconditionally
+/// could silently pick a sibling branch's sha as the "base" (issue #4
+/// review, follow-up finding).
 async fn remote_branch_head(
     repo_path: &Path,
     remote: &str,
@@ -354,62 +373,91 @@ async fn remote_branch_head(
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
-        .args(["ls-remote", "--exit-code", "--heads", remote, branch])
+        .args(["ls-remote", "--heads", remote])
         .output()
         .await?;
 
-    match output.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().next())
-            .map(str::to_string)),
-        Some(2) => Ok(None),
-        _ => Err(GatedError::GitCommandFailed {
-            command: format!(
-                "git -C {} ls-remote --exit-code --heads {remote} {branch}",
-                repo_path.display()
-            ),
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }),
-    }
-}
-
-/// Fetches `branch` from `remote` into `repo_path`'s local object store
-/// (read-only) so its tip commit can be diffed/merge-based against locally.
-async fn fetch_branch(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
-    run_git(repo_path, &["fetch", "--quiet", remote, branch]).await
-}
-
-async fn merge_base(repo_path: &Path, a: &str, b: &str) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .args(["merge-base", a, b])
-        .output()
-        .await?;
     if !output.status.success() {
         return Err(GatedError::GitCommandFailed {
-            command: format!("git -C {} merge-base {a} {b}", repo_path.display()),
+            command: format!("git -C {} ls-remote --heads {remote}", repo_path.display()),
             exit_code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    let target_ref = format!("refs/heads/{branch}");
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?;
+            let refname = fields.next()?;
+            (refname == target_ref).then(|| sha.to_string())
+        }))
 }
 
-async fn diff_name_only(repo_path: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+/// Fetches `branch` from `remote` into `repo_path`'s local object store
+/// (read-only) so its history can be walked/diffed locally.
+async fn fetch_branch(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
+    run_git(repo_path, &["fetch", "--quiet", remote, branch]).await
+}
+
+/// Lists the commits that `git push {range_end}:refs/heads/<branch>` would
+/// actually transfer: everything reachable from `range_end` but not from
+/// `range_start` (`git rev-list <start>..<end>`), or -- when there is no
+/// `range_start` at all (`base_branch` doesn't exist on `origin` yet) --
+/// every commit reachable from `range_end`, since there's nothing to
+/// exclude.
+async fn commits_in_range(
+    repo_path: &Path,
+    range_start: Option<&str>,
+    range_end: &str,
+) -> Result<Vec<String>> {
+    let range_arg = match range_start {
+        Some(start) => format!("{start}..{range_end}"),
+        None => range_end.to_string(),
+    };
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_path)
-        .args(["diff", "--name-only", from, to])
+        .args(["rev-list", &range_arg])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(GatedError::GitCommandFailed {
+            command: format!("git -C {} rev-list {range_arg}", repo_path.display()),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// The file paths `commit_sha` itself introduces, relative to its first
+/// parent -- or relative to the empty tree if it's a root commit (`--root`,
+/// so a root commit's real content isn't mistaken for "no diff" just
+/// because it has no parent to diff against).
+async fn commit_own_diff(repo_path: &Path, commit_sha: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            commit_sha,
+        ])
         .output()
         .await?;
     if !output.status.success() {
         return Err(GatedError::GitCommandFailed {
             command: format!(
-                "git -C {} diff --name-only {from} {to}",
+                "git -C {} diff-tree --no-commit-id --name-only -r --root {commit_sha}",
                 repo_path.display()
             ),
             exit_code: output.status.code(),
@@ -868,6 +916,91 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// The exact-match fix (issue #4 review, follow-up finding): `origin`
+    /// has both `refs/heads/main` and `refs/heads/feat/main` (a sibling
+    /// branch whose last path segment also happens to be "main"). Asking
+    /// for `main` must resolve to `refs/heads/main`'s own sha, never
+    /// `feat/main`'s -- `git ls-remote --heads <remote> main` alone would
+    /// match both refs as a pattern, so this exercises `remote_branch_head`
+    /// doing the exact-ref filtering itself rather than trusting the
+    /// pattern match.
+    #[tokio::test]
+    async fn remote_branch_head_matches_the_exact_ref_not_a_sibling_suffix_match() {
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "--quiet"]);
+
+        let seed = tempfile::TempDir::new().unwrap();
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
+        run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(seed.path(), &["config", "user.name", "warden-test"]);
+        run_git(
+            seed.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "main tip"],
+        );
+        let main_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(
+            seed.path(),
+            &[
+                "push",
+                "--quiet",
+                &origin.path().display().to_string(),
+                "main",
+            ],
+        );
+
+        run_git(seed.path(), &["checkout", "--quiet", "-b", "feat/main"]);
+        run_git(
+            seed.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "feat/main tip"],
+        );
+        run_git(
+            seed.path(),
+            &[
+                "push",
+                "--quiet",
+                &origin.path().display().to_string(),
+                "feat/main",
+            ],
+        );
+
+        let gate_repo = tempfile::TempDir::new().unwrap();
+        run_git(
+            gate_repo.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &seed.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(
+            gate_repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &origin.path().display().to_string(),
+            ],
+        );
+
+        let head = remote_branch_head(gate_repo.path(), "origin", "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            head,
+            Some(main_sha),
+            "must resolve refs/heads/main exactly, not a sibling refs/heads/feat/main"
+        );
+    }
+
     /// A bare gate repo with `origin` pointed at a second local bare repo,
     /// plus the sha of a commit already present in the gate repo -- enough
     /// to exercise `push::push_to_origin` (which `open_draft`/`finalize`
@@ -1168,6 +1301,124 @@ mod tests {
         );
     }
 
+    /// The range-check follow-up (issue #4 review): an *endpoint-only* diff
+    /// (skeleton tip tree vs. base tip tree) would miss this entirely --
+    /// the skeleton's tip tree is identical to `origin/main`'s, because an
+    /// intermediate commit adds `secret.rs` and a later commit removes it
+    /// again. But `git push {skeleton}:refs/heads/<branch>` still transfers
+    /// every object in that range, so `secret.rs`'s blob would land on
+    /// `origin` and stay reachable via `git log`/`git show` on the pushed
+    /// branch even though the tree at the tip never shows it. `open_draft`
+    /// must catch this by checking every commit in the range individually,
+    /// not just the range's net effect.
+    #[tokio::test]
+    async fn open_draft_rejects_a_skeleton_whose_tip_matches_base_but_whose_history_leaks_a_secret_file(
+    ) {
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "--quiet"]);
+
+        let seed = tempfile::TempDir::new().unwrap();
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
+        run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(seed.path(), &["config", "user.name", "warden-test"]);
+        std::fs::write(seed.path().join("f.txt"), "skeleton\n").unwrap();
+        run_git(seed.path(), &["add", "."]);
+        run_git(seed.path(), &["commit", "--quiet", "-m", "skeleton"]);
+        run_git(
+            seed.path(),
+            &[
+                "push",
+                "--quiet",
+                &origin.path().display().to_string(),
+                "main",
+            ],
+        );
+
+        // Intermediate commit: adds a secret file that must never reach
+        // `origin`.
+        std::fs::write(seed.path().join("secret.rs"), "const KEY: &str = \"x\";\n").unwrap();
+        run_git(seed.path(), &["add", "."]);
+        run_git(seed.path(), &["commit", "--quiet", "-m", "add secret.rs"]);
+
+        // Later commit: removes it again, so the *tip* tree is byte-for-
+        // byte identical to `main`'s -- an endpoint-only diff would see
+        // nothing wrong here.
+        run_git(seed.path(), &["rm", "--quiet", "secret.rs"]);
+        run_git(
+            seed.path(),
+            &["commit", "--quiet", "-m", "remove secret.rs"],
+        );
+        let tip_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        let gate_repo = tempfile::TempDir::new().unwrap();
+        run_git(
+            gate_repo.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &seed.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(
+            gate_repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &origin.path().display().to_string(),
+            ],
+        );
+
+        let provider = RecordingProvider::new(29);
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &tip_sha,
+            branch: "warden/run-leaky-history",
+            base_branch: "main",
+            intent: "Add a feature",
+        };
+
+        let result = open_draft(&request, &provider).await;
+        match result {
+            Err(GatedError::SkeletonNotContentFree {
+                commit_sha, files, ..
+            }) => {
+                assert_eq!(commit_sha, tip_sha);
+                assert_eq!(files, vec!["secret.rs".to_string()]);
+            }
+            other => panic!("expected SkeletonNotContentFree, got {other:?}"),
+        }
+
+        assert!(
+            provider.calls().is_empty(),
+            "a rejected skeleton must never reach the PR provider"
+        );
+
+        let ref_check = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                "refs/heads/warden/run-leaky-history",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !ref_check.status.success(),
+            "origin must never receive a push when the range leaks a secret file, \
+             even if the tip tree matches base"
+        );
+    }
+
     /// Exercises the other content-free path (finding #1's "e.g. ... or the
     /// empty tree" case): when `base_branch` doesn't exist on `origin` yet
     /// (a brand-new repo, first run ever), a skeleton with a genuinely
@@ -1242,6 +1493,140 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&origin_head.stdout).trim(),
             skeleton_sha
+        );
+    }
+
+    /// The other half of the empty-tree fallback (finding #1): when
+    /// `base_branch` doesn't exist on `origin` yet, the *only* content-free
+    /// skeleton is one with a genuinely empty tree -- a skeleton that adds
+    /// real files must still be rejected, exactly as it would be against an
+    /// existing base branch. Without this, a brand-new repo's very first
+    /// run would let *any* skeleton content through unchecked.
+    #[tokio::test]
+    async fn open_draft_rejects_a_non_empty_skeleton_when_base_branch_does_not_exist_on_origin() {
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "--quiet"]);
+
+        let seed = tempfile::TempDir::new().unwrap();
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
+        run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(seed.path(), &["config", "user.name", "warden-test"]);
+        std::fs::write(seed.path().join("src_business.rs"), "fn business() {}\n").unwrap();
+        run_git(seed.path(), &["add", "."]);
+        run_git(
+            seed.path(),
+            &["commit", "--quiet", "-m", "not actually a skeleton"],
+        );
+        let non_empty_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        // Deliberately never pushed to `origin` -- `main` doesn't exist
+        // there yet, same as the accept-case fixture.
+
+        let gate_repo = tempfile::TempDir::new().unwrap();
+        run_git(
+            gate_repo.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &seed.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(
+            gate_repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &origin.path().display().to_string(),
+            ],
+        );
+
+        let provider = RecordingProvider::new(19);
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &non_empty_sha,
+            branch: "warden/run-first-ever-rejected",
+            base_branch: "main",
+            intent: "Bootstrap the repo",
+        };
+
+        let result = open_draft(&request, &provider).await;
+        match result {
+            Err(GatedError::SkeletonNotContentFree {
+                commit_sha, files, ..
+            }) => {
+                assert_eq!(commit_sha, non_empty_sha);
+                assert_eq!(files, vec!["src_business.rs".to_string()]);
+            }
+            other => panic!("expected SkeletonNotContentFree, got {other:?}"),
+        }
+
+        assert!(
+            provider.calls().is_empty(),
+            "a rejected first-run skeleton must never reach the PR provider"
+        );
+        let ref_check = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                "refs/heads/warden/run-first-ever-rejected",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !ref_check.status.success(),
+            "origin must never receive a push for a rejected first-run skeleton"
+        );
+    }
+
+    /// Ordering invariant (issue #4 review, finding #2): pure validation
+    /// (here, a blank intent that `generate_pr_title` refuses) must surface
+    /// *before* `open_draft` does anything irreversible -- no content-free
+    /// check, no push, no provider call. Proven here against a real gate
+    /// repo/origin pair rather than just unit-testing `generate_pr_title` in
+    /// isolation, so the ordering itself (not just the pure function) is
+    /// under test.
+    #[tokio::test]
+    async fn open_draft_rejects_a_blank_intent_before_touching_git_or_the_provider() {
+        let (origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
+        let provider = RecordingProvider::new(23);
+
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &commit_sha,
+            branch: "warden/run-blank-intent",
+            base_branch: "main",
+            intent: "   \n  \n",
+        };
+
+        let result = open_draft(&request, &provider).await;
+        assert!(matches!(result, Err(GatedError::EmptyIntent)));
+
+        assert!(
+            provider.calls().is_empty(),
+            "a blank intent must be rejected before the PR provider is ever called"
+        );
+        let ref_check = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                "refs/heads/warden/run-blank-intent",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !ref_check.status.success(),
+            "a blank intent must be rejected before anything is pushed to origin"
         );
     }
 
