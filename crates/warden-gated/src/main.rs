@@ -4,10 +4,14 @@
 
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use warden_gated::ci_watcher::{watch_pr, WatchConfig, WatchOutcome};
 use warden_gated::gate::verify_and_authorize;
+use warden_gated::gh_provider::GhProvider;
+use warden_gated::pr_manager::PrHandle;
 use warden_gated::verify::GateDecision;
 use warden_gated::{bare_repo, db, hook, relay, serve};
 
@@ -103,6 +107,38 @@ enum Commands {
         #[arg(long)]
         commit: String,
     },
+
+    /// CI Watcher (issue #5): polls an already-opened PR until a terminal
+    /// status is reached -- merged, closed, checks-passed, checks-failed, or
+    /// an inactivity timeout -- and reports that outcome. Never merges the
+    /// PR itself: once checks pass, the merge decision is left entirely to a
+    /// human via the PR provider's own UI.
+    WatchPr {
+        /// The local bare gate repo, used to resolve `owner/repo` from its
+        /// `origin` remote when `--repo` isn't given (same resolution
+        /// `GhProvider::new` already does for `OpenDraft`/`Finalize`).
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        bare_repo: PathBuf,
+
+        /// Explicit `owner/repo` override, bypassing `origin` remote
+        /// detection.
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// The PR number to watch.
+        #[arg(long)]
+        pr: u64,
+
+        /// Seconds to sleep between two polls. Never busy-spins.
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval_secs: u64,
+
+        /// Seconds the polled status may go completely unchanged before
+        /// giving up (inactivity timeout) -- issue #5: "pas d'attente
+        /// infinie".
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+        inactivity_timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -125,6 +161,22 @@ async fn main() -> anyhow::Result<()> {
         } => run_serve(socket, db, bare_repo, branch).await,
         Commands::Notify { socket } => notify(socket).await,
         Commands::VerifyRun { db, run_id, commit } => verify_run(db, run_id, commit).await,
+        Commands::WatchPr {
+            bare_repo,
+            repo,
+            pr,
+            poll_interval_secs,
+            inactivity_timeout_secs,
+        } => {
+            watch_pr_cmd(
+                bare_repo,
+                repo,
+                pr,
+                poll_interval_secs,
+                inactivity_timeout_secs,
+            )
+            .await
+        }
     }
 }
 
@@ -195,6 +247,61 @@ async fn verify_run(db: PathBuf, run_id: String, commit: String) -> anyhow::Resu
         GateDecision::Blocked(reason) => {
             println!("BLOCKED: {reason:?}");
             bail!("push blocked for run {run_id}: {reason:?}");
+        }
+    }
+}
+
+/// Watches `pr` until a terminal outcome, then prints it and maps it to an
+/// exit code: `0` for `Merged`/`ChecksPassed` (the two outcomes that need no
+/// further action from Warden itself), non-zero otherwise -- mirroring
+/// `verify_run`'s `Allow`/`Blocked` exit-code convention. Never merges the
+/// PR (issue #5): `ChecksPassed` is reported and left to a human, exactly
+/// like `Merged` is.
+async fn watch_pr_cmd(
+    bare_repo: PathBuf,
+    repo: Option<String>,
+    pr_number: u64,
+    poll_interval_secs: u64,
+    inactivity_timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let provider = GhProvider::new(&bare_repo, repo.as_deref())
+        .await
+        .context("failed to resolve the GitHub repo to watch")?;
+    let pr = PrHandle { number: pr_number };
+    let config = WatchConfig {
+        poll_interval: Duration::from_secs(poll_interval_secs),
+        inactivity_timeout: Duration::from_secs(inactivity_timeout_secs),
+    };
+
+    let outcome = watch_pr(&pr, &provider, &config)
+        .await
+        .context("failed while watching the pr")?;
+
+    match outcome {
+        WatchOutcome::Merged => {
+            println!("MERGED: pr #{pr_number}");
+            Ok(())
+        }
+        WatchOutcome::ChecksPassed => {
+            println!("CHECKS-PASSED: pr #{pr_number} (merge decision left to a human)");
+            Ok(())
+        }
+        WatchOutcome::Closed => {
+            println!("CLOSED: pr #{pr_number} (closed without merging)");
+            bail!("pr #{pr_number} was closed without merging");
+        }
+        WatchOutcome::ChecksFailed(findings) => {
+            println!("CHECKS-FAILED: pr #{pr_number}");
+            for finding in &findings {
+                println!("- [{}] {}", finding.severity.as_str(), finding.description);
+            }
+            bail!("pr #{pr_number} has failing CI checks");
+        }
+        WatchOutcome::TimedOut => {
+            println!(
+                "TIMED-OUT: pr #{pr_number} (no status change for {inactivity_timeout_secs}s)"
+            );
+            bail!("timed out watching pr #{pr_number}: no status change for {inactivity_timeout_secs}s");
         }
     }
 }

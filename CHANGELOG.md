@@ -118,3 +118,37 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   bibliothèque : aucun déclenchement CLI/IPC ne les invoque encore depuis
   `warden` (câblage laissé à une décision d'architecture distincte, hors
   périmètre de cette livraison).
+
+### Added — Phase 5 : CI Watcher (`warden-gated`)
+
+- Nouveau module `ci_watcher` dans `warden-gated`, qui surveille une PR déjà
+  ouverte jusqu'à un statut terminal : `Merged`, `Closed` (fermée sans
+  merge), `ChecksPassed`, `ChecksFailed` (avec un finding bloquant par check
+  en échec, `FindingSource::Ci`), ou `TimedOut` (timeout d'inactivité
+  configurable — jamais d'attente infinie).
+- Boucle de polling (`watch_pr`) qui ne fait jamais de busy-spin (`sleep`
+  entre deux appels) et réinitialise son horloge d'inactivité à chaque
+  changement de statut observé — une CI qui progresse réellement (nouveaux
+  checks, check en cours qui se termine) n'est jamais interrompue
+  prématurément ; seul un statut resté strictement inchangé pendant la durée
+  configurée déclenche le `TimedOut`.
+- Trait `CiProvider`, seam au-dessus d'un fournisseur de statut PR/CI,
+  implémenté pour GitHub par `gh_provider::GhProvider` (`gh pr view --json
+  state,statusCheckRollup`), avec reconnaissance des deux formats de check
+  que GitHub peut renvoyer (Checks API récente et Statuses API historique).
+- Sous-commande `warden-gated watch-pr` (mêmes conventions que
+  `verify-run` : code de sortie `0` pour `Merged`/`ChecksPassed`, non nul
+  sinon) — validée de bout en bout sur de vrais dépôts GitHub publics : PR
+  mergée, PR ouverte aux checks tous verts, et PR sans aucune CI configurée
+  (timeout d'inactivité déclenché proprement, sans busy-spin).
+- Fonction pure `warden_core::decide_next_state_after_ci`, miroir de
+  `decide_next_state` pour les findings reviewer/tester : décide le
+  `RunState` (`Done` / `CoderRunning` / `Failed`) à partir du résultat
+  terminal du watcher. `warden-gated` ne fait que remonter le résultat ;
+  c'est l'orchestrateur (`warden`) qui déciderait, via cette fonction, de
+  reboucler vers le coder — le câblage réel de cette décision dans la
+  boucle de convergence reste, comme pour le PR Manager (Phase 4), une
+  décision d'architecture distincte hors périmètre de cette livraison.
+- **Aucun merge automatique** : `CiProvider`/`ci_watcher` n'exposent aucune
+  capacité de merge, quel que soit le statut observé — la décision de merger
+  reste entièrement humaine, y compris une fois `ChecksPassed` atteint.

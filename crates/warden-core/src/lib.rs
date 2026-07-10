@@ -8,6 +8,9 @@ mod convergence;
 mod error;
 mod state;
 
-pub use convergence::{decide_next_state, parse_findings, Finding, FindingSource, Severity};
+pub use convergence::{
+    decide_next_state, decide_next_state_after_ci, parse_findings, CiOutcome, Finding,
+    FindingSource, Severity,
+};
 pub use error::{CoreError, Result};
 pub use state::{AgentRole, RunState};
