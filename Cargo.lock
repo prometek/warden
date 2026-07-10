@@ -1854,6 +1854,8 @@ dependencies = [
  "clap",
  "predicates",
  "regex",
+ "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",

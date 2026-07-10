@@ -31,6 +31,12 @@ bibliothèque dans `warden-gated` — voir "Gestion des PR" ci-dessous — mais,
 manière, aucun déclenchement CLI/IPC ne l'invoque encore depuis `warden` : ce câblage reste
 une décision d'architecture distincte, non couverte par cette livraison.
 
+Le **CI Watcher** (Phase 5) est livré et utilisable de bout en bout via la sous-commande
+`warden-gated watch-pr` — voir "CI Watcher" ci-dessous. Le câblage de sa décision
+(reboucler vers le coder ou non) dans la boucle de convergence de `warden` reste, comme
+pour le PR Manager, une décision d'architecture distincte hors périmètre de cette livraison.
+Warden ne merge **jamais** automatiquement une PR, quel que soit le statut observé.
+
 **Limite d'isolation à connaître avant tout déploiement** : dans la configuration par
 défaut documentée ici, `warden` et `warden-gated` tournent sous le **même utilisateur OS**.
 Cela donne une frontière de sécurité **process/logique** (aucun code d'accès credentials
@@ -191,6 +197,59 @@ Ce module fournit également le formatage des attributs de commit structurés
 **Ce qui n'est pas encore câblé** : ces trois actions existent uniquement comme capacité de
 bibliothèque — aucun déclenchement CLI/IPC ne les invoque encore depuis `warden`. Ce câblage
 est une décision d'architecture distincte, hors périmètre de cette livraison.
+
+### CI Watcher (`watch-pr`)
+
+`warden-gated` surveille une PR déjà ouverte jusqu'à un statut terminal, via le trait
+`CiProvider` (`crates/warden-gated/src/ci_watcher.rs`) — implémenté aujourd'hui par
+`gh_provider::GhProvider`, qui réutilise la même session `gh` authentifiée que le PR Manager
+(`gh pr view --json state,statusCheckRollup`, sans jamais stocker de credential GitHub).
+
+```sh
+warden-gated watch-pr \
+  --bare-repo ~/.warden/gate.git \
+  --pr 42 \
+  --poll-interval-secs 15 \
+  --inactivity-timeout-secs 1800
+```
+
+- `--bare-repo <PATH>` — sert à résoudre `owner/repo` depuis le remote `origin` du dépôt
+  bare, comme `GhProvider::new` le fait déjà pour `OpenDraft`/`Finalize`. `--repo
+  <owner/repo>` permet de court-circuiter cette résolution.
+- `--poll-interval-secs` (défaut `15`) — délai entre deux interrogations ; la boucle ne fait
+  jamais de busy-spin, elle attend systématiquement ce délai (`tokio::time::sleep`) entre deux
+  appels.
+- `--inactivity-timeout-secs` (défaut `1800`) — durée maximale pendant laquelle le statut
+  observé peut rester **strictement inchangé** avant abandon (`TimedOut`) ; jamais d'attente
+  infinie. Cette horloge se réinitialise à chaque changement de statut réellement observé
+  (nouveau check, check en cours qui se termine) — une CI qui progresse encore n'est jamais
+  interrompue prématurément, seul un statut resté figé pendant tout ce délai déclenche le
+  timeout.
+
+Un échec transitoire de poll (`gh` injoignable, rate limit réseau) est toléré et retenté
+jusqu'à 3 fois consécutives (compteur réinitialisé dès le prochain poll réussi) avant que
+`watch-pr` n'abandonne ; une réponse malformée ou inattendue de `gh`, elle, fait toujours
+échouer `watch-pr` immédiatement, sans retry.
+
+Statuts terminaux et code de sortie (même convention que `verify-run`) :
+
+- `MERGED` / `CHECKS-PASSED` (exit `0`) — dans les deux cas, la décision de merger reste
+  **entièrement humaine** : `CiProvider`/`ci_watcher` n'exposent aucune capacité de merge,
+  Warden ne merge jamais automatiquement une PR.
+- `CLOSED` (fermée sans merge), `CHECKS-FAILED` (un finding bloquant par check en échec,
+  `FindingSource::Ci`), `TIMED-OUT` — exit non nul.
+
+Validé de bout en bout sur de vrais dépôts GitHub publics : une PR déjà mergée (`MERGED`),
+une PR ouverte dont tous les checks sont verts (`CHECKS-PASSED`), et une PR sans aucune CI
+configurée (`TIMED-OUT` déclenché proprement au bout du délai configuré, sans busy-spin).
+
+La fonction pure `warden_core::decide_next_state_after_ci` décide le `RunState`
+(`Done` / `CoderRunning` / `Failed`) qu'implique un résultat de watch — miroir de
+`decide_next_state` pour les findings reviewer/tester. **Ce qui n'est pas encore câblé** :
+`warden-gated` ne fait que remonter le résultat de `watch-pr` ; brancher cette décision dans
+la boucle de convergence de `warden` (pour reboucler automatiquement vers le coder sur un
+`ChecksFailed`) est, comme pour le PR Manager, une décision d'architecture distincte hors
+périmètre de cette livraison.
 
 ### Service managé
 

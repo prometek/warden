@@ -9,11 +9,15 @@ use serde::Deserialize;
 use crate::error::{CoreError, Result};
 use crate::state::RunState;
 
-/// Which agent raised a finding (`FINDINGS.source`).
+/// Which agent (or, for CI, which non-agent process) raised a finding
+/// (`FINDINGS.source`). `Ci` (issue #5) covers a failing check surfaced by
+/// `warden-gated`'s CI watcher -- distinct from `Reviewer`/`Tester` since
+/// it never comes from an agent subprocess at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
     Reviewer,
     Tester,
+    Ci,
 }
 
 impl FindingSource {
@@ -21,6 +25,7 @@ impl FindingSource {
         match self {
             FindingSource::Reviewer => "reviewer",
             FindingSource::Tester => "tester",
+            FindingSource::Ci => "ci",
         }
     }
 
@@ -28,6 +33,7 @@ impl FindingSource {
         match raw {
             "reviewer" => Ok(FindingSource::Reviewer),
             "tester" => Ok(FindingSource::Tester),
+            "ci" => Ok(FindingSource::Ci),
             other => Err(CoreError::UnknownFindingSource(other.to_string())),
         }
     }
@@ -143,6 +149,58 @@ pub fn decide_next_state(findings: &[Finding], current_cycle: u32, max_cycles: u
         RunState::MaxCyclesExceeded
     } else {
         RunState::CoderRunning
+    }
+}
+
+/// Coarse result of `warden-gated`'s CI watcher polling loop (issue #5),
+/// passed in by the caller rather than re-derived here -- this module only
+/// ever decides which [`RunState`] a given outcome implies, exactly like
+/// [`decide_next_state`] does for reviewer/tester findings. Deliberately not
+/// the same type as `warden-gated::ci_watcher::WatchOutcome`: that one
+/// carries the full per-check `Finding` list for human-readable reporting,
+/// while this crate only needs the coarse signal to pick a `RunState`
+/// (`warden-gated` must never depend on `warden`, and `warden-core` must
+/// never depend on `warden-gated` -- ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiOutcome {
+    Merged,
+    ChecksPassed,
+    Closed,
+    ChecksFailed,
+    TimedOut,
+}
+
+/// Decides the next [`RunState`] once a run's CI watch (issue #5) reaches a
+/// terminal outcome. Only meaningful from [`RunState::AwaitingCi`], whose
+/// legal next states are exactly `Done` / `CoderRunning` / `Failed`
+/// ([`RunState::validate_transition`]) -- notably *not* `MaxCyclesExceeded`,
+/// unlike [`decide_next_state`]'s cycle-budget case: a CI failure that
+/// exhausts the cycle budget lands on `Failed` here instead.
+///
+/// - `Merged` / `ChecksPassed`: `Done`. Warden's own responsibility ends
+///   once CI is green -- actually merging the PR is deliberately never
+///   automatic (issue #5: "aucun merge automatique n'est déclenché par
+///   Warden"), so `ChecksPassed` reaches the same terminal `RunState` as an
+///   already-`Merged` PR; the merge itself is left entirely to a human.
+/// - `Closed` (closed without merging) / `TimedOut`: `Failed` -- nothing
+///   further for Warden to do, and neither represents a working result.
+/// - `ChecksFailed`, with cycles remaining: `CoderRunning` (reboucle vers le
+///   coder). At the cycle budget: `Failed`.
+pub fn decide_next_state_after_ci(
+    outcome: CiOutcome,
+    current_cycle: u32,
+    max_cycles: u32,
+) -> RunState {
+    match outcome {
+        CiOutcome::Merged | CiOutcome::ChecksPassed => RunState::Done,
+        CiOutcome::Closed | CiOutcome::TimedOut => RunState::Failed,
+        CiOutcome::ChecksFailed => {
+            if current_cycle >= max_cycles {
+                RunState::Failed
+            } else {
+                RunState::CoderRunning
+            }
+        }
     }
 }
 
@@ -315,5 +373,75 @@ mod tests {
     fn decide_next_state_mixed_severities_still_reboucles_on_any_blocking() {
         let findings = vec![info_finding(), blocking_finding()];
         assert_eq!(decide_next_state(&findings, 1, 5), RunState::CoderRunning);
+    }
+
+    // ---- FindingSource::Ci -------------------------------------------------
+
+    #[test]
+    fn ci_finding_source_round_trips_through_its_string_form() {
+        assert_eq!(FindingSource::Ci.as_str(), "ci");
+        assert_eq!(FindingSource::parse("ci").unwrap(), FindingSource::Ci);
+    }
+
+    // ---- decide_next_state_after_ci (issue #5) -----------------------------
+
+    #[test]
+    fn merged_and_checks_passed_both_reach_done() {
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::Merged, 1, 5),
+            RunState::Done
+        );
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::ChecksPassed, 1, 5),
+            RunState::Done
+        );
+    }
+
+    #[test]
+    fn closed_without_merging_and_timed_out_both_fail_the_run() {
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::Closed, 1, 5),
+            RunState::Failed
+        );
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::TimedOut, 1, 5),
+            RunState::Failed
+        );
+    }
+
+    #[test]
+    fn checks_failed_reboucles_to_coder_within_cycle_budget() {
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::ChecksFailed, 1, 5),
+            RunState::CoderRunning
+        );
+    }
+
+    #[test]
+    fn checks_failed_at_cycle_budget_fails_the_run_not_max_cycles_exceeded() {
+        // AwaitingCi's only legal next states are Done/CoderRunning/Failed
+        // (state.rs) -- MaxCyclesExceeded is not reachable from here, unlike
+        // decide_next_state's reviewer/tester equivalent.
+        assert_eq!(
+            decide_next_state_after_ci(CiOutcome::ChecksFailed, 5, 5),
+            RunState::Failed
+        );
+    }
+
+    #[test]
+    fn every_decide_next_state_after_ci_outcome_is_a_legal_awaiting_ci_transition() {
+        for outcome in [
+            CiOutcome::Merged,
+            CiOutcome::ChecksPassed,
+            CiOutcome::Closed,
+            CiOutcome::ChecksFailed,
+            CiOutcome::TimedOut,
+        ] {
+            let next = decide_next_state_after_ci(outcome, 1, 5);
+            assert!(
+                RunState::AwaitingCi.validate_transition(next).is_ok(),
+                "{outcome:?} -> {next:?} is not a legal AwaitingCi transition"
+            );
+        }
     }
 }
