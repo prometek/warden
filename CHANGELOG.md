@@ -84,3 +84,37 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   runs convergés vers le dépôt bare du gate (câblage `Converged` → `Pushed`
   prévu en Phase 4) ; le mécanisme du gate lui-même est complet et testé de
   bout en bout indépendamment de ce câblage.
+
+### Added — Phase 4 : PR Manager (`warden-gated`)
+
+- Nouveau module `pr_manager` dans `warden-gated`, exposant trois actions de
+  bibliothèque formant le cycle de vie d'une PR (ADR-0007) :
+  - `OpenDraft` — pousse un commit squelette de branche **sans aucun contenu
+    métier** et ouvre une PR en draft, liée à l'issue détectée dans l'intent
+    (`(?i)(fixes|closes|resolves)\s+#\d+`) ou titrée à partir de l'intent
+    sinon.
+  - `PostCycleUpdate` — poste un commentaire informatif par cycle (findings
+    reviewer/tester) sur la PR ; ne modifie jamais son statut draft ni son
+    contenu.
+  - `Finalize` — revérifie `state == Converged` et le hash committé via le
+    même chemin `gate::verify_and_authorize` que le gate git lui-même (jamais
+    une vérification séparée et plus faible), puis seulement si autorisé :
+    pousse le contenu réel, met à jour le corps de la PR et retire le statut
+    draft.
+- Vérification indépendante « contenu vide » avant tout push de squelette par
+  `OpenDraft` : comparaison d'arbre net contre la branche de base **et**
+  parcours commit par commit de l'historique effectivement transféré
+  (`git diff-tree --cc`, pour couvrir aussi le contenu propre d'un commit de
+  fusion) — un squelette qui changerait le moindre fichier est refusé plutôt
+  que poussé.
+- Attributs de commit structurés (`Warden-Cycle`, `Warden-Findings-Resolved`,
+  `Warden-Agent`) formatés par ce même module, destinés aux commits
+  coder/doc.
+- Trait `PrProvider`, seam fine au-dessus d'un fournisseur de PR, avec une
+  implémentation GitHub (`gh_provider::GhProvider`) qui pilote la CLI `gh`
+  déjà authentifiée sur la machine — `warden-gated` ne stocke ni ne lit
+  lui-même de credential GitHub.
+- Ces trois actions n'existent pour l'instant que comme capacité de
+  bibliothèque : aucun déclenchement CLI/IPC ne les invoque encore depuis
+  `warden` (câblage laissé à une décision d'architecture distincte, hors
+  périmètre de cette livraison).
