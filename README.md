@@ -7,11 +7,12 @@ des agents.
 
 ## État du projet
 
-Phase 1 (fondations) est livrée : un workspace Cargo avec le binaire `warden`, capable de
-piloter une boucle de convergence *séquentielle* (coder → review/test → reboucle si
-besoin) sur un unique worktree, avec persistance SQLite et reprise après crash. Le
-parallélisme réel (review/test concurrents), le point de passage git (`warden-gated`) et
-la TUI (`warden-tui`) arrivent dans des phases ultérieures et n'existent pas encore.
+Phase 1 (fondations) et Phase 2 (parallélisme réel) sont livrées : un workspace Cargo avec
+le binaire `warden`, capable de piloter une boucle de convergence (coder → review/test →
+reboucle si besoin) avec persistance SQLite et reprise après crash. Reviewer et tester
+tournent désormais **en parallèle** (`tokio::join!`), chacun dans son propre worktree
+synchronisé sur le commit du coder. Le point de passage git (`warden-gated`) et la TUI
+(`warden-tui`) arrivent dans des phases ultérieures et n'existent pas encore.
 
 ## Structure du dépôt
 
