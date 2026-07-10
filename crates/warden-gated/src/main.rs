@@ -271,6 +271,7 @@ async fn watch_pr_cmd(
     let config = WatchConfig {
         poll_interval: Duration::from_secs(poll_interval_secs),
         inactivity_timeout: Duration::from_secs(inactivity_timeout_secs),
+        max_consecutive_poll_errors: WatchConfig::DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS,
     };
 
     let outcome = watch_pr(&pr, &provider, &config)

@@ -30,3 +30,9 @@ warden-core = { path = "../warden-core" }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# `test-util` is unified with the main `tokio` dependency above by Cargo
+# (same crate, same version) and only takes effect for test/bench builds --
+# needed for `#[tokio::test(start_paused = true)]`'s virtual clock, which
+# `ci_watcher`'s loop tests use instead of real sub-millisecond sleeps
+# (code-standards.md: "tests déterministes, pas de temps réel non mocké").
+tokio = { version = "1", features = ["test-util"] }

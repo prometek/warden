@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::time::{sleep, Instant};
 use warden_core::{Finding, FindingSource, Severity};
 
-use crate::error::Result;
+use crate::error::{GatedError, Result};
 use crate::pr_manager::PrHandle;
 
 // ---------------------------------------------------------------------------
@@ -161,6 +161,14 @@ pub enum WatchOutcome {
 /// Configuration for one [`watch_pr`] invocation. Both durations are
 /// explicit, caller-supplied inputs, never hardcoded constants (issue #5:
 /// "timeout d'inactivité configurable").
+///
+/// **The inactivity timeout has no absolute wall-clock cap.** Its clock
+/// resets on *any* observed status change (see [`watch_pr`]'s doc comment),
+/// so a PR whose status keeps changing on every single poll (e.g. a
+/// perpetually flapping check) never times out, no matter how long the
+/// watch has been running in total -- this is by design (issue #5's own
+/// framing is "si la CI ne se déclenche jamais", an idle condition, not a
+/// total-duration budget), not an oversight.
 #[derive(Debug, Clone, Copy)]
 pub struct WatchConfig {
     /// How long to sleep between two polls. `watch_pr` never busy-spins: it
@@ -169,8 +177,24 @@ pub struct WatchConfig {
     /// How long the polled status may go completely unchanged before
     /// `watch_pr` gives up and returns [`WatchOutcome::TimedOut`] (issue #5
     /// acceptance criterion: "le timeout d'inactivité interrompt proprement
-    /// la surveillance si la CI ne se déclenche jamais").
+    /// la surveillance si la CI ne se déclenche jamais"). See this struct's
+    /// top-level doc comment for the idle-vs-absolute distinction.
     pub inactivity_timeout: Duration,
+    /// How many *consecutive* transient poll failures (a `gh` command or
+    /// I/O failure -- rate limit, network blip; never a malformed/
+    /// unparseable response, which always aborts immediately regardless of
+    /// this budget) `watch_pr` tolerates before giving up. Resets to zero on
+    /// any successful poll. Issue #5 fix-cycle 1: the ticket's own
+    /// flakiness motivation ("différences d'environnement, flakiness")
+    /// applies just as much to polling CI status as to CI itself.
+    pub max_consecutive_poll_errors: u32,
+}
+
+impl WatchConfig {
+    /// A sensible default retry budget for transient poll failures: enough
+    /// to ride out a single rate-limit/network blip without masking a truly
+    /// broken `gh`/network setup forever.
+    pub const DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +281,26 @@ fn failed_checks_to_findings(failed_checks: &[CheckRun]) -> Vec<Finding> {
         .collect()
 }
 
+/// Whether `error` represents a transient failure to reach `gh`/the network
+/// (worth retrying a poll, up to [`WatchConfig::max_consecutive_poll_errors`]
+/// times in a row) rather than a malformed/unexpected response, which must
+/// abort `watch_pr` immediately and loudly regardless of that budget --
+/// code-standards.md: "ne jamais faire confiance à la sortie d'un agent
+/// CLI" applies just as much to a provider's own malformed output as to an
+/// agent's. `GhCommandFailed`/`Io` are the only variants `CiProvider::
+/// pr_status` implementations return for "couldn't even talk to `gh`"; every
+/// other `GatedError` variant a `pr_status` call could plausibly return
+/// (`UnparsablePrStatusJson`, `UnknownPrLifecycle`, `UnknownCheckConclusion`,
+/// `MalformedCheckEntry`) means `gh` *did* respond, just not with something
+/// this module understands -- never worth retrying, since the same
+/// malformed response would come back every time.
+fn is_transient_poll_error(error: &GatedError) -> bool {
+    matches!(
+        error,
+        GatedError::GhCommandFailed { .. } | GatedError::Io(_)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Watch loop (I/O)
 // ---------------------------------------------------------------------------
@@ -267,7 +311,16 @@ fn failed_checks_to_findings(failed_checks: &[CheckRun]) -> Vec<Finding> {
 /// differs from the previous one, so a CI run that's genuinely progressing
 /// (new checks appearing, a pending check finishing) is never cut off just
 /// because it takes a while; only a status that's been stuck unchanged for
-/// `config.inactivity_timeout` ends the watch as [`WatchOutcome::TimedOut`].
+/// `config.inactivity_timeout` ends the watch as [`WatchOutcome::TimedOut`]
+/// (see [`WatchConfig`]'s doc comment for why that has no absolute
+/// wall-clock cap).
+///
+/// A transient poll failure (`is_transient_poll_error`) is tolerated and
+/// retried, up to `config.max_consecutive_poll_errors` times in a row --
+/// reset to zero on the next successful poll. Exceeding that budget, or any
+/// non-transient (malformed/unexpected) error, aborts the watch immediately
+/// with that error; a malformed response is never silently retried or
+/// swallowed.
 ///
 /// Never merges the PR -- see this module's top-level doc comment.
 pub async fn watch_pr<P: CiProvider>(
@@ -275,21 +328,86 @@ pub async fn watch_pr<P: CiProvider>(
     provider: &P,
     config: &WatchConfig,
 ) -> Result<WatchOutcome> {
+    tracing::info!(
+        pr_number = pr.number,
+        poll_interval = ?config.poll_interval,
+        inactivity_timeout = ?config.inactivity_timeout,
+        max_consecutive_poll_errors = config.max_consecutive_poll_errors,
+        "watch_pr: starting to watch a PR for a terminal CI/lifecycle outcome"
+    );
+
     let mut last_snapshot: Option<StatusSnapshot> = None;
     let mut last_change_at = Instant::now();
+    let mut consecutive_poll_errors: u32 = 0;
 
     loop {
-        let status = provider.pr_status(pr).await?;
+        let status = match provider.pr_status(pr).await {
+            Ok(status) => {
+                consecutive_poll_errors = 0;
+                status
+            }
+            Err(error) if is_transient_poll_error(&error) => {
+                consecutive_poll_errors += 1;
+                if consecutive_poll_errors > config.max_consecutive_poll_errors {
+                    tracing::error!(
+                        pr_number = pr.number,
+                        %error,
+                        consecutive_poll_errors,
+                        max_consecutive_poll_errors = config.max_consecutive_poll_errors,
+                        "watch_pr: giving up after too many consecutive transient CI poll failures"
+                    );
+                    return Err(error);
+                }
+                tracing::warn!(
+                    pr_number = pr.number,
+                    %error,
+                    consecutive_poll_errors,
+                    max_consecutive_poll_errors = config.max_consecutive_poll_errors,
+                    "watch_pr: tolerating a transient CI poll failure, will retry after the next sleep"
+                );
+                sleep(config.poll_interval).await;
+                continue;
+            }
+            Err(error) => {
+                tracing::error!(
+                    pr_number = pr.number,
+                    %error,
+                    "watch_pr: aborting on a non-transient (malformed/unexpected) poll error"
+                );
+                return Err(error);
+            }
+        };
+
+        tracing::debug!(
+            pr_number = pr.number,
+            lifecycle = ?status.lifecycle,
+            check_count = status.checks.len(),
+            "watch_pr: polled PR status"
+        );
+
         let snapshot = StatusSnapshot::from_status(&status);
         let now = Instant::now();
         if last_snapshot.as_ref() != Some(&snapshot) {
+            if last_snapshot.is_some() {
+                tracing::debug!(
+                    pr_number = pr.number,
+                    "watch_pr: status changed since the last poll; resetting the inactivity clock"
+                );
+            }
             last_change_at = now;
             last_snapshot = Some(snapshot);
         }
         let idle_elapsed = now.saturating_duration_since(last_change_at);
 
         match decide_step(&status, idle_elapsed, config.inactivity_timeout) {
-            WatchStep::Terminal(outcome) => return Ok(outcome),
+            WatchStep::Terminal(outcome) => {
+                tracing::info!(
+                    pr_number = pr.number,
+                    outcome = ?outcome,
+                    "watch_pr: reached a terminal outcome"
+                );
+                return Ok(outcome);
+            }
             WatchStep::KeepWaiting => sleep(config.poll_interval).await,
         }
     }
@@ -468,7 +586,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// A sensible retry budget for the loop tests below that don't
+    /// themselves exercise the transient-poll-error tolerance -- non-zero
+    /// so a genuinely unrelated transient failure wouldn't make these tests
+    /// flaky, but otherwise irrelevant to what each test is checking.
+    const DEFAULT_ERROR_BUDGET: u32 = WatchConfig::DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS;
+
+    // Fix-cycle 1 (issue #5 review): these loop tests now run under tokio's
+    // paused virtual clock (`start_paused = true`) instead of real
+    // sub-millisecond sleeps -- code-standards.md "tests déterministes, pas
+    // de temps réel non mocké". `sleep`/`Instant::now()` inside `watch_pr`
+    // still behave correctly (auto-advance fires pending timers instantly),
+    // so these run in effectively zero wall-clock time with no flakiness.
+
+    #[tokio::test(start_paused = true)]
     async fn watch_pr_returns_checks_passed_once_all_checks_succeed() {
         let provider = ScriptedProvider::new(vec![
             open_status(vec![pending("build")]),
@@ -477,6 +608,7 @@ mod tests {
         let config = WatchConfig {
             poll_interval: Duration::from_millis(1),
             inactivity_timeout: LONG,
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
         };
 
         let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
@@ -485,7 +617,7 @@ mod tests {
         assert_eq!(outcome, WatchOutcome::ChecksPassed);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn watch_pr_times_out_when_nothing_ever_changes() {
         let provider = ScriptedProvider::new(vec![
             open_status(vec![]),
@@ -495,11 +627,287 @@ mod tests {
         let config = WatchConfig {
             poll_interval: Duration::from_millis(1),
             inactivity_timeout: Duration::from_millis(2),
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
         };
 
         let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
             .await
             .unwrap();
         assert_eq!(outcome, WatchOutcome::TimedOut);
+    }
+
+    /// Acceptance criterion (issue #5): merged-PR detection, exercised
+    /// through the full polling loop (not just `decide_step` in isolation)
+    /// -- a PR that's still pending on one poll and reports `MERGED` on the
+    /// next must end the watch as `WatchOutcome::Merged`.
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_returns_merged_once_the_pr_lifecycle_flips_to_merged() {
+        let provider = ScriptedProvider::new(vec![
+            open_status(vec![pending("build")]),
+            PrStatus {
+                lifecycle: PrLifecycle::Merged,
+                checks: vec![passed("build")],
+            },
+        ]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
+        };
+
+        let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WatchOutcome::Merged);
+    }
+
+    /// Acceptance criterion (issue #5): closed-without-merging detection,
+    /// exercised through the full polling loop.
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_returns_closed_once_the_pr_is_closed_without_merging() {
+        let provider = ScriptedProvider::new(vec![
+            open_status(vec![pending("build")]),
+            PrStatus {
+                lifecycle: PrLifecycle::Closed,
+                checks: vec![pending("build")],
+            },
+        ]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
+        };
+
+        let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WatchOutcome::Closed);
+    }
+
+    /// Acceptance criterion (issue #5): a CI failure must surface findings
+    /// so the orchestrator can decide to reboucle vers le coder --
+    /// exercised through the full polling loop, not just `decide_step`.
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_returns_checks_failed_with_findings_once_a_check_fails() {
+        let provider = ScriptedProvider::new(vec![
+            open_status(vec![pending("build")]),
+            open_status(vec![failed("build"), passed("lint")]),
+        ]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
+        };
+
+        let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
+            .await
+            .unwrap();
+        match outcome {
+            WatchOutcome::ChecksFailed(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].source, FindingSource::Ci);
+                assert_eq!(findings[0].severity, Severity::Blocking);
+                assert!(findings[0].description.contains("build"));
+            }
+            other => panic!("expected ChecksFailed, got {other:?}"),
+        }
+    }
+
+    // ---- transient poll-error tolerance (issue #5 fix-cycle 1) -------------
+
+    /// A [`CiProvider`] whose scripted responses are full `Result`s rather
+    /// than always-`Ok` statuses, standing in for a `gh` invocation that
+    /// sometimes fails transiently before recovering (or doesn't).
+    struct ScriptedResultProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<Result<PrStatus>>>,
+    }
+
+    impl ScriptedResultProvider {
+        fn new(responses: Vec<Result<PrStatus>>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+            }
+        }
+    }
+
+    impl CiProvider for ScriptedResultProvider {
+        async fn pr_status(&self, _pr: &PrHandle) -> Result<PrStatus> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedResultProvider ran out of scripted responses")
+        }
+    }
+
+    /// A `gh`-command failure -- the shape `is_transient_poll_error`
+    /// recognizes as transient/retryable (e.g. a rate limit or network
+    /// blip), not a malformed response.
+    fn transient_error() -> GatedError {
+        GatedError::GhCommandFailed {
+            command: "gh pr view".to_string(),
+            exit_code: Some(1),
+            stderr: "rate limited".to_string(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_tolerates_fewer_than_the_configured_consecutive_poll_errors_then_recovers() {
+        // K = 2 consecutive transient failures, N (budget) = 3 -- still
+        // within budget, so `watch_pr` must retry through them and still
+        // reach its terminal outcome from the next, successful poll.
+        let provider = ScriptedResultProvider::new(vec![
+            Err(transient_error()),
+            Err(transient_error()),
+            Ok(open_status(vec![passed("build")])),
+        ]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: 3,
+        };
+
+        let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WatchOutcome::ChecksPassed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_aborts_after_more_than_the_configured_consecutive_poll_errors() {
+        // N + 1 = 4 consecutive transient failures against a budget of 3:
+        // the first three are tolerated/retried, the fourth exceeds the
+        // budget and must abort with that same typed error.
+        let provider = ScriptedResultProvider::new(vec![
+            Err(transient_error()),
+            Err(transient_error()),
+            Err(transient_error()),
+            Err(transient_error()),
+        ]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: 3,
+        };
+
+        let result = watch_pr(&PrHandle { number: 1 }, &provider, &config).await;
+        assert!(matches!(result, Err(GatedError::GhCommandFailed { .. })));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_aborts_immediately_on_a_malformed_response_without_retrying() {
+        // A non-transient (malformed/unexpected) error must abort on the
+        // very first occurrence, never counted against the transient-error
+        // budget and never silently retried -- code-standards.md: never
+        // trust/paper over an unparseable provider response.
+        let provider = ScriptedResultProvider::new(vec![Err(GatedError::UnknownPrLifecycle(
+            "BOGUS".to_string(),
+        ))]);
+        let config = WatchConfig {
+            poll_interval: Duration::from_millis(1),
+            inactivity_timeout: Duration::from_secs(3600),
+            max_consecutive_poll_errors: 3,
+        };
+
+        let result = watch_pr(&PrHandle { number: 1 }, &provider, &config).await;
+        assert!(matches!(result, Err(GatedError::UnknownPrLifecycle(_))));
+    }
+
+    // ---- busy-spin proof (deterministic, virtual clock) --------------------
+
+    /// Issue #5: `watch_pr` "never busy-spins: it always awaits
+    /// `tokio::time::sleep(poll_interval)` between iterations" (this
+    /// module's own doc comment on `watch_pr`). Fix-cycle 1 (issue #5
+    /// review): proven deterministically under tokio's paused virtual
+    /// clock, rather than measuring real wall-clock gaps between polls
+    /// (code-standards.md: "tests déterministes, pas de temps réel non
+    /// mocké") -- a busy-spinning implementation would issue far more polls
+    /// than the virtual time budget allows (since none of its iterations
+    /// would ever await a timer to advance the paused clock), so bounding
+    /// the poll count against how much virtual time actually elapsed proves
+    /// each iteration genuinely waited on `sleep`.
+    struct CountingProvider {
+        poll_count: std::sync::Mutex<u32>,
+    }
+
+    impl CiProvider for CountingProvider {
+        async fn pr_status(&self, _pr: &PrHandle) -> Result<PrStatus> {
+            *self.poll_count.lock().unwrap() += 1;
+            Ok(open_status(vec![]))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_pr_polls_at_most_once_per_poll_interval_of_virtual_time_elapsed() {
+        let poll_interval = Duration::from_millis(30);
+        let inactivity_timeout = Duration::from_millis(90);
+        let provider = CountingProvider {
+            poll_count: std::sync::Mutex::new(0),
+        };
+        let config = WatchConfig {
+            poll_interval,
+            inactivity_timeout,
+            max_consecutive_poll_errors: DEFAULT_ERROR_BUDGET,
+        };
+
+        let outcome = watch_pr(&PrHandle { number: 1 }, &provider, &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WatchOutcome::TimedOut);
+
+        // Every poll but the first is preceded by one full `sleep(poll_interval)`
+        // (the loop only reaches a next poll via that await point), so the
+        // number of polls issued can never exceed
+        // `inactivity_timeout / poll_interval + 1` regardless of how much
+        // real wall-clock time this test takes to run -- a busy-spinning
+        // loop that never actually awaited the timer would instead issue an
+        // effectively unbounded number of polls before the virtual clock
+        // ever advanced past `inactivity_timeout`.
+        let max_possible_polls =
+            (inactivity_timeout.as_millis() / poll_interval.as_millis()) as u32 + 1;
+        let poll_count = *provider.poll_count.lock().unwrap();
+        assert!(
+            poll_count >= 2,
+            "expected at least two polls before timing out, got {poll_count}"
+        );
+        assert!(
+            poll_count <= max_possible_polls,
+            "watch_pr issued {poll_count} polls, more than the {max_possible_polls} a \
+             sleep-between-polls loop could possibly issue before \
+             {inactivity_timeout:?} of virtual time elapsed -- looks like it busy-spun \
+             instead of awaiting the timer"
+        );
+    }
+
+    /// Acceptance criterion (issue #5, non-negotiable): "aucun merge
+    /// automatique n'est déclenché par Warden". `CiProvider` (this module,
+    /// above) exposes only `pr_status` -- there is no method on the trait
+    /// that could merge a PR, so no `watch_pr` caller can trigger one
+    /// through this seam. This is a static regression guard for the actual
+    /// `gh` invocation in the watcher's only real implementation
+    /// (`gh_provider::GhProvider`): it fails loudly if a `gh pr merge` (or
+    /// equivalent "merge" argument) is ever wired into the CI-watching path.
+    #[test]
+    fn the_ci_watcher_path_never_issues_a_gh_merge_argument() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        for relative_path in ["src/ci_watcher.rs", "src/gh_provider.rs"] {
+            let contents = std::fs::read_to_string(format!("{manifest_dir}/{relative_path}"))
+                .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
+            // Scan production code only: this very test file's own source
+            // (read back via `relative_path == "src/ci_watcher.rs"`) quotes
+            // the literal it's guarding against in its own doc comments/
+            // assertion message, so scanning past the `#[cfg(test)]` module
+            // boundary would trivially match itself.
+            let production_code = contents
+                .split_once("#[cfg(test)]")
+                .map(|(before, _)| before)
+                .unwrap_or(contents.as_str());
+            let merge_arg = format!("{quote}merge{quote}", quote = '"');
+            assert!(
+                !production_code.contains(&merge_arg),
+                "{relative_path}'s production code must never pass a `merge` argument to `gh` -- \
+                 the CI watcher must stay read-only (issue #5)"
+            );
+        }
     }
 }
