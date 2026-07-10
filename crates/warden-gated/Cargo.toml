@@ -1,0 +1,29 @@
+[package]
+name = "warden-gated"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Warden's git gate daemon: sole holder of origin credentials, independently re-verifies run state before any push reaches the real remote (ADR-0002/ADR-0006)."
+
+[[bin]]
+name = "warden-gated"
+path = "src/main.rs"
+
+[lib]
+name = "warden_gated"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+warden-core = { path = "../warden-core" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
