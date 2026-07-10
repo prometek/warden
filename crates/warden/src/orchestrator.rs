@@ -262,10 +262,13 @@ impl Orchestrator {
     /// (`WorktreeManager::create` paths worktrees by `<run_id>/<role>`, so
     /// the two agents never touch the same directory — no shared mutable
     /// state between the two concurrent branches, per code-standards.md
-    /// "Async & concurrence"). `tokio::join!` always awaits both branches to
-    /// completion before this returns, even if one finishes with an error,
-    /// so a failing reviewer never leaves the tester's worktree/process
-    /// bookkeeping half-done.
+    /// "Async & concurrence"). On an `Err` from either branch, `tokio::join!`
+    /// still awaits the other branch to completion before this returns, so a
+    /// failing reviewer never leaves the tester's worktree/process
+    /// bookkeeping half-done (the exception is a panic, which unwinds and
+    /// drops the sibling future without awaiting it — mitigated by
+    /// `kill_on_drop` on the spawned child process and `Worktree`'s `Drop`
+    /// impl, both of which clean up best-effort even on an ungraceful exit).
     async fn run_review_and_test(
         &self,
         run_id: &str,
@@ -275,6 +278,15 @@ impl Orchestrator {
         commit: &str,
         cancel: CancellationToken,
     ) -> Result<Vec<Finding>> {
+        // ADR-0003 / issue #2 explicitly permit "tokio::join! ou
+        // équivalent"; code-standards.md's "sa propre task" phrasing is
+        // satisfied loosely here rather than via `tokio::spawn`. `join!`
+        // polls both futures concurrently on the current task, which is
+        // enough: the actual agent work happens in a child process started
+        // by `process::spawn` (with `kill_on_drop`), so a dedicated tokio
+        // task around `run_finding_agent` would add no real isolation --
+        // the child process is already the isolation boundary, and its
+        // worktree already gives it a private working directory.
         let (reviewer_result, tester_result) = tokio::join!(
             self.run_finding_agent(FindingAgentInvocation {
                 run_id,
@@ -773,5 +785,194 @@ mod tests {
         assert_eq!(run.state, RunState::CoderRunning);
 
         child.kill().await.unwrap();
+    }
+
+    /// Acceptance criterion 1 (issue #2), exercised directly against
+    /// `run_review_and_test` rather than through the full CLI: reviewer and
+    /// tester each write to a DIFFERENT file in their own worktree, then
+    /// (after a deliberate sleep long enough to overlap with the other
+    /// role's run) read back the *other* role's target file from their own
+    /// worktree. If the two roles ever shared a worktree/directory, the
+    /// other role's write -- which completes well before the sleep ends --
+    /// would already be visible here instead of the original, untouched
+    /// content. This distinguishes "isolated worktrees" from "shared
+    /// worktree" deterministically, regardless of exact interleaving.
+    #[tokio::test]
+    async fn run_review_and_test_isolates_concurrent_writes_to_different_worktree_files() {
+        let repo = init_test_repo();
+        std::fs::write(repo.path().join("review_target.txt"), "original-review\n").unwrap();
+        std::fs::write(repo.path().join("test_target.txt"), "original-test\n").unwrap();
+        let commit = |args: &[&str]| {
+            let status = SyncCommand::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        commit(&["add", "."]);
+        commit(&["commit", "--quiet", "-m", "add review/test targets"]);
+
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+
+        db::insert_run(
+            &pool,
+            "collision-run",
+            &repo.path().display().to_string(),
+            "main",
+            "crossed findings, no collision",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "collision-cycle", "collision-run", 1)
+            .await
+            .unwrap();
+
+        let reviewer_command = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                echo modified-by-reviewer > review_target.txt
+                sleep 0.3
+                seen=$(cat test_target.txt)
+                echo "{\"source\":\"reviewer\",\"severity\":\"info\",\"description\":\"review_target=modified-by-reviewer test_target_seen=$seen\"}"
+                "#,
+            ],
+        );
+        let tester_command = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                echo modified-by-tester > test_target.txt
+                sleep 0.3
+                seen=$(cat review_target.txt)
+                echo "{\"source\":\"tester\",\"severity\":\"info\",\"description\":\"test_target=modified-by-tester review_target_seen=$seen\"}"
+                "#,
+            ],
+        );
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "crossed findings, no collision".to_string(),
+            max_cycles: 3,
+            coder_command: AgentCommand::new("sh", ["-c", "true"]),
+            reviewer_command,
+            tester_command,
+        };
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let findings = orchestrator
+            .run_review_and_test(
+                "collision-run",
+                "collision-cycle",
+                &config,
+                &worktree_manager,
+                "HEAD",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(findings.len(), 2);
+        let reviewer_finding = findings
+            .iter()
+            .find(|f| f.source == warden_core::FindingSource::Reviewer)
+            .expect("reviewer finding present");
+        let tester_finding = findings
+            .iter()
+            .find(|f| f.source == warden_core::FindingSource::Tester)
+            .expect("tester finding present");
+
+        assert!(
+            reviewer_finding
+                .description
+                .contains("test_target_seen=original-test"),
+            "reviewer's worktree must still see the untouched original \
+             test_target.txt, not the tester's concurrent write -- got: {}",
+            reviewer_finding.description
+        );
+        assert!(
+            tester_finding
+                .description
+                .contains("review_target_seen=original-review"),
+            "tester's worktree must still see the untouched original \
+             review_target.txt, not the reviewer's concurrent write -- got: {}",
+            tester_finding.description
+        );
+    }
+
+    /// Acceptance criterion 2 (issue #2): "Temps de cycle mesurablement
+    /// réduit par rapport à la Phase 1" -- reviewer and tester must run
+    /// concurrently (`tokio::join!`), so total wall-clock time is dominated
+    /// by the slower of the two, not their sum. Both fake agents sleep the
+    /// same fixed, deterministic duration; a 1.5x margin (well under the 2x
+    /// a sequential implementation would produce) absorbs process-spawn and
+    /// worktree-creation overhead without risking flakiness.
+    #[tokio::test]
+    async fn run_review_and_test_runs_reviewer_and_tester_concurrently_not_sequentially() {
+        const SLEEP_MS: u64 = 500;
+
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+
+        db::insert_run(
+            &pool,
+            "timing-run",
+            &repo.path().display().to_string(),
+            "main",
+            "timing check",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "timing-cycle", "timing-run", 1)
+            .await
+            .unwrap();
+
+        let sleepy_agent = AgentCommand::new("sh", ["-c", "sleep 0.5"]);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "timing check".to_string(),
+            max_cycles: 3,
+            coder_command: AgentCommand::new("sh", ["-c", "true"]),
+            reviewer_command: sleepy_agent.clone(),
+            tester_command: sleepy_agent,
+        };
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let start = std::time::Instant::now();
+        orchestrator
+            .run_review_and_test(
+                "timing-run",
+                "timing-cycle",
+                &config,
+                &worktree_manager,
+                "HEAD",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(SLEEP_MS * 3 / 2),
+            "expected reviewer+tester to run concurrently (~{SLEEP_MS}ms total), \
+             took {elapsed:?} -- this looks sequential (~{}ms expected)",
+            SLEEP_MS * 2
+        );
     }
 }

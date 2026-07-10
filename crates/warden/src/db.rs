@@ -5,6 +5,7 @@
 //! callers never see raw strings for `state`/`role`/`source`/`severity`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -12,6 +13,14 @@ use sqlx::SqlitePool;
 use warden_core::{AgentRole, Finding, FindingSource, RunState, Severity};
 
 use crate::error::{Result, WardenError};
+
+/// How long a connection waits on SQLite's own lock before giving up with
+/// `SQLITE_BUSY`. Matches sqlx's own default (5s) -- named and set
+/// explicitly rather than left implicit, because Phase 2 makes concurrent
+/// writers a real, expected case (reviewer and tester findings/worktree-path
+/// updates land on the same `cycles`/`agent_processes` rows via
+/// `tokio::join!`, see orchestrator.rs), not just a theoretical one.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Opens (creating if needed) the SQLite database at `db_path`, enables WAL
 /// mode so `warden-tui`/`warden-gated` can read concurrently (see
@@ -30,7 +39,13 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
         // clauses (see migrations/0001_initial.sql) that are otherwise
         // decorative — SQLite does not enforce foreign keys unless this
         // pragma is on for the connection.
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // Explicit rather than relying on sqlx's default, for the same
+        // reason as `foreign_keys` above: with reviewer and tester now
+        // writing concurrently (ADR-0003), a `SQLITE_BUSY` under real WAL
+        // write contention is a case worth naming and reasoning about, not
+        // an implicit library default.
+        .busy_timeout(BUSY_TIMEOUT);
 
     let pool = SqlitePoolOptions::new().connect_with(options).await?;
 
