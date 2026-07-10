@@ -8,6 +8,9 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -28,11 +31,38 @@ pub async fn relay(socket_path: &Path, payload: &[u8]) -> Result<()> {
 /// Binds a fresh listener at `socket_path`, removing a stale socket file
 /// left over from a previous run first -- a Unix socket path can't be
 /// re-bound while the old inode still exists.
+///
+/// This socket is an unauthenticated local trigger into the sole holder of
+/// `origin`'s credentials: anyone who can connect to it can make the daemon
+/// attempt a push (the actual push decision is still independently
+/// re-verified against SQLite, but there's no reason to let another local
+/// user even attempt it). Hardened to `0600` right after bind, matching the
+/// `0600` permission ADR-0008 already mandates for the analogous
+/// `warden-tui` event bus socket -- `bind(2)` creates the socket file with
+/// the umask-derived default mode, which is not narrow enough on its own.
 pub async fn bind(socket_path: &Path) -> Result<UnixListener> {
     if socket_path.exists() {
         tokio::fs::remove_file(socket_path).await?;
     }
-    Ok(UnixListener::bind(socket_path)?)
+
+    let listener = UnixListener::bind(socket_path)?;
+
+    #[cfg(unix)]
+    harden_socket_permissions(socket_path).await?;
+
+    Ok(listener)
+}
+
+/// Restricts `socket_path` to owner-only read/write (`0600`). The
+/// containing directory's permissions are the deployment's responsibility
+/// (e.g. `~/.warden` is expected to already be private to its owner) --
+/// this module only narrows the one file it creates.
+#[cfg(unix)]
+async fn harden_socket_permissions(socket_path: &Path) -> Result<()> {
+    let mut permissions = tokio::fs::metadata(socket_path).await?.permissions();
+    permissions.set_mode(0o600);
+    tokio::fs::set_permissions(socket_path, permissions).await?;
+    Ok(())
 }
 
 /// Reads a relayed payload to completion (the hook side always shuts its
@@ -77,5 +107,27 @@ mod tests {
 
         let listener = bind(&socket_path).await;
         assert!(listener.is_ok());
+    }
+
+    /// MEDIUM finding (issue #3 review): the socket is an unauthenticated
+    /// local trigger into the sole credential holder -- must be `0600` so
+    /// only its owner can even attempt to connect, matching ADR-0008's
+    /// `0600` for the analogous TUI socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_restricts_the_socket_file_to_owner_only_read_write() {
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("gated.sock");
+        let _listener = bind(&socket_path).await.unwrap();
+
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "socket must be owner-only read/write, got mode {mode:o}"
+        );
     }
 }

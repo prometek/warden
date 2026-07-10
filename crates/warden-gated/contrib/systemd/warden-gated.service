@@ -15,6 +15,19 @@
 # running `ssh-agent` reachable through `SSH_AUTH_SOCK`, or a git credential
 # helper configured for the `origin` remote inside the bare gate repo. This
 # unit intentionally does not embed any secret directly.
+#
+# SECURITY NOTE (issue #3 review, ADR-0006 "Precision v1"): as written,
+# `%h` resolves to the SAME OS user that runs `warden`. That gives a
+# process/logical security boundary (no shared credential-access code,
+# independent SQLite re-verification) but NOT OS-level isolation -- a
+# `warden` compromised at the code level, running under this same UID, can
+# read whatever this UID can read, including the SSH key / credential
+# helper this unit relies on. For a boundary that holds even against a
+# fully code-compromised `warden`, run this unit under a DEDICATED OS user
+# (distinct from `warden`'s), owning the bare repo and the `origin`
+# credentials exclusively -- see README.md, "Deploiement durci (isolation
+# OS reelle)". This file intentionally keeps the simple same-user setup as
+# its default for ease of installation.
 
 [Unit]
 Description=Warden git gate daemon (sole holder of origin credentials)

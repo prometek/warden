@@ -18,7 +18,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 warden-core = { path = "../warden-core" }

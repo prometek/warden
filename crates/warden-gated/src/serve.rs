@@ -48,38 +48,60 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
 
     loop {
         let (mut stream, _addr) = listener.accept().await?;
-        let payload = relay::read_payload(&mut stream).await?;
-        if let Err(error) = handle_payload(&pool, &config, &payload).await {
-            tracing::error!(%error, "failed to handle push notification");
+        let payload = match relay::read_payload(&mut stream).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(%error, "failed to read a relayed push notification");
+                continue;
+            }
+        };
+        handle_payload(&pool, &config, &payload).await;
+    }
+}
+
+/// Processes one relayed payload (one or more `post-receive` lines): each
+/// line is re-verified and, if authorized, pushed independently. A single
+/// malformed line, or a single line whose re-verification/push fails, is
+/// logged and **skipped** rather than aborting the rest of the batch -- a
+/// multi-ref push could legitimately contain one bad ref alongside a good
+/// one, and a boundary-validation failure on untrusted input must never
+/// take down otherwise-valid work (code-standards.md: "valider ... à la
+/// frontière", not "tout annuler à la moindre entrée invalide").
+async fn handle_payload(pool: &SqlitePool, config: &ServeConfig, payload: &str) {
+    for line in payload.lines().filter(|line| !line.trim().is_empty()) {
+        if let Err(error) = handle_push_notification_line(pool, config, line).await {
+            tracing::error!(%error, line, "skipping one malformed/failed push-notification line");
         }
     }
 }
 
-/// Processes one relayed payload (one or more `post-receive` lines),
-/// re-verifying and, if authorized, pushing each ref update in turn.
-async fn handle_payload(pool: &SqlitePool, config: &ServeConfig, payload: &str) -> Result<()> {
-    for line in payload.lines().filter(|line| !line.trim().is_empty()) {
-        let notification = parse_post_receive_line(line)?;
-        let decision =
-            verify_and_authorize(pool, &notification.run_id, &notification.new_commit_sha).await?;
+/// Re-verifies and, if authorized, pushes the single ref update described by
+/// one `post-receive` line.
+async fn handle_push_notification_line(
+    pool: &SqlitePool,
+    config: &ServeConfig,
+    line: &str,
+) -> Result<()> {
+    let notification = parse_post_receive_line(line)?;
+    let decision =
+        verify_and_authorize(pool, &notification.run_id, &notification.new_commit_sha).await?;
 
-        match decision {
-            GateDecision::Allow { commit_sha } => {
-                tracing::info!(
-                    run_id = %notification.run_id,
-                    %commit_sha,
-                    "run converged and hash matches; pushing to origin"
-                );
-                push::push_to_origin(&config.bare_repo_path, &commit_sha, &config.target_branch)
-                    .await?;
-            }
-            GateDecision::Blocked(reason) => {
-                tracing::warn!(
-                    run_id = %notification.run_id,
-                    ?reason,
-                    "push blocked: independent re-verification against SQLite failed"
-                );
-            }
+    match decision {
+        GateDecision::Allow { commit_sha } => {
+            tracing::info!(
+                run_id = %notification.run_id,
+                %commit_sha,
+                "run converged and hash matches; pushing to origin"
+            );
+            push::push_to_origin(&config.bare_repo_path, &commit_sha, &config.target_branch)
+                .await?;
+        }
+        GateDecision::Blocked(reason) => {
+            tracing::warn!(
+                run_id = %notification.run_id,
+                ?reason,
+                "push blocked: independent re-verification against SQLite failed"
+            );
         }
     }
     Ok(())
@@ -202,7 +224,7 @@ mod tests {
         };
 
         let payload = format!("0000000 {commit_sha} refs/heads/warden-run/run-1\n");
-        handle_payload(&pool, &config, &payload).await.unwrap();
+        handle_payload(&pool, &config, &payload).await;
 
         // `origin` must still have no `main` ref at all -- nothing was pushed.
         let output = SyncCommand::new("git")
@@ -247,7 +269,7 @@ mod tests {
         };
 
         let payload = format!("0000000 {commit_sha} refs/heads/warden-run/run-1\n");
-        handle_payload(&pool, &config, &payload).await.unwrap();
+        handle_payload(&pool, &config, &payload).await;
 
         let output = SyncCommand::new("git")
             .current_dir(origin.path())
@@ -256,5 +278,56 @@ mod tests {
             .unwrap();
         let origin_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert_eq!(origin_head, commit_sha);
+    }
+
+    /// LOW finding (issue #3 review): a malformed line earlier in the same
+    /// payload must not prevent a legitimate, later line from still being
+    /// processed -- a multi-ref push could contain one bad ref alongside a
+    /// good one, and boundary-validation failures are per-line, not
+    /// batch-wide.
+    #[tokio::test]
+    async fn a_malformed_line_does_not_prevent_a_later_valid_line_from_being_pushed() {
+        let (_db_dir, origin, gate_repo, db_path, commit_sha) =
+            test_fixture(RunState::Converged, None).await;
+
+        let pool = db::connect_read_only(&db_path).await.unwrap();
+        {
+            let write_options = SqliteConnectOptions::new().filename(&db_path);
+            let write_pool = SqlitePoolOptions::new()
+                .connect_with(write_options)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE runs SET converged_commit_sha = ? WHERE id = 'run-1'")
+                .bind(&commit_sha)
+                .execute(&write_pool)
+                .await
+                .unwrap();
+            write_pool.close().await;
+        }
+
+        let config = ServeConfig {
+            socket_path: PathBuf::from("/unused/for/this/test"),
+            db_path: db_path.clone(),
+            bare_repo_path: gate_repo.path().to_path_buf(),
+            target_branch: "main".to_string(),
+        };
+
+        // First line is deliberately malformed (wrong ref prefix); second
+        // line is the real, valid, converged notification.
+        let payload = format!(
+            "old111 new222 refs/heads/not-a-warden-ref\n0000000 {commit_sha} refs/heads/warden-run/run-1\n"
+        );
+        handle_payload(&pool, &config, &payload).await;
+
+        let output = SyncCommand::new("git")
+            .current_dir(origin.path())
+            .args(["log", "-1", "--format=%H", "refs/heads/main"])
+            .output()
+            .unwrap();
+        let origin_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            origin_head, commit_sha,
+            "the valid second line must still have been pushed despite the malformed first line"
+        );
     }
 }

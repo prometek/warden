@@ -18,6 +18,20 @@
   process at start time (e.g. a running `ssh-agent`/keychain-backed SSH key,
   or a git credential helper configured on the `origin` remote inside the
   bare gate repo) -- nothing here embeds a secret directly.
+
+  SECURITY NOTE (issue #3 review, ADR-0006 "Precision v1"): as written,
+  this agent runs under `gui/$(id -u)` for whichever user installs it --
+  the SAME OS user that (presumably) also runs `warden`. That gives a
+  process/logical security boundary (no shared credential-access code,
+  independent SQLite re-verification) but NOT OS-level isolation -- a
+  `warden` compromised at the code level, running under this same UID, can
+  read whatever this UID can read, including the SSH key / credential
+  helper this agent relies on. For a boundary that holds even against a
+  fully code-compromised `warden`, install and run this agent under a
+  DEDICATED OS user (distinct from `warden`'s), owning the bare repo and
+  the `origin` credentials exclusively -- see README.md, "Deploiement
+  durci (isolation OS reelle)". This file intentionally keeps the simple
+  same-user setup as its default for ease of installation.
 -->
 <plist version="1.0">
   <dict>

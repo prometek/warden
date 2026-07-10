@@ -18,6 +18,22 @@ run et le hash validé en SQLite (connexion strictement lecture seule) avant tou
 `origin`, et ne fait jamais confiance à ce que `warden` prétend. La TUI (`warden-tui`)
 arrive dans une phase ultérieure et n'existe pas encore.
 
+**Ce qui n'est pas encore câblé (Phase 4)** : `warden` lui-même ne pousse pas encore
+automatiquement les runs convergés vers le dépôt bare de `warden-gated`, et la transition
+`Converged` → `Pushed` de la state machine n'est pas encore déclenchée par l'orchestrateur.
+`warden-gated` (hook, socket, revérification, push vers `origin`) est entièrement
+fonctionnel et testé de bout en bout indépendamment, mais le déclenchement du premier push
+(`git push` vers le dépôt bare local à la convergence) reste, pour l'instant, une étape
+manuelle ou scriptée — voir "Le gate git" ci-dessous.
+
+**Limite d'isolation à connaître avant tout déploiement** : dans la configuration par
+défaut documentée ici, `warden` et `warden-gated` tournent sous le **même utilisateur OS**.
+Cela donne une frontière de sécurité **process/logique** (aucun code d'accès credentials
+partagé, revérification indépendante en base) mais **pas** une isolation OS — un `warden`
+compromis au niveau code, sous cet UID, peut lire directement les credentials `origin`. Voir
+"Déploiement durci" ci-dessous et ADR-0006 dans `docs/Architecture.md` pour la configuration
+qui ferme cet écart.
+
 ## Structure du dépôt
 
 - `crates/warden-core/` — logique pure (state machine des runs, interprétation des
@@ -129,6 +145,13 @@ réel du run en base et ne relaie le push vers `origin` que si `state == Converg
 le commit poussé correspond au hash validé (`runs.converged_commit_sha`) ; sinon, le push
 est bloqué et loggé, sans jamais toucher `origin`.
 
+**Ce push initial vers `refs/heads/warden-run/<run_id>` n'est aujourd'hui déclenché par
+personne automatiquement** : câbler `warden` pour qu'il le fasse à la convergence est du
+ressort de la Phase 4 (non couverte par ce dépôt pour l'instant). Le mécanisme ci-dessus
+(hook, socket, revérification, push vers `origin`) est complet et testé de bout en bout
+(`crates/warden-gated/tests/cli.rs`) via un `git push` manuel/scripté vers le dépôt bare ;
+seul le déclenchement automatique côté orchestrateur reste à écrire.
+
 `warden-gated verify-run --db <path> --run-id <id> --commit <sha>` est un utilitaire de
 diagnostic qui rejoue cette même revérification indépendamment de tout push réel (code de
 sortie `0` = autorisé, `1` = bloqué).
@@ -141,9 +164,39 @@ machine) :
 - Linux (systemd, service utilisateur) : `crates/warden-gated/contrib/systemd/warden-gated.service`.
 - macOS (launchd, agent utilisateur) : `crates/warden-gated/contrib/launchd/com.warden.gated.plist`.
 
-Les deux fichiers documentent leur installation en commentaire. Les credentials du remote
-réel (clé SSH, credential helper) doivent être utilisables par ce service au démarrage —
-`warden-gated` ne les embarque jamais lui-même.
+Les deux fichiers documentent leur installation en commentaire, sous la forme la plus
+simple (même utilisateur OS que `warden`) — voir la limite d'isolation qui en découle
+ci-dessous et dans "Déploiement durci". Les credentials du remote réel (clé SSH,
+credential helper) doivent être utilisables par ce service au démarrage — `warden-gated`
+ne les embarque jamais lui-même.
+
+### Déploiement durci (isolation OS réelle)
+
+Le déploiement documenté ci-dessus (unités `contrib/`, même utilisateur OS pour `warden`
+et `warden-gated`) donne une frontière **process/logique**, pas une isolation **OS** : les
+deux binaires ne partagent aucun code d'accès aux credentials et `warden-gated` revérifie
+tout de manière indépendante, mais un `warden` compromis au niveau code, tournant sous le
+même UID, peut lire directement ce que cet UID peut lire — y compris la clé SSH ou le
+credential helper d'`origin`. C'est un choix documenté, pas un oubli (voir ADR-0006,
+section "Précision v1" dans `docs/Architecture.md`).
+
+Pour une isolation qui tient même si `warden` est compromis **au niveau code** :
+
+1. Créer un utilisateur OS dédié (ex. `warden-gate`), distinct de celui qui exécute
+   `warden`.
+2. Faire posséder à cet utilisateur, et à lui seul, le dépôt bare local
+   (`~/.warden/gate.git` sous son propre `$HOME`) et les credentials `origin` (clé SSH
+   privée ou credential helper configuré pour son compte uniquement — permissions fichier
+   excluant l'utilisateur qui exécute `warden`).
+3. Lancer `warden-gated serve` comme service managé sous cet utilisateur dédié (adapter
+   les chemins `%h`/`HOME_PLACEHOLDER` des fichiers `contrib/` en conséquence).
+4. Donner à l'utilisateur de `warden` uniquement un accès en écriture au dépôt bare (ex.
+   via un push SSH vers `warden-gate@localhost:gate.git`, ou un partage de groupe Unix
+   limité à ce seul répertoire) — jamais un accès aux credentials `origin` eux-mêmes.
+
+Ce mode n'est pas automatisé par les fichiers `contrib/` fournis (qui visent la simplicité
+d'installation mono-utilisateur) ; il nécessite une configuration système manuelle
+correspondant à l'infrastructure de déploiement réelle.
 
 ## Documentation
 

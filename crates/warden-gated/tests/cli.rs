@@ -197,6 +197,203 @@ async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
     let _ = serve_child.wait();
 }
 
+/// End-to-end positive case (issue #3, acceptance criterion 2): when the run
+/// genuinely is `converged` in the real SQLite and the commit that git
+/// actually wrote into the bare gate repo matches `converged_commit_sha`,
+/// the real installed `post-receive` hook, relayed to a real running `serve`
+/// daemon, must relay the push all the way to `origin`.
+#[tokio::test]
+async fn a_real_git_push_through_the_installed_hook_reaches_origin_when_converged_and_hash_matches()
+{
+    let warden_home = TempDir::new().unwrap();
+
+    let bare_repo = warden_home.path().join("gate.git");
+    let socket_path = warden_home.path().join("gated.sock");
+    let origin = TempDir::new().unwrap();
+    run_git_sync(origin.path(), &["init", "--bare", "--quiet"]);
+
+    let bin_path = assert_cmd::cargo::cargo_bin("warden-gated");
+
+    Command::cargo_bin("warden-gated")
+        .unwrap()
+        .args([
+            "init-bare",
+            "--bare-repo",
+            bare_repo.to_str().unwrap(),
+            "--bin",
+            bin_path.to_str().unwrap(),
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--origin-url",
+            origin.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Build the commit that will be pushed *before* seeding the DB, so the
+    // seeded `converged_commit_sha` can be the real sha rather than a
+    // guessed value.
+    let seed = TempDir::new().unwrap();
+    run_git_sync(seed.path(), &["init", "--quiet"]);
+    run_git_sync(seed.path(), &["config", "user.email", "test@warden.local"]);
+    run_git_sync(seed.path(), &["config", "user.name", "warden-test"]);
+    std::fs::write(seed.path().join("f.txt"), "content\n").unwrap();
+    run_git_sync(seed.path(), &["add", "."]);
+    run_git_sync(
+        seed.path(),
+        &["commit", "--quiet", "-m", "converged commit"],
+    );
+    let commit_sha_output = SyncCommand::new("git")
+        .current_dir(seed.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let commit_sha = String::from_utf8_lossy(&commit_sha_output.stdout)
+        .trim()
+        .to_string();
+
+    let db_path = seed_db(
+        warden_home.path(),
+        "run-1",
+        "converged",
+        Some(commit_sha.as_str()),
+    )
+    .await;
+
+    let mut serve_child = std::process::Command::new(&bin_path)
+        .args([
+            "serve",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+            "--bare-repo",
+            bare_repo.to_str().unwrap(),
+            "--branch",
+            "main",
+        ])
+        .spawn()
+        .unwrap();
+
+    wait_for_socket(&socket_path);
+
+    run_git_sync(
+        seed.path(),
+        &[
+            "push",
+            &bare_repo.display().to_string(),
+            "HEAD:refs/heads/warden-run/run-1",
+        ],
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let origin_head = std::process::Command::new("git")
+        .current_dir(origin.path())
+        .args(["log", "-1", "--format=%H", "refs/heads/main"])
+        .output()
+        .unwrap();
+    assert!(
+        origin_head.status.success(),
+        "origin should have received the push for a converged run with a matching hash"
+    );
+    let origin_head_sha = String::from_utf8_lossy(&origin_head.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(origin_head_sha, commit_sha);
+
+    let _ = serve_child.kill();
+    let _ = serve_child.wait();
+}
+
+/// End-to-end negative case (issue #3, acceptance criterion 2): the run is
+/// genuinely `converged`, but the commit actually written into the bare gate
+/// repo by this push does not match the persisted `converged_commit_sha`
+/// (standing in for a stale/tampered validated hash). The real installed
+/// hook must still not let anything reach `origin`.
+#[tokio::test]
+async fn a_real_git_push_through_the_installed_hook_is_blocked_when_hash_does_not_match() {
+    let warden_home = TempDir::new().unwrap();
+    let db_path = seed_db(
+        warden_home.path(),
+        "run-1",
+        "converged",
+        Some("some-other-validated-sha-not-what-gets-pushed"),
+    )
+    .await;
+
+    let bare_repo = warden_home.path().join("gate.git");
+    let socket_path = warden_home.path().join("gated.sock");
+    let origin = TempDir::new().unwrap();
+    run_git_sync(origin.path(), &["init", "--bare", "--quiet"]);
+
+    let bin_path = assert_cmd::cargo::cargo_bin("warden-gated");
+
+    Command::cargo_bin("warden-gated")
+        .unwrap()
+        .args([
+            "init-bare",
+            "--bare-repo",
+            bare_repo.to_str().unwrap(),
+            "--bin",
+            bin_path.to_str().unwrap(),
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--origin-url",
+            origin.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut serve_child = std::process::Command::new(bin_path)
+        .args([
+            "serve",
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+            "--bare-repo",
+            bare_repo.to_str().unwrap(),
+            "--branch",
+            "main",
+        ])
+        .spawn()
+        .unwrap();
+
+    wait_for_socket(&socket_path);
+
+    let seed = TempDir::new().unwrap();
+    run_git_sync(seed.path(), &["init", "--quiet"]);
+    run_git_sync(seed.path(), &["config", "user.email", "test@warden.local"]);
+    run_git_sync(seed.path(), &["config", "user.name", "warden-test"]);
+    std::fs::write(seed.path().join("f.txt"), "content\n").unwrap();
+    run_git_sync(seed.path(), &["add", "."]);
+    run_git_sync(seed.path(), &["commit", "--quiet", "-m", "coder commit"]);
+    run_git_sync(
+        seed.path(),
+        &[
+            "push",
+            &bare_repo.display().to_string(),
+            "HEAD:refs/heads/warden-run/run-1",
+        ],
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let origin_head = std::process::Command::new("git")
+        .current_dir(origin.path())
+        .args(["rev-parse", "--verify", "refs/heads/main"])
+        .output()
+        .unwrap();
+    assert!(
+        !origin_head.status.success(),
+        "origin must not have received a push when the pushed commit doesn't match the validated hash"
+    );
+
+    let _ = serve_child.kill();
+    let _ = serve_child.wait();
+}
+
 fn run_git_sync(dir: &Path, args: &[&str]) {
     let status = SyncCommand::new("git")
         .current_dir(dir)
