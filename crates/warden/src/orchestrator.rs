@@ -912,34 +912,31 @@ mod tests {
     /// Acceptance criterion 2 (issue #2): "Temps de cycle mesurablement
     /// réduit par rapport à la Phase 1" -- reviewer and tester must run
     /// concurrently (`tokio::join!`), so total wall-clock time is dominated
-    /// by the slower of the two, not their sum. Both fake agents sleep the
-    /// same fixed, deterministic duration; a 1.5x margin (well under the 2x
-    /// a sequential implementation would produce) absorbs process-spawn and
-    /// worktree-creation overhead without risking flakiness.
+    /// by the slower of the two, not their sum.
+    ///
+    /// Deliberately not a fixed wall-clock threshold (e.g. `elapsed <
+    /// 1.5 * SLEEP`): under cargo's default parallel test harness, `git
+    /// worktree add` contention and process-spawn overhead from other
+    /// worktree-creating tests running at the same time can push a single
+    /// absolute bound past its margin without anything actually being wrong
+    /// -- non-deterministic per code-standards.md line 17. Instead, this
+    /// measures a **sequential baseline through the exact same code path**
+    /// (`run_finding_agent`, back-to-back: worktree create -> spawn -> wait
+    /// -> worktree remove -> DB writes, for reviewer then tester) and
+    /// compares it against the real `run_review_and_test` (`tokio::join!`)
+    /// path measured immediately after, on the same machine/run. Both
+    /// numbers absorb the same ambient overhead, so only their *ratio* is
+    /// asserted on: sequential is ~2x SLEEP + overhead, parallel is ~1x
+    /// SLEEP + overhead, so parallel must land under 75% of sequential
+    /// regardless of how loaded the machine is.
     #[tokio::test]
     async fn run_review_and_test_runs_reviewer_and_tester_concurrently_not_sequentially() {
-        const SLEEP_MS: u64 = 500;
-
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let worktree_manager =
             WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
-
-        db::insert_run(
-            &pool,
-            "timing-run",
-            &repo.path().display().to_string(),
-            "main",
-            "timing check",
-            3,
-        )
-        .await
-        .unwrap();
-        db::insert_cycle(&pool, "timing-cycle", "timing-run", 1)
-            .await
-            .unwrap();
 
         let sleepy_agent = AgentCommand::new("sh", ["-c", "sleep 0.5"]);
         let config = RunConfig {
@@ -954,7 +951,69 @@ mod tests {
         };
 
         let orchestrator = Orchestrator::new(pool.clone());
-        let start = std::time::Instant::now();
+
+        // Sequential baseline: same real invocation (`run_finding_agent`)
+        // used for reviewer then tester, awaited back-to-back rather than
+        // concurrently. Uses its own run/cycle id so it doesn't share
+        // worktree paths or DB rows with the parallel measurement below.
+        db::insert_run(
+            &pool,
+            "sequential-run",
+            &repo.path().display().to_string(),
+            "main",
+            "timing check",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "sequential-cycle", "sequential-run", 1)
+            .await
+            .unwrap();
+
+        let sequential_start = std::time::Instant::now();
+        orchestrator
+            .run_finding_agent(FindingAgentInvocation {
+                run_id: "sequential-run",
+                cycle_id: "sequential-cycle",
+                role: AgentRole::Reviewer,
+                command: &config.reviewer_command,
+                worktree_manager: &worktree_manager,
+                commit: "HEAD",
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        orchestrator
+            .run_finding_agent(FindingAgentInvocation {
+                run_id: "sequential-run",
+                cycle_id: "sequential-cycle",
+                role: AgentRole::Tester,
+                command: &config.tester_command,
+                worktree_manager: &worktree_manager,
+                commit: "HEAD",
+                cancel: CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+        let sequential_elapsed = sequential_start.elapsed();
+
+        // Parallel path: the real `run_review_and_test`, measured right
+        // after, on the same machine/run as the baseline above.
+        db::insert_run(
+            &pool,
+            "timing-run",
+            &repo.path().display().to_string(),
+            "main",
+            "timing check",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "timing-cycle", "timing-run", 1)
+            .await
+            .unwrap();
+
+        let parallel_start = std::time::Instant::now();
         orchestrator
             .run_review_and_test(
                 "timing-run",
@@ -966,13 +1025,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let elapsed = start.elapsed();
+        let parallel_elapsed = parallel_start.elapsed();
 
         assert!(
-            elapsed < std::time::Duration::from_millis(SLEEP_MS * 3 / 2),
-            "expected reviewer+tester to run concurrently (~{SLEEP_MS}ms total), \
-             took {elapsed:?} -- this looks sequential (~{}ms expected)",
-            SLEEP_MS * 2
+            parallel_elapsed < sequential_elapsed.mul_f64(0.75),
+            "expected the tokio::join! path ({parallel_elapsed:?}) to be \
+             meaningfully faster than the sequential baseline \
+             ({sequential_elapsed:?}) -- this looks like reviewer/tester ran \
+             one after another instead of concurrently"
         );
     }
 }
