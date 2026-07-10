@@ -41,6 +41,32 @@ pub enum GatedError {
         exit_code: Option<i32>,
         stderr: String,
     },
+
+    /// A run's intent has no non-blank content to derive a PR title from --
+    /// the orchestrator should never hand the gate a blank intent; surfaced
+    /// as a typed error rather than inventing a placeholder title
+    /// (code-standards.md: no silent fallback).
+    #[error("cannot generate a PR title: intent is blank")]
+    EmptyIntent,
+
+    #[error("gh command `{command}` failed (exit {exit_code:?}): {stderr}")]
+    GhCommandFailed {
+        command: String,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+
+    /// The bare gate repo's `origin` remote isn't a recognizable GitHub URL
+    /// -- most likely a misconfigured `origin`, or a non-GitHub remote with
+    /// no explicit repo slug override supplied.
+    #[error("could not determine a GitHub owner/repo from origin remote url {0:?}")]
+    UnknownOriginRemote(String),
+
+    /// `gh pr create`'s stdout didn't look like a PR URL ending in
+    /// `/pull/<number>` -- an unexpected `gh` output format, surfaced
+    /// rather than silently treated as "no PR number".
+    #[error("could not parse a PR number from gh's output: {0:?}")]
+    UnparsablePrUrl(String),
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;
