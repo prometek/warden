@@ -67,6 +67,22 @@ pub enum GatedError {
     /// rather than silently treated as "no PR number".
     #[error("could not parse a PR number from gh's output: {0:?}")]
     UnparsablePrUrl(String),
+
+    /// `OpenDraft`'s independent content-free check (issue #4 review,
+    /// finding #1): the caller-supplied skeleton commit changes files
+    /// relative to `base_branch` (or the empty tree, if `base_branch`
+    /// doesn't exist on `origin` yet) -- refused rather than trusted, the
+    /// same way `gate::verify_and_authorize` never trusts a caller's claim
+    /// of convergence.
+    #[error(
+        "refusing to push skeleton commit {commit_sha} for base branch {base_branch:?}: it \
+         changes {files:?} relative to base -- OpenDraft must never push business code"
+    )]
+    SkeletonNotContentFree {
+        commit_sha: String,
+        base_branch: String,
+        files: Vec<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;

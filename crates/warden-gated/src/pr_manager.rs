@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use sqlx::SqlitePool;
+use tokio::process::Command;
 use warden_core::{Finding, FindingSource};
 
 use crate::error::{GatedError, Result};
@@ -292,13 +293,150 @@ pub struct OpenDraftRequest<'a> {
     /// The local bare gate repo to push the skeleton branch from (the same
     /// repo `push::push_to_origin` always pushes from).
     pub bare_repo_path: &'a Path,
-    /// The branch-skeleton commit -- **must** contain no business code; that
-    /// invariant is the caller's responsibility (the orchestrator only ever
-    /// hands the gate a skeleton commit before the coder has run).
+    /// The branch-skeleton commit -- **must** contain no business code.
+    /// `open_draft` never takes the caller's word for that: it independently
+    /// re-derives it (see `skeleton_is_content_free`) before ever pushing,
+    /// the same "never trust the caller" principle `gate::verify_and_authorize`
+    /// applies to convergence (ADR-0002/0006).
     pub skeleton_commit_sha: &'a str,
     pub branch: &'a str,
     pub base_branch: &'a str,
     pub intent: &'a str,
+}
+
+/// The well-known, content-addressed sha of git's empty tree object --
+/// identical in every repository, since it's hashed from fixed content
+/// (`tree\0` with no entries). Used as the comparison point when
+/// `base_branch` doesn't exist on `origin` yet (e.g. the very first run
+/// against a brand-new repo): in that case the only content-free skeleton
+/// is one whose own tree is also empty.
+const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// Independently determines whether `skeleton_commit_sha` changes anything
+/// relative to `base_branch`'s current tip on `origin`. Returns the list of
+/// changed file paths (empty means content-free).
+///
+/// `open_draft` must never trust a caller-supplied sha to truly be "just a
+/// branch skeleton" (issue #4 review, finding #1) -- this re-derives that
+/// fact itself instead, mirroring how `gate::verify_and_authorize` re-derives
+/// convergence rather than trusting the caller. Fetching `base_branch` from
+/// `origin` is a read-only operation already within the access
+/// `warden-gated` holds (it can already push there) -- no new credential
+/// exposure.
+async fn skeleton_diff_against_base(
+    bare_repo_path: &Path,
+    base_branch: &str,
+    skeleton_commit_sha: &str,
+) -> Result<Vec<String>> {
+    let compare_from = match remote_branch_head(bare_repo_path, "origin", base_branch).await? {
+        Some(base_sha) => {
+            fetch_branch(bare_repo_path, "origin", base_branch).await?;
+            merge_base(bare_repo_path, &base_sha, skeleton_commit_sha).await?
+        }
+        // `base_branch` doesn't exist on `origin` yet -- the only
+        // content-free skeleton in that case has a genuinely empty tree.
+        None => EMPTY_TREE_SHA.to_string(),
+    };
+
+    diff_name_only(bare_repo_path, &compare_from, skeleton_commit_sha).await
+}
+
+/// The sha `base_branch` currently points to on `remote`, or `None` if that
+/// branch doesn't exist there yet. Uses `ls-remote --exit-code`, whose
+/// documented exit code `2` means "no matching ref" -- distinguished here
+/// from any other (genuine) failure, which is still surfaced as an error
+/// rather than silently treated as "branch absent".
+async fn remote_branch_head(
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["ls-remote", "--exit-code", "--heads", remote, branch])
+        .output()
+        .await?;
+
+    match output.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_string)),
+        Some(2) => Ok(None),
+        _ => Err(GatedError::GitCommandFailed {
+            command: format!(
+                "git -C {} ls-remote --exit-code --heads {remote} {branch}",
+                repo_path.display()
+            ),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
+}
+
+/// Fetches `branch` from `remote` into `repo_path`'s local object store
+/// (read-only) so its tip commit can be diffed/merge-based against locally.
+async fn fetch_branch(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
+    run_git(repo_path, &["fetch", "--quiet", remote, branch]).await
+}
+
+async fn merge_base(repo_path: &Path, a: &str, b: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["merge-base", a, b])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(GatedError::GitCommandFailed {
+            command: format!("git -C {} merge-base {a} {b}", repo_path.display()),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn diff_name_only(repo_path: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["diff", "--name-only", from, to])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(GatedError::GitCommandFailed {
+            command: format!(
+                "git -C {} diff --name-only {from} {to}",
+                repo_path.display()
+            ),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+async fn run_git(repo_path: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(GatedError::GitCommandFailed {
+            command: format!("git -C {} {}", repo_path.display(), args.join(" ")),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// `OpenDraft` (ADR-0007): pushes only the branch skeleton to `origin`, then
@@ -306,20 +444,46 @@ pub struct OpenDraftRequest<'a> {
 /// from the intent otherwise). Triggered at coder start -- before any
 /// business code exists, so this is the earliest point metadata is allowed
 /// to reach `origin` under ADR-0002/0007.
+///
+/// Order matters here (issue #4 review, finding #2): all fallible *pure*
+/// validation/generation (title, body) runs first, so a caller mistake
+/// (e.g. a blank intent) surfaces before anything irreversible happens.
+/// Only once that's settled does this reach for I/O -- first the
+/// independent content-free re-verification (finding #1), then the push
+/// itself, and only if both succeed does it ask the provider to open the PR
+/// (which itself needs the branch already on `origin` to set `--head`).
+///
+/// Trigger wiring: how `warden` actually invokes this action (CLI
+/// subcommand vs. some other channel) is a separate architectural decision
+/// deferred out of this module's scope -- see issue #4.
 pub async fn open_draft<P: PrProvider>(
     request: &OpenDraftRequest<'_>,
     provider: &P,
 ) -> Result<PrHandle> {
+    let linked_issue = detect_linked_issue(request.intent);
+    let title = generate_pr_title(request.intent)?;
+    let body = open_draft_pr_body(request.intent, linked_issue.as_ref());
+
+    let offending_files = skeleton_diff_against_base(
+        request.bare_repo_path,
+        request.base_branch,
+        request.skeleton_commit_sha,
+    )
+    .await?;
+    if !offending_files.is_empty() {
+        return Err(GatedError::SkeletonNotContentFree {
+            commit_sha: request.skeleton_commit_sha.to_string(),
+            base_branch: request.base_branch.to_string(),
+            files: offending_files,
+        });
+    }
+
     push::push_to_origin(
         request.bare_repo_path,
         request.skeleton_commit_sha,
         request.branch,
     )
     .await?;
-
-    let linked_issue = detect_linked_issue(request.intent);
-    let title = generate_pr_title(request.intent)?;
-    let body = open_draft_pr_body(request.intent, linked_issue.as_ref());
 
     provider
         .open_draft(&OpenDraftParams {
@@ -388,6 +552,15 @@ pub struct FinalizeRequest<'a> {
 /// draft status. Order matters -- the body is updated *before* the PR is
 /// marked ready, so a reviewer can never see a "ready" PR with a stale body,
 /// even momentarily.
+///
+/// Partial-failure note (issue #4 review, finding #3): if the push succeeds
+/// but `update_body` or `mark_ready` then fails (e.g. a transient `gh`
+/// error), the PR is left as a **draft carrying the previous or
+/// partially-updated body** -- never "ready" with a stale body, since
+/// `mark_ready` only runs after `update_body` completes. `push_to_origin`,
+/// `gh pr edit`, and `gh pr ready` are all idempotent, so simply retrying
+/// `finalize` with the same `FinalizeRequest` converges to the fully
+/// finalized state without any special-cased recovery logic here.
 pub async fn finalize<P: PrProvider>(
     pool: &SqlitePool,
     request: &FinalizeRequest<'_>,
@@ -652,10 +825,10 @@ mod tests {
 
     impl PrProvider for RecordingProvider {
         async fn open_draft(&self, params: &OpenDraftParams<'_>) -> Result<PrHandle> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("open_draft({}, {})", params.branch, params.title));
+            self.calls.lock().unwrap().push(format!(
+                "open_draft({}, {}) body={}",
+                params.branch, params.title, params.body
+            ));
             Ok(PrHandle {
                 number: self.next_pr_number,
             })
@@ -699,6 +872,14 @@ mod tests {
     /// plus the sha of a commit already present in the gate repo -- enough
     /// to exercise `push::push_to_origin` (which `open_draft`/`finalize`
     /// both call) without any network access.
+    ///
+    /// `origin`'s `main` branch is seeded with this exact commit as its tip
+    /// (pushed there before the fixture returns): `open_draft`'s content-
+    /// free check (`skeleton_diff_against_base`) fetches `main` from
+    /// `origin` and diffs the skeleton against it, so the returned commit
+    /// must genuinely be content-free relative to whatever `origin` already
+    /// has -- matching real usage, where `OpenDraft` fires before the coder
+    /// has changed anything.
     fn gate_repo_fixture() -> (
         tempfile::TempDir,
         tempfile::TempDir,
@@ -709,13 +890,100 @@ mod tests {
         run_git(origin.path(), &["init", "--bare", "--quiet"]);
 
         let seed = tempfile::TempDir::new().unwrap();
-        run_git(seed.path(), &["init", "--quiet"]);
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
         run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
         run_git(seed.path(), &["config", "user.name", "warden-test"]);
         std::fs::write(seed.path().join("f.txt"), "skeleton\n").unwrap();
         run_git(seed.path(), &["add", "."]);
         run_git(seed.path(), &["commit", "--quiet", "-m", "skeleton"]);
         let commit_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(
+            seed.path(),
+            &[
+                "push",
+                "--quiet",
+                &origin.path().display().to_string(),
+                "main",
+            ],
+        );
+
+        let gate_repo = tempfile::TempDir::new().unwrap();
+        run_git(
+            gate_repo.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &seed.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(
+            gate_repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &origin.path().display().to_string(),
+            ],
+        );
+
+        (origin, seed, gate_repo, commit_sha)
+    }
+
+    /// A bare gate repo whose local history has a skeleton commit followed
+    /// by a second "business code" commit on top of it (standing in for
+    /// content that -- through some later bug or race -- ended up in the
+    /// gate's local history ahead of `Finalize`). `open_draft` must still
+    /// only ever push the exact sha it's handed, never the branch tip, so
+    /// this lets tests prove that invariant even when business code already
+    /// exists locally.
+    ///
+    /// Only the skeleton commit is pushed to `origin`'s `main` -- the
+    /// business commit stays local-only, standing in for content that must
+    /// never reach `origin` via `OpenDraft`. Returns `(origin, gate_repo,
+    /// skeleton_sha, business_sha)`.
+    fn gate_repo_with_business_commit_on_top_of_skeleton(
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, String) {
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "--quiet"]);
+
+        let seed = tempfile::TempDir::new().unwrap();
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
+        run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(seed.path(), &["config", "user.name", "warden-test"]);
+        std::fs::write(seed.path().join("SKELETON.md"), "skeleton\n").unwrap();
+        run_git(seed.path(), &["add", "."]);
+        run_git(seed.path(), &["commit", "--quiet", "-m", "skeleton"]);
+        let skeleton_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(
+            seed.path(),
+            &[
+                "push",
+                "--quiet",
+                &origin.path().display().to_string(),
+                "main",
+            ],
+        );
+
+        std::fs::write(seed.path().join("src_business.rs"), "fn business() {}\n").unwrap();
+        run_git(seed.path(), &["add", "."]);
+        run_git(seed.path(), &["commit", "--quiet", "-m", "business code"]);
+        let business_sha = {
             let output = std::process::Command::new("git")
                 .current_dir(seed.path())
                 .args(["rev-parse", "HEAD"])
@@ -745,7 +1013,7 @@ mod tests {
             ],
         );
 
-        (origin, seed, gate_repo, commit_sha)
+        (origin, gate_repo, skeleton_sha, business_sha)
     }
 
     #[tokio::test]
@@ -776,6 +1044,205 @@ mod tests {
             .unwrap();
         let origin_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert_eq!(origin_head, commit_sha, "skeleton commit must reach origin");
+    }
+
+    #[tokio::test]
+    async fn open_draft_falls_back_to_an_intent_derived_title_when_no_issue_is_linked() {
+        let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
+        let provider = RecordingProvider::new(9);
+
+        let intent = "Add JWT expiry handling";
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &commit_sha,
+            branch: "warden/run-2",
+            base_branch: "main",
+            intent,
+        };
+
+        let pr = open_draft(&request, &provider).await.unwrap();
+        assert_eq!(pr.number, 9);
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].starts_with(&format!("open_draft(warden/run-2, {intent})")));
+        assert!(
+            !calls[0].contains('#'),
+            "no linked issue means neither the generated title nor the body may \
+             reference one: {}",
+            calls[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_draft_never_pushes_content_beyond_the_given_skeleton_commit() {
+        let (origin, gate_repo, skeleton_sha, _business_sha) =
+            gate_repo_with_business_commit_on_top_of_skeleton();
+        let provider = RecordingProvider::new(11);
+
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &skeleton_sha,
+            branch: "warden/run-3",
+            base_branch: "main",
+            intent: "Add a feature",
+        };
+
+        open_draft(&request, &provider).await.unwrap();
+
+        let log_output = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args(["log", "-1", "--format=%H", "refs/heads/warden/run-3"])
+            .output()
+            .unwrap();
+        let origin_head = String::from_utf8_lossy(&log_output.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(
+            origin_head, skeleton_sha,
+            "origin must land on exactly the skeleton commit, never the branch tip \
+             that happens to sit on top of it locally"
+        );
+
+        let ls_tree = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args(["ls-tree", "-r", "--name-only", "refs/heads/warden/run-3"])
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&ls_tree.stdout);
+        assert!(
+            files.contains("SKELETON.md"),
+            "skeleton file missing: {files}"
+        );
+        assert!(
+            !files.contains("src_business.rs"),
+            "business code must never reach origin via open_draft: {files}"
+        );
+    }
+
+    /// The security crux (issue #4 review, finding #1): `open_draft` must
+    /// not blindly trust a caller-supplied sha to be a content-free
+    /// skeleton. Here the caller (standing in for a buggy/compromised
+    /// orchestrator) hands it the *business* commit instead of the
+    /// skeleton -- `open_draft` must independently detect the extra file
+    /// relative to `origin/main`, refuse, and push nothing at all.
+    #[tokio::test]
+    async fn open_draft_rejects_a_skeleton_sha_that_carries_business_content() {
+        let (origin, gate_repo, _skeleton_sha, business_sha) =
+            gate_repo_with_business_commit_on_top_of_skeleton();
+        let provider = RecordingProvider::new(13);
+
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &business_sha,
+            branch: "warden/run-rejected",
+            base_branch: "main",
+            intent: "Add a feature",
+        };
+
+        let result = open_draft(&request, &provider).await;
+
+        match result {
+            Err(GatedError::SkeletonNotContentFree {
+                commit_sha, files, ..
+            }) => {
+                assert_eq!(commit_sha, business_sha);
+                assert_eq!(files, vec!["src_business.rs".to_string()]);
+            }
+            other => panic!("expected SkeletonNotContentFree, got {other:?}"),
+        }
+
+        assert!(
+            provider.calls().is_empty(),
+            "a rejected skeleton must never reach the PR provider"
+        );
+
+        let ref_check = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args(["rev-parse", "--verify", "refs/heads/warden/run-rejected"])
+            .output()
+            .unwrap();
+        assert!(
+            !ref_check.status.success(),
+            "origin must never receive a push for a rejected skeleton"
+        );
+    }
+
+    /// Exercises the other content-free path (finding #1's "e.g. ... or the
+    /// empty tree" case): when `base_branch` doesn't exist on `origin` yet
+    /// (a brand-new repo, first run ever), a skeleton with a genuinely
+    /// empty tree is still accepted.
+    #[tokio::test]
+    async fn open_draft_accepts_an_empty_tree_skeleton_when_base_branch_does_not_exist_on_origin() {
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "--quiet"]);
+
+        let seed = tempfile::TempDir::new().unwrap();
+        run_git(seed.path(), &["init", "--quiet", "-b", "main"]);
+        run_git(seed.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(seed.path(), &["config", "user.name", "warden-test"]);
+        run_git(
+            seed.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "skeleton"],
+        );
+        let skeleton_sha = {
+            let output = std::process::Command::new("git")
+                .current_dir(seed.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        // Deliberately never pushed to `origin` -- `origin` stays empty, so
+        // `main` doesn't exist there yet.
+
+        let gate_repo = tempfile::TempDir::new().unwrap();
+        run_git(
+            gate_repo.path(),
+            &[
+                "clone",
+                "--bare",
+                "--quiet",
+                &seed.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(
+            gate_repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &origin.path().display().to_string(),
+            ],
+        );
+
+        let provider = RecordingProvider::new(17);
+        let request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &skeleton_sha,
+            branch: "warden/run-first-ever",
+            base_branch: "main",
+            intent: "Bootstrap the repo",
+        };
+
+        let pr = open_draft(&request, &provider).await.unwrap();
+        assert_eq!(pr.number, 17);
+
+        let origin_head = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args([
+                "log",
+                "-1",
+                "--format=%H",
+                "refs/heads/warden/run-first-ever",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&origin_head.stdout).trim(),
+            skeleton_sha
+        );
     }
 
     #[tokio::test]
@@ -890,6 +1357,179 @@ mod tests {
         assert!(
             provider.calls().is_empty(),
             "a blocked finalize must never call the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_blocks_and_never_touches_the_provider_on_hash_mismatch() {
+        let (origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
+        let (_db_dir, db_path) = seeded_run_db(
+            warden_core::RunState::Converged,
+            Some("some-other-validated-sha"),
+        )
+        .await;
+        let pool = crate::db::connect_read_only(&db_path).await.unwrap();
+        let provider = RecordingProvider::new(1);
+        let pr = PrHandle { number: 7 };
+
+        let request = FinalizeRequest {
+            bare_repo_path: gate_repo.path(),
+            branch: "main",
+            run_id: "run-1",
+            pushed_commit_sha: &commit_sha,
+            pr: &pr,
+            summary_body: "full run summary",
+        };
+        let outcome = finalize(&pool, &request, &provider).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            FinalizeOutcome::Blocked(GateBlockReason::HashMismatch {
+                validated: Some("some-other-validated-sha".to_string()),
+                pushed: commit_sha.clone(),
+            })
+        );
+        assert!(
+            provider.calls().is_empty(),
+            "a blocked finalize (hash mismatch) must never call the provider"
+        );
+
+        // `gate_repo_fixture` seeds `origin`'s `main` with `commit_sha` up
+        // front (so `open_draft`'s content-free check has a real base to
+        // diff against elsewhere) -- a blocked finalize must leave that ref
+        // exactly as it already was, not add or move anything.
+        let origin_head = std::process::Command::new("git")
+            .current_dir(origin.path())
+            .args(["log", "-1", "--format=%H", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&origin_head.stdout).trim(),
+            commit_sha,
+            "a blocked finalize must never push anything to origin"
+        );
+    }
+
+    /// Tracks a fake PR's actual `draft`/`body` state (not just a call log)
+    /// -- lets this test assert the invariant itself ("the PR's draft status
+    /// flips only at `Finalize`, never at `PostCycleUpdate`") rather than
+    /// only that the right provider method got called.
+    struct StatefulProvider {
+        next_pr_number: u64,
+        draft: std::sync::Mutex<bool>,
+        body: std::sync::Mutex<String>,
+    }
+
+    impl StatefulProvider {
+        fn new(next_pr_number: u64) -> Self {
+            Self {
+                next_pr_number,
+                draft: std::sync::Mutex::new(true),
+                body: std::sync::Mutex::new(String::new()),
+            }
+        }
+
+        fn is_draft(&self) -> bool {
+            *self.draft.lock().unwrap()
+        }
+
+        fn body(&self) -> String {
+            self.body.lock().unwrap().clone()
+        }
+    }
+
+    impl PrProvider for StatefulProvider {
+        async fn open_draft(&self, params: &OpenDraftParams<'_>) -> Result<PrHandle> {
+            *self.body.lock().unwrap() = params.body.to_string();
+            Ok(PrHandle {
+                number: self.next_pr_number,
+            })
+        }
+
+        async fn post_comment(&self, _pr: &PrHandle, _body: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn mark_ready(&self, _pr: &PrHandle) -> Result<()> {
+            *self.draft.lock().unwrap() = false;
+            Ok(())
+        }
+
+        async fn update_body(&self, _pr: &PrHandle, body: &str) -> Result<()> {
+            *self.body.lock().unwrap() = body.to_string();
+            Ok(())
+        }
+    }
+
+    /// End-to-end across the full lifecycle a real run drives
+    /// `pr_manager` through: `OpenDraft`, two `PostCycleUpdate`s, then
+    /// `Finalize`. Asserts the ticket's core orchestration invariant --
+    /// the PR never leaves draft, and its body never changes, until
+    /// `Finalize` explicitly does both -- against a provider double that
+    /// tracks real state rather than just recording calls.
+    #[tokio::test]
+    async fn pr_never_leaves_draft_or_changes_body_before_finalize_across_a_full_cycle_sequence() {
+        let (_origin, _seed, gate_repo, skeleton_sha) = gate_repo_fixture();
+        let provider = StatefulProvider::new(21);
+
+        let open_request = OpenDraftRequest {
+            bare_repo_path: gate_repo.path(),
+            skeleton_commit_sha: &skeleton_sha,
+            branch: "warden/run-4",
+            base_branch: "main",
+            intent: "Add JWT expiry handling",
+        };
+        let pr = open_draft(&open_request, &provider).await.unwrap();
+        assert!(
+            provider.is_draft(),
+            "PR must be a draft immediately after OpenDraft"
+        );
+        let body_after_open = provider.body();
+
+        for cycle in 1..=2 {
+            let summary = CycleSummary {
+                cycle_number: cycle,
+                findings: vec![reviewer_finding()],
+            };
+            post_cycle_update(&pr, &summary, &provider).await.unwrap();
+            assert!(
+                provider.is_draft(),
+                "PostCycleUpdate must never flip a PR out of draft (cycle {cycle})"
+            );
+            assert_eq!(
+                provider.body(),
+                body_after_open,
+                "PostCycleUpdate must never touch the PR body (cycle {cycle})"
+            );
+        }
+
+        let (_db_dir, db_path) =
+            seeded_run_db(warden_core::RunState::Converged, Some(&skeleton_sha)).await;
+        let pool = crate::db::connect_read_only(&db_path).await.unwrap();
+        let finalize_request = FinalizeRequest {
+            bare_repo_path: gate_repo.path(),
+            branch: "warden/run-4",
+            run_id: "run-1",
+            pushed_commit_sha: &skeleton_sha,
+            pr: &pr,
+            summary_body: "full run summary",
+        };
+        let outcome = finalize(&pool, &finalize_request, &provider).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            FinalizeOutcome::Finalized {
+                commit_sha: skeleton_sha.clone()
+            }
+        );
+        assert!(
+            !provider.is_draft(),
+            "Finalize must be the point where the PR leaves draft"
+        );
+        assert_eq!(
+            provider.body(),
+            "full run summary",
+            "Finalize must update the PR body to the full run summary"
         );
     }
 }
