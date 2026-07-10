@@ -141,6 +141,11 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   sinon) — validée de bout en bout sur de vrais dépôts GitHub publics : PR
   mergée, PR ouverte aux checks tous verts, et PR sans aucune CI configurée
   (timeout d'inactivité déclenché proprement, sans busy-spin).
+- Tolérance aux échecs de polling transitoires (`gh` injoignable, rate
+  limit réseau) : jusqu'à 3 échecs consécutifs sont retentés avant abandon,
+  le compteur étant réinitialisé dès le prochain poll réussi ; une réponse
+  malformée ou inattendue de `gh`, elle, fait toujours échouer `watch-pr`
+  immédiatement, sans retry ni tolérance — jamais avalée silencieusement.
 - Fonction pure `warden_core::decide_next_state_after_ci`, miroir de
   `decide_next_state` pour les findings reviewer/tester : décide le
   `RunState` (`Done` / `CoderRunning` / `Failed`) à partir du résultat

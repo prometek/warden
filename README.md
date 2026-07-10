@@ -226,6 +226,11 @@ warden-gated watch-pr \
   interrompue prématurément, seul un statut resté figé pendant tout ce délai déclenche le
   timeout.
 
+Un échec transitoire de poll (`gh` injoignable, rate limit réseau) est toléré et retenté
+jusqu'à 3 fois consécutives (compteur réinitialisé dès le prochain poll réussi) avant que
+`watch-pr` n'abandonne ; une réponse malformée ou inattendue de `gh`, elle, fait toujours
+échouer `watch-pr` immédiatement, sans retry.
+
 Statuts terminaux et code de sortie (même convention que `verify-run`) :
 
 - `MERGED` / `CHECKS-PASSED` (exit `0`) — dans les deux cas, la décision de merger reste
