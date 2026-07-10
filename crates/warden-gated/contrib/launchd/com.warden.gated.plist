@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for `warden-gated` (issue #3, ADR-0002/ADR-0006).
+
+  Install:
+    cp com.warden.gated.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.warden.gated.plist
+    launchctl enable gui/$(id -u)/com.warden.gated
+
+  RunAtLoad + KeepAlive make this agent come back both after a machine
+  restart and after a crash (acceptance criterion 2, issue #3: "warden-gated
+  survit à un redémarrage machine"). Replace `HOME_PLACEHOLDER` below with
+  the absolute home directory of the user this agent runs as (launchd does
+  not expand `~` in plist values).
+
+  Credentials for the real `origin` remote must already be usable by this
+  process at start time (e.g. a running `ssh-agent`/keychain-backed SSH key,
+  or a git credential helper configured on the `origin` remote inside the
+  bare gate repo) -- nothing here embeds a secret directly.
+-->
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.warden.gated</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>HOME_PLACEHOLDER/.cargo/bin/warden-gated</string>
+      <string>serve</string>
+      <string>--socket</string>
+      <string>HOME_PLACEHOLDER/.warden/gated.sock</string>
+      <string>--db</string>
+      <string>HOME_PLACEHOLDER/.warden/state.db</string>
+      <string>--bare-repo</string>
+      <string>HOME_PLACEHOLDER/.warden/gate.git</string>
+      <string>--branch</string>
+      <string>main</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+      <key>SuccessfulExit</key>
+      <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>HOME_PLACEHOLDER/.warden/warden-gated.log</string>
+    <key>StandardErrorPath</key>
+    <string>HOME_PLACEHOLDER/.warden/warden-gated.err.log</string>
+  </dict>
+</plist>

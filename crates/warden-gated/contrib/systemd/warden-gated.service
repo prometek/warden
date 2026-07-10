@@ -1,0 +1,35 @@
+# systemd user service for `warden-gated` (issue #3, ADR-0002/ADR-0006).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp warden-gated.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now warden-gated.service
+#
+# `loginctl enable-linger $USER` additionally makes the service survive a
+# machine restart even before the user logs back in (acceptance criterion 2,
+# issue #3: "warden-gated survit à un redémarrage machine").
+#
+# Credentials for the real `origin` remote (SSH key / token / credential
+# helper) must already be usable by this unit at start time -- e.g. via a
+# running `ssh-agent` reachable through `SSH_AUTH_SOCK`, or a git credential
+# helper configured for the `origin` remote inside the bare gate repo. This
+# unit intentionally does not embed any secret directly.
+
+[Unit]
+Description=Warden git gate daemon (sole holder of origin credentials)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/warden-gated serve \
+    --socket %h/.warden/gated.sock \
+    --db %h/.warden/state.db \
+    --bare-repo %h/.warden/gate.git \
+    --branch main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
