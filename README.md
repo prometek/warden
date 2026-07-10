@@ -145,6 +145,11 @@ réel du run en base et ne relaie le push vers `origin` que si `state == Converg
 le commit poussé correspond au hash validé (`runs.converged_commit_sha`) ; sinon, le push
 est bloqué et loggé, sans jamais toucher `origin`.
 
+Le socket d'écoute (`--socket`) est automatiquement restreint en lecture/écriture au seul
+propriétaire (`0600`) dès son ouverture par `serve` — le répertoire qui le contient
+(`~/.warden` par défaut) doit néanmoins rester lui-même privé à cet utilisateur pour que
+cette restriction ait un sens.
+
 **Ce push initial vers `refs/heads/warden-run/<run_id>` n'est aujourd'hui déclenché par
 personne automatiquement** : câbler `warden` pour qu'il le fasse à la convergence est du
 ressort de la Phase 4 (non couverte par ce dépôt pour l'instant). Le mécanisme ci-dessus

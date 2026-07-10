@@ -64,3 +64,23 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   gate survive à un redémarrage machine.
 - Cache `sqlx` offline propre au crate (`crates/warden-gated/.sqlx/`),
   indépendant de celui de `warden`.
+
+### Security — Phase 3 : durcissement post-revue (`warden-gated`)
+
+- Socket Unix du daemon `warden-gated serve` désormais restreint en
+  lecture/écriture au seul propriétaire (`0600`) juste après le `bind` — le
+  mode par défaut du système n'était pas suffisamment restrictif — aligné sur
+  le `0600` déjà exigé par l'ADR-0008 pour le socket équivalent de la TUI.
+- Traitement des payloads `post-receive` multi-refs ligne par ligne : une
+  ligne malformée, ou dont la revérification/le push échoue, est désormais
+  journalisée et ignorée individuellement plutôt que d'annuler tout le lot.
+- Documentation corrigée pour ne plus survendre la frontière de sécurité :
+  les unités systemd/launchd fournies font tourner `warden-gated` sous le
+  **même** utilisateur OS que `warden` (frontière process/logique, pas
+  isolation OS) ; le README documente désormais cette limite et la
+  configuration à utilisateur OS dédié nécessaire pour une isolation qui
+  tient face à un `warden` compromis au niveau code ("Déploiement durci").
+- Clarification README : `warden` ne pousse pas encore automatiquement les
+  runs convergés vers le dépôt bare du gate (câblage `Converged` → `Pushed`
+  prévu en Phase 4) ; le mécanisme du gate lui-même est complet et testé de
+  bout en bout indépendamment de ce câblage.
