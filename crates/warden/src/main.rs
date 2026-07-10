@@ -27,9 +27,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a full convergence loop (coder -> review/test -> reboucle if
-    /// needed) against a repository, sequentially (Phase 1 — no
-    /// parallelism yet).
+    /// Run a full convergence loop (coder -> [review ∥ test] -> reboucle if
+    /// needed) against a repository. Reviewer and tester run in parallel,
+    /// each in its own worktree synced onto the coder's commit (ADR-0003).
     Run {
         /// Path to the user's existing repository. Never written to
         /// directly; only worktrees created under `--warden-home` are.

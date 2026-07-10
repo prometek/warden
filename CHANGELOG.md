@@ -28,3 +28,15 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - Compilation et tests entièrement hors ligne grâce au cache `sqlx` committé
   (`crates/warden/.sqlx/`) — pas de `DATABASE_URL` requis pour `cargo build` /
   `cargo test`.
+
+### Changed — Phase 2 : parallélisme réel
+
+- Reviewer et tester ne tournent plus séquentiellement : `run_review_and_test`
+  les lance désormais en parallèle (`tokio::join!`), chacun dans son propre
+  worktree synchronisé sur le commit du coder, sans état partagé entre les
+  deux. Le temps de cycle est donc borné par le plus lent des deux agents et
+  non plus par leur somme ; aucun changement fonctionnel sur les findings
+  produits.
+- Timeout de verrou SQLite (`busy_timeout`) rendu explicite sur la connexion,
+  en anticipation des écritures concurrentes reviewer/tester introduites par
+  ce parallélisme.

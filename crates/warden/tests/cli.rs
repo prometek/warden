@@ -11,7 +11,7 @@ use std::process::Command as SyncCommand;
 use assert_cmd::Command;
 use predicates::str::contains;
 use tempfile::TempDir;
-use warden_core::{AgentRole, RunState};
+use warden_core::{AgentRole, FindingSource, RunState};
 
 /// Sets up a throwaway git repo with a single commit, suitable as `--repo`.
 fn init_test_repo() -> TempDir {
@@ -493,6 +493,148 @@ async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_b
         String::from_utf8_lossy(&ref_lookup.stdout).trim(),
         converged_sha,
         "the protective ref must point at the same commit persisted in SQLite"
+    );
+}
+
+/// Acceptance criterion 1 (issue #2): "Aucune collision d'écriture constatée
+/// sur un repo de test avec des findings croisés (reviewer et tester
+/// modifiant des fichiers différents en simultané)" — driven through the
+/// real `warden run` CLI entry point.
+///
+/// The reviewer writes `review_target.txt`, then (after a deliberate sleep
+/// that overlaps with the tester's run) reads back `test_target.txt` from
+/// its own worktree; the tester does the mirror image. If reviewer and
+/// tester ever shared a worktree/directory (a write collision), the other
+/// role's write — which completes well before the sleep ends — would already
+/// be visible, instead of the untouched original content. This is what
+/// distinguishes "isolated worktrees" from "shared worktree" deterministically,
+/// without relying on interleaving order.
+#[tokio::test]
+async fn e2e_reviewer_and_tester_modify_different_files_concurrently_without_collision() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        r#"#!/bin/sh
+echo original-review > review_target.txt
+echo original-test > test_target.txt
+git add review_target.txt test_target.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+    );
+    let reviewer = write_script(
+        scripts_dir.path(),
+        "reviewer.sh",
+        r#"#!/bin/sh
+echo modified-by-reviewer > review_target.txt
+sleep 0.3
+seen=$(cat test_target.txt)
+echo "{\"source\":\"reviewer\",\"severity\":\"info\",\"description\":\"review_target=modified-by-reviewer test_target_seen=$seen\"}"
+"#,
+    );
+    let tester = write_script(
+        scripts_dir.path(),
+        "tester.sh",
+        r#"#!/bin/sh
+echo modified-by-tester > test_target.txt
+sleep 0.3
+seen=$(cat review_target.txt)
+echo "{\"source\":\"tester\",\"severity\":\"info\",\"description\":\"test_target=modified-by-tester review_target_seen=$seen\"}"
+"#,
+    );
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "crossed findings, no collision",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    // No `db.rs` getter maps a run to its cycles yet, so a direct query is
+    // used here rather than adding production API surface just for a test
+    // (same convention as the other tests in this file).
+    let (cycle_id,): (String,) = sqlx::query_as("SELECT id FROM cycles WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let findings = warden::db::list_findings_for_cycle(&pool, &cycle_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        findings.len(),
+        2,
+        "expected exactly one finding from each of reviewer and tester"
+    );
+
+    let reviewer_finding = findings
+        .iter()
+        .find(|f| f.source == FindingSource::Reviewer)
+        .expect("reviewer finding present");
+    let tester_finding = findings
+        .iter()
+        .find(|f| f.source == FindingSource::Tester)
+        .expect("tester finding present");
+
+    assert!(
+        reviewer_finding
+            .description
+            .contains("test_target_seen=original-test"),
+        "reviewer's worktree must still see the untouched original \
+         test_target.txt, not the tester's concurrent write -- got: {}",
+        reviewer_finding.description
+    );
+    assert!(
+        tester_finding
+            .description
+            .contains("review_target_seen=original-review"),
+        "tester's worktree must still see the untouched original \
+         review_target.txt, not the reviewer's concurrent write -- got: {}",
+        tester_finding.description
+    );
+
+    // Cross-check at the worktree-path level too: reviewer and tester must
+    // have been assigned distinct directories for this cycle.
+    let (reviewer_wt, tester_wt): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT reviewer_worktree_path, tester_worktree_path FROM cycles WHERE id = ?",
+    )
+    .bind(&cycle_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let reviewer_wt = reviewer_wt.expect("reviewer worktree path recorded");
+    let tester_wt = tester_wt.expect("tester worktree path recorded");
+    assert_ne!(
+        reviewer_wt, tester_wt,
+        "reviewer and tester must run in distinct worktree directories"
     );
 }
 
