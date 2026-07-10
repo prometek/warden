@@ -26,6 +26,11 @@ fonctionnel et testé de bout en bout indépendamment, mais le déclenchement du
 (`git push` vers le dépôt bare local à la convergence) reste, pour l'instant, une étape
 manuelle ou scriptée — voir "Le gate git" ci-dessous.
 
+Le **PR Manager** (`OpenDraft` / `PostCycleUpdate` / `Finalize`) a lui aussi livré côté
+bibliothèque dans `warden-gated` — voir "Gestion des PR" ci-dessous — mais, de la même
+manière, aucun déclenchement CLI/IPC ne l'invoque encore depuis `warden` : ce câblage reste
+une décision d'architecture distincte, non couverte par cette livraison.
+
 **Limite d'isolation à connaître avant tout déploiement** : dans la configuration par
 défaut documentée ici, `warden` et `warden-gated` tournent sous le **même utilisateur OS**.
 Cela donne une frontière de sécurité **process/logique** (aucun code d'accès credentials
@@ -160,6 +165,32 @@ seul le déclenchement automatique côté orchestrateur reste à écrire.
 `warden-gated verify-run --db <path> --run-id <id> --commit <sha>` est un utilitaire de
 diagnostic qui rejoue cette même revérification indépendamment de tout push réel (code de
 sortie `0` = autorisé, `1` = bloqué).
+
+### Gestion des PR (`OpenDraft` / `PostCycleUpdate` / `Finalize`)
+
+`warden-gated` expose aussi, comme capacité de bibliothèque (`crates/warden-gated/src/pr_manager.rs`),
+trois actions formant le cycle de vie d'une PR, adossées à un trait `PrProvider` implémenté
+aujourd'hui via la CLI `gh` (`gh_provider::GhProvider`) — celle-ci réutilise la session `gh`
+déjà authentifiée de la machine : `warden-gated` ne stocke ni ne lit lui-même de credential
+GitHub.
+
+- `OpenDraft` — pousse un commit squelette de branche **sans aucun contenu métier**
+  (vérifié indépendamment avant tout push : comparaison d'arbre net contre la branche de
+  base, et parcours commit par commit de l'historique effectivement transféré, y compris le
+  contenu propre d'un commit de fusion) et ouvre une PR en draft, liée à l'issue détectée
+  dans l'intent (`(?i)(fixes|closes|resolves)\s+#\d+`) ou titrée à partir de l'intent sinon.
+- `PostCycleUpdate` — poste un commentaire informatif par cycle (findings reviewer/tester)
+  sur la PR ; ne modifie jamais son statut draft ni son contenu.
+- `Finalize` — revérifie `state == Converged` et le hash committé via le même chemin
+  `gate::verify_and_authorize` que le gate git lui-même, puis seulement si autorisé : pousse
+  le contenu réel, met à jour le corps de la PR et retire le statut draft.
+
+Ce module fournit également le formatage des attributs de commit structurés
+(`Warden-Cycle`, `Warden-Findings-Resolved`, `Warden-Agent`) destinés aux commits coder/doc.
+
+**Ce qui n'est pas encore câblé** : ces trois actions existent uniquement comme capacité de
+bibliothèque — aucun déclenchement CLI/IPC ne les invoque encore depuis `warden`. Ce câblage
+est une décision d'architecture distincte, hors périmètre de cette livraison.
 
 ### Service managé
 
