@@ -638,6 +638,263 @@ echo "{\"source\":\"tester\",\"severity\":\"info\",\"description\":\"test_target
     );
 }
 
+/// Issue #6 acceptance criteria, driven end-to-end through the real CLI
+/// restart path (`main.rs::run` unconditionally calls `recover_crashed_runs`
+/// before starting any new run): "aucun worktree ni process orphelin ne
+/// persiste après un cycle de crash + redémarrage". This seeds a single
+/// crashed run that left BOTH kinds of orphaned resources behind — an
+/// on-disk worktree whose owning guard was never dropped (a crash is a
+/// `SIGKILL`, not a graceful `Drop`), and a genuinely still-running agent
+/// process — then launches a brand-new, unrelated `warden run` against the
+/// same `--warden-home` and checks recovery cleaned up both as a side effect
+/// of that single startup, with no manual intervention.
+#[tokio::test]
+async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let db_path = warden_home.path().join("state.db");
+
+    // Seed: a run "crashed" mid-cycle, with a real orphaned worktree on disk
+    // and a real, still-running orphaned agent process.
+    let (worktree_path, mut orphan_child) = {
+        let pool = warden::db::connect(&db_path).await.unwrap();
+
+        let worktree_manager = warden::worktree::WorktreeManager::new(
+            repo.path(),
+            warden_home.path().join("worktrees"),
+        )
+        .unwrap();
+        // Simulates the crash itself: the `Worktree` guard is forgotten
+        // instead of dropped or explicitly removed -- exactly what a
+        // SIGKILL'd orchestrator would leave behind.
+        let worktree = worktree_manager
+            .create("orphan-e2e-run", "coder", "HEAD")
+            .await
+            .unwrap();
+        let worktree_path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+        assert!(worktree_path.exists(), "precondition: orphan worktree exists on disk");
+
+        warden::db::insert_run(
+            &pool,
+            "orphan-e2e-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        warden::db::update_run_state(&pool, "orphan-e2e-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        warden::db::insert_cycle(&pool, "orphan-e2e-cycle", "orphan-e2e-run", 1)
+            .await
+            .unwrap();
+        warden::db::set_cycle_worktree_path(
+            &pool,
+            "orphan-e2e-cycle",
+            AgentRole::Coder,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Two concurrent agent processes recorded for the same cycle, the
+        // way reviewer and tester run in parallel (ADR-0003): an earlier one
+        // that is genuinely still alive (a real orphan agent process the
+        // crashed orchestrator never reaped or killed), and a later, dead
+        // one -- recovery decides whether the *run* crashed based on the
+        // latest recorded process (`latest_open_agent_process_for_run`), so
+        // the dead one must sort after the live one for this run to be
+        // recovered as Failed at all, exactly like
+        // `recovery_terminates_an_orphaned_live_agent_process` in
+        // orchestrator.rs.
+        let orphan_child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let orphan_pid = orphan_child.id().unwrap();
+        warden::db::insert_agent_process(
+            &pool,
+            "orphan-e2e-live-process",
+            "orphan-e2e-cycle",
+            AgentRole::Reviewer,
+            orphan_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Guarantees the dead process's `started_at` sorts strictly after
+        // the live one's, so which row is "latest" is deterministic.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let mut dead_child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = dead_child.id().unwrap();
+        dead_child.wait().await.unwrap();
+        warden::db::insert_agent_process(
+            &pool,
+            "orphan-e2e-dead-process",
+            "orphan-e2e-cycle",
+            AgentRole::Coder,
+            dead_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.close().await;
+        (worktree_path, orphan_child)
+    };
+
+    // Restart: a completely unrelated, trivial run against the same
+    // --warden-home. Startup crash recovery must run first regardless.
+    let scripts_dir = TempDir::new().unwrap();
+    let (coder, reviewer, tester) = always_converging_scripts(scripts_dir.path());
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "unrelated new run",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    // Behavior 1: the run is recovered as Failed and its orphan worktree no
+    // longer exists on disk.
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let recovered = warden::db::get_run(&pool, "orphan-e2e-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, RunState::Failed);
+    assert!(
+        !worktree_path.exists(),
+        "no orphan worktree may persist after a crash+restart cycle"
+    );
+
+    // Behavior 2: the orphan agent process was actually terminated, not
+    // merely forgotten about.
+    let exit_status = orphan_child.wait().await.unwrap();
+    assert!(
+        !exit_status.success(),
+        "no orphan agent process may persist after a crash+restart cycle"
+    );
+    let open_processes =
+        warden::db::list_open_agent_processes_for_run(&pool, "orphan-e2e-run")
+            .await
+            .unwrap();
+    assert!(
+        open_processes.is_empty(),
+        "recovery must mark the orphaned agent_processes row ended"
+    );
+}
+
+/// Issue #6 acceptance criterion: an automatic backup of the SQLite database
+/// is taken before a pending schema migration is applied, driven through the
+/// real CLI entry point rather than calling `db::connect` directly -- every
+/// `warden run` invocation opens the db exactly this way on startup
+/// (`main.rs::run`). Simulates restarting a pre-existing Warden installation
+/// whose schema predates the latest migrations.
+#[tokio::test]
+async fn e2e_restart_backs_up_db_before_applying_pending_migrations_via_cli() {
+    let warden_home = TempDir::new().unwrap();
+    std::fs::create_dir_all(warden_home.path()).unwrap();
+    let db_path = warden_home.path().join("state.db");
+
+    // Simulate an older installation: only the first migration has ever
+    // been applied, so the rest are pending on the next `warden run`.
+    {
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .unwrap();
+        static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+        let first_migration_version = MIGRATOR.iter().next().unwrap().version;
+        MIGRATOR
+            .run_to(first_migration_version, &pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    let repo = init_test_repo();
+    let scripts_dir = TempDir::new().unwrap();
+    let (coder, reviewer, tester) = always_converging_scripts(scripts_dir.path());
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "trigger startup migration",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let backups: Vec<_> = std::fs::read_dir(warden_home.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak-"))
+        .collect();
+    assert_eq!(
+        backups.len(),
+        1,
+        "restarting against a pre-existing db with pending migrations must produce exactly one backup file: {backups:?}"
+    );
+
+    // The schema must actually have been migrated to current, not just
+    // backed up and left stale.
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let (run_id,): (String,) = sqlx::query_as("SELECT id FROM runs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(run.state, RunState::Converged);
+}
+
 /// A malformed `--coder-cmd` (empty string) must be a clean CLI error, not a
 /// panic — realistic misuse from a human typo or a bad config file.
 #[test]

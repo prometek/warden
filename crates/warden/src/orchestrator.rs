@@ -1293,4 +1293,210 @@ mod tests {
              one after another instead of concurrently"
         );
     }
+
+    /// Issue #6, H1 (PID-reuse hardening) exercised through the *full*
+    /// recovery path, not just `process::kill_pid` in isolation: a run's
+    /// recorded agent process has a `pid_started_at_unix` that no longer
+    /// matches the process currently holding that PID (the OS reused it
+    /// after the original process died) — recovery must still mark the run
+    /// `Failed` and close out the stale `agent_processes` row, but must
+    /// never signal the unrelated live process that now happens to hold
+    /// that PID.
+    #[tokio::test]
+    async fn recovery_never_kills_a_live_process_whose_pid_fingerprint_no_longer_matches() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        db::insert_run(
+            &pool,
+            "pid-reuse-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "pid-reuse-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "pid-reuse-cycle", "pid-reuse-run", 1)
+            .await
+            .unwrap();
+
+        // A genuinely live process, standing in for "the OS handed this PID
+        // to an unrelated process after the originally-recorded one died".
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let real_start_time = process::process_start_time(pid).unwrap();
+        let bogus_start_time = real_start_time + 1_000_000;
+
+        // insert_agent_process derives the start time itself from the live
+        // PID at insert time, so the row is written directly here instead,
+        // with a fingerprint that deliberately does not match the process
+        // currently alive at `pid`.
+        sqlx::query!(
+            "INSERT INTO agent_processes (id, cycle_id, role, pid, pid_started_at_unix, worktree_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "pid-reuse-process",
+            "pid-reuse-cycle",
+            "coder",
+            pid,
+            bogus_start_time,
+            "/tmp/wt",
+            "2020-01-01T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let failed = recover_crashed_runs(&pool).await.unwrap();
+        assert_eq!(failed, vec!["pid-reuse-run".to_string()]);
+
+        // The live process must be untouched: recovery believed the row was
+        // "dead" (fingerprint mismatch), never a live process to leave
+        // running, so it never called kill_pid on it at all.
+        assert!(
+            process::is_process_alive(pid, real_start_time),
+            "a process whose PID was reused must never be killed by crash recovery"
+        );
+
+        // The stale row must still be closed out, so it doesn't keep
+        // looking like an open process on the next recovery pass.
+        let open_processes = db::list_open_agent_processes_for_run(&pool, "pid-reuse-run")
+            .await
+            .unwrap();
+        assert!(
+            open_processes.is_empty(),
+            "the stale agent_processes row must be marked ended even though its process was never touched"
+        );
+
+        child.kill().await.unwrap();
+    }
+
+    /// Regression test for a real gap in `recover_crashed_runs`: the run's
+    /// state is written as `Failed` to SQLite *before* its orphaned
+    /// worktree/process cleanup runs (see the function body — `Failed` is
+    /// persisted, then `cleanup_orphan_worktrees`/`terminate_orphan_processes`
+    /// are attempted afterwards, best-effort). If the orchestrator process
+    /// itself dies in that window -- a crash *during* recovery, e.g. the
+    /// very next `SIGKILL` -- the run is already `Failed` by the time the
+    /// process comes back up. `list_intermediate_runs` only looks at
+    /// `coder_running`/`awaiting_review_test`/`awaiting_ci`, so a `Failed`
+    /// run is never revisited by a later recovery pass, and its worktree
+    /// and/or live process are never cleaned up again: a permanent leak,
+    /// not merely a delayed cleanup.
+    ///
+    /// This test sets up exactly that already-crashed-mid-recovery state
+    /// directly (run already `Failed`, orphan worktree still on disk, an
+    /// agent process still recorded open and still alive) and asserts what
+    /// issue #6 actually requires -- "aucun worktree ni process orphelin ne
+    /// persiste après un cycle de crash + redémarrage" makes no exception
+    /// for a run already marked `Failed`. As of this commit this FAILS
+    /// against the current implementation, which silently skips `Failed`
+    /// runs entirely: see the discrepancy reported alongside this test.
+    #[tokio::test]
+    async fn recovery_cleans_up_orphans_even_for_a_run_already_marked_failed_by_an_earlier_crashed_recovery_pass()
+    {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        let worktree = worktree_manager
+            .create("crash-during-recovery-run", "coder", "HEAD")
+            .await
+            .unwrap();
+        let worktree_path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+        assert!(worktree_path.exists(), "precondition: orphan worktree exists");
+
+        db::insert_run(
+            &pool,
+            "crash-during-recovery-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(
+            &pool,
+            "crash-during-recovery-cycle",
+            "crash-during-recovery-run",
+            1,
+        )
+        .await
+        .unwrap();
+        db::set_cycle_worktree_path(
+            &pool,
+            "crash-during-recovery-cycle",
+            AgentRole::Coder,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // A still-running agent process, recorded but never marked ended --
+        // exactly the shape left behind if the *first* recovery pass died
+        // right after writing `Failed` but before `terminate_orphan_processes`
+        // ran.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        db::insert_agent_process(
+            &pool,
+            "crash-during-recovery-process",
+            "crash-during-recovery-cycle",
+            AgentRole::Coder,
+            pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Simulates the first, interrupted recovery pass having already
+        // committed the state transition (write-ahead of intention,
+        // ADR-0004) before it crashed -- CoderRunning -> Failed is a valid
+        // transition, so this mirrors exactly what
+        // `recover_crashed_runs` itself would have written.
+        db::update_run_state(&pool, "crash-during-recovery-run", RunState::Failed)
+            .await
+            .unwrap();
+
+        // A second, successful recovery pass -- the restart after the crash
+        // that hit mid-recovery.
+        recover_crashed_runs(&pool).await.unwrap();
+
+        // Kill the still-running child unconditionally, before asserting,
+        // so this test never leaks a real background `sleep 30` process
+        // regardless of whether the assertions below pass or (expectedly,
+        // as of this commit) fail.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+
+        assert!(
+            !worktree_path.exists(),
+            "BUG: a run already marked Failed by an interrupted recovery pass is never \
+             revisited by list_intermediate_runs, so its orphan worktree is leaked forever, \
+             not just cleaned up late"
+        );
+
+        let open_processes =
+            db::list_open_agent_processes_for_run(&pool, "crash-during-recovery-run")
+                .await
+                .unwrap();
+        assert!(
+            open_processes.is_empty(),
+            "BUG: a run already marked Failed by an interrupted recovery pass leaves its \
+             agent_processes row open forever, and the process itself keeps running"
+        );
+    }
 }

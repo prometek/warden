@@ -1003,4 +1003,62 @@ mod tests {
             "a pre-existing db with pending migrations must be backed up exactly once: {backups:?}"
         );
     }
+
+    /// Issue #6: "a failed backup aborts migration (fails loud) rather than
+    /// proceeding". Forces `VACUUM INTO` to fail by revoking write
+    /// permission on the directory the backup file would be created in
+    /// *after* the pool (and its `-wal`/`-shm` sidecars) already exist —
+    /// so the failure genuinely comes from the backup step itself, not from
+    /// merely opening the database. `backup_before_migration` is private but
+    /// reachable here via `super::*`, letting this test target the exact
+    /// failure point without needing a full second `connect` (which would
+    /// hit the same permission error earlier, at WAL setup, and not prove
+    /// anything about the backup step specifically).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_failure_is_a_typed_error_not_a_silent_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        // Simulate an older Warden installation with only the first
+        // migration applied, so a migration is genuinely pending and a
+        // backup is attempted (mirrors the "pending migrations" test above).
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .unwrap();
+        let first_migration_version = MIGRATOR.iter().next().unwrap().version;
+        MIGRATOR
+            .run_to(first_migration_version, &pool)
+            .await
+            .unwrap();
+
+        // Revoke write permission on the directory only now, after the pool
+        // and its WAL sidecars already exist -- `VACUUM INTO` must fail
+        // trying to create the *new* backup file in a directory it can no
+        // longer write to.
+        let original_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), readonly).unwrap();
+
+        let result = backup_before_migration(&db_path, &pool).await;
+
+        // Restore permissions before the TempDir is dropped, regardless of
+        // the assertion outcome, so cleanup doesn't itself fail.
+        std::fs::set_permissions(dir.path(), original_permissions).unwrap();
+
+        assert!(
+            matches!(result, Err(WardenError::Backup { .. })),
+            "expected a typed Backup error when VACUUM INTO cannot write its target, got: {result:?}"
+        );
+
+        pool.close().await;
+    }
 }
