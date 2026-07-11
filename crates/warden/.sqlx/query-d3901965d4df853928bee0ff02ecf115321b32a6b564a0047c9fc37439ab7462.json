@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT coder_worktree_path, reviewer_worktree_path, tester_worktree_path\n        FROM cycles\n        WHERE run_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "coder_worktree_path",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycles",
+            "name": "coder_worktree_path"
+          }
+        }
+      },
+      {
+        "name": "reviewer_worktree_path",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycles",
+            "name": "reviewer_worktree_path"
+          }
+        }
+      },
+      {
+        "name": "tester_worktree_path",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycles",
+            "name": "tester_worktree_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "d3901965d4df853928bee0ff02ecf115321b32a6b564a0047c9fc37439ab7462"
+}

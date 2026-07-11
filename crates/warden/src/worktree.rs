@@ -105,6 +105,71 @@ impl WorktreeManager {
     }
 }
 
+/// Removes a worktree at `path` from `main_repo_path` that no longer has a
+/// [`Worktree`] guard owning it — used by crash recovery, where the
+/// orchestrator that would normally call [`Worktree::remove`] (or drop the
+/// guard) died before it got the chance (Architecture.md §9, Disaster
+/// Recovery).
+///
+/// Idempotent by design: if `path` doesn't exist on disk anymore (already
+/// cleaned up, or never fully created), this returns `Ok(())` without
+/// invoking git at all, rather than treating "already gone" as a recovery
+/// failure. A `path` that *does* exist but that git genuinely refuses to
+/// remove (corrupted worktree metadata, permissions, ...) still surfaces as
+/// [`WorktreeError::GitCommandFailed`] — only the "nothing there" case is
+/// swallowed.
+pub async fn remove_orphan_worktree(
+    main_repo_path: &Path,
+    path: &Path,
+) -> Result<(), WorktreeError> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(main_repo_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(WorktreeError::GitCommandFailed {
+            command: format!("git worktree remove --force {}", path.display()),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Runs `git worktree prune` against `main_repo_path`, clearing any
+/// remaining `.git/worktrees/<name>` administrative entries left behind by
+/// worktrees whose working directory is already gone (e.g. removed by
+/// [`remove_orphan_worktree`], or deleted out-of-band). Called once after
+/// processing all of a crashed run's recorded worktree paths, not per-path —
+/// pruning is a whole-repository operation.
+pub async fn prune_worktrees(main_repo_path: &Path) -> Result<(), WorktreeError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(main_repo_path)
+        .args(["worktree", "prune"])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(WorktreeError::GitCommandFailed {
+            command: "git worktree prune".to_string(),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    Ok(())
+}
+
 /// Canonicalizes `path`, walking up to the nearest existing ancestor if
 /// `path` itself doesn't exist yet.
 fn canonicalize_best_effort(path: &Path) -> Result<PathBuf, WorktreeError> {
@@ -298,6 +363,67 @@ mod tests {
         worktree.remove().await.unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_orphan_worktree_removes_a_worktree_left_behind_without_its_guard() {
+        let repo = init_test_repo();
+        let worktrees_root = TempDir::new().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees_root.path()).unwrap();
+
+        // Simulates a crash: the `Worktree` guard is forgotten (never
+        // dropped, never `remove`d) rather than cleaned up normally, the way
+        // an orchestrator killed by SIGKILL would leave it.
+        let worktree = manager.create("orphan-run", "coder", "HEAD").await.unwrap();
+        let path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+        assert!(path.exists());
+
+        remove_orphan_worktree(repo.path(), &path).await.unwrap();
+
+        assert!(!path.exists(), "orphan worktree must be removed");
+    }
+
+    #[tokio::test]
+    async fn remove_orphan_worktree_on_an_already_gone_path_is_a_noop_not_an_error() {
+        let repo = init_test_repo();
+        let never_existed = repo.path().join("never-existed");
+
+        // Idempotent: recovery may run this twice, or the worktree may
+        // already have been cleaned up by some other path — either way,
+        // "nothing there" must not surface as a recovery failure.
+        remove_orphan_worktree(repo.path(), &never_existed)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_worktrees_clears_stale_administrative_entries() {
+        let repo = init_test_repo();
+        let worktrees_root = TempDir::new().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees_root.path()).unwrap();
+
+        let worktree = manager.create("prune-run", "coder", "HEAD").await.unwrap();
+        let path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+
+        // Delete the working directory out-of-band (as if the filesystem,
+        // not git, removed it) so `.git/worktrees/coder` is left dangling —
+        // exactly what `git worktree prune` exists to clear.
+        std::fs::remove_dir_all(&path).unwrap();
+
+        prune_worktrees(repo.path()).await.unwrap();
+
+        let list_output = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&list_output.stdout);
+        assert!(
+            !listing.contains(&path.display().to_string()),
+            "pruned worktree must no longer be listed: {listing}"
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use warden_core::{decide_next_state, parse_findings, AgentRole, Finding, RunStat
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
 use crate::process::{self, AgentCommand, AgentOutcome};
-use crate::worktree::WorktreeManager;
+use crate::worktree::{self, WorktreeManager};
 
 /// Static configuration for a single run of the convergence loop.
 ///
@@ -515,6 +515,15 @@ async fn protect_cycle_commit(
 /// PID *and* same recorded start time, see `process::is_process_alive` and
 /// H1 — is left untouched; Phase 1 does not attempt to re-attach to it.
 ///
+/// Beyond the state transition itself, a run recovered as `Failed` (issue
+/// #6) may have left two kinds of resources orphaned by the crash: worktrees
+/// whose owning `Worktree` guard never ran `Drop` (a crash is a `SIGKILL`,
+/// not a graceful drop), and agent child processes that outlive the
+/// orchestrator that spawned them (`kill_on_drop` also never fires without a
+/// `Drop`). Both are cleaned up here, best-effort — a cleanup failure for
+/// one run is logged and does not stop recovery from proceeding to the next
+/// one.
+///
 /// Returns the ids of runs that were marked `Failed`.
 pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
     let intermediate_runs = db::list_intermediate_runs(pool).await?;
@@ -534,10 +543,90 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
         run.state.validate_transition(RunState::Failed)?;
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
+
+        if let Err(error) = cleanup_orphan_worktrees(pool, &run).await {
+            tracing::error!(run_id = %run.id, %error, "failed to clean up orphaned worktrees during crash recovery");
+        }
+        if let Err(error) = terminate_orphan_processes(pool, &run.id).await {
+            tracing::error!(run_id = %run.id, %error, "failed to terminate orphan agent processes during crash recovery");
+        }
+
         failed_run_ids.push(run.id);
     }
 
     Ok(failed_run_ids)
+}
+
+/// Removes every worktree recorded across `run`'s cycles that still exists
+/// on disk, then runs `git worktree prune` once to clear any leftover
+/// `.git/worktrees/...` administrative entries (issue #6). `run.repo_path`
+/// (persisted at `insert_run` time) is the main repository to run these git
+/// commands against — the same one `WorktreeManager` would have used had the
+/// orchestrator not crashed.
+///
+/// Per-path removal failures (`remove_orphan_worktree` — already-gone paths
+/// are not an error, see its docs) and the final prune are both logged, not
+/// propagated: one bad worktree must not stop the rest of crash recovery.
+async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()> {
+    let worktree_paths = db::list_worktree_paths_for_run(pool, &run.id).await?;
+    if worktree_paths.is_empty() {
+        return Ok(());
+    }
+
+    let main_repo_path = Path::new(&run.repo_path);
+    for path in &worktree_paths {
+        if let Err(error) = worktree::remove_orphan_worktree(main_repo_path, Path::new(path)).await
+        {
+            tracing::error!(run_id = %run.id, worktree_path = %path, %error, "failed to remove orphaned worktree");
+        }
+    }
+
+    if let Err(error) = worktree::prune_worktrees(main_repo_path).await {
+        tracing::error!(run_id = %run.id, %error, "git worktree prune failed during crash recovery");
+    }
+
+    Ok(())
+}
+
+/// Exit code recorded for an `agent_processes` row that crash recovery
+/// closed out itself, rather than one the process reported on a normal
+/// exit — mirrors the `-1` `run_agent` already records for a cancelled or
+/// errored outcome (never a valid real exit code), named here for clarity
+/// at this second call site.
+const RECOVERY_TERMINATED_EXIT_CODE: i32 = -1;
+
+/// Terminates every agent process still recorded as open
+/// (`agent_processes.ended_at IS NULL`) for a run crash recovery just marked
+/// `Failed`, then marks each row ended — closing out bookkeeping the crashed
+/// orchestrator never got to write itself. Safety against PID reuse is
+/// delegated entirely to `process::kill_pid`, which re-checks the recorded
+/// start time immediately before signalling (H1): a process whose
+/// fingerprint no longer matches is left untouched, never killed. A row
+/// whose process already exited on its own is simply marked ended, with
+/// nothing to terminate.
+async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    let open_processes = db::list_open_agent_processes_for_run(pool, run_id).await?;
+
+    for open_process in open_processes {
+        if process::is_process_alive(open_process.pid, open_process.pid_started_at_unix) {
+            match process::kill_pid(open_process.pid, open_process.pid_started_at_unix) {
+                Ok(()) => tracing::warn!(
+                    run_id,
+                    pid = open_process.pid,
+                    "terminated orphan agent process left running after a crash"
+                ),
+                Err(error) => tracing::error!(
+                    run_id,
+                    pid = open_process.pid,
+                    %error,
+                    "failed to terminate orphan agent process"
+                ),
+            }
+        }
+        db::mark_agent_process_ended(pool, &open_process.id, RECOVERY_TERMINATED_EXIT_CODE).await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -785,6 +874,175 @@ mod tests {
         assert_eq!(run.state, RunState::CoderRunning);
 
         child.kill().await.unwrap();
+    }
+
+    /// Issue #6, acceptance criterion "aucun worktree ... ne persiste après
+    /// un cycle de crash + redémarrage": a worktree left behind by a crashed
+    /// run (its `Worktree` guard never ran `Drop` — a crash is `SIGKILL`,
+    /// not a graceful drop) must be removed as a side effect of the same
+    /// recovery pass that marks the run `Failed`.
+    #[tokio::test]
+    async fn recovery_removes_an_orphaned_worktree_left_behind_by_a_crashed_run() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        // Simulates the crash itself: the `Worktree` guard is forgotten
+        // rather than dropped or explicitly removed, exactly what a
+        // SIGKILL'd orchestrator would leave behind.
+        let worktree = worktree_manager
+            .create("orphan-recovery-run", "coder", "HEAD")
+            .await
+            .unwrap();
+        let worktree_path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+        assert!(worktree_path.exists(), "precondition: worktree exists");
+
+        db::insert_run(
+            &pool,
+            "orphan-recovery-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "orphan-recovery-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "orphan-recovery-cycle", "orphan-recovery-run", 1)
+            .await
+            .unwrap();
+        db::set_cycle_worktree_path(
+            &pool,
+            "orphan-recovery-cycle",
+            AgentRole::Coder,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Dead pid recorded for the coder, same as the other crash-recovery
+        // tests: no live process, so this run must recover as `Failed`.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id().unwrap();
+        child.wait().await.unwrap();
+        db::insert_agent_process(
+            &pool,
+            "orphan-recovery-process",
+            "orphan-recovery-cycle",
+            AgentRole::Coder,
+            dead_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let failed = recover_crashed_runs(&pool).await.unwrap();
+        assert_eq!(failed, vec!["orphan-recovery-run".to_string()]);
+
+        assert!(
+            !worktree_path.exists(),
+            "orphaned worktree must be removed by crash recovery"
+        );
+    }
+
+    /// Issue #6, acceptance criterion "aucun ... process orphelin ne
+    /// persiste": an agent process still alive when its run is recovered as
+    /// `Failed` must be terminated, and its `agent_processes` row marked
+    /// ended, so it no longer looks like an in-flight process on the next
+    /// recovery pass.
+    #[tokio::test]
+    async fn recovery_terminates_an_orphaned_live_agent_process() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        db::insert_run(
+            &pool,
+            "orphan-process-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "orphan-process-run", RunState::AwaitingReviewTest)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "orphan-process-cycle", "orphan-process-run", 1)
+            .await
+            .unwrap();
+
+        // An *earlier* concurrent process (reviewer/tester run via
+        // `tokio::join!`, ADR-0003) is still alive, but the run's *latest*
+        // recorded process (inserted after it, so it sorts last by
+        // `started_at` and is what drives the Failed decision, see
+        // `latest_open_agent_process_for_run`) is dead -- exactly the shape
+        // a crash mid-`AwaitingReviewTest` leaves behind.
+        let mut live_child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let live_pid = live_child.id().unwrap();
+        db::insert_agent_process(
+            &pool,
+            "orphan-process-live",
+            "orphan-process-cycle",
+            AgentRole::Tester,
+            live_pid,
+            "/tmp/wt/tester",
+        )
+        .await
+        .unwrap();
+
+        // Guarantees the dead process's `started_at` sorts strictly after
+        // the live one's, so which row is "latest" is deterministic rather
+        // than relying on two `now_rfc3339()` calls happening to differ.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let mut dead_child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = dead_child.id().unwrap();
+        dead_child.wait().await.unwrap();
+        db::insert_agent_process(
+            &pool,
+            "orphan-process-dead",
+            "orphan-process-cycle",
+            AgentRole::Reviewer,
+            dead_pid,
+            "/tmp/wt/reviewer",
+        )
+        .await
+        .unwrap();
+
+        let failed = recover_crashed_runs(&pool).await.unwrap();
+        assert_eq!(failed, vec!["orphan-process-run".to_string()]);
+
+        // The live process must actually be gone, not just marked ended in
+        // the database.
+        let exit_status = live_child.wait().await.unwrap();
+        assert!(
+            !exit_status.success(),
+            "orphaned live process must have been killed by recovery"
+        );
+
+        let open_processes = db::list_open_agent_processes_for_run(&pool, "orphan-process-run")
+            .await
+            .unwrap();
+        assert!(
+            open_processes.is_empty(),
+            "every agent_processes row for a Failed run must be marked ended by recovery"
+        );
     }
 
     /// Acceptance criterion 1 (issue #2), exercised directly against

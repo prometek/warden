@@ -196,6 +196,44 @@ pub fn is_process_alive(pid: u32, expected_start_time: i64) -> bool {
     actual_start_time == expected_start_time
 }
 
+/// Terminates `pid`, but only if it is still the exact process recorded at
+/// `expected_start_time` (H1: PID-reuse hardening) — re-checked here,
+/// immediately before signalling, to shrink the race window between a
+/// caller's earlier [`is_process_alive`] check and the kill itself. Used by
+/// crash recovery to clean up orphaned agent processes left running after
+/// the orchestrator that owned them died without a chance to run
+/// `kill_on_drop` (Architecture.md §9, Disaster Recovery).
+///
+/// Returns `Ok(())` if the process is already gone, or was never the one
+/// recorded (fingerprint mismatch) — neither is an error, both just mean
+/// there is nothing left to kill. `pid == 0` is always treated as
+/// already-gone: see [`is_process_alive`] for why a pid-0 sentinel must
+/// never be signalled.
+pub fn kill_pid(pid: u32, expected_start_time: i64) -> Result<(), ProcessError> {
+    if !is_process_alive(pid, expected_start_time) {
+        return Ok(());
+    }
+
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(
+        sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]),
+        true,
+    );
+
+    match system.process(sysinfo::Pid::from_u32(pid)) {
+        Some(process) => {
+            if process.kill() {
+                Ok(())
+            } else {
+                Err(ProcessError::KillFailed { pid })
+            }
+        }
+        // Disappeared between the liveness check above and this refresh —
+        // already gone, nothing to do.
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +340,52 @@ mod tests {
     fn pid_zero_is_never_reported_alive() {
         assert!(!is_process_alive(0, UNKNOWN_START_TIME));
         assert!(!is_process_alive(0, 12345));
+    }
+
+    #[tokio::test]
+    async fn kill_pid_terminates_a_live_process_with_a_matching_fingerprint() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "sleep 30"]);
+        let mut child = spawn(&cmd, dir.path()).unwrap();
+        let pid = child.id().unwrap();
+        let start_time = process_start_time(pid).unwrap();
+
+        kill_pid(pid, start_time).unwrap();
+
+        // `wait()` blocks until the OS has reaped it — proves the signal
+        // actually landed, not just that `kill_pid` returned `Ok`.
+        let status = child.wait().await.unwrap();
+        assert!(!status.success());
+        assert!(!is_process_alive(pid, start_time));
+    }
+
+    #[tokio::test]
+    async fn kill_pid_is_a_noop_when_the_fingerprint_no_longer_matches() {
+        // H1 regression: a live process that genuinely exists at `pid` must
+        // never be signalled if its recorded start time doesn't match —
+        // that mismatch is exactly the PID-reuse case this guards against.
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "sleep 30"]);
+        let mut child = spawn(&cmd, dir.path()).unwrap();
+        let pid = child.id().unwrap();
+        let real_start_time = process_start_time(pid).unwrap();
+        let bogus_start_time = real_start_time + 1_000_000;
+
+        kill_pid(pid, bogus_start_time).unwrap();
+
+        // Still alive: the mismatched fingerprint must have stopped
+        // `kill_pid` from touching it.
+        assert!(is_process_alive(pid, real_start_time));
+        child.kill().await.unwrap();
+    }
+
+    #[test]
+    fn kill_pid_on_pid_zero_is_a_noop_not_a_signal_to_the_process_group() {
+        assert!(kill_pid(0, UNKNOWN_START_TIME).is_ok());
+    }
+
+    #[test]
+    fn kill_pid_on_an_already_dead_pid_is_a_noop() {
+        assert!(kill_pid(999_999_999, UNKNOWN_START_TIME).is_ok());
     }
 }

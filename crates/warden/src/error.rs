@@ -56,6 +56,14 @@ pub enum ProcessError {
         "child process for `{command}` has no PID (already reaped before it could be observed)"
     )]
     MissingPid { command: String },
+
+    /// The OS reported the process still exists (fingerprint matched) but
+    /// refused to signal it — e.g. a permissions error, or it exited in the
+    /// instant between the liveness check and the kill attempt. Surfaced
+    /// explicitly rather than assumed-dead, so crash recovery logs it
+    /// instead of silently believing an orphan agent process was cleaned up.
+    #[error("failed to terminate orphan process (pid {pid})")]
+    KillFailed { pid: u32 },
 }
 
 #[derive(Debug, Error)]
@@ -93,6 +101,16 @@ pub enum WardenError {
         cycle_id: String,
         exit_code: i32,
         stderr: String,
+    },
+
+    /// A pre-migration backup of the SQLite database file failed. Per
+    /// code-standards.md ("no silent fallback"), this must abort the
+    /// migration rather than proceed without a safety net.
+    #[error("failed to back up database to {path} before applying migrations: {source}")]
+    Backup {
+        path: PathBuf,
+        #[source]
+        source: sqlx::Error,
     },
 }
 
