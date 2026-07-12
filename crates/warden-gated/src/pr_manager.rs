@@ -646,11 +646,54 @@ pub struct FinalizeRequest<'a> {
     /// checked against `runs.converged_commit_sha`, never trusted as-is.
     pub pushed_commit_sha: &'a str,
     pub pr: &'a PrHandle,
-    /// The full run summary to write into the PR body -- composed by the
-    /// caller (the orchestrator, which has access to the run's
-    /// cycles/findings history); this module only knows how to post it, the
-    /// same way `post_cycle_update` doesn't re-derive findings itself.
+    /// The cycles/findings recap to write into the PR body -- composed by
+    /// the caller (the orchestrator, which has access to the run's
+    /// cycles/findings history, `warden::pr_summary::pr_body_from_run`);
+    /// this module only knows how to post it, the same way
+    /// `post_cycle_update` doesn't re-derive findings itself. Must **not**
+    /// already contain an Evidence section -- `finalize` appends its own
+    /// (see `evidence`/`repo_slug` below) so there's exactly one renderer
+    /// for it, reachable from the one place that actually posts a PR body
+    /// in production.
+    ///
+    /// TODO(#4): when the real orchestrator -> gate Finalize trigger is
+    /// wired, whatever composes this value (today only
+    /// `warden::pr_summary::pr_body_from_run` in tests) must stop rendering
+    /// its own Evidence section (`evidence` parameter of
+    /// `pr_body_from_run`) -- otherwise a run with captured evidence gets
+    /// the section twice once `finalize_pr_body` appends its own below.
     pub summary_body: &'a str,
+    /// Evidence captured across the run's cycles, already committed into
+    /// the repo -- rendered as this PR's Evidence section (ADR-0009) by
+    /// `finalize_pr_body`. Empty means "no Evidence section", exactly like
+    /// `warden::pr_summary::pr_body_from_run`.
+    ///
+    /// TODO(#4): populate this from the gate's own read-only re-read of the
+    /// `evidence` table (mirrors `gate::verify_and_authorize` re-deriving
+    /// authorization from SQLite rather than trusting the push
+    /// notification, code-standards.md "warden-gated ... revérifie l'état
+    /// de manière indépendante") once the real trigger is wired -- not by
+    /// trusting a list handed over the git-bare-remote/hook boundary.
+    pub evidence: &'a [warden_core::EvidenceRow],
+    /// `"<owner>/<repo>"` -- needed alongside `branch` to build the
+    /// evidence section's `raw.githubusercontent.com` URLs (ADR-0009).
+    pub repo_slug: &'a str,
+}
+
+/// Composes the PR body `finalize` actually writes: `summary_body` verbatim,
+/// plus an Evidence section (ADR-0009) appended when `evidence` is
+/// non-empty. This is the genuine, reachable call site for
+/// `warden_core::format_evidence_section` in production -- `finalize`/
+/// `update_body` are the only code that ever sets a PR body for real (see
+/// module docs), so this is where the Evidence section must be assembled,
+/// not in `warden` (which `warden-gated` can never depend on, ADR-0006).
+fn finalize_pr_body(request: &FinalizeRequest<'_>) -> String {
+    if request.evidence.is_empty() {
+        return request.summary_body.to_string();
+    }
+    let evidence_section =
+        warden_core::format_evidence_section(request.evidence, request.repo_slug, request.branch);
+    format!("{}\n\n{evidence_section}", request.summary_body)
 }
 
 /// `Finalize` (ADR-0007): re-verifies `state == Converged` and the committed
@@ -681,9 +724,8 @@ pub async fn finalize<P: PrProvider>(
         GateDecision::Blocked(reason) => Ok(FinalizeOutcome::Blocked(reason)),
         GateDecision::Allow { commit_sha } => {
             push::push_to_origin(request.bare_repo_path, &commit_sha, request.branch).await?;
-            provider
-                .update_body(request.pr, request.summary_body)
-                .await?;
+            let body = finalize_pr_body(request);
+            provider.update_body(request.pr, &body).await?;
             provider.mark_ready(request.pr).await?;
             Ok(FinalizeOutcome::Finalized { commit_sha })
         }
@@ -1881,6 +1923,58 @@ mod tests {
         (dir, db_path)
     }
 
+    // ---- finalize_pr_body: the reachable, production evidence-section
+    // call site (HIGH code-review finding, issue #7) --------------------
+
+    #[test]
+    fn finalize_pr_body_leaves_summary_body_untouched_when_there_is_no_evidence() {
+        let pr = PrHandle { number: 1 };
+        let request = FinalizeRequest {
+            bare_repo_path: Path::new("/unused"),
+            branch: "main",
+            run_id: "run-1",
+            pushed_commit_sha: "deadbeef",
+            pr: &pr,
+            summary_body: "full run summary",
+            evidence: &[],
+            repo_slug: "acme/widgets",
+        };
+        assert_eq!(finalize_pr_body(&request), "full run summary");
+    }
+
+    #[test]
+    fn finalize_pr_body_appends_an_evidence_section_via_warden_core_format_evidence_section() {
+        let pr = PrHandle { number: 1 };
+        let evidence = [warden_core::EvidenceRow {
+            cycle_number: 1,
+            evidence_type: warden_core::EvidenceType::Image,
+            repo_relative_path: ".warden/evidence/1/screenshot.png".to_string(),
+            description: "login screen".to_string(),
+        }];
+        let request = FinalizeRequest {
+            bare_repo_path: Path::new("/unused"),
+            branch: "main",
+            run_id: "run-1",
+            pushed_commit_sha: "deadbeef",
+            pr: &pr,
+            summary_body: "full run summary",
+            evidence: &evidence,
+            repo_slug: "acme/widgets",
+        };
+
+        let body = finalize_pr_body(&request);
+
+        assert!(body.starts_with("full run summary"));
+        assert_eq!(
+            body,
+            format!(
+                "full run summary\n\n{}",
+                warden_core::format_evidence_section(&evidence, "acme/widgets", "main")
+            ),
+            "finalize_pr_body must delegate to warden_core::format_evidence_section, not a local copy"
+        );
+    }
+
     #[tokio::test]
     async fn finalize_pushes_and_marks_ready_when_converged_and_hash_matches() {
         let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
@@ -1897,6 +1991,8 @@ mod tests {
             pushed_commit_sha: &commit_sha,
             pr: &pr,
             summary_body: "full run summary",
+            evidence: &[],
+            repo_slug: "acme/widgets",
         };
         let outcome = finalize(&pool, &request, &provider).await.unwrap();
 
@@ -1917,6 +2013,51 @@ mod tests {
         );
     }
 
+    /// End-to-end proof of the HIGH code-review finding's fix (issue #7):
+    /// `finalize`/`update_body` -- the only code that actually sets a PR
+    /// body in production -- genuinely calls the Evidence section renderer
+    /// when evidence was captured, not just `finalize_pr_body` in
+    /// isolation.
+    #[tokio::test]
+    async fn finalize_posts_an_evidence_section_when_evidence_was_captured() {
+        let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
+        let (_db_dir, db_path) =
+            seeded_run_db(warden_core::RunState::Converged, Some(&commit_sha)).await;
+        let pool = crate::db::connect_read_only(&db_path).await.unwrap();
+        let provider = RecordingProvider::new(1);
+        let pr = PrHandle { number: 7 };
+        let evidence = [warden_core::EvidenceRow {
+            cycle_number: 1,
+            evidence_type: warden_core::EvidenceType::Image,
+            repo_relative_path: ".warden/evidence/1/screenshot.png".to_string(),
+            description: "login screen".to_string(),
+        }];
+
+        let request = FinalizeRequest {
+            bare_repo_path: gate_repo.path(),
+            branch: "main",
+            run_id: "run-1",
+            pushed_commit_sha: &commit_sha,
+            pr: &pr,
+            summary_body: "full run summary",
+            evidence: &evidence,
+            repo_slug: "acme/widgets",
+        };
+        finalize(&pool, &request, &provider).await.unwrap();
+
+        let calls = provider.calls();
+        assert!(
+            calls[0].contains("## Evidence"),
+            "finalize must post an Evidence section when evidence was captured: {calls:?}"
+        );
+        assert!(
+            calls[0].contains(
+                "https://raw.githubusercontent.com/acme/widgets/main/.warden/evidence/1/screenshot.png"
+            ),
+            "calls were: {calls:?}"
+        );
+    }
+
     #[tokio::test]
     async fn finalize_blocks_and_never_touches_the_provider_when_not_converged() {
         let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
@@ -1932,6 +2073,8 @@ mod tests {
             pushed_commit_sha: &commit_sha,
             pr: &pr,
             summary_body: "full run summary",
+            evidence: &[],
+            repo_slug: "acme/widgets",
         };
         let outcome = finalize(&pool, &request, &provider).await.unwrap();
 
@@ -1966,6 +2109,8 @@ mod tests {
             pushed_commit_sha: &commit_sha,
             pr: &pr,
             summary_body: "full run summary",
+            evidence: &[],
+            repo_slug: "acme/widgets",
         };
         let outcome = finalize(&pool, &request, &provider).await.unwrap();
 
@@ -2100,6 +2245,8 @@ mod tests {
             pushed_commit_sha: &skeleton_sha,
             pr: &pr,
             summary_body: "full run summary",
+            evidence: &[],
+            repo_slug: "acme/widgets",
         };
         let outcome = finalize(&pool, &finalize_request, &provider).await.unwrap();
 

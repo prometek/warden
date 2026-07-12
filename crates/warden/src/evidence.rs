@@ -400,7 +400,14 @@ pub async fn commit_evidence_into_repo(
         tokio::fs::copy(&scratch_path, &destination).await?;
     }
 
-    run_git(worktree.path(), &["add", ".warden/evidence"]).await?;
+    // `-f`: the target repo may gitignore `.warden/` wholesale (a
+    // reasonable default for a repo that doesn't want Warden's own scratch
+    // state tracked) -- without it, `git add` silently no-ops on every
+    // evidence file under a gitignored `.warden/`, and the commit below
+    // either fails on "nothing to commit" or, worse, produces an empty
+    // commit that claims to carry evidence it doesn't (code-review MEDIUM
+    // finding #2, issue #7).
+    run_git(worktree.path(), &["add", "-f", ".warden/evidence"]).await?;
     run_git(
         worktree.path(),
         &[

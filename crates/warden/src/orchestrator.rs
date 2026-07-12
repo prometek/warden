@@ -187,15 +187,14 @@ impl Orchestrator {
                 // the very commit `converged_commit_sha` names.
                 let converged_commit = if config.evidence_store_in_repo {
                     let evidence = db::list_evidence_for_run(&self.pool, &run_id).await?;
-                    evidence::commit_evidence_into_repo(
+                    self.commit_evidence_for_convergence(
                         &worktree_manager,
-                        &config.repo_path,
-                        &config.warden_home,
+                        &config,
                         &run_id,
                         &base_commit,
                         &evidence,
                     )
-                    .await?
+                    .await
                 } else {
                     base_commit.clone()
                 };
@@ -426,6 +425,44 @@ impl Orchestrator {
         Ok(findings)
     }
 
+    /// Best-effort evidence commit at convergence (ADR-0009 / code-review
+    /// MEDIUM finding #1, issue #7): mirrors `capture_evidence_for_cycle`'s
+    /// philosophy -- a git failure while folding captured evidence into the
+    /// repo (disk full, permissions, an evidence worktree collision, ...)
+    /// must not abort an otherwise-converged run. Falls back to
+    /// `base_commit` (i.e. "converge without evidence attached") and logs
+    /// loudly rather than swallowing the error silently (code-standards.md:
+    /// "catch-and-ignore ... qui jette l'erreur sans la logger").
+    async fn commit_evidence_for_convergence(
+        &self,
+        worktree_manager: &WorktreeManager,
+        config: &RunConfig,
+        run_id: &str,
+        base_commit: &str,
+        evidence: &[db::EvidenceWithCycle],
+    ) -> String {
+        match evidence::commit_evidence_into_repo(
+            worktree_manager,
+            &config.repo_path,
+            &config.warden_home,
+            run_id,
+            base_commit,
+            evidence,
+        )
+        .await
+        {
+            Ok(converged_commit) => converged_commit,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run_id,
+                    "failed to commit captured evidence into the repo; converging without evidence attached"
+                );
+                base_commit.to_string()
+            }
+        }
+    }
+
     /// Best-effort evidence capture (ADR-0009): logs and continues on
     /// failure rather than failing the run. A missing/misconfigured
     /// evidence tool (Playwright/asciinema not installed, no artifacts
@@ -489,6 +526,19 @@ impl Orchestrator {
         };
         let captured = evidence::capture_evidence(&markers, config.evidence_tool, &ctx).await?;
 
+        // Code-review LOW finding (issue #7): when `evidence_store_in_repo`
+        // is false, these `EVIDENCE.file_path` values name a
+        // `.warden/evidence/<cycle>/...` repo path that never gets created
+        // (`commit_evidence_into_repo` doesn't run -- see the convergence
+        // branch above), so any future PR-body Evidence section built
+        // straight off this table would need to skip rows it can't safely
+        // link to. NOT changed here: `e2e_evidence_store_in_repo_false_...`
+        // (crates/warden/tests/cli.rs) already asserts, as a deliberate
+        // product decision, that evidence rows are recorded regardless of
+        // `store_in_repo` ("still captured locally") -- only the git commit
+        // is skipped. Suppressing the insert would contradict that existing,
+        // intentional behaviour; reconciling the two is a product call, not
+        // a mechanical fix, so left as-is pending that decision.
         for item in captured {
             db::insert_evidence(
                 &self.pool,
