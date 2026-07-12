@@ -118,3 +118,27 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   bibliothèque : aucun déclenchement CLI/IPC ne les invoque encore depuis
   `warden` (câblage laissé à une décision d'architecture distincte, hors
   périmètre de cette livraison).
+
+### Added — Phase 6 : résilience et récupération après crash
+
+- `recover_crashed_runs` va désormais au-delà du simple marquage `Failed` :
+  au démarrage de `warden`, les runs laissés dans un état intermédiaire
+  (`CoderRunning`, `AwaitingReviewTest`, `AwaitingCi`) sans processus agent
+  vivant associé sont marqués `Failed`, puis leurs ressources orphelines
+  sont récupérées automatiquement — processus agents encore vivants
+  terminés (identification par PID *et* heure de démarrage enregistrée,
+  robuste à une réutilisation de PID par l'OS) et worktrees git orphelins
+  supprimés (`git worktree remove --force` + `git worktree prune`), sans
+  aucune intervention manuelle.
+- Cette récupération est elle-même résiliente à un crash pendant la
+  récupération : une seconde passe repère les runs déjà `Failed` qui ont
+  encore un processus ouvert ou un chemin de worktree non nettoyé en base,
+  et reprend leur nettoyage — un chemin de worktree n'est effacé en base
+  qu'une fois sa suppression effectivement confirmée.
+- Sauvegarde automatique de la base SQLite avant toute migration de schéma :
+  `db::connect` copie la base existante vers un fichier horodaté
+  (`state.db.bak-<horodatage RFC3339>`, suffixé en cas de collision) via
+  `VACUUM INTO` (capture fiable même avec des écritures encore uniquement
+  dans le WAL) avant d'appliquer les migrations en attente ; un échec de
+  cette sauvegarde interrompt la migration plutôt que de continuer sans
+  filet de sécurité.
