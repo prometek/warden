@@ -45,13 +45,12 @@ pub enum TuiError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The connected terminal does not support any of the inline graphics
-    /// protocols ADR-0010 covers (Kitty, iTerm2, Sixel) -- surfaced as a
-    /// typed condition the caller decides how to react to (fall back to an
-    /// external viewer), never a panic or a garbled render attempt.
-    #[error("terminal does not support an inline graphics protocol (Kitty/iTerm2/Sixel)")]
-    NoInlineGraphicsSupport,
-
+    // Note: a terminal not supporting any inline graphics protocol
+    // (Kitty/iTerm2/Sixel, ADR-0010) is deliberately *not* a variant here --
+    // `evidence::render` treats it as a successful, ordinary rendering
+    // outcome (`Rendering::ExternalViewer`), not a failure: ADR-0010's
+    // universal fallback is expected, everyday behaviour on an
+    // unsupported terminal, not an error condition to surface as one.
     #[error("failed to decode image {path}: {source}")]
     ImageDecode {
         path: PathBuf,

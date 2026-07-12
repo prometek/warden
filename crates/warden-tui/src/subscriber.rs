@@ -8,7 +8,7 @@
 //! which `warden-tui` could send anything back to the orchestrator
 //! (code-standards.md: "la TUI n'émet jamais vers Warden").
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
@@ -17,24 +17,15 @@ use warden_core::RunEventRecord;
 
 use crate::error::Result;
 
-/// Mirrors `warden::event_bus::MAX_SOCKET_PATH_LEN` / `resolve_socket_path`
-/// exactly: both sides must derive the identical path from `run_id` alone,
-/// independent of `runs_dir`'s (user-controlled) length, or a late attach
-/// could look in the wrong place after a fallback. Duplicated rather than
-/// shared for the same reason `db.rs` is duplicated from `warden::db` (see
-/// its module docs) -- `warden-tui` never depends on `warden`'s own code,
-/// only on `warden-core`'s shared types.
-const MAX_SOCKET_PATH_LEN: usize = 100;
-
-/// See `warden::event_bus::resolve_socket_path` -- this is the exact same
-/// resolution rule, independently re-implemented.
-pub fn resolve_socket_path(run_id: &str, runs_dir: &Path) -> PathBuf {
-    let preferred = runs_dir.join(format!("{run_id}.sock"));
-    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        return preferred;
-    }
-    std::env::temp_dir().join(format!("warden-{run_id}.sock"))
-}
+/// Re-exported rather than duplicated: unlike `db.rs` (deliberately
+/// duplicated from `warden::db`, ADR-0006, to keep two crates' *query
+/// correctness* independently re-verified), the socket path is a single
+/// wire-addressing rule both the publisher (`warden::event_bus`) and this
+/// subscriber must agree on byte-for-byte -- see `warden_core::socket`'s
+/// module docs for why it lives there instead. Re-exported (not just
+/// called directly at each use site) so existing callers/tests referencing
+/// `subscriber::resolve_socket_path` keep working unchanged.
+pub use warden_core::resolve_socket_path;
 
 /// Connects to `socket_path` and spawns a background task that decodes each
 /// NDJSON line into a [`RunEventRecord`] and forwards it on the returned
@@ -124,23 +115,17 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // `resolve_socket_path` itself is tested in `warden_core::socket`, the
+    // single shared implementation this re-export delegates to (see this
+    // module's docs) -- this is just a smoke test that the re-export is
+    // actually wired to it.
     #[test]
-    fn resolve_socket_path_matches_warden_event_bus_for_a_short_runs_dir() {
+    fn resolve_socket_path_re_export_delegates_to_warden_core() {
         let runs_dir = Path::new("/tmp/warden/runs");
         let run_id = "11111111-1111-1111-1111-111111111111";
         assert_eq!(
             resolve_socket_path(run_id, runs_dir),
-            runs_dir.join(format!("{run_id}.sock"))
-        );
-    }
-
-    #[test]
-    fn resolve_socket_path_falls_back_to_temp_dir_for_a_long_runs_dir() {
-        let runs_dir = PathBuf::from(format!("/tmp/{}", "a".repeat(200)));
-        let run_id = "11111111-1111-1111-1111-111111111111";
-        assert_eq!(
-            resolve_socket_path(run_id, &runs_dir),
-            std::env::temp_dir().join(format!("warden-{run_id}.sock"))
+            warden_core::resolve_socket_path(run_id, runs_dir)
         );
     }
 }

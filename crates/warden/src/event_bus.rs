@@ -26,7 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
-use warden_core::RunEventRecord;
+use warden_core::{resolve_socket_path, RunEventRecord};
 
 use crate::error::Result;
 
@@ -36,42 +36,6 @@ use crate::error::Result;
 /// pick, since it directly trades off "how much history survives a
 /// subscriber hiccup" against "how much memory a stalled subscriber can pin".
 const CHANNEL_CAPACITY: usize = 256;
-
-/// Conservative usable length for `sockaddr_un.sun_path`. The real limit is
-/// platform-specific (104 bytes total including the NUL terminator on
-/// macOS/BSD, 108 on Linux) -- 100 leaves headroom on the tighter of the
-/// two rather than cutting it exactly at the boundary.
-const MAX_SOCKET_PATH_LEN: usize = 100;
-
-/// Resolves where a run's Event Bus socket should live: the ADR-0008-
-/// mandated `<runs_dir>/<run_id>.sock` when that fits within
-/// [`MAX_SOCKET_PATH_LEN`], otherwise a short, deterministic path under the
-/// OS temp directory keyed by `run_id` alone.
-///
-/// `runs_dir` comes from `--warden-home` (user-controlled, and `~/.warden`
-/// itself may already sit under a deep sandboxed/containerized home
-/// directory) concatenated with a UUID run id -- comfortably within limits
-/// for a typical `$HOME`, but not guaranteed for every deployment. Binding
-/// would otherwise fail outright with an opaque `EINVAL`/`SUN_LEN` OS error;
-/// falling back to a short, still run-id-keyed path keeps the Event Bus
-/// working rather than silently disabling Phase 8 observability for anyone
-/// whose `--warden-home` happens to resolve to a long path. `warden-tui`
-/// must derive the exact same path the same way to find it -- see the
-/// mirrored copy of this function in that crate.
-fn resolve_socket_path(run_id: &str, runs_dir: &Path) -> PathBuf {
-    let preferred = runs_dir.join(format!("{run_id}.sock"));
-    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
-        return preferred;
-    }
-
-    tracing::warn!(
-        run_id,
-        preferred = %preferred.display(),
-        "preferred event bus socket path exceeds the Unix socket path limit; \
-         falling back to a short path under the OS temp directory"
-    );
-    std::env::temp_dir().join(format!("warden-{run_id}.sock"))
-}
 
 /// A run's Event Bus: owns the Unix socket listener and the broadcast
 /// channel every accepted connection is subscribed to. Dropping this stops
@@ -87,20 +51,24 @@ pub struct EventBus {
 
 impl EventBus {
     /// Binds a fresh listener at `<runs_dir>/<run_id>.sock`, creating
-    /// `runs_dir` if needed and removing a stale socket file left over from
-    /// a previous run with the same id first (a Unix socket path can't be
-    /// re-bound while the old inode still exists). Hardens the socket file
-    /// to `0600` right after bind -- `bind(2)` creates it with the
-    /// umask-derived default mode, which is not narrow enough on its own
-    /// (ADR-0008, mirrors `warden_gated::relay::bind`'s identical hardening
-    /// for its own socket).
+    /// `runs_dir` if needed (owner-only, `0700` -- see [`create_private_dir`])
+    /// and removing a stale socket file left over from a previous run with
+    /// the same id first (a Unix socket path can't be re-bound while the old
+    /// inode still exists). Hardens the socket file to `0600` right after
+    /// bind -- `bind(2)` creates it with the umask-derived default mode,
+    /// which is not narrow enough on its own (ADR-0008, mirrors
+    /// `warden_gated::relay::bind`'s identical hardening for its own socket).
     ///
     /// Spawns the accept loop as a background task so publishing never has
     /// to wait on a subscriber connecting.
     pub async fn bind(run_id: &str, runs_dir: &Path) -> Result<Self> {
-        tokio::fs::create_dir_all(runs_dir).await?;
+        create_private_dir(runs_dir).await?;
         let socket_path = resolve_socket_path(run_id, runs_dir);
         if let Some(parent) = socket_path.parent() {
+            // Only ever `runs_dir` itself (already hardened above) or, in
+            // the long-path fallback, the OS temp directory -- which this
+            // must *not* be narrowed to `0700`, since it's shared with every
+            // other process/user on the machine, not owned by `warden`.
             tokio::fs::create_dir_all(parent).await?;
         }
 
@@ -140,6 +108,51 @@ impl EventBus {
     }
 }
 
+impl Drop for EventBus {
+    /// Best-effort removal of the socket file once the run that owned it
+    /// ends. Run ids are UUIDs, so [`EventBus::bind`]'s own stale-file
+    /// replacement (which only fires on an *exact* path collision) would
+    /// practically never clean these up on its own -- without this,
+    /// `<runs_dir>` would accumulate one orphaned socket per completed run
+    /// forever. A failure here (already gone, a benign race with another
+    /// process) is not worth surfacing: the run has already ended either
+    /// way, and this is cleanup, not a step anything downstream depends on.
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.socket_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::debug!(
+                    socket = %self.socket_path.display(),
+                    %error,
+                    "failed to remove event bus socket file on shutdown"
+                );
+            }
+        }
+    }
+}
+
+/// Creates `dir` (if needed) and restricts it to owner-only access (`0700`)
+/// -- used for `runs_dir` itself, which `warden` owns exclusively. Closes
+/// the brief window between `mkdir` (umask-derived default mode, typically
+/// `0755`) and an explicit `chmod` during which the directory would
+/// otherwise be group/world-readable, listing every run id (and, however
+/// briefly, any socket already bound inside it) to other local users.
+#[cfg(unix)]
+async fn create_private_dir(dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let mut permissions = tokio::fs::metadata(dir).await?.permissions();
+    permissions.set_mode(0o700);
+    tokio::fs::set_permissions(dir, permissions).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn create_private_dir(dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    Ok(())
+}
+
 /// Restricts `socket_path` to owner-only read/write (`0600`), matching the
 /// permission ADR-0008 mandates and the identical hardening
 /// `warden_gated::relay::bind` already applies to its own socket.
@@ -155,6 +168,13 @@ async fn harden_socket_permissions(socket_path: &Path) -> Result<()> {
 /// Never reads from an accepted connection (see module docs) -- a
 /// subscriber has nothing to say to the bus, only something to receive from
 /// it.
+///
+/// An `accept` failure is logged and does not stop the loop: `accept` errors
+/// (`EMFILE`, a dropped-before-fully-established connection, ...) are
+/// typically transient, and a single hiccup permanently killing live attach
+/// for the rest of the run would be far worse than logging and trying again.
+/// A short delay precedes the retry so a *persistent* failure (e.g. the
+/// process is out of file descriptors) can't turn into a tight busy-loop.
 async fn accept_loop(listener: UnixListener, sender: broadcast::Sender<RunEventRecord>) {
     loop {
         match listener.accept().await {
@@ -163,12 +183,15 @@ async fn accept_loop(listener: UnixListener, sender: broadcast::Sender<RunEventR
                 tokio::spawn(forward_to_subscriber(stream, receiver));
             }
             Err(error) => {
-                tracing::error!(%error, "event bus: failed to accept a subscriber connection");
-                break;
+                tracing::error!(%error, "event bus: failed to accept a subscriber connection; retrying");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
 }
+
+/// See [`accept_loop`]'s docs on why a retry backoff exists at all.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Forwards every broadcast event to `stream` as one line of JSON
 /// (NDJSON, the same wire convention `warden_core::parse_findings` already
@@ -411,33 +434,60 @@ mod tests {
             .unwrap();
 
         assert!(
-            bus.socket_path().as_os_str().len() <= MAX_SOCKET_PATH_LEN,
+            bus.socket_path().as_os_str().len() <= warden_core::MAX_SOCKET_PATH_LEN,
             "fallback socket path is still too long: {}",
             bus.socket_path().display()
         );
     }
 
-    #[test]
-    fn resolve_socket_path_prefers_runs_dir_when_short_enough() {
-        let runs_dir = Path::new("/tmp/warden/runs");
-        let run_id = "11111111-1111-1111-1111-111111111111";
+    // `resolve_socket_path`/`MAX_SOCKET_PATH_LEN` themselves are tested in
+    // `warden_core::socket` now, the single shared implementation both this
+    // module and `warden_tui::subscriber` call into (see that module's
+    // docs) -- no longer duplicated here.
 
-        let resolved = resolve_socket_path(run_id, runs_dir);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_restricts_runs_dir_itself_to_owner_only_access() {
+        let dir = TempDir::new().unwrap();
+        let runs_dir = dir.path().join("runs");
+        let _bus = EventBus::bind("run-1", &runs_dir).await.unwrap();
 
-        assert_eq!(resolved, runs_dir.join(format!("{run_id}.sock")));
+        let mode = std::fs::metadata(&runs_dir).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "runs_dir must be owner-only, closing the mkdir/chmod window on the socket inside it"
+        );
     }
 
-    #[test]
-    fn resolve_socket_path_falls_back_to_temp_dir_when_runs_dir_is_too_long() {
-        let runs_dir = PathBuf::from(format!("/tmp/{}", "a".repeat(200)));
-        let run_id = "11111111-1111-1111-1111-111111111111";
+    /// Issue #8 review, item 6: run ids are UUIDs, so `bind`'s own
+    /// stale-file replacement (path-exact) practically never fires to clean
+    /// up a finished run's socket -- without `Drop`, `runs_dir` would
+    /// accumulate one orphaned file per run forever.
+    #[tokio::test]
+    async fn dropping_the_event_bus_removes_its_socket_file() {
+        let dir = TempDir::new().unwrap();
+        let bus = EventBus::bind("run-1", dir.path()).await.unwrap();
+        let socket_path = bus.socket_path().to_path_buf();
+        assert!(socket_path.exists(), "precondition: socket file exists");
 
-        let resolved = resolve_socket_path(run_id, &runs_dir);
+        drop(bus);
 
-        assert_eq!(
-            resolved,
-            std::env::temp_dir().join(format!("warden-{run_id}.sock"))
+        assert!(
+            !socket_path.exists(),
+            "socket file must be removed once the EventBus that owns it is dropped"
         );
-        assert!(resolved.as_os_str().len() <= MAX_SOCKET_PATH_LEN);
+    }
+
+    /// Dropping an `EventBus` whose socket file has already been removed by
+    /// something else must not panic -- `Drop` can't return a `Result`, so
+    /// this has to be handled internally as a no-op.
+    #[tokio::test]
+    async fn dropping_the_event_bus_after_its_socket_was_already_removed_does_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let bus = EventBus::bind("run-1", dir.path()).await.unwrap();
+        std::fs::remove_file(bus.socket_path()).unwrap();
+
+        drop(bus);
     }
 }

@@ -34,6 +34,26 @@ pub enum EvidenceKind {
     Other,
 }
 
+impl EvidenceKind {
+    /// Maps `RunEvent::EvidenceCaptured.evidence_type`'s free-form string
+    /// onto a rendering kind. Deliberately infallible rather than a
+    /// `Result`-returning `parse` (unlike `warden_core::EventKind::parse`,
+    /// which guards the wire *protocol*): an unrecognized value here is not
+    /// a corrupted protocol, only a rendering hint this crate doesn't
+    /// specifically know how to render inline -- it degrades to `Other`
+    /// (external-viewer fallback, per ADR-0010's own universal fallback
+    /// rule) rather than breaking the whole evidence pane over a single
+    /// unfamiliar type string.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "image" => EvidenceKind::Image,
+            "video" => EvidenceKind::Video,
+            "asciinema" => EvidenceKind::Asciinema,
+            _ => EvidenceKind::Other,
+        }
+    }
+}
+
 /// One piece of evidence to render, in the shape a future Phase 7
 /// `EVIDENCE` row would carry -- passed in directly by the caller rather
 /// than read from a database query that doesn't exist yet.
@@ -181,6 +201,19 @@ mod tests {
 
         let result = render(&evidence, GraphicsCapability::Kitty, None, sample_area());
         assert!(matches!(result, Err(TuiError::NotYetImplemented { .. })));
+    }
+
+    #[test]
+    fn evidence_kind_parses_every_known_wire_value() {
+        assert_eq!(EvidenceKind::parse("image"), EvidenceKind::Image);
+        assert_eq!(EvidenceKind::parse("video"), EvidenceKind::Video);
+        assert_eq!(EvidenceKind::parse("asciinema"), EvidenceKind::Asciinema);
+        assert_eq!(EvidenceKind::parse("other"), EvidenceKind::Other);
+    }
+
+    #[test]
+    fn evidence_kind_parse_degrades_an_unknown_value_to_other_rather_than_erroring() {
+        assert_eq!(EvidenceKind::parse("carrier-pigeon"), EvidenceKind::Other);
     }
 
     #[test]

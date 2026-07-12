@@ -47,8 +47,15 @@ pub async fn attach(pool: &SqlitePool, run_id: &str, socket_path: &Path) -> Resu
 
     // Subscribe first (see module docs). A connection failure here just
     // means the run isn't live right now -- a finished run's socket file no
-    // longer accepts connections, which is expected, not an error.
-    let mut live = subscriber::subscribe(socket_path).await.ok();
+    // longer accepts connections, which is expected, not an error -- but it
+    // must never be a *silent* one (code-standards.md: no catch-and-ignore).
+    let mut live = match subscriber::subscribe(socket_path).await {
+        Ok(rx) => Some(rx),
+        Err(error) => {
+            log_subscribe_failure(socket_path, &error);
+            None
+        }
+    };
 
     let history = db::list_events_for_run(pool, run_id).await?;
     let mut model = RunModel::new();
@@ -65,6 +72,54 @@ pub async fn attach(pool: &SqlitePool, run_id: &str, socket_path: &Path) -> Resu
     Ok(Attachment { model, live })
 }
 
+/// Classifies why the initial subscribe attempt failed, and logs
+/// accordingly, instead of silently discarding the error entirely
+/// (code-standards.md: "catch-and-ignore (`.ok()` qui jette l'erreur sans
+/// la logger)" is an explicitly named anti-pattern).
+///
+/// `NotFound` (the socket file was never created -- the run was never live,
+/// or has already been cleaned up, see `warden::event_bus::EventBus`'s
+/// `Drop` impl) and `ConnectionRefused` (the file still exists but nothing
+/// is listening on it -- the orchestrator process that owned it has exited
+/// without the file being removed yet) are both entirely ordinary ways to
+/// discover "this run is not live right now", so they're logged at `debug`
+/// only. Anything else (permission errors, and the like) is unexpected --
+/// logged at `warn` so it doesn't disappear silently, while `attach` still
+/// degrades to a history-only view rather than failing outright: a
+/// `warden-tui` that can still read `events` is more useful than one that
+/// refuses to attach at all over a live-socket-specific problem.
+fn log_subscribe_failure(socket_path: &Path, error: &TuiError) {
+    if is_expected_no_live_bus_error(error) {
+        tracing::debug!(
+            socket = %socket_path.display(),
+            %error,
+            "no live Event Bus for this run (expected for a finished or not-yet-started run)"
+        );
+    } else {
+        tracing::warn!(
+            socket = %socket_path.display(),
+            %error,
+            "failed to subscribe to the run's Event Bus for an unexpected reason; \
+             falling back to a history-only attach"
+        );
+    }
+}
+
+/// `true` for the two ordinary ways a subscribe attempt fails when a run
+/// simply isn't live right now -- see [`log_subscribe_failure`]'s docs.
+/// Split out as its own pure predicate so the classification itself is
+/// unit-testable without capturing log output.
+fn is_expected_no_live_bus_error(error: &TuiError) -> bool {
+    matches!(
+        error,
+        TuiError::Io(io_error)
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +128,23 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
     use warden_core::RunEvent;
+
+    #[test]
+    fn not_found_and_connection_refused_are_classified_as_expected() {
+        assert!(is_expected_no_live_bus_error(&TuiError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(is_expected_no_live_bus_error(&TuiError::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
+        )));
+    }
+
+    #[test]
+    fn a_permission_error_is_not_classified_as_an_expected_no_live_bus_condition() {
+        assert!(!is_expected_no_live_bus_error(&TuiError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
+    }
 
     async fn seeded_pool(dir: &Path) -> SqlitePool {
         let db_path = dir.join("state.db");

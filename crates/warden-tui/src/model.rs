@@ -25,11 +25,19 @@ impl RunModel {
     /// history (Architecture.md §5.4, to avoid a gap) can see the same
     /// event delivered from both sources, and this must be a no-op the
     /// second time, not a duplicated log line.
-    pub fn apply(&mut self, record: RunEventRecord) {
+    ///
+    /// Returns `true` if `record` was newly inserted, `false` if it was
+    /// already known (a duplicate). Every caller that turns applied events
+    /// into user-visible output -- not just the interactive `app_loop`, but
+    /// also the headless NDJSON dump -- must gate on this return value
+    /// rather than re-deriving "is this new" some other way, or the two
+    /// paths can disagree about what counts as a duplicate.
+    pub fn apply(&mut self, record: RunEventRecord) -> bool {
         if !self.seen_ids.insert(record.id.clone()) {
-            return;
+            return false;
         }
         self.events.push(record);
+        true
     }
 
     /// The run this model has observed events for, if any have arrived yet.
@@ -93,6 +101,19 @@ impl RunModel {
         self.events
             .iter()
             .filter(|record| matches!(record.event, RunEvent::FindingRaised { .. }))
+    }
+
+    /// The most recently captured evidence, if any -- what `crate::ui`'s
+    /// evidence pane shows right now. `None` until an `EvidenceCaptured`
+    /// event has actually been applied; nothing in this codebase currently
+    /// emits one (Phase 7 / issue #7's Evidence Capture Adapter hasn't
+    /// landed), but the rendering path this feeds (`crate::ui`,
+    /// `crate::evidence`) is fully wired and exercised the moment one is.
+    pub fn latest_evidence(&self) -> Option<&RunEventRecord> {
+        self.events
+            .iter()
+            .rev()
+            .find(|record| matches!(record.event, RunEvent::EvidenceCaptured { .. }))
     }
 }
 
@@ -206,5 +227,45 @@ mod tests {
         let findings: Vec<&RunEventRecord> = model.findings().collect();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].id, "e2");
+    }
+
+    #[test]
+    fn latest_evidence_is_none_until_an_evidence_captured_event_is_applied() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        assert!(model.latest_evidence().is_none());
+    }
+
+    #[test]
+    fn latest_evidence_tracks_the_most_recently_applied_evidence_captured_event() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::EvidenceCaptured {
+                cycle_number: 1,
+                evidence_type: "image".to_string(),
+                file_path: "first.png".to_string(),
+                description: None,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record(
+            "e3",
+            RunEvent::EvidenceCaptured {
+                cycle_number: 2,
+                evidence_type: "image".to_string(),
+                file_path: "second.png".to_string(),
+                description: None,
+            },
+        ));
+
+        let latest = model
+            .latest_evidence()
+            .expect("an evidence event was applied");
+        assert_eq!(latest.id, "e3");
+        assert!(matches!(
+            &latest.event,
+            RunEvent::EvidenceCaptured { file_path, .. } if file_path == "second.png"
+        ));
     }
 }

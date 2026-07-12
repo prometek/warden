@@ -11,9 +11,11 @@ use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
 use warden_core::RunEventRecord;
 use warden_tui::attach::{attach, Attachment};
+use warden_tui::capabilities::GraphicsCapability;
 use warden_tui::{capabilities, db, subscriber, ui};
 
 #[derive(Parser)]
@@ -103,7 +105,17 @@ async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
     }
     if let Some(mut live) = attachment.live.take() {
         while let Some(record) = live.recv().await {
-            println!("{}", serde_json::to_string(&record)?);
+            // A live record can duplicate one already folded into history by
+            // `attach()`'s own best-effort drain (see `attach.rs`'s module
+            // docs on the "subscribe before querying history" race) --
+            // `RunModel::apply`'s id-based dedup is the single source of
+            // truth for "is this actually new", so it must gate what gets
+            // printed here exactly the way it gates what the interactive
+            // `app_loop` renders. Printing straight off the channel without
+            // going through the model first would print duplicates.
+            if attachment.model.apply(record.clone()) {
+                println!("{}", serde_json::to_string(&record)?);
+            }
         }
     }
     Ok(())
@@ -118,15 +130,14 @@ async fn run_tui(attachment: Attachment) -> anyhow::Result<()> {
 
     // Must run after entering the alternate screen but before reading
     // terminal events, per `ratatui_image::picker::Picker::from_query_stdio`'s
-    // own documented contract (ADR-0010).
+    // own documented contract (ADR-0010). Kept alive for the whole app loop
+    // (not dropped) and threaded into `ui::draw`: it's what makes an inline
+    // `EvidenceCaptured` image actually reach the screen (acceptance
+    // criterion 3), not just get detected and discarded.
     let (capability, picker) = capabilities::detect();
     tracing::info!(?capability, "detected terminal graphics capability");
-    // Evidence rendering (`warden_tui::evidence`) is ready to use once
-    // Phase 7 (issue #7) produces real `EVIDENCE` rows; this view has
-    // nothing to show yet, so `picker` is only queried for its capability.
-    drop(picker);
 
-    let result = app_loop(&mut terminal, attachment).await;
+    let result = app_loop(&mut terminal, attachment, capability, picker.as_ref()).await;
 
     restore_terminal(&mut terminal)?;
     result
@@ -150,6 +161,8 @@ fn restore_terminal(
 async fn app_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut attachment: Attachment,
+    capability: GraphicsCapability,
+    picker: Option<&Picker>,
 ) -> anyhow::Result<()> {
     // Crossterm's blocking event reader runs on its own OS thread and
     // forwards decoded events over a channel -- keeps this async loop free
@@ -164,7 +177,7 @@ async fn app_loop(
         }
     });
 
-    terminal.draw(|frame| ui::draw(frame, &attachment.model))?;
+    terminal.draw(|frame| ui::draw(frame, &attachment.model, capability, picker))?;
 
     loop {
         tokio::select! {
@@ -177,13 +190,18 @@ async fn app_loop(
             }
             record = recv_live(&mut attachment.live) => {
                 match record {
-                    Some(record) => attachment.model.apply(record),
+                    // The interactive view doesn't need to distinguish a
+                    // genuinely new event from a duplicate the way the
+                    // headless dump does (`run_headless`) -- every applied
+                    // event, new or not, simply results in a redraw of
+                    // whatever the model currently holds.
+                    Some(record) => { attachment.model.apply(record); }
                     None => attachment.live = None, // run ended; stop selecting on it
                 }
             }
         }
 
-        terminal.draw(|frame| ui::draw(frame, &attachment.model))?;
+        terminal.draw(|frame| ui::draw(frame, &attachment.model, capability, picker))?;
     }
 }
 
