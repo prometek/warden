@@ -1,0 +1,110 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT evidence.id as \"id!\", evidence.cycle_id as \"cycle_id!\", evidence.finding_id,\n               evidence.type as \"evidence_type!\", evidence.file_path as \"file_path!\",\n               evidence.description as \"description!\", evidence.captured_at as \"captured_at!\",\n               cycles.cycle_number as \"cycle_number!\"\n        FROM evidence\n        JOIN cycles ON cycles.id = evidence.cycle_id\n        WHERE cycles.run_id = ?\n        ORDER BY cycles.cycle_number ASC, evidence.captured_at ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "cycle_id!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "cycle_id"
+          }
+        }
+      },
+      {
+        "name": "finding_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "finding_id"
+          }
+        }
+      },
+      {
+        "name": "evidence_type!",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "type"
+          }
+        }
+      },
+      {
+        "name": "file_path!",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "file_path"
+          }
+        }
+      },
+      {
+        "name": "description!",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "name": "captured_at!",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "evidence",
+            "name": "captured_at"
+          }
+        }
+      },
+      {
+        "name": "cycle_number!",
+        "ordinal": 7,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cycles",
+            "name": "cycle_number"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "de436633777c891f06b50156c1fca55d712b473fe8afc6102474f656b958b88e"
+}

@@ -6,6 +6,7 @@
 
 mod convergence;
 mod error;
+mod evidence;
 mod state;
 
 pub use convergence::{
@@ -13,4 +14,8 @@ pub use convergence::{
     FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
+pub use evidence::{
+    detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,
+    ProjectType,
+};
 pub use state::{AgentRole, RunState};

@@ -105,7 +105,37 @@ Flags de `warden run` :
   (`RunState::MaxCyclesExceeded`). Doit être ≥ 1. Défaut : `5`.
 - `--warden-home <PATH>` — répertoire d'état de Warden (base SQLite + worktrees).
   Défaut : `~/.warden`.
+- `--evidence-tool <playwright|asciinema>` — force l'outil de capture de preuve
+  (ADR-0009) au lieu de la détection automatique du type de projet (présence d'un
+  serveur/framework front → Playwright, sinon → asciinema).
+- `--evidence-store-in-repo <true|false>` — commite les preuves capturées sous
+  `.warden/evidence/<cycle>/` pour qu'elles apparaissent dans la PR finalisée. Activé
+  par défaut (ADR-0009).
 - `-v`, `-vv`, `-vvv` — verbosité des logs (`warn` par défaut, jusqu'à `trace`).
+
+### Preuve d'exécution (Evidence)
+
+Après chaque cycle dont le tester ne remonte aucun finding bloquant (test e2e réussi),
+Warden déclenche un **Evidence Capture Adapter** dans le worktree du tester, avant sa
+suppression (ADR-0009) :
+
+- **Playwright** pour un projet web/UI (détecté via un `package.json` référençant un
+  framework front, ou un marker comme `index.html`) — capture les captures
+  d'écran/vidéos produites par `npx playwright test` sous `test-results/`.
+- **asciinema** sinon (projet CLI) — enregistre la commande tester elle-même via
+  `asciinema rec`.
+
+Les artefacts atterrissent d'abord en stockage local (`<warden-home>/evidence/<run_id>/<cycle>/`,
+jamais dans un dépôt git), puis — si `--evidence-store-in-repo` (défaut) — sont commités
+sous `.warden/evidence/<cycle>/` dans un commit dédié au moment de la convergence, avant
+que `Finalize` ne pousse le contenu final (jamais avant, ADR-0007). Le corps de la PR
+finalisée inclut alors une section **Evidence** : images intégrées en inline via l'URL de
+contenu brut du repo, enregistrements asciinema en lien cliquable.
+
+Un outil de capture absent ou en échec (Playwright/asciinema non installés, aucun
+artefact produit, ...) est loggé (`tracing::warn!`) et n'interrompt jamais un run par
+ailleurs convergent — l'absence de preuve pour un cycle donné n'est pas traitée comme un
+finding bloquant.
 
 ### Protocole de sortie des agents (findings)
 
