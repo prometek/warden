@@ -26,6 +26,9 @@ pub enum CoreError {
 
     #[error("malformed agent output: {0}")]
     MalformedAgentOutput(String),
+
+    #[error("unknown event kind: {0:?}")]
+    UnknownEventKind(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

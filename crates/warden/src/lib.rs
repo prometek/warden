@@ -3,6 +3,7 @@
 
 pub mod db;
 pub mod error;
+pub mod event_bus;
 pub mod orchestrator;
 pub mod process;
 pub mod worktree;

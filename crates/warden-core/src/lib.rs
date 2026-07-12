@@ -6,6 +6,7 @@
 
 mod convergence;
 mod error;
+mod event;
 mod state;
 
 pub use convergence::{
@@ -13,4 +14,5 @@ pub use convergence::{
     FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
+pub use event::{EventKind, RunEvent, RunEventRecord};
 pub use state::{AgentRole, RunState};

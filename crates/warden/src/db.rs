@@ -1,8 +1,9 @@
 //! SQLite persistence (ADR-0004). `warden` is the only writer; schema
-//! covers `runs`, `cycles`, `findings`, `agent_processes` for this phase
-//! (`events`/`evidence` land in later phases). Every row read back is
-//! reparsed into a strongly-typed Rust value before leaving this module —
-//! callers never see raw strings for `state`/`role`/`source`/`severity`.
+//! covers `runs`, `cycles`, `findings`, `agent_processes`, and (Phase 8,
+//! ADR-0008) `events` -- `evidence` is still deferred to Phase 7 (issue #7).
+//! Every row read back is reparsed into a strongly-typed Rust value before
+//! leaving this module — callers never see raw strings for
+//! `state`/`role`/`source`/`severity`/`event_type`.
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,7 +11,9 @@ use std::time::Duration;
 use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
-use warden_core::{AgentRole, Finding, FindingSource, RunState, Severity};
+use warden_core::{
+    AgentRole, EventKind, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
+};
 
 use crate::error::{Result, WardenError};
 
@@ -652,6 +655,87 @@ pub async fn list_findings_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Resul
             })
         })
         .collect::<std::result::Result<Vec<_>, WardenError>>()
+}
+
+/// Persists one [`RunEvent`] (Phase 8, ADR-0008) as an `events` row. `id`
+/// and `created_at` are supplied by the caller rather than generated here
+/// (unlike most other `insert_*` functions in this module): the orchestrator
+/// needs the *exact same* id/timestamp to also appear on the live Event Bus
+/// broadcast (see `event_bus::EventBus::publish`), so a `warden-tui` that
+/// subscribes to the bus before querying history can deduplicate an event it
+/// already saw live against the same event showing up in a later history
+/// query, by id.
+pub async fn insert_event(
+    pool: &SqlitePool,
+    id: &str,
+    run_id: &str,
+    event: &RunEvent,
+    created_at: &str,
+) -> Result<()> {
+    let event_type = event.kind().as_str();
+    let payload_json = serde_json::to_string(event)?;
+    sqlx::query!(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+        id,
+        run_id,
+        event_type,
+        payload_json,
+        created_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Raw shape of an `events` row as decoded by sqlx, before `event_type` and
+/// `payload_json` have been validated into a [`RunEvent`]. Kept private:
+/// [`RunEventRecord`] is the only form that ever leaves this module.
+struct EventRow {
+    id: String,
+    run_id: String,
+    event_type: String,
+    payload_json: String,
+    created_at: String,
+}
+
+fn row_to_event_record(row: EventRow) -> Result<RunEventRecord> {
+    let declared_kind = EventKind::parse(&row.event_type)?;
+    let event: RunEvent = serde_json::from_str(&row.payload_json)?;
+    if event.kind() != declared_kind {
+        return Err(WardenError::EventKindMismatch {
+            id: row.id,
+            event_type: row.event_type,
+            payload_kind: event.kind().as_str(),
+        });
+    }
+    Ok(RunEventRecord {
+        id: row.id,
+        run_id: row.run_id,
+        event,
+        created_at: row.created_at,
+    })
+}
+
+/// Every event recorded for `run_id`, oldest first -- the full history a
+/// late-attaching `warden-tui` replays before switching to the live socket
+/// stream (Architecture.md §5.4). Ordered by `created_at` then `id` so two
+/// events sharing the same (second-resolution) timestamp still come back in
+/// a stable, deterministic order rather than SQLite's unspecified row order.
+pub async fn list_events_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<RunEventRecord>> {
+    let rows = sqlx::query_as!(
+        EventRow,
+        r#"
+        SELECT id as "id!", run_id, event_type, payload_json, created_at
+        FROM events
+        WHERE run_id = ?
+        ORDER BY created_at ASC, id ASC
+        "#,
+        run_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(row_to_event_record).collect()
 }
 
 /// Persists an agent process record, capturing the OS-reported start time
@@ -1384,5 +1468,105 @@ mod tests {
             pending.is_empty(),
             "a run that isn't Failed yet belongs to list_intermediate_runs, not this query"
         );
+    }
+
+    // ---- events (Phase 8, issue #8) ----------------------------------------
+
+    #[tokio::test]
+    async fn event_round_trips_through_insert_and_list() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-events", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let event = RunEvent::CycleStarted { cycle_number: 1 };
+        insert_event(
+            &pool,
+            "event-1",
+            "run-events",
+            &event,
+            "2026-07-12T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-events").await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "event-1");
+        assert_eq!(events[0].run_id, "run-events");
+        assert_eq!(events[0].event, event);
+        assert_eq!(events[0].created_at, "2026-07-12T00:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn list_events_for_run_orders_oldest_first() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        insert_event(
+            &pool,
+            "event-b",
+            "run-order",
+            &RunEvent::CycleStarted { cycle_number: 2 },
+            "2026-07-12T00:00:02+00:00",
+        )
+        .await
+        .unwrap();
+        insert_event(
+            &pool,
+            "event-a",
+            "run-order",
+            &RunEvent::CycleStarted { cycle_number: 1 },
+            "2026-07-12T00:00:01+00:00",
+        )
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-order").await.unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["event-a", "event-b"]);
+    }
+
+    #[tokio::test]
+    async fn list_events_for_run_is_empty_for_a_run_with_no_events() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-no-events", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let events = list_events_for_run(&pool, "run-no-events").await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    /// code-standards.md: "toute ligne relue est reparsée en type Rust
+    /// fort" -- a row whose `event_type` column disagrees with what its own
+    /// `payload_json` decodes to (corruption, or a write from something
+    /// other than `insert_event`) must be a typed error, never silently
+    /// trusted as whichever of the two the reader happens to pick.
+    #[tokio::test]
+    async fn mismatched_event_type_and_payload_kind_is_a_typed_error_not_silently_trusted() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-corrupt", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let payload_json =
+            serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-corrupt",
+            "run-corrupt",
+            "run_finished",
+            payload_json,
+            "2026-07-12T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = list_events_for_run(&pool, "run-corrupt").await;
+        assert!(matches!(result, Err(WardenError::EventKindMismatch { .. })));
     }
 }
