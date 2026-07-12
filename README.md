@@ -42,6 +42,14 @@ Le **CI Watcher** (Phase 5) est livré et utilisable de bout en bout via la sous
 pour le PR Manager, une décision d'architecture distincte hors périmètre de cette livraison.
 Warden ne merge **jamais** automatiquement une PR, quel que soit le statut observé.
 
+L'**Evidence Capture Adapter** (Phase 7, ADR-0009) est livré et entièrement câblé dans la
+boucle de convergence de `warden` : chaque cycle dont le tester réussit son test e2e produit
+une preuve (Playwright ou asciinema selon le projet), committée dans le dépôt à la
+convergence si `--evidence-store-in-repo` (défaut) — voir "Preuve d'exécution (Evidence)"
+ci-dessous. Le renderer de la section Evidence du corps de PR est lui aussi livré et appelé
+par `warden-gated::pr_manager::finalize`, mais son affichage dans une vraie PR GitHub dépend
+du câblage `Finalize` du PR Manager décrit au paragraphe précédent, qui n'existe pas encore.
+
 **Limite d'isolation à connaître avant tout déploiement** : dans la configuration par
 défaut documentée ici, `warden` et `warden-gated` tournent sous le **même utilisateur OS**.
 Cela donne une frontière de sécurité **process/logique** (aucun code d'accès credentials
@@ -105,7 +113,46 @@ Flags de `warden run` :
   (`RunState::MaxCyclesExceeded`). Doit être ≥ 1. Défaut : `5`.
 - `--warden-home <PATH>` — répertoire d'état de Warden (base SQLite + worktrees).
   Défaut : `~/.warden`.
+- `--evidence-tool <playwright|asciinema>` — force l'outil de capture de preuve
+  (ADR-0009) au lieu de la détection automatique du type de projet (présence d'un
+  serveur/framework front → Playwright, sinon → asciinema).
+- `--evidence-store-in-repo <true|false>` — commite les preuves capturées sous
+  `.warden/evidence/<cycle>/` pour qu'elles apparaissent dans la PR finalisée. Activé
+  par défaut (ADR-0009).
 - `-v`, `-vv`, `-vvv` — verbosité des logs (`warn` par défaut, jusqu'à `trace`).
+
+### Preuve d'exécution (Evidence)
+
+Après chaque cycle dont le tester ne remonte aucun finding bloquant (test e2e réussi),
+Warden déclenche un **Evidence Capture Adapter** dans le worktree du tester, avant sa
+suppression (ADR-0009) :
+
+- **Playwright** pour un projet web/UI (détecté via un `package.json` référençant un
+  framework front, ou un marker comme `index.html`) — capture les captures
+  d'écran/vidéos produites par `npx playwright test` sous `test-results/`.
+- **asciinema** sinon (projet CLI) — enregistre la commande tester elle-même via
+  `asciinema rec`.
+
+Les artefacts atterrissent d'abord en stockage local (`<warden-home>/evidence/<run_id>/<cycle>/`,
+jamais dans un dépôt git), puis — si `--evidence-store-in-repo` (défaut) — sont commités
+sous `.warden/evidence/<cycle>/` dans un commit dédié au moment de la convergence, avant
+que `Finalize` ne pousse le contenu final (jamais avant, ADR-0007). Ceci est entièrement
+automatique et câblé dans la boucle de convergence de `warden` — un run qui converge avec
+`--evidence-store-in-repo` (défaut) porte réellement ce commit d'évidence.
+
+Le renderer de la section **Evidence** du corps de PR (`warden_core::format_evidence_section` :
+images intégrées en inline via l'URL de contenu brut du repo, vidéos/logs/enregistrements
+asciinema en lien cliquable) est lui aussi livré et appelé par `warden-gated::pr_manager::finalize`.
+Mais, comme documenté dans "Gestion des PR" ci-dessous, `Finalize` lui-même n'est pas encore
+déclenché automatiquement par `warden` (câblage laissé à une décision d'architecture
+distincte, Phase 4) : tant que ce déclenchement n'existe pas, la section Evidence
+n'apparaît donc pas encore dans une vraie PR GitHub, même si les preuves, elles, sont bien
+committées dans le dépôt à chaque convergence.
+
+Un outil de capture absent ou en échec (Playwright/asciinema non installés, aucun
+artefact produit, ...) est loggé (`tracing::warn!`) et n'interrompt jamais un run par
+ailleurs convergent — l'absence de preuve pour un cycle donné n'est pas traitée comme un
+finding bloquant.
 
 ### Protocole de sortie des agents (findings)
 

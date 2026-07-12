@@ -26,6 +26,12 @@ pub enum CoreError {
 
     #[error("malformed agent output: {0}")]
     MalformedAgentOutput(String),
+
+    #[error("unknown evidence type: {0:?}")]
+    UnknownEvidenceType(String),
+
+    #[error("unknown evidence tool: {0:?}")]
+    UnknownEvidenceTool(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

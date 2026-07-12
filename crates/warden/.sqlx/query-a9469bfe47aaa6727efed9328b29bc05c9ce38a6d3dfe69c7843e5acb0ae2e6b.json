@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO evidence (id, cycle_id, finding_id, type, file_path, description, captured_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "a9469bfe47aaa6727efed9328b29bc05c9ce38a6d3dfe69c7843e5acb0ae2e6b"
+}

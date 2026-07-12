@@ -68,6 +68,18 @@ enum Commands {
         /// Tester agent command; same findings JSON protocol as reviewer.
         #[arg(long)]
         tester_cmd: String,
+
+        /// Overrides automatic project-type detection for the Evidence
+        /// Capture Adapter (ADR-0009): `playwright` for web/UI projects,
+        /// `asciinema` for CLI projects. Detected from the repo when
+        /// omitted.
+        #[arg(long, value_parser = parse_evidence_tool)]
+        evidence_tool: Option<warden_core::EvidenceTool>,
+
+        /// Commits captured evidence into `.warden/evidence/<cycle>/` so it
+        /// lands in the finalized PR (ADR-0009). Enabled by default.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        evidence_store_in_repo: bool,
     },
 }
 
@@ -86,6 +98,8 @@ async fn main() -> anyhow::Result<()> {
             coder_cmd,
             reviewer_cmd,
             tester_cmd,
+            evidence_tool,
+            evidence_store_in_repo,
         } => {
             run(
                 repo,
@@ -96,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
                 coder_cmd,
                 reviewer_cmd,
                 tester_cmd,
+                evidence_tool,
+                evidence_store_in_repo,
             )
             .await
         }
@@ -112,6 +128,8 @@ async fn run(
     coder_cmd: String,
     reviewer_cmd: String,
     tester_cmd: String,
+    evidence_tool: Option<warden_core::EvidenceTool>,
+    evidence_store_in_repo: bool,
 ) -> anyhow::Result<()> {
     let warden_home = warden_home.unwrap_or(default_warden_home()?);
     let db_path = warden_home.join("state.db");
@@ -149,6 +167,8 @@ async fn run(
         coder_command: parse_agent_command(&coder_cmd)?,
         reviewer_command: parse_agent_command(&reviewer_cmd)?,
         tester_command: parse_agent_command(&tester_cmd)?,
+        evidence_tool,
+        evidence_store_in_repo,
     };
 
     let orchestrator = Orchestrator::new(pool);
@@ -171,6 +191,14 @@ fn parse_agent_command(raw: &str) -> anyhow::Result<AgentCommand> {
     let mut parts = raw.split_whitespace();
     let program = parts.next().context("agent command must not be empty")?;
     Ok(AgentCommand::new(program, parts))
+}
+
+/// clap `value_parser` for `--evidence-tool`: delegates to
+/// `warden_core::EvidenceTool::parse` so the CLI and any future config-file
+/// parsing validate against the exact same closed set (code-standards.md:
+/// "valider toute entrée externe... à la frontière").
+fn parse_evidence_tool(raw: &str) -> Result<warden_core::EvidenceTool, String> {
+    warden_core::EvidenceTool::parse(raw).map_err(|error| error.to_string())
 }
 
 fn default_warden_home() -> anyhow::Result<PathBuf> {

@@ -66,6 +66,32 @@ pub enum ProcessError {
     KillFailed { pid: u32 },
 }
 
+/// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).
+/// Spawn/wait failures for the underlying `npx`/`asciinema` subprocess reuse
+/// [`ProcessError`] (via `process::spawn_and_wait`) rather than duplicating
+/// that handling here -- these variants only cover outcomes that are valid
+/// from a subprocess point of view (it ran, it exited) but still mean no
+/// usable evidence was produced.
+#[derive(Debug, Error)]
+pub enum EvidenceError {
+    #[error("evidence tool `{tool}` exited with status {exit_code:?}: {stderr}")]
+    CommandFailed {
+        tool: &'static str,
+        exit_code: Option<i32>,
+        stderr: String,
+    },
+
+    #[error("evidence tool `{tool}` produced no artifacts in {path}")]
+    NoArtifactsProduced { tool: &'static str, path: PathBuf },
+
+    /// A `evidence.file_path` column value that isn't of the
+    /// `.warden/evidence/<cycle>/<filename>` shape `evidence::repo_relative_path`
+    /// always writes -- a row written by something other than this code, or a
+    /// corrupted database (code-standards.md: "no silent fallback").
+    #[error("stored evidence file_path {file_path:?} has no file name component")]
+    InvalidStoredEvidencePath { file_path: String },
+}
+
 #[derive(Debug, Error)]
 pub enum WardenError {
     #[error(transparent)]
@@ -73,6 +99,9 @@ pub enum WardenError {
 
     #[error(transparent)]
     Process(#[from] ProcessError),
+
+    #[error(transparent)]
+    Evidence(#[from] EvidenceError),
 
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
@@ -111,6 +140,16 @@ pub enum WardenError {
         path: PathBuf,
         #[source]
         source: sqlx::Error,
+    },
+
+    /// The target repo's root `package.json` exists but isn't valid JSON --
+    /// evidence project-type detection (ADR-0009) must not silently treat
+    /// this as "no dependencies" (code-standards.md: "no silent fallback").
+    #[error("malformed package.json at {path}: {source}")]
+    InvalidPackageJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
     },
 }
 
