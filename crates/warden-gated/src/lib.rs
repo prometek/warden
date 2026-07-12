@@ -10,6 +10,7 @@
 //! pas la logique de vérification — dupliquée volontairement côté gate)").
 
 pub mod bare_repo;
+pub mod ci_watcher;
 pub mod db;
 pub mod error;
 pub mod gate;

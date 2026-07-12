@@ -83,6 +83,31 @@ pub enum GatedError {
         base_branch: String,
         files: Vec<String>,
     },
+
+    /// `gh pr view --json state,statusCheckRollup`'s stdout didn't
+    /// deserialize into the shape the CI watcher (issue #5) expects --
+    /// an unexpected `gh` output format, surfaced rather than silently
+    /// treated as "no status yet".
+    #[error("could not parse gh pr view output as PR status ({reason}): {json:?}")]
+    UnparsablePrStatusJson { json: String, reason: String },
+
+    /// `gh`'s `state` field for a PR wasn't one of `OPEN`/`CLOSED`/`MERGED`
+    /// -- a closed set per GitHub's own API, so anything else is a boundary
+    /// error, not a guess.
+    #[error("unknown PR lifecycle state from gh: {0:?}")]
+    UnknownPrLifecycle(String),
+
+    /// A `statusCheckRollup` entry's `status`/`conclusion` (Checks API) or
+    /// `state` (legacy Statuses API) combination wasn't one this module
+    /// recognizes.
+    #[error("unknown CI check status/conclusion from gh: {0}")]
+    UnknownCheckConclusion(String),
+
+    /// A `statusCheckRollup` entry had neither the Checks API shape
+    /// (`status`/`conclusion`) nor the legacy Statuses API shape (`state`) --
+    /// unrecognized as either, so its outcome can't be classified.
+    #[error("CI check {0:?} has neither a Checks API nor a Statuses API shape")]
+    MalformedCheckEntry(String),
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;
