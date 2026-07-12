@@ -520,11 +520,25 @@ async fn protect_cycle_commit(
 /// whose owning `Worktree` guard never ran `Drop` (a crash is a `SIGKILL`,
 /// not a graceful drop), and agent child processes that outlive the
 /// orchestrator that spawned them (`kill_on_drop` also never fires without a
-/// `Drop`). Both are cleaned up here, best-effort — a cleanup failure for
-/// one run is logged and does not stop recovery from proceeding to the next
-/// one.
+/// `Drop`). Reclaiming both is [`reclaim_orphan_resources`] — best-effort, a
+/// cleanup failure for one run is logged and does not stop recovery from
+/// proceeding to the next one.
 ///
-/// Returns the ids of runs that were marked `Failed`.
+/// The state write and that reclaim are two separate steps, so a *second*
+/// crash — the orchestrator dying again in the window between persisting
+/// `Failed` and cleanup finishing — must not be able to orphan a resource
+/// permanently: a run already `Failed` is no longer
+/// [`RunState::is_intermediate`], so it would never be revisited by the pass
+/// below on its own. [`db::list_failed_runs_with_pending_cleanup`] is the
+/// second pass that catches exactly that case, driven off what's still
+/// recorded (an open `agent_processes` row, or a worktree path not yet
+/// cleared) rather than off the run's state — so it keeps retrying a
+/// specific run only for as long as it actually still has something to
+/// reclaim.
+///
+/// Returns the ids of runs newly transitioned to `Failed` by this call (not
+/// runs merely revisited for cleanup because an earlier, interrupted pass
+/// already made that transition).
 pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
     let intermediate_runs = db::list_intermediate_runs(pool).await?;
     let mut failed_run_ids = Vec::new();
@@ -544,17 +558,42 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
-        if let Err(error) = cleanup_orphan_worktrees(pool, &run).await {
-            tracing::error!(run_id = %run.id, %error, "failed to clean up orphaned worktrees during crash recovery");
-        }
-        if let Err(error) = terminate_orphan_processes(pool, &run.id).await {
-            tracing::error!(run_id = %run.id, %error, "failed to terminate orphan agent processes during crash recovery");
-        }
-
+        reclaim_orphan_resources(pool, &run).await;
         failed_run_ids.push(run.id);
     }
 
+    // Second pass (issue #6, HIGH): resumes cleanup for runs that were
+    // already `Failed` before this call — either by an earlier, interrupted
+    // recovery pass (the case this exists for), or by the normal
+    // `CoderFailed` path in `run_coder`, which already removes its own
+    // worktree, so those runs simply won't match here at all. Idempotent by
+    // construction: a run stops being returned the moment nothing is left
+    // recorded for it to reclaim.
+    let failed_runs_needing_cleanup = db::list_failed_runs_with_pending_cleanup(pool).await?;
+    for run in failed_runs_needing_cleanup {
+        tracing::warn!(run_id = %run.id, "resuming orphan cleanup for a run already marked Failed by an earlier, interrupted recovery pass");
+        reclaim_orphan_resources(pool, &run).await;
+    }
+
     Ok(failed_run_ids)
+}
+
+/// Reclaims both kinds of resources a crashed run may have left orphaned
+/// (issue #6). Processes are terminated *before* worktrees are removed: a
+/// still-live orphan agent's `cwd` is inside the worktree directory
+/// `cleanup_orphan_worktrees` is about to `git worktree remove --force`, and
+/// could keep writing to (or recreating files in) it while removal is in
+/// progress otherwise. Both steps are best-effort — failures are logged,
+/// never propagated, so one bad run's cleanup never stops the rest of
+/// recovery; each step is independently safe to retry on a later pass (see
+/// [`terminate_orphan_processes`] and [`cleanup_orphan_worktrees`]).
+async fn reclaim_orphan_resources(pool: &SqlitePool, run: &db::Run) {
+    if let Err(error) = terminate_orphan_processes(pool, &run.id).await {
+        tracing::error!(run_id = %run.id, %error, "failed to terminate orphan agent processes during crash recovery");
+    }
+    if let Err(error) = cleanup_orphan_worktrees(pool, run).await {
+        tracing::error!(run_id = %run.id, %error, "failed to clean up orphaned worktrees during crash recovery");
+    }
 }
 
 /// Removes every worktree recorded across `run`'s cycles that still exists
@@ -564,20 +603,34 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
 /// commands against — the same one `WorktreeManager` would have used had the
 /// orchestrator not crashed.
 ///
+/// A path is only cleared from `cycles` (via
+/// `db::clear_cycle_worktree_path`) once it is actually confirmed removed —
+/// that's what lets [`db::list_failed_runs_with_pending_cleanup`] stop
+/// re-processing a run once its cleanup has genuinely succeeded, and keeps
+/// retrying it otherwise.
+///
 /// Per-path removal failures (`remove_orphan_worktree` — already-gone paths
 /// are not an error, see its docs) and the final prune are both logged, not
 /// propagated: one bad worktree must not stop the rest of crash recovery.
 async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()> {
-    let worktree_paths = db::list_worktree_paths_for_run(pool, &run.id).await?;
-    if worktree_paths.is_empty() {
+    let entries = db::list_cycle_worktree_entries_for_run(pool, &run.id).await?;
+    if entries.is_empty() {
         return Ok(());
     }
 
     let main_repo_path = Path::new(&run.repo_path);
-    for path in &worktree_paths {
-        if let Err(error) = worktree::remove_orphan_worktree(main_repo_path, Path::new(path)).await
-        {
-            tracing::error!(run_id = %run.id, worktree_path = %path, %error, "failed to remove orphaned worktree");
+    for entry in &entries {
+        match worktree::remove_orphan_worktree(main_repo_path, Path::new(&entry.path)).await {
+            Ok(()) => {
+                if let Err(error) =
+                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, entry.role).await
+                {
+                    tracing::error!(run_id = %run.id, cycle_id = %entry.cycle_id, %error, "failed to clear recorded worktree path after removing it");
+                }
+            }
+            Err(error) => {
+                tracing::error!(run_id = %run.id, worktree_path = %entry.path, %error, "failed to remove orphaned worktree");
+            }
         }
     }
 
@@ -596,34 +649,45 @@ async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()
 const RECOVERY_TERMINATED_EXIT_CODE: i32 = -1;
 
 /// Terminates every agent process still recorded as open
-/// (`agent_processes.ended_at IS NULL`) for a run crash recovery just marked
-/// `Failed`, then marks each row ended — closing out bookkeeping the crashed
-/// orchestrator never got to write itself. Safety against PID reuse is
-/// delegated entirely to `process::kill_pid`, which re-checks the recorded
-/// start time immediately before signalling (H1): a process whose
-/// fingerprint no longer matches is left untouched, never killed. A row
-/// whose process already exited on its own is simply marked ended, with
-/// nothing to terminate.
+/// (`agent_processes.ended_at IS NULL`) for a run crash recovery is
+/// reclaiming, then marks each successfully-handled row ended — closing out
+/// bookkeeping the crashed orchestrator never got to write itself. Safety
+/// against PID reuse is delegated entirely to `process::kill_pid`, which
+/// checks the recorded start time against the *exact same* process handle it
+/// signals, in one refresh (H1): a process whose fingerprint no longer
+/// matches is left untouched, never killed.
+///
+/// One process's failure — a DB error, or `kill_pid` itself failing — is
+/// logged and does not stop the rest from being processed. A process
+/// `kill_pid` could not terminate is deliberately left `ended_at IS NULL`:
+/// it is still alive, so the row must stay visible to a later recovery pass
+/// (via `db::list_failed_runs_with_pending_cleanup`) rather than being
+/// forgotten about while the process keeps running.
 async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<()> {
     let open_processes = db::list_open_agent_processes_for_run(pool, run_id).await?;
 
     for open_process in open_processes {
-        if process::is_process_alive(open_process.pid, open_process.pid_started_at_unix) {
-            match process::kill_pid(open_process.pid, open_process.pid_started_at_unix) {
-                Ok(()) => tracing::warn!(
-                    run_id,
-                    pid = open_process.pid,
-                    "terminated orphan agent process left running after a crash"
-                ),
-                Err(error) => tracing::error!(
-                    run_id,
-                    pid = open_process.pid,
-                    %error,
-                    "failed to terminate orphan agent process"
-                ),
-            }
+        if let Err(error) = process::kill_pid(open_process.pid, open_process.pid_started_at_unix) {
+            tracing::error!(
+                run_id,
+                pid = open_process.pid,
+                %error,
+                "failed to terminate a live orphan agent process; leaving its row open for a later recovery pass"
+            );
+            continue;
         }
-        db::mark_agent_process_ended(pool, &open_process.id, RECOVERY_TERMINATED_EXIT_CODE).await?;
+
+        if let Err(error) =
+            db::mark_agent_process_ended(pool, &open_process.id, RECOVERY_TERMINATED_EXIT_CODE)
+                .await
+        {
+            tracing::error!(
+                run_id,
+                pid = open_process.pid,
+                %error,
+                "failed to mark a terminated orphan agent process ended"
+            );
+        }
     }
 
     Ok(())
@@ -1307,16 +1371,9 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(
-            &pool,
-            "pid-reuse-run",
-            "/tmp/repo",
-            "main",
-            "intent",
-            3,
-        )
-        .await
-        .unwrap();
+        db::insert_run(&pool, "pid-reuse-run", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
         db::update_run_state(&pool, "pid-reuse-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -1398,8 +1455,8 @@ mod tests {
     /// against the current implementation, which silently skips `Failed`
     /// runs entirely: see the discrepancy reported alongside this test.
     #[tokio::test]
-    async fn recovery_cleans_up_orphans_even_for_a_run_already_marked_failed_by_an_earlier_crashed_recovery_pass()
-    {
+    async fn recovery_cleans_up_orphans_even_for_a_run_already_marked_failed_by_an_earlier_crashed_recovery_pass(
+    ) {
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
@@ -1413,7 +1470,10 @@ mod tests {
             .unwrap();
         let worktree_path = worktree.path().to_path_buf();
         std::mem::forget(worktree);
-        assert!(worktree_path.exists(), "precondition: orphan worktree exists");
+        assert!(
+            worktree_path.exists(),
+            "precondition: orphan worktree exists"
+        );
 
         db::insert_run(
             &pool,

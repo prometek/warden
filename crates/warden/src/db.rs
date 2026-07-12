@@ -122,15 +122,11 @@ async fn backup_before_migration(db_path: &Path, pool: &SqlitePool) -> Result<()
         return Ok(());
     }
 
-    let file_name = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.db");
     // `:` is valid in Unix filenames but awkward to work with on the
     // command line, so it's stripped from the timestamp purely for
     // readability — RFC3339 ordering is preserved either way.
     let timestamp = now_rfc3339().replace(':', "-");
-    let backup_path = db_path.with_file_name(format!("{file_name}.bak-{timestamp}"));
+    let backup_path = unique_backup_path(db_path, &timestamp).await?;
 
     sqlx::query("VACUUM INTO ?")
         .bind(backup_path.display().to_string())
@@ -146,6 +142,29 @@ async fn backup_before_migration(db_path: &Path, pool: &SqlitePool) -> Result<()
         "backed up SQLite database before applying pending migrations"
     );
     Ok(())
+}
+
+/// Picks a backup path of the form `<file_name>.bak-<timestamp>`, appending
+/// `-1`, `-2`, ... if that name is already taken. `now_rfc3339()`'s
+/// resolution isn't guaranteed finer than a second on every platform, so two
+/// backups requested within the same second (or a stale leftover file from a
+/// previous run sharing the same timestamp) must not collide — `VACUUM INTO`
+/// refuses to overwrite an existing file, which would otherwise abort the
+/// migration on a spurious naming collision rather than a real backup
+/// failure.
+async fn unique_backup_path(db_path: &Path, timestamp: &str) -> Result<std::path::PathBuf> {
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.db");
+
+    let mut candidate = db_path.with_file_name(format!("{file_name}.bak-{timestamp}"));
+    let mut suffix: u32 = 1;
+    while tokio::fs::try_exists(&candidate).await? {
+        candidate = db_path.with_file_name(format!("{file_name}.bak-{timestamp}-{suffix}"));
+        suffix += 1;
+    }
+    Ok(candidate)
 }
 
 fn now_rfc3339() -> String {
@@ -331,6 +350,50 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     rows.into_iter().map(row_to_run).collect()
 }
 
+/// `Failed` runs that may still have orphaned resources needing cleanup: an
+/// `agent_processes` row never marked ended, or a `cycles` row still
+/// recording a worktree path (only cleared once crash recovery successfully
+/// removes it — see [`clear_cycle_worktree_path`]).
+///
+/// This exists because [`list_intermediate_runs`] alone is not enough for
+/// crash-safe recovery (issue #6): `recover_crashed_runs` writes `Failed`
+/// *before* attempting orphan cleanup (write-ahead of intention, ADR-0004),
+/// so if the orchestrator crashes again in the window between that write and
+/// cleanup finishing, the run is already `Failed` — no longer
+/// `is_intermediate()` — and `list_intermediate_runs` would never surface it
+/// again, permanently leaking its worktree/process. A run whose cleanup
+/// already succeeded has neither an open process nor a recorded path left,
+/// so it naturally stops being returned here — no separate "cleanup done"
+/// flag needed.
+pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<Vec<Run>> {
+    let rows = sqlx::query_as!(
+        RunRow,
+        r#"
+        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha
+        FROM runs
+        WHERE runs.state = 'failed'
+          AND (
+            EXISTS (
+                SELECT 1 FROM agent_processes
+                JOIN cycles ON cycles.id = agent_processes.cycle_id
+                WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL
+            )
+            OR EXISTS (
+                SELECT 1 FROM cycles
+                WHERE cycles.run_id = runs.id
+                  AND (cycles.coder_worktree_path IS NOT NULL
+                       OR cycles.reviewer_worktree_path IS NOT NULL
+                       OR cycles.tester_worktree_path IS NOT NULL)
+            )
+          )
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(row_to_run).collect()
+}
+
 pub async fn insert_cycle(
     pool: &SqlitePool,
     id: &str,
@@ -407,6 +470,46 @@ pub async fn set_cycle_worktree_path(
     Ok(())
 }
 
+/// Nulls out the recorded worktree path for `role` on `cycle_id`, once crash
+/// recovery has actually removed that worktree from disk (issue #6). This is
+/// what lets [`list_failed_runs_with_pending_cleanup`] stop returning a run
+/// after its orphan cleanup succeeds — the run stays `Failed` forever (a
+/// terminal state), but the *recorded path* is the signal that tells a later
+/// recovery pass whether there is still anything left to reclaim for it.
+pub async fn clear_cycle_worktree_path(
+    pool: &SqlitePool,
+    cycle_id: &str,
+    role: AgentRole,
+) -> Result<()> {
+    match role {
+        AgentRole::Coder => {
+            sqlx::query!(
+                "UPDATE cycles SET coder_worktree_path = NULL WHERE id = ?",
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+        AgentRole::Reviewer => {
+            sqlx::query!(
+                "UPDATE cycles SET reviewer_worktree_path = NULL WHERE id = ?",
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+        AgentRole::Tester => {
+            sqlx::query!(
+                "UPDATE cycles SET tester_worktree_path = NULL WHERE id = ?",
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn close_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<()> {
     let now = now_rfc3339();
     sqlx::query!("UPDATE cycles SET ended_at = ? WHERE id = ?", now, cycle_id)
@@ -446,6 +549,65 @@ pub async fn list_worktree_paths_for_run(pool: &SqlitePool, run_id: &str) -> Res
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// A single recorded worktree path for one cycle/role, together with enough
+/// identity (`cycle_id`, `role`) to clear it via
+/// [`clear_cycle_worktree_path`] once crash recovery has removed it from
+/// disk — unlike [`list_worktree_paths_for_run`], which flattens/dedups
+/// paths for simple removal and loses that association.
+pub struct CycleWorktreeEntry {
+    pub cycle_id: String,
+    pub role: AgentRole,
+    pub path: String,
+}
+
+/// Every non-null worktree path recorded across `run_id`'s cycles, tagged
+/// with the cycle/role it came from. Used by crash recovery so a
+/// successfully removed worktree's path can be cleared afterwards
+/// (issue #6): without that, a `Failed` run would look like it still has
+/// orphaned worktrees forever, since the path column is otherwise never
+/// cleared once a cycle records it.
+pub async fn list_cycle_worktree_entries_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<CycleWorktreeEntry>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id as "id!", coder_worktree_path, reviewer_worktree_path, tester_worktree_path
+        FROM cycles
+        WHERE run_id = ?
+        "#,
+        run_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        if let Some(path) = row.coder_worktree_path {
+            entries.push(CycleWorktreeEntry {
+                cycle_id: row.id.clone(),
+                role: AgentRole::Coder,
+                path,
+            });
+        }
+        if let Some(path) = row.reviewer_worktree_path {
+            entries.push(CycleWorktreeEntry {
+                cycle_id: row.id.clone(),
+                role: AgentRole::Reviewer,
+                path,
+            });
+        }
+        if let Some(path) = row.tester_worktree_path {
+            entries.push(CycleWorktreeEntry {
+                cycle_id: row.id.clone(),
+                role: AgentRole::Tester,
+                path,
+            });
+        }
+    }
+    Ok(entries)
 }
 
 pub async fn insert_finding(
@@ -1060,5 +1222,167 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn unique_backup_path_appends_a_suffix_on_a_same_timestamp_collision() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let timestamp = "2026-07-11T00-00-00+00-00";
+
+        // Nothing on disk yet: the plain, unsuffixed name is used.
+        let first = unique_backup_path(&db_path, timestamp).await.unwrap();
+        assert_eq!(first, dir.path().join(format!("state.db.bak-{timestamp}")));
+
+        // Simulates a leftover/duplicate backup sharing the same timestamp
+        // (e.g. two restarts within the same second) -- `VACUUM INTO` would
+        // otherwise abort on a spurious naming collision rather than a real
+        // backup failure.
+        std::fs::write(&first, b"pre-existing backup").unwrap();
+        let second = unique_backup_path(&db_path, timestamp).await.unwrap();
+        assert_eq!(
+            second,
+            dir.path().join(format!("state.db.bak-{timestamp}-1"))
+        );
+
+        std::fs::write(&second, b"pre-existing backup").unwrap();
+        let third = unique_backup_path(&db_path, timestamp).await.unwrap();
+        assert_eq!(
+            third,
+            dir.path().join(format!("state.db.bak-{timestamp}-2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_cycle_worktree_path_nulls_out_only_the_given_role() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-clear", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-clear", "run-clear", 1)
+            .await
+            .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder, "/tmp/wt/coder")
+            .await
+            .unwrap();
+        set_cycle_worktree_path(
+            &pool,
+            "cycle-clear",
+            AgentRole::Reviewer,
+            "/tmp/wt/reviewer",
+        )
+        .await
+        .unwrap();
+
+        clear_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder)
+            .await
+            .unwrap();
+
+        let entries = list_cycle_worktree_entries_for_run(&pool, "run-clear")
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1, "only the reviewer path should remain");
+        assert_eq!(entries[0].role, AgentRole::Reviewer);
+        assert_eq!(entries[0].path, "/tmp/wt/reviewer");
+    }
+
+    #[tokio::test]
+    async fn failed_run_with_no_open_process_and_no_recorded_worktree_needs_no_cleanup() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-clean-failed", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        update_run_state(&pool, "run-clean-failed", RunState::CoderRunning)
+            .await
+            .unwrap();
+        update_run_state(&pool, "run-clean-failed", RunState::Failed)
+            .await
+            .unwrap();
+
+        let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a Failed run with nothing recorded to clean up must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_run_with_an_open_agent_process_needs_cleanup() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-open-proc", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-open-proc", "run-open-proc", 1)
+            .await
+            .unwrap();
+        insert_agent_process(
+            &pool,
+            "proc-open",
+            "cycle-open-proc",
+            AgentRole::Coder,
+            999_999_998,
+            "/tmp/wt",
+        )
+        .await
+        .unwrap();
+        update_run_state(&pool, "run-open-proc", RunState::Failed)
+            .await
+            .unwrap();
+
+        let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "run-open-proc");
+    }
+
+    #[tokio::test]
+    async fn failed_run_with_a_recorded_worktree_path_needs_cleanup() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-recorded-wt", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-recorded-wt", "run-recorded-wt", 1)
+            .await
+            .unwrap();
+        set_cycle_worktree_path(
+            &pool,
+            "cycle-recorded-wt",
+            AgentRole::Coder,
+            "/tmp/wt/coder",
+        )
+        .await
+        .unwrap();
+        update_run_state(&pool, "run-recorded-wt", RunState::Failed)
+            .await
+            .unwrap();
+
+        let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "run-recorded-wt");
+
+        // Once the path is cleared (simulating a successful removal), the
+        // run must stop being returned -- no separate "cleanup done" flag,
+        // the recorded path itself is the signal.
+        clear_cycle_worktree_path(&pool, "cycle-recorded-wt", AgentRole::Coder)
+            .await
+            .unwrap();
+        let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn intermediate_runs_are_not_returned_by_the_failed_cleanup_query() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-still-running", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        update_run_state(&pool, "run-still-running", RunState::CoderRunning)
+            .await
+            .unwrap();
+
+        let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "a run that isn't Failed yet belongs to list_intermediate_runs, not this query"
+        );
     }
 }

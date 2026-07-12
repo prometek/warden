@@ -673,7 +673,10 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             .unwrap();
         let worktree_path = worktree.path().to_path_buf();
         std::mem::forget(worktree);
-        assert!(worktree_path.exists(), "precondition: orphan worktree exists on disk");
+        assert!(
+            worktree_path.exists(),
+            "precondition: orphan worktree exists on disk"
+        );
 
         warden::db::insert_run(
             &pool,
@@ -801,10 +804,9 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
         !exit_status.success(),
         "no orphan agent process may persist after a crash+restart cycle"
     );
-    let open_processes =
-        warden::db::list_open_agent_processes_for_run(&pool, "orphan-e2e-run")
-            .await
-            .unwrap();
+    let open_processes = warden::db::list_open_agent_processes_for_run(&pool, "orphan-e2e-run")
+        .await
+        .unwrap();
     assert!(
         open_processes.is_empty(),
         "recovery must mark the orphaned agent_processes row ended"
