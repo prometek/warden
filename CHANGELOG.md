@@ -180,3 +180,50 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - **Aucun merge automatique** : `CiProvider`/`ci_watcher` n'exposent aucune
   capacité de merge, quel que soit le statut observé — la décision de merger
   reste entièrement humaine, y compris une fois `ChecksPassed` atteint.
+
+### Added — Phase 8 : moniteur TUI en lecture seule (`warden-tui`)
+
+- Nouveau binaire `warden-tui`, membre du workspace, sous-commande `attach
+  --run-id <ID>` : suit un run en direct depuis un terminal séparé de celui
+  qui l'a lancé, **strictement en lecture seule** (ADR-0008) — aucune
+  commande d'action (approve/fix/skip) ne transite par lui, il n'écrit
+  jamais dans la SQLite de `warden`, ne spawn aucun agent et ne touche
+  jamais git ; ces actions restent explicitement hors périmètre v1
+  (ADR-0008).
+- Event Bus (`warden::event_bus`) : `warden` publie chaque événement
+  significatif d'un run (`RunStarted`, `CycleStarted`, `AgentStarted`,
+  `AgentFinished`, `FindingRaised`, `RunFinished`) sur un socket Unix
+  local propre au run (`~/.warden/runs/<run_id>.sock`, `0600`,
+  publish-only — le module ne lit jamais ce qu'un abonné y écrit, donc
+  aucune commande ne peut remonter jusqu'à l'orchestrateur par ce canal).
+- Nouvelle table `events` (migration `0004_events.sql`) : persiste chaque
+  événement publié pour permettre le replay de l'historique complet d'un
+  run par une attache tardive.
+- `warden-tui` s'abonne au socket **avant** d'interroger l'historique en
+  base (ordre déterminant pour éviter tout trou entre replay et direct),
+  puis fusionne les deux flux par identifiant d'événement (déduplication) :
+  une attache tardive affiche l'historique complet puis bascule sur le
+  direct sans perte ni doublon, y compris sur un run déjà terminé (replay
+  intégral, sans canal direct).
+- Rendu plein écran (`ratatui`) sur un terminal interactif ; sur une sortie
+  standard non-TTY (pipe, redirection), bascule automatique vers un flux
+  NDJSON (un événement par ligne) — les logs partent toujours sur stderr,
+  jamais sur stdout, pour ne pas corrompre ce mode.
+- `warden-tui` ouvre la SQLite de `warden` en connexion strictement lecture
+  seule et duplique sa propre couche de requêtes plutôt que de dépendre du
+  code I/O de `warden`, à l'image de la frontière déjà établie par
+  `warden-gated` (ADR-0006).
+- Détection des capacités graphiques du terminal (Kitty, iTerm2, Sixel, via
+  `ratatui-image`, ADR-0010) et rendu inline de l'evidence quand le
+  protocole le permet, avec fallback sur un visualiseur externe sinon.
+  **Ce qui n'est pas encore câblé** : la Phase 7 (Evidence Capture Adapter,
+  issue #7), qui produirait réellement ces captures, n'est pas encore
+  livrée — le type d'événement `EvidenceCaptured` et la table `EVIDENCE`
+  n'existent pas encore côté production sur cette branche, donc aucune
+  image n'apparaît réellement pour l'instant malgré un rendu fonctionnel et
+  testé ; l'extraction de frame vidéo (`ffmpeg`) et la lecture asciinema en
+  sous-terminal restent, elles, des erreurs typées explicites
+  (`TuiError::NotYetImplemented`), en attendant une source de données
+  réelle pour les exercer.
+- Cache `sqlx` offline propre au crate (`crates/warden-tui/.sqlx/`),
+  indépendant de celui de `warden` et de `warden-gated`.
