@@ -1559,4 +1559,115 @@ mod tests {
              agent_processes row open forever, and the process itself keeps running"
         );
     }
+
+    /// Issue #6 (idempotency, MED): once a crashed run's cleanup has
+    /// genuinely succeeded -- process terminated and its `agent_processes`
+    /// row marked ended, worktree removed and its path cleared from
+    /// `cycles` -- a *second* `recover_crashed_runs` call must find nothing
+    /// left to reclaim for it: it must not be reported as newly failed
+    /// again, and must not error or re-attempt work on resources that are
+    /// already gone. Otherwise every restart would keep "reclaiming" the
+    /// same, already-clean run forever.
+    #[tokio::test]
+    async fn second_recovery_pass_is_a_noop_once_a_failed_runs_cleanup_has_actually_succeeded() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        let worktree = worktree_manager
+            .create("idempotent-recovery-run", "coder", "HEAD")
+            .await
+            .unwrap();
+        let worktree_path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+
+        db::insert_run(
+            &pool,
+            "idempotent-recovery-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "idempotent-recovery-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::insert_cycle(
+            &pool,
+            "idempotent-recovery-cycle",
+            "idempotent-recovery-run",
+            1,
+        )
+        .await
+        .unwrap();
+        db::set_cycle_worktree_path(
+            &pool,
+            "idempotent-recovery-cycle",
+            AgentRole::Coder,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = child.id().unwrap();
+        child.wait().await.unwrap();
+        db::insert_agent_process(
+            &pool,
+            "idempotent-recovery-process",
+            "idempotent-recovery-cycle",
+            AgentRole::Coder,
+            dead_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // First pass: transitions the run to Failed and fully reclaims both
+        // the worktree and the process.
+        let failed = recover_crashed_runs(&pool).await.unwrap();
+        assert_eq!(failed, vec!["idempotent-recovery-run".to_string()]);
+        assert!(
+            !worktree_path.exists(),
+            "precondition: first pass must actually remove the worktree"
+        );
+
+        // Precondition for the real assertion below: cleanup actually
+        // finished (nothing left recorded), not just that the run was
+        // marked Failed -- otherwise this test would not exercise
+        // idempotency at all.
+        let pending_after_first_pass = db::list_failed_runs_with_pending_cleanup(&pool)
+            .await
+            .unwrap();
+        assert!(
+            pending_after_first_pass.is_empty(),
+            "precondition: first pass must leave nothing pending"
+        );
+
+        // Second pass -- simulates the next CLI invocation / restart
+        // finding this already-Failed, already-clean run again. It must
+        // not be reported as newly failed (that already happened on the
+        // first pass), and must complete without error even though there
+        // is nothing left to reclaim.
+        let failed_again = recover_crashed_runs(&pool).await.unwrap();
+        assert!(
+            failed_again.is_empty(),
+            "a run already Failed with nothing pending must not be reported as newly \
+             failed again"
+        );
+
+        let run = db::get_run(&pool, "idempotent-recovery-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
 }
