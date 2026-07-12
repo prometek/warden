@@ -295,6 +295,66 @@ mod tests {
         bus.publish(&sample_record("event-1"));
     }
 
+    /// ADR-0008: "un abonné qui se déconnecte ne doit jamais bloquer
+    /// l'orchestrateur" -- a subscriber that connects but never reads its
+    /// socket must never slow down `publish`, and a second, well-behaved
+    /// subscriber must still receive events promptly regardless of the
+    /// first one falling behind. Publishes well beyond
+    /// [`CHANNEL_CAPACITY`] with sizeable payloads, so a lagging
+    /// subscriber's un-drained OS socket buffer would genuinely fill (and
+    /// its per-connection `forward_to_subscriber` task would stall on
+    /// `write`) if this property did not hold.
+    #[tokio::test]
+    async fn a_lagging_subscriber_never_blocks_publish_or_other_subscribers() {
+        let dir = TempDir::new().unwrap();
+        let bus = EventBus::bind("run-1", dir.path()).await.unwrap();
+
+        // Connected but deliberately never read from.
+        let _lagging_client = UnixStream::connect(bus.socket_path()).await.unwrap();
+        let mut healthy_client = UnixStream::connect(bus.socket_path()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let large_description = "x".repeat(4096);
+        let large_record = |id: String| RunEventRecord {
+            id,
+            run_id: "run-1".to_string(),
+            event: RunEvent::FindingRaised {
+                cycle_number: 1,
+                source: "reviewer".to_string(),
+                severity: "info".to_string(),
+                file: None,
+                description: large_description.clone(),
+                action: None,
+            },
+            created_at: "2026-07-12T00:00:00+00:00".to_string(),
+        };
+
+        let publish_started = tokio::time::Instant::now();
+        // Comfortably beyond both the broadcast channel's bounded capacity
+        // and any reasonable OS Unix-socket buffer size.
+        for i in 0..(CHANNEL_CAPACITY * 4) {
+            bus.publish(&large_record(format!("event-{i}")));
+        }
+        assert!(
+            publish_started.elapsed() < std::time::Duration::from_secs(2),
+            "publish must never block on a subscriber that isn't reading"
+        );
+
+        // The well-behaved subscriber must still receive events promptly --
+        // not starved by the lagging one.
+        let mut reader = BufReader::new(&mut healthy_client);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("healthy subscriber must not be starved by the lagging one")
+        .unwrap();
+        let received: RunEventRecord = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(received.run_id, "run-1");
+    }
+
     /// Read-only enforcement: nothing this module does ever consumes bytes
     /// written by a subscriber. Writing to the socket from the client side
     /// must have no effect the orchestrator could observe -- there is no
