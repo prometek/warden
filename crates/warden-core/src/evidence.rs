@@ -156,3 +156,138 @@ pub fn select_evidence_tool(
         ProjectType::Cli => EvidenceTool::Asciinema,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------
+    // Project-type detection (ADR-0009 acceptance criterion 1: "web
+    // project -> Playwright selected; CLI project -> asciinema selected").
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn detect_project_type_returns_web_for_a_known_marker_file() {
+        let markers = ProjectMarkers {
+            root_entries: vec!["index.html".to_string(), "src".to_string()],
+            package_json_dependencies: vec![],
+        };
+        assert_eq!(detect_project_type(&markers), ProjectType::Web);
+    }
+
+    #[test]
+    fn detect_project_type_returns_web_for_a_known_framework_dependency() {
+        let markers = ProjectMarkers {
+            root_entries: vec!["package.json".to_string()],
+            package_json_dependencies: vec!["react".to_string(), "lodash".to_string()],
+        };
+        assert_eq!(detect_project_type(&markers), ProjectType::Web);
+    }
+
+    #[test]
+    fn detect_project_type_returns_cli_when_no_web_signal_is_present() {
+        let markers = ProjectMarkers {
+            root_entries: vec!["Cargo.toml".to_string(), "src".to_string()],
+            package_json_dependencies: vec![],
+        };
+        assert_eq!(detect_project_type(&markers), ProjectType::Cli);
+    }
+
+    #[test]
+    fn detect_project_type_ignores_unrelated_package_json_dependencies() {
+        // A package.json exists (e.g. a Node-based CLI tool) but declares
+        // none of the front-end/web-serving frameworks ADR-0009 lists --
+        // must not be misclassified as Web just because *some*
+        // package.json is present.
+        let markers = ProjectMarkers {
+            root_entries: vec!["package.json".to_string(), "bin".to_string()],
+            package_json_dependencies: vec!["commander".to_string(), "chalk".to_string()],
+        };
+        assert_eq!(detect_project_type(&markers), ProjectType::Cli);
+    }
+
+    #[test]
+    fn detect_project_type_with_no_markers_at_all_defaults_to_cli() {
+        assert_eq!(
+            detect_project_type(&ProjectMarkers::default()),
+            ProjectType::Cli
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Tool selection (acceptance criterion 2: "config override
+    // evidence.tool always wins over auto-detection").
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn select_evidence_tool_follows_detected_project_type_when_no_override_is_given() {
+        assert_eq!(
+            select_evidence_tool(ProjectType::Web, None),
+            EvidenceTool::Playwright
+        );
+        assert_eq!(
+            select_evidence_tool(ProjectType::Cli, None),
+            EvidenceTool::Asciinema
+        );
+    }
+
+    #[test]
+    fn select_evidence_tool_override_wins_over_a_web_detected_project() {
+        assert_eq!(
+            select_evidence_tool(ProjectType::Web, Some(EvidenceTool::Asciinema)),
+            EvidenceTool::Asciinema,
+            "an explicit evidence.tool override must always win over auto-detection"
+        );
+    }
+
+    #[test]
+    fn select_evidence_tool_override_wins_over_a_cli_detected_project() {
+        assert_eq!(
+            select_evidence_tool(ProjectType::Cli, Some(EvidenceTool::Playwright)),
+            EvidenceTool::Playwright,
+            "an explicit evidence.tool override must always win over auto-detection"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // EvidenceTool / EvidenceType parse+as_str -- the closed-set
+    // boundary validation `main.rs`'s `--evidence-tool` and `db.rs`'s
+    // stored `evidence.type` column both rely on.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn evidence_tool_as_str_and_parse_round_trip() {
+        for tool in [EvidenceTool::Playwright, EvidenceTool::Asciinema] {
+            assert_eq!(EvidenceTool::parse(tool.as_str()).unwrap(), tool);
+        }
+    }
+
+    #[test]
+    fn evidence_tool_parse_rejects_an_unknown_value() {
+        let result = EvidenceTool::parse("selenium");
+        assert!(
+            matches!(result, Err(CoreError::UnknownEvidenceTool(value)) if value == "selenium")
+        );
+    }
+
+    #[test]
+    fn evidence_type_as_str_and_parse_round_trip() {
+        for evidence_type in [
+            EvidenceType::Image,
+            EvidenceType::Video,
+            EvidenceType::Log,
+            EvidenceType::Other,
+        ] {
+            assert_eq!(
+                EvidenceType::parse(evidence_type.as_str()).unwrap(),
+                evidence_type
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_type_parse_rejects_an_unknown_value() {
+        let result = EvidenceType::parse("audio");
+        assert!(matches!(result, Err(CoreError::UnknownEvidenceType(value)) if value == "audio"));
+    }
+}

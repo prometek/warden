@@ -143,3 +143,148 @@ fn format_evidence_section(evidence: &[EvidenceSummary], repo_slug: &str, branch
     }
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_summary() -> RunSummary {
+        RunSummary {
+            run_id: "run-1".to_string(),
+            intent: "make the button clickable".to_string(),
+            final_state: RunState::Converged,
+            cycles: vec![CycleSummary {
+                cycle_number: 1,
+                findings: vec![],
+            }],
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Acceptance criterion 6: the Evidence section is absent when there
+    // is no evidence.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pr_body_omits_the_evidence_section_when_no_evidence_was_captured() {
+        let body = pr_body_from_run(&run_summary(), &[], "owner/repo", "main");
+        assert!(
+            !body.contains("## Evidence"),
+            "PR body must not contain an Evidence section when nothing was captured: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_includes_the_evidence_section_when_evidence_is_present() {
+        let evidence = vec![EvidenceSummary {
+            cycle_number: 1,
+            evidence_type: EvidenceType::Image,
+            repo_relative_path: ".warden/evidence/1/screenshot.png".to_string(),
+            description: "login screen".to_string(),
+        }];
+        let body = pr_body_from_run(&run_summary(), &evidence, "owner/repo", "main");
+        assert!(body.contains("## Evidence"), "body was: {body}");
+    }
+
+    // -----------------------------------------------------------------
+    // Images render inline via the raw.githubusercontent.com URL.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pr_body_renders_image_evidence_inline_via_the_raw_content_url() {
+        let evidence = vec![EvidenceSummary {
+            cycle_number: 1,
+            evidence_type: EvidenceType::Image,
+            repo_relative_path: ".warden/evidence/1/screenshot.png".to_string(),
+            description: "login screen".to_string(),
+        }];
+        let body = pr_body_from_run(&run_summary(), &evidence, "acme/widgets", "feature-branch");
+
+        let expected = "![login screen](https://raw.githubusercontent.com/acme/widgets/feature-branch/.warden/evidence/1/screenshot.png)";
+        assert!(
+            body.contains(expected),
+            "expected inline image markdown {expected:?} in body: {body}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Video/log/asciinema (Other) evidence renders as a clickable link,
+    // never inline.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pr_body_renders_video_evidence_as_a_clickable_link_not_inline() {
+        let evidence = vec![EvidenceSummary {
+            cycle_number: 1,
+            evidence_type: EvidenceType::Video,
+            repo_relative_path: ".warden/evidence/1/failure.webm".to_string(),
+            description: "failure recording".to_string(),
+        }];
+        let body = pr_body_from_run(&run_summary(), &evidence, "acme/widgets", "main");
+
+        let expected = "[failure recording](https://raw.githubusercontent.com/acme/widgets/main/.warden/evidence/1/failure.webm)";
+        assert!(body.contains(expected), "body was: {body}");
+        assert!(
+            !body.contains(&format!("!{expected}")),
+            "a video must be a link, not embedded inline: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_renders_asciinema_recording_evidence_as_a_clickable_link() {
+        // asciinema recordings are always typed EvidenceType::Other (see
+        // AsciinemaAdapter in evidence.rs).
+        let evidence = vec![EvidenceSummary {
+            cycle_number: 2,
+            evidence_type: EvidenceType::Other,
+            repo_relative_path: ".warden/evidence/2/session.cast".to_string(),
+            description: "asciinema recording of the cycle's tester command".to_string(),
+        }];
+        let body = pr_body_from_run(&run_summary(), &evidence, "acme/widgets", "main");
+
+        let expected = "[asciinema recording of the cycle's tester command](https://raw.githubusercontent.com/acme/widgets/main/.warden/evidence/2/session.cast)";
+        assert!(body.contains(expected), "body was: {body}");
+        assert!(!body.contains(&format!("!{expected}")), "body was: {body}");
+    }
+
+    #[test]
+    fn pr_body_renders_log_evidence_as_a_clickable_link_not_inline() {
+        let evidence = vec![EvidenceSummary {
+            cycle_number: 1,
+            evidence_type: EvidenceType::Log,
+            repo_relative_path: ".warden/evidence/1/run.log".to_string(),
+            description: "test run log".to_string(),
+        }];
+        let body = pr_body_from_run(&run_summary(), &evidence, "acme/widgets", "main");
+
+        assert!(body.contains(
+            "[test run log](https://raw.githubusercontent.com/acme/widgets/main/.warden/evidence/1/run.log)"
+        ));
+        assert!(
+            !body.contains("!["),
+            "a log must never be rendered inline: {body}"
+        );
+    }
+
+    #[test]
+    fn pr_body_renders_multiple_evidence_items_grouped_by_their_own_cycle_number() {
+        let evidence = vec![
+            EvidenceSummary {
+                cycle_number: 1,
+                evidence_type: EvidenceType::Image,
+                repo_relative_path: ".warden/evidence/1/shot.png".to_string(),
+                description: "cycle 1 shot".to_string(),
+            },
+            EvidenceSummary {
+                cycle_number: 2,
+                evidence_type: EvidenceType::Image,
+                repo_relative_path: ".warden/evidence/2/shot.png".to_string(),
+                description: "cycle 2 shot".to_string(),
+            },
+        ];
+        let body = pr_body_from_run(&run_summary(), &evidence, "acme/widgets", "main");
+
+        assert!(body.contains("**Cycle 1** — ![cycle 1 shot]"));
+        assert!(body.contains("**Cycle 2** — ![cycle 2 shot]"));
+    }
+}

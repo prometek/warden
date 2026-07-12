@@ -1835,4 +1835,62 @@ mod tests {
             .unwrap();
         assert_eq!(run.state, RunState::Failed);
     }
+
+    /// Acceptance criterion 7 (issue #7, ADR-0009): "a missing/failing
+    /// evidence tool is non-fatal -- a converging run still converges".
+    /// Exercised directly against `Orchestrator::run_convergence_loop`
+    /// (see `tests/cli.rs` for the same behaviour driven through the real
+    /// `warden` binary): the tester's own project has no web markers, so
+    /// asciinema is selected, and asciinema is genuinely not on `PATH` in
+    /// this test environment -- the run must still converge, and no
+    /// evidence row must have been recorded for it.
+    #[tokio::test]
+    async fn evidence_capture_failure_does_not_prevent_convergence() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "converge even though no evidence tool is installed".to_string(),
+            max_cycles: 3,
+            coder_command: AgentCommand::new(
+                "sh",
+                [
+                    "-c",
+                    "echo hi >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle",
+                ],
+            ),
+            reviewer_command: AgentCommand::new("sh", ["-c", "true"]),
+            tester_command: always_passing_tester(),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::Converged,
+            "a missing evidence tool must not fail an otherwise-converging run"
+        );
+
+        let evidence = db::list_evidence_for_run(&pool, &run_id).await.unwrap();
+        assert!(
+            evidence.is_empty(),
+            "no evidence row should be recorded when the capture tool is unavailable"
+        );
+
+        // With no evidence captured, the converged commit is just the
+        // coder's own commit -- no evidence-only commit is created on top.
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert!(run.converged_commit_sha.is_some());
+    }
 }

@@ -1470,6 +1470,174 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    // -----------------------------------------------------------------
+    // EVIDENCE entity (ADR-0009, issue #7): insert + query back
+    // (migration 0004_evidence).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn evidence_round_trips_through_insert_and_list_evidence_for_run() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-evidence", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-evidence", "run-evidence", 1)
+            .await
+            .unwrap();
+
+        insert_evidence(
+            &pool,
+            "evidence-1",
+            "cycle-evidence",
+            None,
+            EvidenceType::Image,
+            ".warden/evidence/1/screenshot.png",
+            "Playwright capture from the cycle's e2e test run",
+        )
+        .await
+        .unwrap();
+
+        let evidence = list_evidence_for_run(&pool, "run-evidence").await.unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].cycle_number, 1);
+        assert_eq!(evidence[0].evidence.id, "evidence-1");
+        assert_eq!(evidence[0].evidence.cycle_id, "cycle-evidence");
+        assert_eq!(evidence[0].evidence.finding_id, None);
+        assert_eq!(evidence[0].evidence.evidence_type, EvidenceType::Image);
+        assert_eq!(
+            evidence[0].evidence.file_path,
+            ".warden/evidence/1/screenshot.png"
+        );
+        assert_eq!(
+            evidence[0].evidence.description,
+            "Playwright capture from the cycle's e2e test run"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_can_be_linked_to_a_specific_finding() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-evidence-finding",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        insert_cycle(&pool, "cycle-evidence-finding", "run-evidence-finding", 1)
+            .await
+            .unwrap();
+        let finding = Finding {
+            source: FindingSource::Tester,
+            severity: Severity::Blocking,
+            file: Some("src/lib.rs".to_string()),
+            description: "flaky button".to_string(),
+            action: Some("fix it".to_string()),
+        };
+        insert_finding(
+            &pool,
+            "finding-evidence",
+            "cycle-evidence-finding",
+            &finding,
+        )
+        .await
+        .unwrap();
+
+        insert_evidence(
+            &pool,
+            "evidence-linked",
+            "cycle-evidence-finding",
+            Some("finding-evidence"),
+            EvidenceType::Video,
+            ".warden/evidence/1/failure.webm",
+            "video of the observed failure",
+        )
+        .await
+        .unwrap();
+
+        let evidence = list_evidence_for_run(&pool, "run-evidence-finding")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].evidence.finding_id.as_deref(),
+            Some("finding-evidence")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_evidence_for_run_is_empty_when_no_evidence_was_captured() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-no-evidence", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-no-evidence", "run-no-evidence", 1)
+            .await
+            .unwrap();
+
+        let evidence = list_evidence_for_run(&pool, "run-no-evidence")
+            .await
+            .unwrap();
+        assert!(evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_evidence_for_run_orders_by_cycle_number_then_capture_time() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-evidence-order",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        insert_cycle(&pool, "cycle-2", "run-evidence-order", 2)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-1", "run-evidence-order", 1)
+            .await
+            .unwrap();
+
+        // Deliberately inserted out of cycle order: cycle 2's evidence
+        // lands in the table first, but must still be listed *after*
+        // cycle 1's when read back.
+        insert_evidence(
+            &pool,
+            "evidence-cycle-2",
+            "cycle-2",
+            None,
+            EvidenceType::Other,
+            ".warden/evidence/2/session.cast",
+            "cycle 2 recording",
+        )
+        .await
+        .unwrap();
+        insert_evidence(
+            &pool,
+            "evidence-cycle-1",
+            "cycle-1",
+            None,
+            EvidenceType::Other,
+            ".warden/evidence/1/session.cast",
+            "cycle 1 recording",
+        )
+        .await
+        .unwrap();
+
+        let evidence = list_evidence_for_run(&pool, "run-evidence-order")
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].cycle_number, 1);
+        assert_eq!(evidence[1].cycle_number, 2);
+    }
+
     #[tokio::test]
     async fn intermediate_runs_are_not_returned_by_the_failed_cleanup_query() {
         let (_dir, pool) = test_pool().await;

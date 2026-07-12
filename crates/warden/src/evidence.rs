@@ -472,3 +472,303 @@ async fn git_head_commit(cwd: &Path) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as SyncCommand;
+
+    use tempfile::TempDir;
+
+    use crate::db::Evidence;
+    use crate::error::{ProcessError, WardenError};
+
+    fn init_test_repo() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        let run = |args: &[&str]| {
+            let status = SyncCommand::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@warden.local"]);
+        run(&["config", "user.name", "warden-test"]);
+        std::fs::write(dir.path().join("README.md"), "warden test repo\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "initial commit"]);
+        dir
+    }
+
+    fn head_commit(repo: &Path) -> String {
+        let output = SyncCommand::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    // -----------------------------------------------------------------
+    // scan_project_markers: the I/O boundary that feeds
+    // warden_core::detect_project_type.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scan_project_markers_collects_root_entries_and_merged_package_json_dependencies() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"lodash":"1.0.0"},"devDependencies":{"react":"18.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("index.js"), "console.log('hi')").unwrap();
+
+        let markers = scan_project_markers(dir.path()).await.unwrap();
+
+        assert!(markers.root_entries.contains(&"package.json".to_string()));
+        assert!(markers.root_entries.contains(&"index.js".to_string()));
+        assert_eq!(
+            markers.package_json_dependencies,
+            vec!["lodash".to_string(), "react".to_string()],
+            "dependencies and devDependencies must be merged, sorted, and deduped"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_project_markers_returns_empty_dependencies_when_no_package_json_exists() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+
+        let markers = scan_project_markers(dir.path()).await.unwrap();
+
+        assert!(markers.package_json_dependencies.is_empty());
+        assert_eq!(
+            warden_core::detect_project_type(&markers),
+            warden_core::ProjectType::Cli
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_project_markers_detects_a_web_marker_file_end_to_end_into_project_type() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+
+        let markers = scan_project_markers(dir.path()).await.unwrap();
+
+        assert_eq!(
+            warden_core::detect_project_type(&markers),
+            warden_core::ProjectType::Web
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_project_markers_errors_on_malformed_package_json_instead_of_silently_ignoring_it()
+    {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{ not valid json").unwrap();
+
+        let result = scan_project_markers(dir.path()).await;
+
+        assert!(
+            matches!(result, Err(WardenError::InvalidPackageJson { .. })),
+            "a malformed package.json must be a typed error, not treated as \"no dependencies\": {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // capture_evidence: tool selection dispatches to the right adapter,
+    // and a missing tool binary is a typed, non-panicking error
+    // (acceptance criterion 7 relies on this staying an ordinary `Err`).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn capture_evidence_override_beats_web_detection_and_dispatches_to_asciinema() {
+        // Markers look unambiguously like a web project (an `index.html`
+        // marker file) -- without an override this would select
+        // Playwright. The override must still win (acceptance criterion
+        // 2), which we observe here by checking *which binary* capture
+        // actually tried to spawn: `asciinema`, not `npx`/playwright.
+        let markers = warden_core::ProjectMarkers {
+            root_entries: vec!["index.html".to_string()],
+            package_json_dependencies: vec![],
+        };
+        let worktree_dir = TempDir::new().unwrap();
+        let scratch_dir = TempDir::new().unwrap();
+        let ctx = EvidenceCaptureContext {
+            worktree_path: worktree_dir.path(),
+            scratch_dir: scratch_dir.path(),
+            cycle_number: 1,
+            record_command: &AgentCommand::new("sh", ["-c", "true"]),
+            cancel: CancellationToken::new(),
+        };
+
+        let result = capture_evidence(&markers, Some(EvidenceTool::Asciinema), &ctx).await;
+
+        match result {
+            Err(WardenError::Process(ProcessError::Spawn { command, .. })) => {
+                assert_eq!(
+                    command, "asciinema",
+                    "override must dispatch to the asciinema adapter even though the project looks like Web"
+                );
+            }
+            other => panic!(
+                "expected a Spawn error for the (assumed absent) `asciinema` binary, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_evidence_missing_tool_binary_is_a_typed_error_not_a_panic() {
+        let markers = warden_core::ProjectMarkers::default(); // Cli -> asciinema
+        let worktree_dir = TempDir::new().unwrap();
+        let scratch_dir = TempDir::new().unwrap();
+        let ctx = EvidenceCaptureContext {
+            worktree_path: worktree_dir.path(),
+            scratch_dir: scratch_dir.path(),
+            cycle_number: 1,
+            record_command: &AgentCommand::new("sh", ["-c", "true"]),
+            cancel: CancellationToken::new(),
+        };
+
+        // acceptance criterion 7: a missing tool must surface as an
+        // ordinary Result::Err the caller can catch and log -- never a
+        // panic that would take the whole run down with it.
+        let result = capture_evidence(&markers, None, &ctx).await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // commit_evidence_into_repo (acceptance criterion 4: artifacts are
+    // stored locally first and only committed at convergence, under
+    // `.warden/evidence/<cycle>/`, never touching the user's main repo
+    // working tree/branch before that).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn commit_evidence_into_repo_returns_base_commit_unchanged_when_there_is_no_evidence() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        let base_commit = head_commit(repo.path());
+
+        let result = commit_evidence_into_repo(
+            &worktree_manager,
+            repo.path(),
+            warden_home.path(),
+            "run-no-evidence",
+            &base_commit,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result, base_commit,
+            "with no captured evidence, the commit to converge on must be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_evidence_into_repo_commits_artifacts_under_dot_warden_evidence_cycle_dir() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        let base_commit = head_commit(repo.path());
+        let run_id = "run-with-evidence";
+
+        // Simulates what `capture_evidence_for_cycle` already staged on
+        // local scratch storage during the cycle, before this ever runs.
+        let scratch_dir = warden_home.path().join("evidence").join(run_id).join("1");
+        tokio::fs::create_dir_all(&scratch_dir).await.unwrap();
+        tokio::fs::write(scratch_dir.join("screenshot.png"), b"fake-png-bytes")
+            .await
+            .unwrap();
+
+        let evidence = vec![EvidenceWithCycle {
+            cycle_number: 1,
+            evidence: Evidence {
+                id: "evidence-1".to_string(),
+                cycle_id: "cycle-1".to_string(),
+                finding_id: None,
+                evidence_type: EvidenceType::Image,
+                file_path: ".warden/evidence/1/screenshot.png".to_string(),
+                description: "Playwright capture".to_string(),
+                captured_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        }];
+
+        let new_commit = commit_evidence_into_repo(
+            &worktree_manager,
+            repo.path(),
+            warden_home.path(),
+            run_id,
+            &base_commit,
+            &evidence,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            new_commit, base_commit,
+            "committing evidence must produce a new commit on top of base_commit"
+        );
+
+        // The artifact must actually be present in that commit's tree...
+        let show = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args([
+                "show",
+                &format!("{new_commit}:.warden/evidence/1/screenshot.png"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            show.status.success(),
+            "expected .warden/evidence/1/screenshot.png inside the evidence commit"
+        );
+        assert_eq!(show.stdout, b"fake-png-bytes");
+
+        // ...reachable via the protective ref (mirrors
+        // orchestrator::protect_cycle_commit's rationale: worktrees share
+        // the main repo's object store).
+        let ref_lookup = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", &format!("refs/warden/runs/{run_id}/evidence")])
+            .output()
+            .unwrap();
+        assert!(ref_lookup.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&ref_lookup.stdout).trim(),
+            new_commit
+        );
+
+        // ...and the main repo's own checked-out branch/working tree must
+        // be completely untouched -- evidence is committed on an isolated
+        // ref, never merged/checked out into the user's repo (ADR-0007:
+        // "jamais avant Finalize").
+        assert_eq!(
+            head_commit(repo.path()),
+            base_commit,
+            "the main repo's checked-out HEAD must not move"
+        );
+        let status = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "the main repo's working tree must stay clean: {:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert!(
+            !repo.path().join(".warden").exists(),
+            "evidence must never land inside the main repo's own working tree"
+        );
+    }
+}
