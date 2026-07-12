@@ -180,3 +180,48 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - **Aucun merge automatique** : `CiProvider`/`ci_watcher` n'exposent aucune
   capacité de merge, quel que soit le statut observé — la décision de merger
   reste entièrement humaine, y compris une fois `ChecksPassed` atteint.
+
+### Added — Phase 7 : Evidence Capture Adapter (`warden`)
+
+- Nouveau module `evidence`, réparti entre `warden-core` (classification pure :
+  détection du type de projet, choix de l'outil) et `warden` (I/O : scan du
+  repo, capture, commit) : après chaque cycle dont le tester ne remonte aucun
+  finding bloquant, capture une **preuve tangible** de son succès (ADR-0009)
+  dans le worktree du tester, avant sa suppression — **Playwright** pour un
+  projet web/UI (`npx playwright test`, captures d'écran/vidéos récoltées sous
+  `test-results/`), **asciinema** sinon (enregistrement de la commande tester
+  elle-même via `asciinema rec`).
+- Détection automatique du type de projet (marker de fichier comme
+  `index.html`, ou dépendance `package.json` de framework front), toujours
+  surclassée par un override explicite : `evidence.tool` / `--evidence-tool
+  <playwright|asciinema>`.
+- Nouvelle table `evidence` (migration `0004_evidence.sql`) : un artefact par
+  ligne (`type`, `file_path`, `description`, `captured_at`), rattaché à un
+  cycle et, optionnellement, à un finding précis qu'il documente la
+  résolution.
+- `evidence.store_in_repo` / `--evidence-store-in-repo <true|false>` (activé
+  par défaut) : les artefacts, d'abord stockés en local
+  (`<warden-home>/evidence/<run_id>/<cycle>/`, jamais dans un dépôt git), sont
+  commités sous `.warden/evidence/<cycle>/` dans un commit dédié au moment de
+  la convergence — jamais poussés avant `Finalize` (ADR-0007). Un run
+  converge normalement même si ce commit d'évidence échoue (disque plein,
+  permissions, ...) : il est alors journalisé et le run converge sans preuve
+  attachée plutôt que d'échouer.
+- Nouveau renderer `warden_core::format_evidence_section`, appelé par
+  `warden-gated::pr_manager::finalize` : section **Evidence** du corps de la
+  PR finalisée (images intégrées en inline via l'URL de contenu brut du
+  dépôt, vidéos/logs/enregistrements asciinema en lien cliquable, chemins
+  percent-encodés segment par segment pour survivre aux titres de test
+  Playwright contenant espaces/parenthèses).
+- Capture non bloquante par construction : un outil de capture absent ou en
+  échec (Playwright/asciinema non installés, aucun artefact produit, ...) est
+  journalisé (`tracing::warn!`) et n'interrompt jamais un run par ailleurs
+  convergent — l'absence de preuve pour un cycle donné n'est jamais traitée
+  comme un finding bloquant.
+- *Ce qui n'est pas encore câblé* : la capture et le commit des preuves dans
+  le dépôt sont pleinement automatiques dès qu'un run converge, mais leur
+  apparition dans une vraie PR GitHub dépend du déclenchement réel de
+  `Finalize` depuis l'orchestrateur `warden` vers `warden-gated`, qui n'existe
+  pas encore (comme pour le reste du PR Manager, Phase 4) — le formatter de
+  la section Evidence est déjà câblé et testé de bout en bout côté
+  `warden-gated::finalize`, il ne manque que son déclenchement en production.
