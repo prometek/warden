@@ -10,7 +10,12 @@ des agents.
 Phase 1 (fondations), Phase 2 (parallélisme réel) et Phase 3 (gate git) sont livrées :
 un workspace Cargo avec le binaire `warden` (orchestrateur), capable de piloter une boucle
 de convergence (coder → review/test → reboucle si besoin) avec persistance SQLite et
-reprise après crash. Reviewer et tester tournent **en parallèle** (`tokio::join!`), chacun
+reprise après crash : au redémarrage, tout run laissé dans un état intermédiaire sans
+processus agent vivant est marqué `Failed`, et les ressources qu'il a pu laisser
+orphelines (worktrees git, processus agents encore en vie) sont automatiquement
+récupérées — y compris si un second crash interrompt la récupération elle-même. Une
+sauvegarde de la base SQLite est également prise avant toute migration de schéma.
+Reviewer et tester tournent **en parallèle** (`tokio::join!`), chacun
 dans son propre worktree synchronisé sur le commit du coder. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
