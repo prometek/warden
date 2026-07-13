@@ -27,6 +27,8 @@ pub enum CoreError {
     #[error("malformed agent output: {0}")]
     MalformedAgentOutput(String),
 
+    #[error("unknown event kind: {0:?}")]
+    UnknownEventKind(String),
     #[error("unknown evidence type: {0:?}")]
     UnknownEvidenceType(String),
 

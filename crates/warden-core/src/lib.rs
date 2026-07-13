@@ -3,9 +3,15 @@
 //! This crate contains no I/O: no filesystem, no subprocess, no database. It
 //! is the state machine and convergence rules that decide *what* should
 //! happen next; the `warden` binary crate decides *how* to make it happen.
+//! The one narrow exception is [`resolve_socket_path`], which reads
+//! `std::env::temp_dir()` (an environment/OS constant lookup, not a
+//! filesystem access) -- see its module docs for why it lives here rather
+//! than duplicated per-crate like the rest of the I/O layer.
 
 mod convergence;
 mod error;
+mod event;
+mod socket;
 mod evidence;
 mod pr_body;
 mod state;
@@ -15,6 +21,8 @@ pub use convergence::{
     FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
+pub use event::{EventKind, RunEvent, RunEventRecord};
+pub use socket::{resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use evidence::{
     detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,
     ProjectType,

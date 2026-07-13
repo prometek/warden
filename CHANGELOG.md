@@ -181,47 +181,49 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   capacité de merge, quel que soit le statut observé — la décision de merger
   reste entièrement humaine, y compris une fois `ChecksPassed` atteint.
 
-### Added — Phase 7 : Evidence Capture Adapter (`warden`)
+### Added — Phase 8 : moniteur TUI en lecture seule (`warden-tui`)
 
-- Nouveau module `evidence`, réparti entre `warden-core` (classification pure :
-  détection du type de projet, choix de l'outil) et `warden` (I/O : scan du
-  repo, capture, commit) : après chaque cycle dont le tester ne remonte aucun
-  finding bloquant, capture une **preuve tangible** de son succès (ADR-0009)
-  dans le worktree du tester, avant sa suppression — **Playwright** pour un
-  projet web/UI (`npx playwright test`, captures d'écran/vidéos récoltées sous
-  `test-results/`), **asciinema** sinon (enregistrement de la commande tester
-  elle-même via `asciinema rec`).
-- Détection automatique du type de projet (marker de fichier comme
-  `index.html`, ou dépendance `package.json` de framework front), toujours
-  surclassée par un override explicite : `evidence.tool` / `--evidence-tool
-  <playwright|asciinema>`.
-- Nouvelle table `evidence` (migration `0004_evidence.sql`) : un artefact par
-  ligne (`type`, `file_path`, `description`, `captured_at`), rattaché à un
-  cycle et, optionnellement, à un finding précis qu'il documente la
-  résolution.
-- `evidence.store_in_repo` / `--evidence-store-in-repo <true|false>` (activé
-  par défaut) : les artefacts, d'abord stockés en local
-  (`<warden-home>/evidence/<run_id>/<cycle>/`, jamais dans un dépôt git), sont
-  commités sous `.warden/evidence/<cycle>/` dans un commit dédié au moment de
-  la convergence — jamais poussés avant `Finalize` (ADR-0007). Un run
-  converge normalement même si ce commit d'évidence échoue (disque plein,
-  permissions, ...) : il est alors journalisé et le run converge sans preuve
-  attachée plutôt que d'échouer.
-- Nouveau renderer `warden_core::format_evidence_section`, appelé par
-  `warden-gated::pr_manager::finalize` : section **Evidence** du corps de la
-  PR finalisée (images intégrées en inline via l'URL de contenu brut du
-  dépôt, vidéos/logs/enregistrements asciinema en lien cliquable, chemins
-  percent-encodés segment par segment pour survivre aux titres de test
-  Playwright contenant espaces/parenthèses).
-- Capture non bloquante par construction : un outil de capture absent ou en
-  échec (Playwright/asciinema non installés, aucun artefact produit, ...) est
-  journalisé (`tracing::warn!`) et n'interrompt jamais un run par ailleurs
-  convergent — l'absence de preuve pour un cycle donné n'est jamais traitée
-  comme un finding bloquant.
-- *Ce qui n'est pas encore câblé* : la capture et le commit des preuves dans
-  le dépôt sont pleinement automatiques dès qu'un run converge, mais leur
-  apparition dans une vraie PR GitHub dépend du déclenchement réel de
-  `Finalize` depuis l'orchestrateur `warden` vers `warden-gated`, qui n'existe
-  pas encore (comme pour le reste du PR Manager, Phase 4) — le formatter de
-  la section Evidence est déjà câblé et testé de bout en bout côté
-  `warden-gated::finalize`, il ne manque que son déclenchement en production.
+- Nouveau binaire `warden-tui`, membre du workspace, sous-commande `attach
+  --run-id <ID>` : suit un run en direct depuis un terminal séparé de celui
+  qui l'a lancé, **strictement en lecture seule** (ADR-0008) — aucune
+  commande d'action (approve/fix/skip) ne transite par lui, il n'écrit
+  jamais dans la SQLite de `warden`, ne spawn aucun agent et ne touche
+  jamais git ; ces actions restent explicitement hors périmètre v1
+  (ADR-0008).
+- Event Bus (`warden::event_bus`) : `warden` publie chaque événement
+  significatif d'un run (`RunStarted`, `CycleStarted`, `AgentStarted`,
+  `AgentFinished`, `FindingRaised`, `RunFinished`) sur un socket Unix
+  local propre au run (`~/.warden/runs/<run_id>.sock`, `0600`,
+  publish-only — le module ne lit jamais ce qu'un abonné y écrit, donc
+  aucune commande ne peut remonter jusqu'à l'orchestrateur par ce canal).
+- Nouvelle table `events` (migration `0004_events.sql`) : persiste chaque
+  événement publié pour permettre le replay de l'historique complet d'un
+  run par une attache tardive.
+- `warden-tui` s'abonne au socket **avant** d'interroger l'historique en
+  base (ordre déterminant pour éviter tout trou entre replay et direct),
+  puis fusionne les deux flux par identifiant d'événement (déduplication) :
+  une attache tardive affiche l'historique complet puis bascule sur le
+  direct sans perte ni doublon, y compris sur un run déjà terminé (replay
+  intégral, sans canal direct).
+- Rendu plein écran (`ratatui`) sur un terminal interactif ; sur une sortie
+  standard non-TTY (pipe, redirection), bascule automatique vers un flux
+  NDJSON (un événement par ligne) — les logs partent toujours sur stderr,
+  jamais sur stdout, pour ne pas corrompre ce mode.
+- `warden-tui` ouvre la SQLite de `warden` en connexion strictement lecture
+  seule et duplique sa propre couche de requêtes plutôt que de dépendre du
+  code I/O de `warden`, à l'image de la frontière déjà établie par
+  `warden-gated` (ADR-0006).
+- Détection des capacités graphiques du terminal (Kitty, iTerm2, Sixel, via
+  `ratatui-image`, ADR-0010) et rendu inline de l'evidence quand le
+  protocole le permet, avec fallback sur un visualiseur externe sinon.
+  **Ce qui n'est pas encore câblé** : la Phase 7 (Evidence Capture Adapter,
+  issue #7), qui produirait réellement ces captures, n'est pas encore
+  livrée — le type d'événement `EvidenceCaptured` et la table `EVIDENCE`
+  n'existent pas encore côté production sur cette branche, donc aucune
+  image n'apparaît réellement pour l'instant malgré un rendu fonctionnel et
+  testé ; l'extraction de frame vidéo (`ffmpeg`) et la lecture asciinema en
+  sous-terminal restent, elles, des erreurs typées explicites
+  (`TuiError::NotYetImplemented`), en attendant une source de données
+  réelle pour les exercer.
+- Cache `sqlx` offline propre au crate (`crates/warden-tui/.sqlx/`),
+  indépendant de celui de `warden` et de `warden-gated`.

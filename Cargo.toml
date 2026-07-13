@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/warden-core", "crates/warden", "crates/warden-gated"]
+members = ["crates/warden-core", "crates/warden", "crates/warden-gated", "crates/warden-tui"]
 
 [workspace.package]
 edition = "2021"
@@ -8,6 +8,7 @@ license = "MIT"
 
 # Phase 3 scope: `warden-gated` (the git gate daemon) has now joined the
 # workspace alongside `warden-core` (pure logic) and `warden` (orchestrator
-# binary) -- see ADR-0002/ADR-0006 and issue #3. `warden-tui` (Phase 8) will
-# join as its own member when that phase starts -- no stub crate is added
-# ahead of time.
+# binary) -- see ADR-0002/ADR-0006 and issue #3. Phase 8 (issue #8) adds
+# `warden-tui`: a fourth, strictly read-only binary that subscribes to the
+# Event Bus + replays the `events` table (ADR-0008) -- it never shares I/O
+# code with `warden` any more than `warden-gated` does.

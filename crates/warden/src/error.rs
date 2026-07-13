@@ -142,6 +142,35 @@ pub enum WardenError {
         source: sqlx::Error,
     },
 
+    /// `RunEvent` (de)serialization to/from `events.payload_json` failed --
+    /// covers both directions (encode on `insert_event`, decode on
+    /// `list_events_for_run`), since only one `#[from] serde_json::Error`
+    /// variant can exist per enum.
+    #[error("event payload (de)serialization failed: {0}")]
+    EventPayload(#[from] serde_json::Error),
+
+    /// An `events` row's `event_type` column disagrees with the
+    /// discriminant carried by its own `payload_json` (see
+    /// `warden_core::RunEvent::kind`) -- a corrupted row, or one written by
+    /// something other than `db::insert_event`, never silently trusted
+    /// (code-standards.md: "toute ligne relue est reparsée en type Rust
+    /// fort").
+    #[error(
+        "event {id} has event_type {event_type:?} but its payload's own kind is {payload_kind:?}"
+    )]
+    EventKindMismatch {
+        id: String,
+        event_type: String,
+        payload_kind: &'static str,
+    },
+
+    /// [`crate::orchestrator::Orchestrator::run_convergence_loop`] sets up
+    /// its Event Bus / run context exactly once per instance -- an
+    /// orchestrator is one-run-per-instance in this codebase (a fresh one is
+    /// constructed per CLI invocation). A second call on the same instance
+    /// is a programming error, not a runtime condition to paper over.
+    #[error("this orchestrator instance already has an active run in progress")]
+    RunAlreadyInProgress,
     /// The target repo's root `package.json` exists but isn't valid JSON --
     /// evidence project-type detection (ADR-0009) must not silently treat
     /// this as "no dependencies" (code-standards.md: "no silent fallback").

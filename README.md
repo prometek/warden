@@ -7,12 +7,12 @@ des agents.
 
 ## État du projet
 
-Phase 1 (fondations), Phase 2 (parallélisme réel) et Phase 3 (gate git) sont livrées :
-un workspace Cargo avec le binaire `warden` (orchestrateur), capable de piloter une boucle
-de convergence (coder → review/test → reboucle si besoin) avec persistance SQLite et
-reprise après crash : au redémarrage, tout run laissé dans un état intermédiaire sans
-processus agent vivant est marqué `Failed`, et les ressources qu'il a pu laisser
-orphelines (worktrees git, processus agents encore en vie) sont automatiquement
+Phase 1 (fondations), Phase 2 (parallélisme réel), Phase 3 (gate git) et Phase 8 (TUI)
+sont livrées : un workspace Cargo avec le binaire `warden` (orchestrateur), capable de
+piloter une boucle de convergence (coder → review/test → reboucle si besoin) avec
+persistance SQLite et reprise après crash : au redémarrage, tout run laissé dans un état
+intermédiaire sans processus agent vivant est marqué `Failed`, et les ressources qu'il a pu
+laisser orphelines (worktrees git, processus agents encore en vie) sont automatiquement
 récupérées — y compris si un second crash interrompt la récupération elle-même. Une
 sauvegarde de la base SQLite est également prise avant toute migration de schéma.
 Reviewer et tester tournent **en parallèle** (`tokio::join!`), chacun
@@ -20,8 +20,9 @@ dans son propre worktree synchronisé sur le commit du coder. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
 run et le hash validé en SQLite (connexion strictement lecture seule) avant tout push vers
-`origin`, et ne fait jamais confiance à ce que `warden` prétend. La TUI (`warden-tui`)
-arrive dans une phase ultérieure et n'existe pas encore.
+`origin`, et ne fait jamais confiance à ce que `warden` prétend. Un troisième binaire,
+`warden-tui`, permet de suivre un run en direct depuis un terminal séparé, strictement en
+lecture seule (ADR-0008) — voir "`warden-tui` (moniteur en lecture seule)" ci-dessous.
 
 **Ce qui n'est pas encore câblé (Phase 4)** : `warden` lui-même ne pousse pas encore
 automatiquement les runs convergés vers le dépôt bare de `warden-gated`, et la transition
@@ -68,6 +69,10 @@ qui ferme cet écart.
 - `crates/warden-gated/` — binaire du gate git (`[[bin]] warden-gated`) : seul détenteur
   des credentials vers `origin`, hook `post-receive` minimal + revérification indépendante
   de l'état avant tout push (voir "Le gate git (`warden-gated`)" ci-dessous).
+- `crates/warden-tui/` — binaire du moniteur en lecture seule (`[[bin]] warden-tui`) :
+  s'abonne à l'Event Bus de `warden` et relit la table `events` en SQLite (connexion
+  strictement lecture seule), sans jamais écrire en base, spawn d'agent, ni accès git (voir
+  "`warden-tui` (moniteur en lecture seule)" ci-dessous).
 
 ## Compilation & tests
 
@@ -78,10 +83,11 @@ cargo test
 
 Ces commandes fonctionnent **hors ligne**, sans base de données ni `DATABASE_URL` : les
 requêtes `sqlx` sont vérifiées à la compilation via les caches `.sqlx/` committés dans
-`crates/warden/` et `crates/warden-gated/` (chaque crate a le sien : `warden-gated` ne
-dépend pas de `warden`, voir ADR-0006). Toute nouvelle requête ou migration doit
-régénérer le cache du crate concerné (`cargo sqlx prepare`, exécuté depuis ce crate) et le
-committer avec le code — voir `code-standards.md` ("SQLite & sqlx").
+`crates/warden/`, `crates/warden-gated/` et `crates/warden-tui/` (chaque crate a le sien :
+ni `warden-gated` ni `warden-tui` ne dépendent de `warden`, voir ADR-0006). Toute nouvelle
+requête ou migration doit régénérer le cache du crate concerné (`cargo sqlx prepare`,
+exécuté depuis ce crate) et le committer avec le code — voir `code-standards.md` ("SQLite &
+sqlx").
 
 ## Utiliser la CLI `warden`
 
@@ -173,6 +179,48 @@ finding :
 Toute ligne non vide qui n'est pas un JSON valide, ou dont `severity`/`source` sort de
 cet ensemble fermé, fait échouer le parsing (`warden_core::parse_findings`) — jamais de
 confiance aveugle dans la sortie d'un agent, cf. `code-standards.md`.
+
+## `warden-tui` (moniteur en lecture seule)
+
+`warden-tui` est un binaire séparé (ADR-0008) qui permet de suivre un run en direct depuis
+un terminal différent de celui qui l'a lancé, **strictement en lecture seule** : aucune
+commande d'action (approve/fix/skip) ne transite par lui, et il n'écrit jamais dans la
+SQLite de `warden`, ne spawn aucun agent, ne touche jamais git.
+
+```sh
+warden-tui attach --run-id <RUN_ID> --warden-home ~/.warden
+```
+
+- `--run-id <ID>` — l'identifiant de run affiché par `warden run` à la fin de son
+  exécution (aussi consultable en base, table `runs`).
+- `--db <PATH>` — base SQLite de `warden`, ouverte en lecture seule. Défaut :
+  `<warden-home>/state.db`.
+- `--warden-home <PATH>` — sert à localiser la base et le socket de l'Event Bus du run.
+  Défaut : `~/.warden`.
+
+**Event Bus + replay** : `warden` publie chaque événement significatif (démarrage de run,
+de cycle, d'agent, finding remonté, fin de run) à la fois sur un socket Unix local
+(`~/.warden/runs/<run_id>.sock`, permissions `0600`, strictement lecture seule — le module
+qui l'implémente ne lit jamais les octets écrits par un abonné) et dans la table `events`
+en SQLite. `warden-tui` s'abonne d'abord au socket, puis relit l'historique complet en
+base, avant de fusionner les deux (déduplication par identifiant d'événement) : une
+attache tardive sur un run déjà en cours affiche donc l'historique complet puis bascule
+sur le direct, sans trou.
+
+Sur un terminal dont la sortie standard n'est pas un TTY (pipe, redirection), `warden-tui`
+bascule automatiquement sur un mode texte qui affiche un événement par ligne en NDJSON —
+pratique pour scripter/observer un run sans interface plein écran.
+
+**Rendu de l'evidence (ADR-0010)** : au démarrage (terminal plein écran uniquement),
+`warden-tui` détecte les capacités graphiques du terminal (Kitty, iTerm2, Sixel, via
+`ratatui-image`) et affiche les images capturées inline lorsque c'est possible, avec
+fallback sur un visualiseur externe sinon. **Ce qui n'est pas encore câblé** : la Phase 7
+(Evidence Capture Adapter, issue #7) qui produirait réellement ces captures (table
+`EVIDENCE`) n'est pas encore livrée sur cette branche — le rendu inline d'image est
+fonctionnel et testé (`crates/warden-tui/src/evidence.rs`), mais l'extraction de frame
+vidéo (`ffmpeg`) et la lecture asciinema en sous-terminal sont pour l'instant des erreurs
+typées explicites (`TuiError::NotYetImplemented`), en attendant qu'une source de données
+réelle existe pour les exercer.
 
 ## Le gate git (`warden-gated`)
 

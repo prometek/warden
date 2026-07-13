@@ -4,12 +4,23 @@
 //! own worktree (see [`WorktreeManager::create`], keyed by role, so the two
 //! never share a directory). Every [`RunState`] transition is written to
 //! SQLite *before* the action it authorizes, per ADR-0004.
+//!
+//! Phase 8 (ADR-0008, issue #8): every significant transition is also
+//! published as a [`RunEvent`] -- persisted to `events` and broadcast live on
+//! the run's [`EventBus`] -- so a `warden-tui` can observe the run without
+//! polling SQLite itself. See [`Orchestrator::publish_event`].
 
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use warden_core::{decide_next_state, parse_findings, AgentRole, Finding, RunEvent, RunState};
+
+use crate::db;
+use crate::error::{Result, WardenError, WorktreeError};
+use crate::event_bus::EventBus;
 use warden_core::{decide_next_state, parse_findings, AgentRole, EvidenceTool, Finding, RunState};
 
 use crate::db;
@@ -80,14 +91,62 @@ struct FindingAgentInvocation<'a> {
     cancel: CancellationToken,
 }
 
+/// The run this [`Orchestrator`] instance is currently driving, and the
+/// [`EventBus`] its events are published on. Set exactly once, at the top of
+/// [`Orchestrator::run_convergence_loop`] -- an orchestrator is one-run-
+/// per-instance in this codebase (a fresh one is constructed per CLI
+/// invocation, see `main.rs`), so this never needs to change after that.
+struct RunContext {
+    run_id: String,
+    event_bus: EventBus,
+}
+
 /// Drives the convergence loop against a persisted [`SqlitePool`].
 pub struct Orchestrator {
     pool: SqlitePool,
+    /// `None` until [`Orchestrator::run_convergence_loop`] starts a run.
+    /// Read by [`Orchestrator::publish_event`], called from deep inside the
+    /// agent-invocation call chain (`run_agent`) without needing to thread
+    /// an `&EventBus`/`run_id` pair through every intermediate signature --
+    /// several of those (`run_review_and_test`, `run_finding_agent`) are
+    /// also exercised directly by unit tests below with a fixed argument
+    /// list, so adding parameters there would be a breaking, test-rippling
+    /// change for a purely additive observability feature.
+    run_context: tokio::sync::OnceCell<RunContext>,
 }
 
 impl Orchestrator {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            run_context: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Persists `event` to `events` and broadcasts it on the active run's
+    /// [`EventBus`], using the exact same freshly generated id/timestamp for
+    /// both (see `db::insert_event`'s docs on why that matters for
+    /// `warden-tui`'s replay/live dedup). A no-op if no run is currently in
+    /// progress on this instance -- only reachable from a test that calls a
+    /// private agent-invocation method directly without going through
+    /// [`Orchestrator::run_convergence_loop`] first (see the `run_context`
+    /// field docs); the real CLI path always has a context set before any
+    /// agent runs.
+    async fn publish_event(&self, event: RunEvent) -> Result<()> {
+        let Some(context) = self.run_context.get() else {
+            return Ok(());
+        };
+
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        db::insert_event(&self.pool, &id, &context.run_id, &event, &created_at).await?;
+        context.event_bus.publish(&warden_core::RunEventRecord {
+            id,
+            run_id: context.run_id.clone(),
+            event,
+            created_at,
+        });
+        Ok(())
     }
 
     /// Validates and persists a state transition by re-reading the run's
@@ -122,6 +181,17 @@ impl Orchestrator {
         let worktree_manager =
             WorktreeManager::new(&config.repo_path, config.warden_home.join("worktrees"))?;
 
+        // Phase 8: the Event Bus must be live before anything worth
+        // publishing happens, so a `warden-tui` that connects right after
+        // `RunStarted` never sees a socket that doesn't exist yet.
+        let event_bus = EventBus::bind(&run_id, &config.warden_home.join("runs")).await?;
+        self.run_context
+            .set(RunContext {
+                run_id: run_id.clone(),
+                event_bus,
+            })
+            .map_err(|_| WardenError::RunAlreadyInProgress)?;
+
         db::insert_run(
             &self.pool,
             &run_id,
@@ -130,6 +200,12 @@ impl Orchestrator {
             &config.intent,
             config.max_cycles,
         )
+        .await?;
+        self.publish_event(RunEvent::RunStarted {
+            intent: config.intent.clone(),
+            branch: config.branch.clone(),
+            max_cycles: config.max_cycles,
+        })
         .await?;
 
         // Write-ahead: the run is about to launch the coder, so record the
@@ -143,6 +219,8 @@ impl Orchestrator {
             let cycle_id = Uuid::new_v4().to_string();
             db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
             db::set_run_current_cycle(&self.pool, &run_id, cycle_number).await?;
+            self.publish_event(RunEvent::CycleStarted { cycle_number })
+                .await?;
 
             base_commit = self
                 .run_coder(CoderInvocation {
@@ -175,6 +253,15 @@ impl Orchestrator {
             for finding in &findings {
                 db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
                     .await?;
+                self.publish_event(RunEvent::FindingRaised {
+                    cycle_number,
+                    source: finding.source.as_str().to_string(),
+                    severity: finding.severity.as_str().to_string(),
+                    file: finding.file.clone(),
+                    description: finding.description.clone(),
+                    action: finding.action.clone(),
+                })
+                .await?;
             }
             db::close_cycle(&self.pool, &cycle_id).await?;
 
@@ -213,6 +300,11 @@ impl Orchestrator {
                 terminal => break terminal,
             }
         };
+
+        self.publish_event(RunEvent::RunFinished {
+            final_state: final_state.as_str().to_string(),
+        })
+        .await?;
 
         Ok((run_id, final_state))
     }
@@ -264,6 +356,14 @@ impl Orchestrator {
             // Write-ahead (ADR-0004): persist Failed before returning the
             // error to the caller.
             self.transition(run_id, RunState::Failed).await?;
+            // A TUI observer must see a terminal event rather than the
+            // stream simply going silent -- this is the one place the run
+            // ends without ever reaching `run_convergence_loop`'s own
+            // `RunFinished` publish at the bottom of its loop.
+            self.publish_event(RunEvent::RunFinished {
+                final_state: RunState::Failed.as_str().to_string(),
+            })
+            .await?;
             if let Err(error) = worktree.remove().await {
                 tracing::warn!(%error, "failed to clean up coder worktree after a failed coder run");
             }
@@ -587,6 +687,10 @@ impl Orchestrator {
             &cwd.display().to_string(),
         )
         .await?;
+        self.publish_event(RunEvent::AgentStarted {
+            role: role.as_str().to_string(),
+        })
+        .await?;
 
         let outcome_result = process::wait(child, &command.program, cancel).await;
         let exit_code_for_db = match &outcome_result {
@@ -602,6 +706,11 @@ impl Orchestrator {
             if !outcome.stderr.trim().is_empty() {
                 tracing::debug!(cycle_id, ?role, stderr = %outcome.stderr, "agent stderr output");
             }
+            self.publish_event(RunEvent::AgentFinished {
+                role: role.as_str().to_string(),
+                exit_code: outcome.exit_code,
+            })
+            .await?;
         }
 
         Ok(outcome_result?)

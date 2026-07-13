@@ -1,0 +1,34 @@
+[package]
+name = "warden-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Read-only run monitor (ADR-0008): subscribes to the Event Bus and replays the `events` table to observe a run live, with no action capability on the pipeline."
+
+[[bin]]
+name = "warden-tui"
+path = "src/main.rs"
+
+[lib]
+name = "warden_tui"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+warden-core = { path = "../warden-core" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
