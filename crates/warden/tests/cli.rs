@@ -953,3 +953,496 @@ fn e2e_non_git_repo_path_is_a_clean_cli_error() {
         .assert()
         .failure();
 }
+
+// ---------------------------------------------------------------------
+// Issue #7 (ADR-0009): Evidence Capture Adapter.
+//
+// The real `playwright`/`asciinema` binaries are neither installed in
+// this environment nor safe to invoke from a deterministic test (real
+// Playwright execution needs `npx` to fetch a package over the network;
+// see code-standards.md "Tests déterministes: ... pas d'appel réseau
+// externe"). These tests instead put minimal fake `npx`/`asciinema`
+// executables first on `PATH` for the `warden` process (and everything
+// it spawns) -- the exact same `process::spawn` -> PATH lookup -> real
+// subprocess code path production code takes, just with a stand-in tool
+// binary. `git`/`sh` still resolve normally, since the fakes are
+// prepended onto (not substituted for) the real `PATH`.
+// ---------------------------------------------------------------------
+
+/// Writes an executable script to `dir/<name>` (chmod +x, `#!/bin/sh`
+/// shebang), suitable for direct PATH-lookup invocation (unlike
+/// `write_script`, whose callers always invoke `sh <path>` explicitly).
+#[cfg(unix)]
+fn write_fake_tool(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = write_script(dir, name, body);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Stands in for the real `asciinema` binary: `AsciinemaAdapter` always
+/// passes the destination `.cast` path as the last argument
+/// (`asciinema rec --quiet --overwrite --command <cmd> <output>`), so this
+/// just writes a minimal cast-shaped file there and exits 0.
+#[cfg(unix)]
+fn write_fake_asciinema(dir: &Path) -> PathBuf {
+    write_fake_tool(
+        dir,
+        "asciinema",
+        r#"#!/bin/sh
+for arg in "$@"; do
+    output="$arg"
+done
+echo '{"version": 2, "width": 80, "height": 24, "timestamp": 0}' > "$output"
+exit 0
+"#,
+    )
+}
+
+/// Stands in for `npx --yes playwright test --reporter=list`:
+/// `PlaywrightAdapter` only cares that the command exits 0 and that
+/// `test-results/` contains files with a recognized image/video extension
+/// afterwards, so this writes exactly that.
+#[cfg(unix)]
+fn write_fake_npx(dir: &Path) -> PathBuf {
+    write_fake_tool(
+        dir,
+        "npx",
+        r#"#!/bin/sh
+mkdir -p test-results/example-spec
+printf 'fake-png-bytes' > test-results/example-spec/screenshot.png
+exit 0
+"#,
+    )
+}
+
+/// `fake_bin_dir` prepended onto the current process's real `PATH`, so a
+/// fake tool placed there is found first while `git`/`sh`/coreutils still
+/// resolve normally through the rest of the real `PATH`.
+#[cfg(unix)]
+fn path_with_fake_bin_first(fake_bin_dir: &Path) -> String {
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{real_path}", fake_bin_dir.display())
+}
+
+/// Acceptance criterion 1 (issue #7, CLI direction): a project with no web
+/// markers is classified `Cli`, selecting asciinema. Also covers
+/// criterion 3 (`evidence.store_in_repo` defaults to `true`, since
+/// `--evidence-store-in-repo` is deliberately omitted here) and criterion 4
+/// (the captured artifact is committed under `.warden/evidence/<cycle>/` in
+/// a dedicated commit on top of the coder's own commit, only at
+/// convergence) and criterion 5 (the `EVIDENCE` row round-trips through
+/// SQLite) -- all driven through the real `warden run` CLI entry point.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_cli_project_selects_asciinema_and_evidence_is_stored_and_committed_by_default() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let fake_bin_dir = TempDir::new().unwrap();
+    write_fake_asciinema(fake_bin_dir.path());
+    let path = path_with_fake_bin_first(fake_bin_dir.path());
+
+    // No package.json, no web marker files anywhere in the repo -> Cli.
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        "#!/bin/sh\necho hi >> notes.txt\ngit add notes.txt\ngit -c user.email=test@warden.local -c user.name=warden-test commit -q -m \"coder cycle\"\n",
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", &path)
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "cli project captures evidence via asciinema",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    let evidence = warden::db::list_evidence_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence.len(),
+        1,
+        "expected one evidence row captured by the fake asciinema tool"
+    );
+    assert_eq!(
+        evidence[0].evidence.evidence_type,
+        warden_core::EvidenceType::Other
+    );
+    assert_eq!(
+        evidence[0].evidence.file_path,
+        ".warden/evidence/1/session.cast"
+    );
+
+    // store_in_repo defaults to true (--evidence-store-in-repo omitted):
+    // the artifact must be committed under .warden/evidence/<cycle>/, in a
+    // dedicated commit layered on top of the coder's own commit.
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    let converged_sha = run
+        .converged_commit_sha
+        .expect("a converged run has a persisted commit sha");
+
+    let show = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args([
+            "show",
+            &format!("{converged_sha}:.warden/evidence/1/session.cast"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "expected .warden/evidence/1/session.cast inside the converged commit"
+    );
+
+    let (cycle_sha,): (Option<String>,) =
+        sqlx::query_as("SELECT coder_commit_sha FROM cycles WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        Some(converged_sha.as_str()),
+        cycle_sha.as_deref(),
+        "the converged commit must be a distinct evidence commit on top of the coder's own commit"
+    );
+
+    // Never merged/checked out into the user's own working tree.
+    let status = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.stdout.is_empty());
+}
+
+/// Acceptance criterion 1 (issue #7, web direction): a project with a known
+/// web marker file (`index.html`, present in the tester's own worktree
+/// since it's checked out at the coder's commit) is classified `Web`,
+/// selecting Playwright -- the mirror image of the asciinema/Cli test
+/// above.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_web_project_marker_selects_playwright_and_evidence_is_committed() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let fake_bin_dir = TempDir::new().unwrap();
+    write_fake_npx(fake_bin_dir.path());
+    let path = path_with_fake_bin_first(fake_bin_dir.path());
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        "#!/bin/sh\necho '<html></html>' > index.html\ngit add index.html\ngit -c user.email=test@warden.local -c user.name=warden-test commit -q -m \"coder cycle\"\n",
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", &path)
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "web project captures evidence via playwright",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let evidence = warden::db::list_evidence_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        evidence[0].evidence.evidence_type,
+        warden_core::EvidenceType::Image
+    );
+    assert!(evidence[0]
+        .evidence
+        .file_path
+        .starts_with(".warden/evidence/1/"));
+    assert!(evidence[0].evidence.file_path.ends_with("screenshot.png"));
+
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    let converged_sha = run.converged_commit_sha.unwrap();
+    let show = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args([
+            "show",
+            &format!("{converged_sha}:{}", evidence[0].evidence.file_path),
+        ])
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    assert_eq!(show.stdout, b"fake-png-bytes".to_vec());
+}
+
+/// Acceptance criterion 2: `evidence.tool` config override always wins over
+/// auto-detection. The repo carries an unambiguous web marker
+/// (`index.html`) -- auto-detection alone would select Playwright -- but
+/// `--evidence-tool asciinema` must still force the asciinema adapter,
+/// observable by the artifact's file name (`session.cast`, which only the
+/// asciinema adapter ever produces).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_evidence_tool_override_wins_over_web_auto_detection() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let fake_bin_dir = TempDir::new().unwrap();
+    write_fake_asciinema(fake_bin_dir.path());
+    let path = path_with_fake_bin_first(fake_bin_dir.path());
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        "#!/bin/sh\necho '<html></html>' > index.html\ngit add index.html\ngit -c user.email=test@warden.local -c user.name=warden-test commit -q -m \"coder cycle\"\n",
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", &path)
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "override forces asciinema on a web-looking project",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+            "--evidence-tool",
+            "asciinema",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let evidence = warden::db::list_evidence_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(
+        evidence[0].evidence.file_path, ".warden/evidence/1/session.cast",
+        "the config override must dispatch to asciinema, not Playwright, despite the web marker file"
+    );
+}
+
+/// Acceptance criteria 3/4: `evidence.store_in_repo` can be turned off
+/// (`--evidence-store-in-repo false`), in which case a captured artifact
+/// stays on local scratch storage only -- never committed into the repo,
+/// and the converged commit stays exactly the coder's own commit.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_evidence_store_in_repo_false_keeps_evidence_local_and_never_commits_it() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let fake_bin_dir = TempDir::new().unwrap();
+    write_fake_asciinema(fake_bin_dir.path());
+    let path = path_with_fake_bin_first(fake_bin_dir.path());
+    let (coder, reviewer, tester) = always_converging_scripts(scripts_dir.path());
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", &path)
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "evidence stays local when store-in-repo is disabled",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+            "--evidence-store-in-repo",
+            "false",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    // Still captured locally, regardless of store_in_repo.
+    let evidence = warden::db::list_evidence_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 1);
+    let scratch_path = warden_home
+        .path()
+        .join("evidence")
+        .join(&run_id)
+        .join("1")
+        .join("session.cast");
+    assert!(
+        scratch_path.exists(),
+        "evidence must still be staged on local scratch storage: {}",
+        scratch_path.display()
+    );
+
+    // Never committed into the repo: no evidence ref exists, and the
+    // converged commit is exactly the coder's own commit.
+    let ref_lookup = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", &format!("refs/warden/runs/{run_id}/evidence")])
+        .output()
+        .unwrap();
+    assert!(
+        !ref_lookup.status.success(),
+        "no evidence commit/ref may exist when store_in_repo is false"
+    );
+
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    let converged_sha = run.converged_commit_sha.unwrap();
+    let (cycle_sha,): (Option<String>,) =
+        sqlx::query_as("SELECT coder_commit_sha FROM cycles WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        Some(converged_sha.as_str()),
+        cycle_sha.as_deref(),
+        "with store_in_repo=false the converged commit must be exactly the coder's commit"
+    );
+}
+
+/// Acceptance criterion 7: "a missing/failing evidence tool is non-fatal --
+/// a converging run still converges", driven end-to-end through the real
+/// CLI with genuinely no `asciinema`/Playwright tooling on `PATH` (this
+/// sandbox does not have either installed -- see the environment notes in
+/// the test report).
+#[tokio::test]
+async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_still_converges() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let (coder, reviewer, tester) = always_converging_scripts(scripts_dir.path());
+
+    // No web markers -> Cli -> asciinema selected, and asciinema is not
+    // installed in this environment, so capture must fail but the run must
+    // still converge.
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "converges even though no evidence tool is installed",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"))
+        .stdout(contains("evidence capture failed"));
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let (run_id,): (String,) = sqlx::query_as("SELECT id FROM runs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let evidence = warden::db::list_evidence_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert!(
+        evidence.is_empty(),
+        "no evidence row should exist when the capture tool is unavailable"
+    );
+
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(run.state, RunState::Converged);
+}

@@ -21,6 +21,11 @@ use warden_core::{decide_next_state, parse_findings, AgentRole, Finding, RunEven
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
+use warden_core::{decide_next_state, parse_findings, AgentRole, EvidenceTool, Finding, RunState};
+
+use crate::db;
+use crate::error::{Result, WardenError, WorktreeError};
+use crate::evidence::{self, EvidenceCaptureContext};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::worktree::{self, WorktreeManager};
 
@@ -42,6 +47,16 @@ pub struct RunConfig {
     pub coder_command: AgentCommand,
     pub reviewer_command: AgentCommand,
     pub tester_command: AgentCommand,
+    /// Overrides automatic project-type detection for the Evidence Capture
+    /// Adapter (`evidence.tool`, ADR-0009). `None` means "detect from the
+    /// repo" (`warden_core::detect_project_type`).
+    pub evidence_tool: Option<EvidenceTool>,
+    /// Whether captured evidence gets committed into `.warden/evidence/` and
+    /// pushed with the converged commit (`evidence.store_in_repo`,
+    /// ADR-0009). Defaults to `true` at the CLI layer -- kept required here
+    /// rather than defaulted in this struct so every caller states its
+    /// choice explicitly.
+    pub evidence_store_in_repo: bool,
 }
 
 /// Parameters for a single coder invocation. Grouped into a struct (rather
@@ -64,10 +79,15 @@ struct CoderInvocation<'a> {
 struct FindingAgentInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
+    cycle_number: u32,
     role: AgentRole,
     command: &'a AgentCommand,
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
+    /// Only consulted for `AgentRole::Tester` (evidence capture,
+    /// `evidence_tool`/`evidence_store_in_repo`/`warden_home`) -- carried
+    /// through here rather than threading four separate fields.
+    config: &'a RunConfig,
     cancel: CancellationToken,
 }
 
@@ -222,6 +242,7 @@ impl Orchestrator {
                 .run_review_and_test(
                     &run_id,
                     &cycle_id,
+                    cycle_number,
                     &config,
                     &worktree_manager,
                     &base_commit,
@@ -246,10 +267,28 @@ impl Orchestrator {
 
             let next_state = decide_next_state(&findings, cycle_number, config.max_cycles);
             if next_state == RunState::Converged {
+                // Issue #7 / ADR-0009: fold any evidence captured across
+                // this run's cycles into the converged commit before
+                // recording it -- `store_in_repo`'s "committed... never
+                // pushed before Finalize" only holds if it rides along with
+                // the very commit `converged_commit_sha` names.
+                let converged_commit = if config.evidence_store_in_repo {
+                    let evidence = db::list_evidence_for_run(&self.pool, &run_id).await?;
+                    self.commit_evidence_for_convergence(
+                        &worktree_manager,
+                        &config,
+                        &run_id,
+                        &base_commit,
+                        &evidence,
+                    )
+                    .await
+                } else {
+                    base_commit.clone()
+                };
                 // M4: record the commit the run converged on before
                 // persisting the state transition, so a reader that
                 // observes `Converged` can never see a missing SHA.
-                db::set_run_converged_commit(&self.pool, &run_id, &base_commit).await?;
+                db::set_run_converged_commit(&self.pool, &run_id, &converged_commit).await?;
             }
             self.transition(&run_id, next_state).await?;
 
@@ -365,10 +404,12 @@ impl Orchestrator {
     /// drops the sibling future without awaiting it — mitigated by
     /// `kill_on_drop` on the spawned child process and `Worktree`'s `Drop`
     /// impl, both of which clean up best-effort even on an ungraceful exit).
+    #[allow(clippy::too_many_arguments)]
     async fn run_review_and_test(
         &self,
         run_id: &str,
         cycle_id: &str,
+        cycle_number: u32,
         config: &RunConfig,
         worktree_manager: &WorktreeManager,
         commit: &str,
@@ -387,19 +428,23 @@ impl Orchestrator {
             self.run_finding_agent(FindingAgentInvocation {
                 run_id,
                 cycle_id,
+                cycle_number,
                 role: AgentRole::Reviewer,
                 command: &config.reviewer_command,
                 worktree_manager,
                 commit,
+                config,
                 cancel: cancel.clone(),
             }),
             self.run_finding_agent(FindingAgentInvocation {
                 run_id,
                 cycle_id,
+                cycle_number,
                 role: AgentRole::Tester,
                 command: &config.tester_command,
                 worktree_manager,
                 commit,
+                config,
                 cancel,
             })
         );
@@ -416,10 +461,12 @@ impl Orchestrator {
         let FindingAgentInvocation {
             run_id,
             cycle_id,
+            cycle_number,
             role,
             command,
             worktree_manager,
             commit,
+            config,
             cancel,
         } = invocation;
 
@@ -435,30 +482,176 @@ impl Orchestrator {
         .await?;
 
         let outcome = self
-            .run_agent(cycle_id, role, command, worktree.path(), cancel)
+            .run_agent(cycle_id, role, command, worktree.path(), cancel.clone())
             .await?;
-
-        if let Err(error) = worktree.remove().await {
-            tracing::warn!(%error, ?role, "failed to clean up worktree after cycle");
-        }
 
         // Agent stdout is untrusted input: a parse failure becomes a
         // blocking finding describing the problem, never a run-ending
         // panic (code-standards.md: "Ne jamais faire confiance à la sortie
         // d'un agent CLI").
-        match parse_findings(&outcome.stdout) {
-            Ok(findings) => Ok(findings),
+        let findings = match parse_findings(&outcome.stdout) {
+            Ok(findings) => findings,
             Err(parse_error) => {
                 tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable output");
-                Ok(vec![Finding {
+                vec![Finding {
                     source: role_to_finding_source(role),
                     severity: warden_core::Severity::Blocking,
                     file: None,
                     description: format!("{role:?} produced unparsable output: {parse_error}"),
                     action: Some("fix the agent's output format".to_string()),
-                }])
+                }]
+            }
+        };
+
+        // ADR-0009 (issue #7): capture evidence right after a *successful*
+        // tester run, still inside its worktree -- which is about to be
+        // removed below, so this must happen before that, not after.
+        if role == AgentRole::Tester && tester_succeeded(&findings) {
+            self.capture_evidence_for_cycle(
+                run_id,
+                cycle_id,
+                cycle_number,
+                config,
+                worktree.path(),
+                cancel,
+            )
+            .await;
+        }
+
+        if let Err(error) = worktree.remove().await {
+            tracing::warn!(%error, ?role, "failed to clean up worktree after cycle");
+        }
+
+        Ok(findings)
+    }
+
+    /// Best-effort evidence commit at convergence (ADR-0009 / code-review
+    /// MEDIUM finding #1, issue #7): mirrors `capture_evidence_for_cycle`'s
+    /// philosophy -- a git failure while folding captured evidence into the
+    /// repo (disk full, permissions, an evidence worktree collision, ...)
+    /// must not abort an otherwise-converged run. Falls back to
+    /// `base_commit` (i.e. "converge without evidence attached") and logs
+    /// loudly rather than swallowing the error silently (code-standards.md:
+    /// "catch-and-ignore ... qui jette l'erreur sans la logger").
+    async fn commit_evidence_for_convergence(
+        &self,
+        worktree_manager: &WorktreeManager,
+        config: &RunConfig,
+        run_id: &str,
+        base_commit: &str,
+        evidence: &[db::EvidenceWithCycle],
+    ) -> String {
+        match evidence::commit_evidence_into_repo(
+            worktree_manager,
+            &config.repo_path,
+            &config.warden_home,
+            run_id,
+            base_commit,
+            evidence,
+        )
+        .await
+        {
+            Ok(converged_commit) => converged_commit,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    run_id,
+                    "failed to commit captured evidence into the repo; converging without evidence attached"
+                );
+                base_commit.to_string()
             }
         }
+    }
+
+    /// Best-effort evidence capture (ADR-0009): logs and continues on
+    /// failure rather than failing the run. A missing/misconfigured
+    /// evidence tool (Playwright/asciinema not installed, no artifacts
+    /// produced, ...) is an environment issue, not a defect in the code
+    /// under test -- it must not abort an otherwise-converging run over a
+    /// "nice to have" proof. Still logged loudly (`tracing::warn!` with the
+    /// full error), never swallowed silently (code-standards.md:
+    /// "catch-and-ignore ... qui jette l'erreur sans la logger").
+    async fn capture_evidence_for_cycle(
+        &self,
+        run_id: &str,
+        cycle_id: &str,
+        cycle_number: u32,
+        config: &RunConfig,
+        tester_worktree_path: &Path,
+        cancel: CancellationToken,
+    ) {
+        if let Err(error) = self
+            .try_capture_evidence_for_cycle(
+                run_id,
+                cycle_id,
+                cycle_number,
+                config,
+                tester_worktree_path,
+                cancel,
+            )
+            .await
+        {
+            tracing::warn!(
+                %error,
+                run_id,
+                cycle_id,
+                "evidence capture failed; continuing without evidence for this cycle"
+            );
+        }
+    }
+
+    async fn try_capture_evidence_for_cycle(
+        &self,
+        run_id: &str,
+        cycle_id: &str,
+        cycle_number: u32,
+        config: &RunConfig,
+        tester_worktree_path: &Path,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let scratch_dir = config
+            .warden_home
+            .join("evidence")
+            .join(run_id)
+            .join(cycle_number.to_string());
+        tokio::fs::create_dir_all(&scratch_dir).await?;
+
+        let markers = evidence::scan_project_markers(tester_worktree_path).await?;
+        let ctx = EvidenceCaptureContext {
+            worktree_path: tester_worktree_path,
+            scratch_dir: &scratch_dir,
+            cycle_number,
+            record_command: &config.tester_command,
+            cancel,
+        };
+        let captured = evidence::capture_evidence(&markers, config.evidence_tool, &ctx).await?;
+
+        // Code-review LOW finding (issue #7): when `evidence_store_in_repo`
+        // is false, these `EVIDENCE.file_path` values name a
+        // `.warden/evidence/<cycle>/...` repo path that never gets created
+        // (`commit_evidence_into_repo` doesn't run -- see the convergence
+        // branch above), so any future PR-body Evidence section built
+        // straight off this table would need to skip rows it can't safely
+        // link to. NOT changed here: `e2e_evidence_store_in_repo_false_...`
+        // (crates/warden/tests/cli.rs) already asserts, as a deliberate
+        // product decision, that evidence rows are recorded regardless of
+        // `store_in_repo` ("still captured locally") -- only the git commit
+        // is skipped. Suppressing the insert would contradict that existing,
+        // intentional behaviour; reconciling the two is a product call, not
+        // a mechanical fix, so left as-is pending that decision.
+        for item in captured {
+            db::insert_evidence(
+                &self.pool,
+                &Uuid::new_v4().to_string(),
+                cycle_id,
+                None,
+                item.evidence_type,
+                &item.repo_relative_path,
+                &item.description,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Spawns `command`, persisting its PID to `agent_processes` before
@@ -542,6 +735,18 @@ fn truncate_for_error(stderr: &str) -> String {
         .last()
         .unwrap_or(0);
     format!("{}… (truncated)", &stderr[..boundary])
+}
+
+/// "The cycle's e2e test succeeded" (ADR-0009: evidence is captured "après
+/// le succès du test e2e"), inferred as "the tester itself raised no
+/// blocking finding" -- there's no separate pass/fail signal in the
+/// findings protocol, so absence of a blocking `Tester`-sourced finding is
+/// the only available proxy.
+fn tester_succeeded(findings: &[Finding]) -> bool {
+    !findings.iter().any(|finding| {
+        finding.source == warden_core::FindingSource::Tester
+            && finding.severity == warden_core::Severity::Blocking
+    })
 }
 
 fn role_to_finding_source(role: AgentRole) -> warden_core::FindingSource {
@@ -885,6 +1090,8 @@ mod tests {
             coder_command: flip_status_coder(),
             reviewer_command: status_gated_reviewer(),
             tester_command: always_passing_tester(),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
         };
 
         let (run_id, final_state) = orchestrator
@@ -949,6 +1156,8 @@ mod tests {
             coder_command: noop_coder,
             reviewer_command: always_blocking_reviewer,
             tester_command: always_passing_tester(),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
         };
 
         let (_run_id, final_state) = orchestrator
@@ -1293,6 +1502,8 @@ mod tests {
             coder_command: AgentCommand::new("sh", ["-c", "true"]),
             reviewer_command,
             tester_command,
+            evidence_tool: None,
+            evidence_store_in_repo: true,
         };
 
         let orchestrator = Orchestrator::new(pool.clone());
@@ -1300,6 +1511,7 @@ mod tests {
             .run_review_and_test(
                 "collision-run",
                 "collision-cycle",
+                1,
                 &config,
                 &worktree_manager,
                 "HEAD",
@@ -1375,6 +1587,8 @@ mod tests {
             coder_command: AgentCommand::new("sh", ["-c", "true"]),
             reviewer_command: sleepy_agent.clone(),
             tester_command: sleepy_agent,
+            evidence_tool: None,
+            evidence_store_in_repo: true,
         };
 
         let orchestrator = Orchestrator::new(pool.clone());
@@ -1402,10 +1616,12 @@ mod tests {
             .run_finding_agent(FindingAgentInvocation {
                 run_id: "sequential-run",
                 cycle_id: "sequential-cycle",
+                cycle_number: 1,
                 role: AgentRole::Reviewer,
                 command: &config.reviewer_command,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
+                config: &config,
                 cancel: CancellationToken::new(),
             })
             .await
@@ -1414,10 +1630,12 @@ mod tests {
             .run_finding_agent(FindingAgentInvocation {
                 run_id: "sequential-run",
                 cycle_id: "sequential-cycle",
+                cycle_number: 1,
                 role: AgentRole::Tester,
                 command: &config.tester_command,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
+                config: &config,
                 cancel: CancellationToken::new(),
             })
             .await
@@ -1445,6 +1663,7 @@ mod tests {
             .run_review_and_test(
                 "timing-run",
                 "timing-cycle",
+                1,
                 &config,
                 &worktree_manager,
                 "HEAD",
@@ -1774,5 +1993,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// Acceptance criterion 7 (issue #7, ADR-0009): "a missing/failing
+    /// evidence tool is non-fatal -- a converging run still converges".
+    /// Exercised directly against `Orchestrator::run_convergence_loop`
+    /// (see `tests/cli.rs` for the same behaviour driven through the real
+    /// `warden` binary): the tester's own project has no web markers, so
+    /// asciinema is selected, and asciinema is genuinely not on `PATH` in
+    /// this test environment -- the run must still converge, and no
+    /// evidence row must have been recorded for it.
+    #[tokio::test]
+    async fn evidence_capture_failure_does_not_prevent_convergence() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "converge even though no evidence tool is installed".to_string(),
+            max_cycles: 3,
+            coder_command: AgentCommand::new(
+                "sh",
+                [
+                    "-c",
+                    "echo hi >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle",
+                ],
+            ),
+            reviewer_command: AgentCommand::new("sh", ["-c", "true"]),
+            tester_command: always_passing_tester(),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::Converged,
+            "a missing evidence tool must not fail an otherwise-converging run"
+        );
+
+        let evidence = db::list_evidence_for_run(&pool, &run_id).await.unwrap();
+        assert!(
+            evidence.is_empty(),
+            "no evidence row should be recorded when the capture tool is unavailable"
+        );
+
+        // With no evidence captured, the converged commit is just the
+        // coder's own commit -- no evidence-only commit is created on top.
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert!(run.converged_commit_sha.is_some());
     }
 }

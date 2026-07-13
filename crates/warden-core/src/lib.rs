@@ -12,6 +12,8 @@ mod convergence;
 mod error;
 mod event;
 mod socket;
+mod evidence;
+mod pr_body;
 mod state;
 
 pub use convergence::{
@@ -21,4 +23,9 @@ pub use convergence::{
 pub use error::{CoreError, Result};
 pub use event::{EventKind, RunEvent, RunEventRecord};
 pub use socket::{resolve_socket_path, MAX_SOCKET_PATH_LEN};
+pub use evidence::{
+    detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,
+    ProjectType,
+};
+pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use state::{AgentRole, RunState};

@@ -29,6 +29,11 @@ pub enum CoreError {
 
     #[error("unknown event kind: {0:?}")]
     UnknownEventKind(String),
+    #[error("unknown evidence type: {0:?}")]
+    UnknownEvidenceType(String),
+
+    #[error("unknown evidence tool: {0:?}")]
+    UnknownEvidenceTool(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Pure orchestration logic for Warden: run state machine and convergence rules. No I/O."
 
 [dependencies]
+percent-encoding = "2"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
