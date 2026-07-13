@@ -1,7 +1,7 @@
 //! SQLite persistence (ADR-0004). `warden` is the only writer; schema
-//! covers `runs`, `cycles`, `findings`, `agent_processes`, and (Phase 8,
-//! ADR-0008) `events` -- `evidence` is still deferred to Phase 7 (issue #7).
-//! Every row read back is reparsed into a strongly-typed Rust value before
+//! covers `runs`, `cycles`, `findings`, `agent_processes`, `evidence`
+//! (Phase 7, ADR-0009, issue #7), and (Phase 8, ADR-0008) `events`. Every
+//! row read back is reparsed into a strongly-typed Rust value before
 //! leaving this module — callers never see raw strings for
 //! `state`/`role`/`source`/`severity`/`event_type`.
 
@@ -12,7 +12,8 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    AgentRole, EventKind, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
+    AgentRole, EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState,
+    Severity,
 };
 
 use crate::error::{Result, WardenError};
@@ -681,6 +682,12 @@ pub async fn insert_event(
         event_type,
         payload_json,
         created_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A `evidence` row, with `type` already validated into
 /// [`EvidenceType`] (ADR-0009, issue #7).
 #[derive(Debug, Clone)]
@@ -773,6 +780,15 @@ pub async fn list_events_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<
         FROM events
         WHERE run_id = ?
         ORDER BY created_at ASC, id ASC
+        "#,
+        run_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(row_to_event_record).collect()
+}
+
 /// One `evidence` row together with the `cycle_number` it belongs to -- the
 /// bare `evidence` table only carries `cycle_id`, but `pr_summary`'s
 /// Evidence section formatting (issue #7) groups/orders by cycle number.

@@ -16,15 +16,13 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use warden_core::{decide_next_state, parse_findings, AgentRole, Finding, RunEvent, RunState};
+use warden_core::{
+    decide_next_state, parse_findings, AgentRole, EvidenceTool, Finding, RunEvent, RunState,
+};
 
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
-use warden_core::{decide_next_state, parse_findings, AgentRole, EvidenceTool, Finding, RunState};
-
-use crate::db;
-use crate::error::{Result, WardenError, WorktreeError};
 use crate::evidence::{self, EvidenceCaptureContext};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::worktree::{self, WorktreeManager};
