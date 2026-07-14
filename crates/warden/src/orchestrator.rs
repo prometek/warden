@@ -990,31 +990,44 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// The ref prefix `warden` pushes a converged run's branch under in the
-/// local bare gate repo -- **must** match
-/// `warden_gated::notification::GATE_REF_PREFIX` byte-for-byte. Duplicated
-/// as a literal rather than shared via `warden-core` because `warden` must
-/// not depend on `warden-gated` (ADR-0006); mirrors how `serve.rs`'s own
-/// tests already hardcode this identical literal on the receiving side.
-const GATE_REF_PREFIX: &str = "refs/heads/warden-run/";
+/// The ref prefix `warden` stages a converged run's commit under in the
+/// local bare gate repo (issue #15 review, H2).
+///
+/// **Deliberately outside `refs/heads/`, and specifically NOT
+/// `refs/heads/warden-run/`** (`warden_gated::notification::GATE_REF_PREFIX`,
+/// the ref the installed `post-receive` hook / `serve` daemon watch for a
+/// push-notification -- see `notification::parse_post_receive_line` /
+/// `serve::handle_push_notification_line`): this push exists *only* to
+/// transfer git objects into the bare repo's object store so
+/// `warden-gated run-tail`/`resume-watch` can find `commit_sha` by SHA
+/// (ADR-0002: the bare repo is a separate git repository from the user's
+/// own, so the commit isn't otherwise reachable there at all). It is not a
+/// push-notification and must never be treated as one -- staging under
+/// `GATE_REF_PREFIX` would make a *deployed* gate (hook + `serve` daemon
+/// both installed) independently re-verify and then force-push this
+/// business content straight to `origin/<target_branch>`, bypassing the PR
+/// review flow entirely and effectively auto-merging without a human
+/// (exactly what ADR-0002/issue #5 forbid). The PR-based path
+/// (`run_tail`/`Finalize`) is the only thing that ever pushes this content
+/// on to real `origin`, onto the run's own PR branch, never `main` directly.
+const GATE_STAGING_REF_PREFIX: &str = "refs/warden-staging/";
 
 /// Pushes `commit_sha` (already reachable in `repo_path`'s object store --
 /// `protect_cycle_commit` keeps it so) into the local bare gate repo under
-/// this run's ref, transferring the objects `warden-gated`'s `run-tail`/
-/// `resume-watch` need before they can push anything onward to real
-/// `origin` (ADR-0002: `warden-gated`'s bare repo is a separate git
-/// repository from the user's own). `--force`: a reboucled run pushes a new
-/// converged commit onto the same per-run ref repeatedly, and this ref is
-/// exclusively `warden`-managed, so a rejected non-fast-forward push here
-/// would only ever be a false alarm, never a real conflict with anything
-/// else touching it.
+/// this run's staging ref ([`GATE_STAGING_REF_PREFIX`]), transferring the
+/// objects `warden-gated`'s `run-tail`/`resume-watch` need before they can
+/// push anything onward to real `origin`. `--force`: a reboucled run pushes
+/// a new converged commit onto the same per-run ref repeatedly, and this
+/// ref is exclusively `warden`-managed, so a rejected non-fast-forward push
+/// here would only ever be a false alarm, never a real conflict with
+/// anything else touching it.
 async fn push_converged_commit_to_bare_repo(
     repo_path: &Path,
     bare_repo_path: &Path,
     commit_sha: &str,
     run_id: &str,
 ) -> Result<()> {
-    let refspec = format!("{commit_sha}:{GATE_REF_PREFIX}{run_id}");
+    let refspec = format!("{commit_sha}:{GATE_STAGING_REF_PREFIX}{run_id}");
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -2543,6 +2556,64 @@ mod tests {
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Done);
         assert_eq!(run.pr_number, Some(42));
+    }
+
+    /// Issue #15 review, H2: the staged commit must land under
+    /// `refs/warden-staging/`, never under `refs/heads/warden-run/` (the ref
+    /// `warden_gated::notification::parse_post_receive_line`/`serve.rs`
+    /// watch for a push-notification) -- otherwise a deployed gate (hook +
+    /// `serve` daemon) would independently re-verify and force-push this
+    /// business content straight to `origin/<target_branch>`, bypassing the
+    /// PR review flow entirely.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_stages_the_commit_outside_the_notify_hooks_ref_namespace()
+    {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            pr_number: Some(42),
+        };
+        orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        let staging_ref_check = SyncCommand::new("git")
+            .current_dir(bare_repo.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/warden-staging/{run_id}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            staging_ref_check.status.success(),
+            "the converged commit must be staged under refs/warden-staging/<run_id>"
+        );
+
+        let notify_ref_check = SyncCommand::new("git")
+            .current_dir(bare_repo.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/warden-run/{run_id}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !notify_ref_check.status.success(),
+            "the converged commit must NOT be staged under refs/heads/warden-run/<run_id> -- \
+             that ref is what the notify hook/serve daemon watch for a push-notification, and \
+             would auto-push this content straight to origin on a deployed gate"
+        );
     }
 
     #[tokio::test]
