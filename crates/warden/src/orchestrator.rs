@@ -27,18 +27,19 @@ use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
-use crate::gate_trigger::{GateTrigger, RunTailTrigger};
+use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::worktree::{self, WorktreeManager};
 
-/// Issue #15 review, H1(b): added on top of a watch's own configured
-/// inactivity timeout when bounding [`crate::ci_channel::CiResultListener::receive`].
-/// The tail's push/skeleton-commit/`OpenDraft`/`Finalize` steps all happen
-/// *before* `watch_pr` itself starts, so the receive timeout must cover more
-/// than just the watch's own inactivity budget -- this margin is a
-/// deliberately generous, fixed allowance for that upfront work, not a
-/// tuned/measured bound.
-pub const CI_RESULT_RECEIVE_TIMEOUT_MARGIN: Duration = Duration::from_secs(15 * 60);
+/// Issue #15 review, M-new-1: once the triggered `warden-gated` subprocess is
+/// observed to have exited, how long `warden` still waits for its terminal CI
+/// message to arrive over the reverse socket before concluding the child died
+/// without delivering. `warden-gated` writes the message and *then* exits, so
+/// on a local Unix socket the bytes are already buffered by the time the exit
+/// is observed -- this grace only covers the tiny window between the two, and
+/// is never the primary bound (a *live* child is waited on with no wall-clock
+/// cap at all, since `watch_pr`'s runtime is legitimately uncapped).
+const GATE_CHILD_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Static configuration for a single run of the convergence loop.
 ///
@@ -472,7 +473,7 @@ impl Orchestrator {
             "Run {run_id} converged.\n\nIntent:\n{}\n",
             config.intent.trim()
         );
-        trigger
+        let gate_child = trigger
             .trigger_run_tail(&RunTailTrigger {
                 run_id,
                 branch: &branch,
@@ -488,24 +489,43 @@ impl Orchestrator {
 
         self.transition(run_id, RunState::AwaitingCi).await?;
 
-        // Issue #15 review, H1(b): bounded, not an infinite await -- a
-        // margin on top of the watch's own inactivity timeout, since the
-        // tail's push/OpenDraft/Finalize steps ahead of the watch itself
-        // also take real (if normally short) time. On expiry, this run is
-        // failed outright rather than left stuck in `AwaitingCi` forever;
-        // crash recovery's own `resume_awaiting_ci_runs` no longer applies
-        // once a run is `Failed` -- that's an intentional, visible stop, not
-        // silent data loss (GitHub remains queryable out-of-band if a human
-        // needs to check what actually happened to the PR).
-        let receive_timeout = Duration::from_secs(gate_config.inactivity_timeout_secs)
-            + CI_RESULT_RECEIVE_TIMEOUT_MARGIN;
-        match listener.receive(receive_timeout).await {
+        let outcome = self
+            .await_and_apply_ci_result(run_id, &listener, gate_child)
+            .await?;
+
+        // Issue #15 review, L-new-1: the per-run staging ref
+        // (`push_converged_commit_to_bare_repo`) is force-pushed every pass
+        // and would otherwise accumulate unbounded in the bare gate repo. A
+        // reboucle (`Reboucle`) re-pushes the same ref next pass, so only
+        // reclaim it once the run has actually reached a terminal state.
+        if let PostConvergenceOutcome::Terminal(_) = &outcome {
+            delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
+        }
+        Ok(outcome)
+    }
+
+    /// Waits for `warden-gated`'s one terminal CI message and applies it,
+    /// bounding the wait by the triggered child's *liveness* rather than a
+    /// wall-clock timeout (issue #15 review, M-new-1). While the child is
+    /// alive the watch is legitimately still in progress (bounded on the
+    /// gated side by `watch_pr`'s own inactivity timeout), so `warden` keeps
+    /// waiting with no cap of its own -- a wall-clock bound derived from that
+    /// inactivity timeout would spuriously fail a long-but-active CI, since
+    /// `watch_pr` has no absolute cap. Only if the child exits *without* ever
+    /// delivering (a hard crash before it could send even a `GateFailed`) is
+    /// the run failed outright, after a short grace for an in-flight message.
+    async fn await_and_apply_ci_result(
+        &self,
+        run_id: &str,
+        listener: &CiResultListener,
+        gate_child: GateChild,
+    ) -> Result<PostConvergenceOutcome> {
+        match await_ci_result(run_id, listener, gate_child).await {
             Ok(message) => self.apply_ci_result_message(run_id, &message).await,
-            Err(WardenError::CiResultTimedOut { .. }) => {
+            Err(WardenError::GateChildDiedWithoutResult { .. }) => {
                 tracing::error!(
                     run_id,
-                    timeout_secs = receive_timeout.as_secs(),
-                    "timed out waiting for warden-gated's terminal CI result; failing the run"
+                    "warden-gated exited without delivering a terminal CI result; failing the run"
                 );
                 self.fail_awaiting_ci_run(run_id).await
             }
@@ -1148,6 +1168,70 @@ async fn push_converged_commit_to_bare_repo(
     Ok(())
 }
 
+/// Waits for `warden-gated`'s single terminal CI message on `listener`,
+/// bounded by `gate_child`'s liveness (issue #15 review, M-new-1) rather than
+/// any wall-clock timeout. A live child means the watch is still legitimately
+/// in progress, so `receive_no_timeout` is awaited with no cap of `warden`'s
+/// own; only if the child exits *without* delivering -- and a short grace for
+/// an in-flight message elapses -- is this a
+/// [`WardenError::GateChildDiedWithoutResult`].
+async fn await_ci_result(
+    run_id: &str,
+    listener: &CiResultListener,
+    gate_child: GateChild,
+) -> Result<CiResultMessage> {
+    tokio::select! {
+        biased;
+        // Polled first: a delivered (or malformed) message always wins over
+        // the child-exit branch, including a message that lands during the
+        // grace period below.
+        result = listener.receive_no_timeout() => result,
+        () = wait_child_then_grace(gate_child) => {
+            Err(WardenError::GateChildDiedWithoutResult {
+                run_id: run_id.to_string(),
+            })
+        }
+    }
+}
+
+/// Resolves once the triggered child has exited *and* [`GATE_CHILD_GRACE_PERIOD`]
+/// has since elapsed -- the grace covers the tiny window between
+/// `warden-gated` writing its final message and its process being observed to
+/// exit. The concurrently-awaited `receive_no_timeout` keeps running
+/// throughout, so a message that lands during the grace still wins.
+async fn wait_child_then_grace(gate_child: GateChild) {
+    gate_child.wait_exit().await;
+    tokio::time::sleep(GATE_CHILD_GRACE_PERIOD).await;
+}
+
+/// Best-effort removal of a run's staging ref from the bare gate repo once the
+/// run is terminal (issue #15 review, L-new-1) -- the ref is force-pushed on
+/// every pass and would otherwise accumulate (pinning objects) unbounded.
+/// Never propagates: failing to reclaim it must not fail an otherwise-finished
+/// run, and a lingering ref is harmless until a later GC.
+async fn delete_gate_staging_ref(bare_repo_path: &Path, run_id: &str) {
+    let ref_name = format!("{GATE_STAGING_REF_PREFIX}{run_id}");
+    let result = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(bare_repo_path)
+        .args(["update-ref", "-d", &ref_name])
+        .output()
+        .await;
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::debug!(
+            run_id,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "failed to delete the gate staging ref on a terminal outcome (best-effort)"
+        ),
+        Err(error) => tracing::debug!(
+            run_id,
+            %error,
+            "failed to run git to delete the gate staging ref (best-effort)"
+        ),
+    }
+}
+
 /// Creates a local ref pointing at `commit_sha` in the main repository
 /// (M4), so the commit produced by a cycle's coder stays reachable — and
 /// therefore safe from `git gc` — after its worktree is removed. Worktrees
@@ -1289,16 +1373,17 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
 /// Returns the ids of runs this call reached a terminal state for (`Done`
 /// or `Failed`) or reboucled to `CoderRunning`, purely for the caller's own
 /// startup logging (mirrors [`recover_crashed_runs`]'s return contract).
-/// Takes `pool`/`warden_home`/`trigger` by value (issue #15 review, H1(c)/M4)
-/// specifically so callers can move this whole call into a `tokio::spawn`ed
-/// task -- see this function's own module-level context: it must never gate
-/// `warden`'s own startup (a stuck run's watch can legitimately take up to
-/// `receive_timeout` to resolve).
+/// Takes `pool`/`warden_home`/`trigger`/`bare_repo_path` by value (issue #15
+/// review, H1(c)/M4) specifically so callers can move this whole call into a
+/// `tokio::spawn`ed task -- see this function's own module-level context: it
+/// must never gate `warden`'s own startup (a stuck run's watch can
+/// legitimately take a long, uncapped time to resolve, bounded only by the
+/// resumed `warden-gated` subprocess's own liveness).
 pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
     pool: SqlitePool,
     warden_home: PathBuf,
     trigger: G,
-    receive_timeout: Duration,
+    bare_repo_path: PathBuf,
 ) -> Result<Vec<String>> {
     let intermediate_runs = db::list_intermediate_runs(&pool).await?;
     let orchestrator = Orchestrator::new(pool.clone());
@@ -1322,6 +1407,10 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
             // should already have no open agent_processes/worktree rows
             // left), but confirms no leak rather than assuming it.
             reclaim_orphan_resources(&pool, &run).await;
+            // Best-effort staging-ref reclaim (issue #15 review, L-new-1):
+            // the run reached `AwaitingCi`, so a staging ref was pushed for
+            // it even though no PR number was ever recorded.
+            delete_gate_staging_ref(&bare_repo_path, &run.id).await;
             resumed_run_ids.push(run.id);
             continue;
         };
@@ -1329,27 +1418,17 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
         tracing::info!(run_id = %run.id, pr_number, "resuming CI watch for a run stuck in AwaitingCi");
         let runs_dir = warden_home.join("runs");
         let listener = CiResultListener::bind(&run.id, &runs_dir).await?;
-        trigger
+        let gate_child = trigger
             .trigger_resume_watch(&run.id, pr_number, listener.socket_path())
             .await?;
 
-        // Issue #15 review, H1(b): bounded, mirrors
-        // `drive_post_convergence_tail`'s identical handling.
-        match listener.receive(receive_timeout).await {
-            Ok(message) => {
-                orchestrator
-                    .apply_ci_result_message(&run.id, &message)
-                    .await?;
-            }
-            Err(WardenError::CiResultTimedOut { .. }) => {
-                tracing::error!(
-                    run_id = %run.id,
-                    timeout_secs = receive_timeout.as_secs(),
-                    "timed out resuming the CI watch; failing the run"
-                );
-                orchestrator.fail_awaiting_ci_run(&run.id).await?;
-            }
-            Err(error) => return Err(error),
+        // Issue #15 review, M-new-1: bounded by the resumed child's liveness,
+        // mirroring `drive_post_convergence_tail`'s identical handling.
+        let outcome = orchestrator
+            .await_and_apply_ci_result(&run.id, &listener, gate_child)
+            .await?;
+        if let PostConvergenceOutcome::Terminal(_) = &outcome {
+            delete_gate_staging_ref(&bare_repo_path, &run.id).await;
         }
         resumed_run_ids.push(run.id);
     }
@@ -2557,8 +2636,12 @@ mod tests {
     }
 
     impl GateTrigger for FakeGateTrigger {
-        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()> {
-            self.deliver(request.run_id, request.ci_result_socket).await
+        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
+            self.deliver(request.run_id, request.ci_result_socket).await?;
+            // The message is already buffered on the socket, so the caller's
+            // `receive` wins immediately; modeling the child as still-alive
+            // keeps the grace path out of these success-case tests entirely.
+            Ok(GateChild::never_exiting())
         }
 
         async fn trigger_resume_watch(
@@ -2566,8 +2649,9 @@ mod tests {
             run_id: &str,
             _pr_number: u64,
             ci_result_socket: &Path,
-        ) -> Result<()> {
-            self.deliver(run_id, ci_result_socket).await
+        ) -> Result<GateChild> {
+            self.deliver(run_id, ci_result_socket).await?;
+            Ok(GateChild::never_exiting())
         }
     }
 
@@ -2816,8 +2900,10 @@ mod tests {
     struct NeverDeliversGateTrigger;
 
     impl GateTrigger for NeverDeliversGateTrigger {
-        async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<()> {
-            Ok(())
+        async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<GateChild> {
+            // Models a `warden-gated` that exited without ever delivering:
+            // the wait must fail the run once the grace period elapses.
+            Ok(GateChild::already_exited())
         }
 
         async fn trigger_resume_watch(
@@ -2825,8 +2911,8 @@ mod tests {
             _run_id: &str,
             _pr_number: u64,
             _ci_result_socket: &Path,
-        ) -> Result<()> {
-            Ok(())
+        ) -> Result<GateChild> {
+            Ok(GateChild::already_exited())
         }
     }
 
@@ -2885,7 +2971,7 @@ mod tests {
             pool.clone(),
             warden_home.path().to_path_buf(),
             trigger,
-            Duration::from_millis(200),
+            warden_home.path().to_path_buf(),
         )
         .await
         .unwrap();
@@ -3071,7 +3157,7 @@ mod tests {
             pool.clone(),
             warden_home.path().to_path_buf(),
             trigger,
-            Duration::from_secs(5),
+            warden_home.path().to_path_buf(),
         )
         .await
         .unwrap();
@@ -3114,7 +3200,7 @@ mod tests {
             pool.clone(),
             warden_home.path().to_path_buf(),
             trigger,
-            Duration::from_secs(5),
+            warden_home.path().to_path_buf(),
         )
         .await
         .unwrap();
@@ -3146,7 +3232,7 @@ mod tests {
     }
 
     impl GateTrigger for RecordingGateTrigger {
-        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()> {
+        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
             let run = db::get_run(&self.pool, &self.run_id)
                 .await
                 .unwrap()
@@ -3188,7 +3274,9 @@ mod tests {
                 stream.write_all(json.as_bytes()).await.unwrap();
                 stream.shutdown().await.unwrap();
             });
-            Ok(())
+            // Delivery happens later, from the spawned task above -- the
+            // child is still "alive" until then.
+            Ok(GateChild::never_exiting())
         }
 
         async fn trigger_resume_watch(
@@ -3196,7 +3284,7 @@ mod tests {
             _run_id: &str,
             _pr_number: u64,
             _ci_result_socket: &Path,
-        ) -> Result<()> {
+        ) -> Result<GateChild> {
             unreachable!("resume-watch is not exercised by this test")
         }
     }

@@ -35,12 +35,60 @@
 //! request reaches an already-untrusted-by-default `warden-gated`. See
 //! `docs/Architecture.md`'s ADR-0011 amendment for the recorded decision.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use tokio::process::Command;
 use warden_core::EvidenceRow;
 
 use crate::error::{Result, WardenError};
+
+/// A handle to a triggered `warden-gated` subprocess that resolves once the
+/// child has exited (issue #15 review, M-new-1). The orchestrator selects on
+/// this alongside `CiResultListener::receive` so its wait for the terminal CI
+/// result is bounded by the child's *liveness* rather than a wall-clock guess:
+/// a wall-clock bound derived from `watch_pr`'s inactivity timeout is wrong,
+/// because `watch_pr` has no absolute cap (its inactivity clock resets on every
+/// status change), so a long-but-active CI would be spuriously failed. A live
+/// child means "keep waiting" (the watch is still progressing, bounded by its
+/// own inactivity timeout on the gated side); a child that exits *without*
+/// having delivered a message means the run must be failed rather than waited
+/// on forever.
+pub struct GateChild {
+    exited: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl GateChild {
+    fn new(exited: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            exited: Box::pin(exited),
+        }
+    }
+
+    /// Resolves once the triggered subprocess has exited (or is otherwise
+    /// known to be gone). Consumes the handle -- it is awaited exactly once,
+    /// in the orchestrator's `select!`.
+    pub async fn wait_exit(self) {
+        self.exited.await
+    }
+
+    /// Test helper: a child that never exits on its own -- models a live
+    /// `warden-gated` still watching CI. The orchestrator must keep waiting
+    /// for the delivered message rather than failing the run.
+    #[cfg(test)]
+    pub fn never_exiting() -> Self {
+        Self::new(std::future::pending())
+    }
+
+    /// Test helper: a child that has already exited -- models a `warden-gated`
+    /// that returned before delivering anything (a hard early failure). The
+    /// orchestrator must fail the run once its grace period elapses.
+    #[cfg(test)]
+    pub fn already_exited() -> Self {
+        Self::new(std::future::ready(()))
+    }
+}
 
 /// Everything a fresh (first-time) tail trigger needs to pass to
 /// `warden-gated run-tail`.
@@ -72,12 +120,15 @@ pub struct RunTailTrigger<'a> {
 /// (ADR-0011: "`warden` possède le déclencheur du watch"). Both methods
 /// return once the request has been successfully *issued*, not once the
 /// tail has completed -- the eventual terminal outcome arrives later, over
-/// `ci_result_socket`, delivered by `warden-gated` itself.
+/// `ci_result_socket`, delivered by `warden-gated` itself. The returned
+/// [`GateChild`] lets the caller observe when the triggered subprocess exits,
+/// so its wait on that outcome is bounded by the child's liveness (issue #15
+/// review, M-new-1).
 #[allow(async_fn_in_trait)]
 pub trait GateTrigger {
     /// Starts the fresh tail: skeleton commit + `OpenDraft` + `Finalize` +
     /// `watch_pr`. Triggered once, on first entering `AwaitingCi`.
-    async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()>;
+    async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild>;
 
     /// Resumes watching an already-opened, already-finalized PR (Phase 6
     /// crash recovery, ADR-0011): `OpenDraft`/`Finalize` are not repeated.
@@ -86,7 +137,7 @@ pub trait GateTrigger {
         run_id: &str,
         pr_number: u64,
         ci_result_socket: &Path,
-    ) -> Result<()>;
+    ) -> Result<GateChild>;
 }
 
 /// The production [`GateTrigger`]: spawns `warden-gated run-tail`/
@@ -111,7 +162,7 @@ pub struct SubprocessGateTrigger {
 }
 
 impl GateTrigger for SubprocessGateTrigger {
-    async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()> {
+    async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
         let mut command = Command::new(&self.gated_bin);
         command
             .arg("run-tail")
@@ -147,7 +198,7 @@ impl GateTrigger for SubprocessGateTrigger {
                 .arg("--existing-pr-number")
                 .arg(pr_number.to_string());
         }
-        spawn_detached_with_stdin(command, request.summary_body).await
+        spawn_watched_with_stdin(command, request.summary_body).await
     }
 
     async fn trigger_resume_watch(
@@ -155,7 +206,7 @@ impl GateTrigger for SubprocessGateTrigger {
         run_id: &str,
         _pr_number: u64,
         ci_result_socket: &Path,
-    ) -> Result<()> {
+    ) -> Result<GateChild> {
         // `warden-gated resume-watch` re-derives the PR number itself from
         // `runs.pr_number` (never trusting the caller's copy) -- `pr_number`
         // is still part of this trait's signature so a fake `GateTrigger`
@@ -178,13 +229,16 @@ impl GateTrigger for SubprocessGateTrigger {
         if let Some(repo_slug) = &self.repo_slug {
             command.arg("--repo").arg(repo_slug);
         }
-        spawn_detached(command).await
+        spawn_watched(command).await
     }
 }
 
 /// Spawns `command` with `stdin` piped and immediately written/closed, then
-/// detaches (never awaits the child's exit -- see this module's docs on why).
-async fn spawn_detached_with_stdin(mut command: Command, stdin: &str) -> Result<()> {
+/// returns a [`GateChild`] tracking the child's exit (issue #15 review,
+/// M-new-1) -- `warden` never awaits the child inline, but must be able to
+/// observe when it goes away so a run whose gated subprocess dies without
+/// delivering a terminal message is failed rather than waited on forever.
+async fn spawn_watched_with_stdin(mut command: Command, stdin: &str) -> Result<GateChild> {
     use tokio::io::AsyncWriteExt;
 
     command.stdin(std::process::Stdio::piped());
@@ -198,36 +252,45 @@ async fn spawn_detached_with_stdin(mut command: Command, stdin: &str) -> Result<
     if let Some(mut child_stdin) = child.stdin.take() {
         child_stdin.write_all(stdin.as_bytes()).await?;
     }
-    tokio::spawn(async move {
-        if let Ok(status) = child.wait().await {
-            if !status.success() {
-                tracing::warn!(?status, "warden-gated run-tail subprocess exited non-zero");
-            }
-        }
-    });
-    Ok(())
+    Ok(watch_child_exit(child, "run-tail"))
 }
 
-/// Spawns `command` and detaches, without any stdin to write.
-async fn spawn_detached(mut command: Command) -> Result<()> {
+/// Spawns `command` (no stdin) and returns a [`GateChild`] tracking its exit.
+async fn spawn_watched(mut command: Command) -> Result<GateChild> {
     let debug_command = format!("{command:?}");
-    let mut child = command.spawn().map_err(|source| {
+    let child = command.spawn().map_err(|source| {
         WardenError::Process(crate::error::ProcessError::Spawn {
             command: debug_command,
             source,
         })
     })?;
+    Ok(watch_child_exit(child, "resume-watch"))
+}
+
+/// Reaps `child` in a detached task (logging a non-zero exit) and signals a
+/// [`GateChild`] once it has exited -- covering both a clean exit and the
+/// waiter task itself going away, so the orchestrator's `select!` can never
+/// block forever on a child that is already gone.
+fn watch_child_exit(mut child: tokio::process::Child, subcommand: &'static str) -> GateChild {
+    let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        if let Ok(status) = child.wait().await {
-            if !status.success() {
-                tracing::warn!(
-                    ?status,
-                    "warden-gated resume-watch subprocess exited non-zero"
-                );
+        match child.wait().await {
+            Ok(status) if !status.success() => {
+                tracing::warn!(?status, subcommand, "warden-gated subprocess exited non-zero");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, subcommand, "failed to wait on warden-gated subprocess");
             }
         }
+        // A dropped receiver just means the orchestrator already moved on.
+        let _ = exited_tx.send(());
     });
-    Ok(())
+    // If the waiter task is ever cancelled, `exited_tx` drops and the awaited
+    // `Err(RecvError)` still counts as "the child is gone" -- never a hang.
+    GateChild::new(async move {
+        let _ = exited_rx.await;
+    })
 }
 
 #[cfg(test)]

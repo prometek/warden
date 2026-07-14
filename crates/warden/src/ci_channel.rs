@@ -94,6 +94,16 @@ impl CiResultListener {
         }
     }
 
+    /// Accepts one connection and parses one [`CiResultMessage`] with no
+    /// timeout of its own (issue #15 review, M-new-1). The orchestrator drives
+    /// this inside a `select!` against the triggered subprocess's liveness
+    /// ([`crate::gate_trigger::GateChild`]), so the wait is bounded by the
+    /// child being alive rather than a wall-clock guess that can't match
+    /// `watch_pr`'s uncapped runtime. Same size cap as [`Self::receive`].
+    pub async fn receive_no_timeout(&self) -> Result<CiResultMessage> {
+        self.receive_unbounded().await
+    }
+
     async fn receive_unbounded(&self) -> Result<CiResultMessage> {
         let (mut stream, _addr) = self.listener.accept().await?;
         // `.take(N)` caps how much `read_to_string` will ever buffer; +1

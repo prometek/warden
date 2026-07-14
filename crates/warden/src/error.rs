@@ -188,6 +188,15 @@ pub enum WardenError {
     #[error("timed out after {timeout_secs}s waiting for a CI result on run {run_id}")]
     CiResultTimedOut { run_id: String, timeout_secs: u64 },
 
+    /// Issue #15 review, M-new-1: the triggered `warden-gated` subprocess for
+    /// this run exited without ever delivering a terminal CI result (a hard
+    /// crash/kill before it could send even a `GateFailed`). The caller maps
+    /// this to failing the run outright -- unlike a still-live child, whose
+    /// wait is bounded only by its own watch inactivity timeout, a dead child
+    /// will never deliver, so waiting further would hang the run forever.
+    #[error("warden-gated for run {run_id} exited without delivering a CI result")]
+    GateChildDiedWithoutResult { run_id: String },
+
     /// Issue #15 review, L1: a reverse-channel payload exceeded the size
     /// cap before `warden-gated` ever closed its write half -- refused
     /// outright rather than buffered without bound (OOM risk).

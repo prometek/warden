@@ -227,16 +227,15 @@ async fn run(
             poll_interval_secs: gate_config.poll_interval_secs,
             inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
         };
-        let receive_timeout = std::time::Duration::from_secs(gate_config.inactivity_timeout_secs)
-            + orchestrator::CI_RESULT_RECEIVE_TIMEOUT_MARGIN;
         let resume_pool = pool.clone();
         let resume_warden_home = warden_home.clone();
+        let resume_bare_repo = gate_config.bare_repo_path.clone();
         tokio::spawn(async move {
             match orchestrator::resume_awaiting_ci_runs(
                 resume_pool,
                 resume_warden_home,
                 trigger,
-                receive_timeout,
+                resume_bare_repo,
             )
             .await
             {
