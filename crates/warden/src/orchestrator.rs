@@ -1115,6 +1115,20 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
     let mut failed_run_ids = Vec::new();
 
     for run in intermediate_runs {
+        // Issue #15/ADR-0011: `AwaitingCi` is intermediate, but has no
+        // *agent* process to check liveness of at all -- the run is waiting
+        // on `warden-gated`'s CI watch, tracked nowhere in
+        // `agent_processes`. Treating it the same as a crashed coder/
+        // reviewer/tester (no live process found => `Failed`) would
+        // incorrectly fail every run still legitimately waiting on CI.
+        // Left untouched here; [`resume_awaiting_ci_runs`] is the dedicated
+        // recovery path for this state, called separately once a
+        // [`crate::gate_trigger::GateTrigger`] is available to re-request
+        // the watch with (this free function has no trigger of its own).
+        if run.state == RunState::AwaitingCi {
+            continue;
+        }
+
         let open_process = db::latest_open_agent_process_for_run(pool, &run.id).await?;
         let has_live_process = open_process
             .map(|p| process::is_process_alive(p.pid, p.pid_started_at_unix))
@@ -1147,6 +1161,63 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
     }
 
     Ok(failed_run_ids)
+}
+
+/// Phase 6 crash-recovery counterpart of issue #15/ADR-0011: resumes every
+/// run found stuck in `AwaitingCi` on startup, re-requesting the watch from
+/// `warden-gated` rather than treating it like a crashed agent process (see
+/// [`recover_crashed_runs`]'s own doc comment on why that check does not
+/// apply here). Idempotent by construction: `watch_pr` re-polls GitHub, so
+/// re-requesting a terminal PR just returns that same terminal outcome
+/// again (ADR-0011) -- `warden-gated` keeps no watch state of its own for
+/// this to lose.
+///
+/// A run with no persisted `pr_number` (crashed before `OpenDraft` ever
+/// returned one) has nothing to resume watching and is marked `Failed`
+/// instead -- there is no PR to re-derive.
+///
+/// Returns the ids of runs this call reached a terminal state for (`Done`
+/// or `Failed`) or reboucled to `CoderRunning`, purely for the caller's own
+/// startup logging (mirrors [`recover_crashed_runs`]'s return contract).
+pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
+    pool: &SqlitePool,
+    warden_home: &Path,
+    trigger: &G,
+) -> Result<Vec<String>> {
+    let intermediate_runs = db::list_intermediate_runs(pool).await?;
+    let orchestrator = Orchestrator::new(pool.clone());
+    let mut resumed_run_ids = Vec::new();
+
+    for run in intermediate_runs {
+        if run.state != RunState::AwaitingCi {
+            continue;
+        }
+
+        let Some(pr_number) = run.pr_number else {
+            tracing::warn!(
+                run_id = %run.id,
+                "run stuck in AwaitingCi with no pr_number recorded; nothing to resume watching, marking Failed"
+            );
+            run.state.validate_transition(RunState::Failed)?;
+            db::update_run_state(pool, &run.id, RunState::Failed).await?;
+            resumed_run_ids.push(run.id);
+            continue;
+        };
+
+        tracing::info!(run_id = %run.id, pr_number, "resuming CI watch for a run stuck in AwaitingCi");
+        let runs_dir = warden_home.join("runs");
+        let listener = CiResultListener::bind(&run.id, &runs_dir).await?;
+        trigger
+            .trigger_resume_watch(&run.id, pr_number, listener.socket_path())
+            .await?;
+        let message = listener.receive().await?;
+        orchestrator
+            .apply_ci_result_message(&run.id, &message)
+            .await?;
+        resumed_run_ids.push(run.id);
+    }
+
+    Ok(resumed_run_ids)
 }
 
 /// Reclaims both kinds of resources a crashed run may have left orphaned
@@ -2597,5 +2668,117 @@ mod tests {
             run.pr_number, None,
             "a stale delivery must not even record its pr_number once ignored"
         );
+    }
+
+    // ---- Issue #15/ADR-0011: crash-recovery resume of AwaitingCi ---------
+
+    /// The bug `recover_crashed_runs` alone would have: `AwaitingCi` has no
+    /// live *agent* process to find (it's waiting on `warden-gated`, not an
+    /// `agent_processes` row), so the blanket "no live process -> Failed"
+    /// rule would incorrectly fail it. Confirms it's left untouched instead.
+    #[tokio::test]
+    async fn recover_crashed_runs_leaves_awaiting_ci_runs_untouched() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::AwaitingReviewTest)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::Converged)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::Pushed)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::AwaitingCi)
+            .await
+            .unwrap();
+
+        let failed = recover_crashed_runs(&pool).await.unwrap();
+
+        assert!(
+            failed.is_empty(),
+            "AwaitingCi must never be marked Failed by recover_crashed_runs"
+        );
+        let run = db::get_run(&pool, "run-ci").await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::AwaitingCi);
+    }
+
+    #[tokio::test]
+    async fn resume_awaiting_ci_runs_resumes_the_watch_and_applies_its_outcome() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let warden_home = TempDir::new().unwrap();
+
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        for state in [
+            RunState::CoderRunning,
+            RunState::AwaitingReviewTest,
+            RunState::Converged,
+            RunState::Pushed,
+            RunState::AwaitingCi,
+        ] {
+            db::update_run_state(&pool, "run-ci", state).await.unwrap();
+        }
+        db::set_run_pr_number(&pool, "run-ci", 42).await.unwrap();
+
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::merged(),
+            pr_number: Some(42),
+        };
+
+        let resumed = resume_awaiting_ci_runs(&pool, warden_home.path(), &trigger)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed, vec!["run-ci".to_string()]);
+        let run = db::get_run(&pool, "run-ci").await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Done);
+    }
+
+    /// A run crashed before `OpenDraft` ever returned a PR number: there is
+    /// nothing to resume watching, so this must fail the run rather than
+    /// hang forever waiting for a watch that was never started.
+    #[tokio::test]
+    async fn resume_awaiting_ci_runs_fails_a_run_with_no_recorded_pr_number() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let warden_home = TempDir::new().unwrap();
+
+        db::insert_run(&pool, "run-no-pr", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        for state in [
+            RunState::CoderRunning,
+            RunState::AwaitingReviewTest,
+            RunState::Converged,
+            RunState::Pushed,
+            RunState::AwaitingCi,
+        ] {
+            db::update_run_state(&pool, "run-no-pr", state)
+                .await
+                .unwrap();
+        }
+
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::merged(),
+            pr_number: None,
+        };
+
+        let resumed = resume_awaiting_ci_runs(&pool, warden_home.path(), &trigger)
+            .await
+            .unwrap();
+
+        assert_eq!(resumed, vec!["run-no-pr".to_string()]);
+        let run = db::get_run(&pool, "run-no-pr").await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
     }
 }

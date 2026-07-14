@@ -7,6 +7,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use warden::db;
+use warden::gate_trigger;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
 use warden::process::AgentCommand;
 
@@ -191,6 +192,27 @@ async fn run(
             run_id,
             "run marked Failed on startup: no live process found (crash recovery)"
         );
+    }
+
+    // Issue #15/ADR-0011 crash-recovery counterpart: any run left stuck in
+    // `AwaitingCi` needs its watch re-requested, not treated as a crashed
+    // agent process (see `recover_crashed_runs`'s own doc comment) --
+    // requires a `GateTrigger`, so only runs when the gate is configured.
+    if let Some(gate_config) = &gate {
+        let trigger = gate_trigger::SubprocessGateTrigger {
+            gated_bin: gate_config.gated_bin.clone(),
+            db_path: db_path.clone(),
+            bare_repo_path: gate_config.bare_repo_path.clone(),
+            repo_slug: gate_config.repo_slug.clone(),
+            poll_interval_secs: gate_config.poll_interval_secs,
+            inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
+        };
+        let resumed = orchestrator::resume_awaiting_ci_runs(&pool, &warden_home, &trigger)
+            .await
+            .context("failed to resume runs stuck in AwaitingCi")?;
+        for run_id in &resumed {
+            tracing::warn!(run_id, "resumed a run stuck in AwaitingCi (crash recovery)");
+        }
     }
 
     let cancel = CancellationToken::new();
