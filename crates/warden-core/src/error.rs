@@ -34,6 +34,14 @@ pub enum CoreError {
 
     #[error("unknown evidence tool: {0:?}")]
     UnknownEvidenceTool(String),
+
+    /// A reverse-channel CI result message (issue #15/ADR-0011) that isn't
+    /// valid JSON, or whose shape doesn't match [`crate::CiResultMessage`] --
+    /// untrusted input at the `warden-gated` -> `warden` process boundary,
+    /// validated with the same rigor as `parse_post_receive_line` (never
+    /// silently ignored).
+    #[error("malformed CI result message: {0}")]
+    MalformedCiResultMessage(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
