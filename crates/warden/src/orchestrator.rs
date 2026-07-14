@@ -2781,4 +2781,225 @@ mod tests {
         let run = db::get_run(&pool, "run-no-pr").await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Failed);
     }
+
+    // ---- Issue #15/ADR-0011: deeper coverage added by the tester agent ---
+
+    /// A [`GateTrigger`] that independently re-reads `run_id`'s persisted
+    /// state from its own pool handle -- the same posture `warden-gated`
+    /// itself takes (ADR-0006: never trust the caller, re-verify from
+    /// SQLite) -- rather than trusting that `drive_post_convergence_tail`
+    /// merely *called* things in the right order. Proves the tail's state
+    /// transitions are durably persisted in order, not just issued in order:
+    /// `trigger_run_tail` snapshots whatever is persisted the instant it's
+    /// invoked (must already be `Pushed`), and delivery of the terminal
+    /// message is deliberately deferred until this trigger independently
+    /// observes `AwaitingCi` persisted -- so a successful delivery is only
+    /// possible if `AwaitingCi` was written to SQLite first.
+    struct RecordingGateTrigger {
+        pool: SqlitePool,
+        run_id: String,
+        outcome: warden_core::CiWatchOutcome,
+        pr_number: Option<u64>,
+        observed_state_at_trigger: std::sync::Mutex<Option<RunState>>,
+    }
+
+    impl GateTrigger for RecordingGateTrigger {
+        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()> {
+            let run = db::get_run(&self.pool, &self.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            *self.observed_state_at_trigger.lock().unwrap() = Some(run.state);
+
+            let pool = self.pool.clone();
+            let run_id = self.run_id.clone();
+            let socket_path = request.ci_result_socket.to_path_buf();
+            let message = CiResultMessage {
+                run_id: request.run_id.to_string(),
+                pr_number: self.pr_number,
+                outcome: self.outcome.clone(),
+            };
+            tokio::spawn(async move {
+                // Bounded poll (real sleep used only as inter-task
+                // synchronization, never as a correctness assertion) for
+                // this trigger's own independent view of `run_id` to reach
+                // `AwaitingCi` before delivering -- caps at ~1s so a genuine
+                // regression (the transition never gets persisted) fails
+                // the test instead of hanging it.
+                for _ in 0..200 {
+                    let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+                    if run.state == RunState::AwaitingCi {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+                assert_eq!(
+                    run.state,
+                    RunState::AwaitingCi,
+                    "gave up waiting for AwaitingCi to be persisted before delivering"
+                );
+
+                use tokio::io::AsyncWriteExt;
+                let json = message.to_json().unwrap();
+                let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+                stream.write_all(json.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            Ok(())
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            _run_id: &str,
+            _pr_number: u64,
+            _ci_result_socket: &Path,
+        ) -> Result<()> {
+            unreachable!("resume-watch is not exercised by this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_post_convergence_tail_persists_pushed_then_awaiting_ci_before_the_terminal_message_is_ever_applied(
+    ) {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = RecordingGateTrigger {
+            pool: pool.clone(),
+            run_id: run_id.clone(),
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            pr_number: Some(11),
+            observed_state_at_trigger: std::sync::Mutex::new(None),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *trigger.observed_state_at_trigger.lock().unwrap(),
+            Some(RunState::Pushed),
+            "Pushed must be durably persisted before the watch is even triggered"
+        );
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Done)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Done);
+    }
+
+    /// `ChecksFailed` at the cycle budget must reach `Failed`, never
+    /// `MaxCyclesExceeded` -- that transition is illegal from `AwaitingCi`
+    /// ([`RunState::validate_transition`]); if `decide_next_state_after_ci`
+    /// or its caller ever regressed to returning it here, `self.transition`
+    /// would reject it and this test would fail loudly rather than silently
+    /// accept a corrupted state.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_maps_checks_failed_at_cycle_budget_to_failed_not_max_cycles_exceeded(
+    ) {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+        // `converged_run_fixture` inserts with max_cycles = 5 and leaves
+        // current_cycle at its 0 default; set it to the budget so this
+        // `ChecksFailed` lands exactly at the limit.
+        db::set_run_current_cycle(&pool, &run_id, 5).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let ci_finding = Finding {
+            source: warden_core::FindingSource::Ci,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "flaky test at budget".to_string(),
+            action: None,
+        };
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_failed(&[ci_finding]),
+            pr_number: Some(13),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, PostConvergenceOutcome::Terminal(RunState::Failed)),
+            "expected Terminal(Failed), got {outcome:?}"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// `Closed` (PR closed without merging) reaches `Failed` -- verified at
+    /// the orchestrator level (real DB, real push, real socket), not just
+    /// the pure `decide_next_state_after_ci` unit test.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_maps_closed_to_failed() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::closed(),
+            pr_number: Some(21),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// `TimedOut` (inactivity timeout inside `watch_pr`) reaches `Failed` --
+    /// verified at the orchestrator level, mirroring the `Closed` case above.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_maps_timed_out_to_failed() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::timed_out(),
+            pr_number: Some(22),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
 }
