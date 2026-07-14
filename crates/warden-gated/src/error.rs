@@ -108,6 +108,18 @@ pub enum GatedError {
     /// unrecognized as either, so its outcome can't be classified.
     #[error("CI check {0:?} has neither a Checks API nor a Statuses API shape")]
     MalformedCheckEntry(String),
+
+    /// Delivering the terminal CI result (issue #15/ADR-0011) to `warden`'s
+    /// reverse socket failed -- surfaced loudly rather than swallowed, per
+    /// ADR-0011's "channel failure semantics": exactly like the forward
+    /// relay already surfaces an undelivered push notification in the
+    /// hook's exit code.
+    #[error("failed to deliver CI result to warden's socket at {socket_path}: {source}")]
+    CiResultDeliveryFailed {
+        socket_path: PathBuf,
+        #[source]
+        source: Box<GatedError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;
