@@ -120,6 +120,14 @@ pub enum GatedError {
         #[source]
         source: Box<GatedError>,
     },
+
+    /// `pr_manager::finalize`'s own independent re-verification refused the
+    /// push (state drifted, hash mismatch, ...) -- issue #15's `run-tail`
+    /// composition surfaces this as part of the run's terminal
+    /// `CiWatchOutcome::GateFailed` rather than leaving the caller to
+    /// distinguish a `Blocked` outcome from every other kind of failure.
+    #[error("Finalize was blocked by re-verification: {reason}")]
+    FinalizeBlocked { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;

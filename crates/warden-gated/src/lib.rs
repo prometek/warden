@@ -21,5 +21,6 @@ pub mod notification;
 pub mod pr_manager;
 pub mod push;
 pub mod relay;
+pub mod run_tail;
 pub mod serve;
 pub mod verify;
