@@ -276,7 +276,11 @@ fn watch_child_exit(mut child: tokio::process::Child, subcommand: &'static str) 
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) if !status.success() => {
-                tracing::warn!(?status, subcommand, "warden-gated subprocess exited non-zero");
+                tracing::warn!(
+                    ?status,
+                    subcommand,
+                    "warden-gated subprocess exited non-zero"
+                );
             }
             Ok(_) => {}
             Err(error) => {

@@ -2637,7 +2637,8 @@ mod tests {
 
     impl GateTrigger for FakeGateTrigger {
         async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
-            self.deliver(request.run_id, request.ci_result_socket).await?;
+            self.deliver(request.run_id, request.ci_result_socket)
+                .await?;
             // The message is already buffered on the socket, so the caller's
             // `receive` wins immediately; modeling the child as still-alive
             // keeps the grace path out of these success-case tests entirely.
@@ -2773,6 +2774,11 @@ mod tests {
     /// `serve` daemon) would independently re-verify and force-push this
     /// business content straight to `origin/<target_branch>`, bypassing the
     /// PR review flow entirely.
+    ///
+    /// Uses a `ChecksFailed` (reboucle, non-terminal) outcome deliberately:
+    /// the staging ref is reclaimed only once a run reaches a *terminal*
+    /// state (issue #15 review, L-new-1), so a reboucle leaves it in place
+    /// for this assertion to observe.
     #[tokio::test]
     async fn drive_post_convergence_tail_stages_the_commit_outside_the_notify_hooks_ref_namespace()
     {
@@ -2784,8 +2790,15 @@ mod tests {
             converged_run_fixture(&pool, &repo, &bare_repo).await;
 
         let orchestrator = Orchestrator::new(pool.clone());
+        let ci_finding = Finding {
+            source: warden_core::FindingSource::Ci,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "build failed".to_string(),
+            action: None,
+        };
         let trigger = FakeGateTrigger {
-            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            outcome: warden_core::CiWatchOutcome::checks_failed(&[ci_finding]),
             pr_number: Some(42),
         };
         orchestrator
@@ -2821,6 +2834,47 @@ mod tests {
             "the converged commit must NOT be staged under refs/heads/warden-run/<run_id> -- \
              that ref is what the notify hook/serve daemon watch for a push-notification, and \
              would auto-push this content straight to origin on a deployed gate"
+        );
+    }
+
+    /// Issue #15 review, L-new-1: once a run reaches a terminal outcome, its
+    /// per-run staging ref must be reclaimed from the bare gate repo (it is
+    /// force-pushed every pass and would otherwise pin objects unbounded).
+    #[tokio::test]
+    async fn drive_post_convergence_tail_reclaims_the_staging_ref_on_a_terminal_outcome() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            pr_number: Some(42),
+        };
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Done)
+        ));
+
+        let staging_ref_check = SyncCommand::new("git")
+            .current_dir(bare_repo.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/warden-staging/{run_id}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !staging_ref_check.status.success(),
+            "the staging ref must be reclaimed once the run reaches a terminal state"
         );
     }
 
@@ -2892,11 +2946,46 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// A [`GateTrigger`] that reports its request as successfully issued
-    /// (mirrors `SubprocessGateTrigger` having spawned the child) but never
-    /// actually connects to `ci_result_socket` -- standing in for
-    /// `warden-gated` crashing, hanging, or otherwise going silent *after*
-    /// being triggered.
+    /// Issue #15 review, M-new-1: the fresh-tail counterpart to
+    /// `resume_awaiting_ci_runs_fails_the_run_when_the_ci_result_never_arrives`.
+    /// If the triggered `warden-gated` subprocess exits without ever
+    /// delivering a terminal message, `drive_post_convergence_tail` must fail
+    /// the run once the grace period elapses -- bounded by the child's
+    /// liveness, not a wall-clock timeout derived from `watch_pr`'s
+    /// (uncapped) inactivity budget. Runs in real time in a couple of seconds
+    /// because the already-exited child, not a timer, is what ends the wait.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_fails_the_run_when_warden_gated_dies_without_delivering() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = NeverDeliversGateTrigger;
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, PostConvergenceOutcome::Terminal(RunState::Failed)),
+            "a gated child that exits without delivering must fail the run, not hang it"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// A [`GateTrigger`] whose subprocess is reported as having *exited*
+    /// without ever connecting to `ci_result_socket` (an
+    /// already-exited [`GateChild`]) -- standing in for `warden-gated`
+    /// crashing/being killed *after* being triggered but *before* it could
+    /// deliver even a `GateFailed`. The liveness-bounded wait must fail the
+    /// run once its grace period elapses, never hang on it (issue #15 review,
+    /// M-new-1).
     struct NeverDeliversGateTrigger;
 
     impl GateTrigger for NeverDeliversGateTrigger {
@@ -2916,31 +3005,16 @@ mod tests {
         }
     }
 
-    /// Issue #15 review, H1(b): if `warden-gated` never delivers a terminal
-    /// `CiResultMessage` at all (crash, hang, network partition -- anything
-    /// short of the process itself failing to spawn), `listener.receive`'s
-    /// bounded wait must still expire and the run must be failed outright,
-    /// never left hanging in `AwaitingCi` forever.
-    ///
-    /// This exercises `resume_awaiting_ci_runs` rather than
-    /// `drive_post_convergence_tail`, even though both contain the exact
-    /// same `match listener.receive(receive_timeout).await { ...
-    /// Err(CiResultTimedOut) => ... self.fail_awaiting_ci_run(...) }` shape
-    /// (see both call sites): `resume_awaiting_ci_runs` takes
-    /// `receive_timeout` as a plain parameter, so this test can use a small
-    /// *real* timeout and actually wait it out in milliseconds.
-    /// `drive_post_convergence_tail` instead always adds the fixed,
-    /// non-injectable `CI_RESULT_RECEIVE_TIMEOUT_MARGIN` (15 minutes) on
-    /// top of the run's configured `inactivity_timeout_secs`, so covering
-    /// its identical branch the same way would mean either really waiting
-    /// 15+ minutes (impractical) or driving it under a paused
-    /// (`start_paused = true`) clock -- which was tried here and found to
-    /// be unsafe together with a real `SqlitePool`: advancing virtual time
-    /// by 15 minutes in one jump races the pool's own real-time-based
-    /// connection acquisition/idle bookkeeping and produces spurious
-    /// `PoolTimedOut` errors unrelated to the behavior under test. Both
-    /// paths share the same code shape and are covered by the same review
-    /// finding (H1(b)), so this test is the deterministic proxy for both.
+    /// Issue #15 review, M-new-1: if the triggered `warden-gated` subprocess
+    /// exits without ever delivering a terminal `CiResultMessage` (a hard
+    /// crash/kill before it could send even a `GateFailed`), the
+    /// liveness-bounded wait must fail the run outright once its grace period
+    /// elapses, never leave it hanging in `AwaitingCi` forever. The sibling
+    /// `drive_post_convergence_tail_fails_the_run_when_warden_gated_dies_without_delivering`
+    /// covers the identical branch on the fresh-tail path; both now run in
+    /// real time (a short grace, no wall-clock timeout and so no paused-clock
+    /// vs `SqlitePool` hazard) because the child-liveness signal, not a timer,
+    /// is what ends the wait.
     #[tokio::test]
     async fn resume_awaiting_ci_runs_fails_the_run_when_the_ci_result_never_arrives() {
         let db_dir = TempDir::new().unwrap();
