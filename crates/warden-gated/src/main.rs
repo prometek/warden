@@ -12,8 +12,9 @@ use warden_gated::ci_watcher::{watch_pr, WatchConfig, WatchOutcome};
 use warden_gated::gate::verify_and_authorize;
 use warden_gated::gh_provider::GhProvider;
 use warden_gated::pr_manager::PrHandle;
+use warden_gated::run_tail::RunTailRequest;
 use warden_gated::verify::GateDecision;
-use warden_gated::{bare_repo, db, hook, relay, serve};
+use warden_gated::{bare_repo, ci_report, db, hook, relay, run_tail, serve};
 
 #[derive(Parser)]
 #[command(
@@ -139,6 +140,88 @@ enum Commands {
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
         inactivity_timeout_secs: u64,
     },
+
+    /// Issue #15/ADR-0011: runs a converged run's post-push tail (skeleton
+    /// commit + `OpenDraft` + `Finalize` + `watch_pr`) and delivers the one
+    /// terminal `CiResultMessage` to `warden`'s reverse socket. `warden`
+    /// spawns this as a subprocess once it has pushed the converged commit
+    /// into the bare gate repo -- itself never touches `origin`/PR
+    /// credentials (ADR-0006); this command independently re-verifies the
+    /// run via `Finalize`'s own `verify_and_authorize` before pushing
+    /// anything. The PR body's summary is read from stdin.
+    RunTail {
+        #[arg(long)]
+        run_id: String,
+
+        /// `warden`'s SQLite database, opened read-only.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        db: PathBuf,
+
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        bare_repo: PathBuf,
+
+        /// The run's own branch, pushed under both the skeleton and the
+        /// final content (e.g. `warden/<run_id>`).
+        #[arg(long)]
+        branch: String,
+
+        /// The branch this run's PR targets (e.g. `main`).
+        #[arg(long)]
+        base_branch: String,
+
+        #[arg(long)]
+        intent: String,
+
+        /// The commit already pushed into the bare gate repo.
+        #[arg(long)]
+        pushed_commit: String,
+
+        /// Explicit `owner/repo` override, bypassing `origin` remote
+        /// detection.
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// `warden`'s reverse-channel socket to deliver the terminal
+        /// `CiResultMessage` to.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        ci_result_socket: PathBuf,
+
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval_secs: u64,
+
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+        inactivity_timeout_secs: u64,
+    },
+
+    /// Issue #15/ADR-0011 crash-recovery counterpart of `run-tail`: the PR
+    /// was already opened/finalized in an earlier attempt (its number is
+    /// read back from `warden`'s own `runs.pr_number`), so this only resumes
+    /// `watch_pr` and delivers the resulting `CiResultMessage` --
+    /// `warden-gated` keeps no watch state of its own between attempts.
+    /// Independently re-verifies the run is still `AwaitingCi` before doing
+    /// anything (never trusts the caller).
+    ResumeWatch {
+        #[arg(long)]
+        run_id: String,
+
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        db: PathBuf,
+
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        bare_repo: PathBuf,
+
+        #[arg(long)]
+        repo: Option<String>,
+
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        ci_result_socket: PathBuf,
+
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval_secs: u64,
+
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+        inactivity_timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -172,6 +255,54 @@ async fn main() -> anyhow::Result<()> {
                 bare_repo,
                 repo,
                 pr,
+                poll_interval_secs,
+                inactivity_timeout_secs,
+            )
+            .await
+        }
+        Commands::RunTail {
+            run_id,
+            db,
+            bare_repo,
+            branch,
+            base_branch,
+            intent,
+            pushed_commit,
+            repo,
+            ci_result_socket,
+            poll_interval_secs,
+            inactivity_timeout_secs,
+        } => {
+            run_tail_cmd(
+                run_id,
+                db,
+                bare_repo,
+                branch,
+                base_branch,
+                intent,
+                pushed_commit,
+                repo,
+                ci_result_socket,
+                poll_interval_secs,
+                inactivity_timeout_secs,
+            )
+            .await
+        }
+        Commands::ResumeWatch {
+            run_id,
+            db,
+            bare_repo,
+            repo,
+            ci_result_socket,
+            poll_interval_secs,
+            inactivity_timeout_secs,
+        } => {
+            resume_watch_cmd(
+                run_id,
+                db,
+                bare_repo,
+                repo,
+                ci_result_socket,
                 poll_interval_secs,
                 inactivity_timeout_secs,
             )
@@ -305,6 +436,111 @@ async fn watch_pr_cmd(
             bail!("timed out watching pr #{pr_number}: no status change for {inactivity_timeout_secs}s");
         }
     }
+}
+
+/// Issue #15/ADR-0011: runs the fresh post-Converged tail and delivers the
+/// resulting `CiResultMessage`. The PR body's summary is read from stdin
+/// (mirrors `Commands::Notify`'s "read stdin, no CLI-arg length/escaping
+/// concerns" convention) -- evidence rows are not yet threaded through this
+/// CLI boundary (deferred: the summary text passed via stdin is expected to
+/// already carry whatever a caller wants in the PR body for now).
+#[allow(clippy::too_many_arguments)]
+async fn run_tail_cmd(
+    run_id: String,
+    db: PathBuf,
+    bare_repo: PathBuf,
+    branch: String,
+    base_branch: String,
+    intent: String,
+    pushed_commit: String,
+    repo: Option<String>,
+    ci_result_socket: PathBuf,
+    poll_interval_secs: u64,
+    inactivity_timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let mut summary_body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut summary_body)
+        .context("failed to read the PR summary body from stdin")?;
+
+    let pool = db::connect_read_only(&db)
+        .await
+        .context("failed to open warden's database read-only")?;
+    let provider = GhProvider::new(&bare_repo, repo.as_deref())
+        .await
+        .context("failed to resolve the GitHub repo for this run's PR")?;
+
+    let request = RunTailRequest {
+        bare_repo_path: &bare_repo,
+        run_id: &run_id,
+        intent: &intent,
+        branch: &branch,
+        base_branch: &base_branch,
+        pushed_commit_sha: &pushed_commit,
+        summary_body: &summary_body,
+        evidence: &[],
+        repo_slug: provider.repo_slug(),
+        watch_config: WatchConfig {
+            poll_interval: Duration::from_secs(poll_interval_secs),
+            inactivity_timeout: Duration::from_secs(inactivity_timeout_secs),
+            max_consecutive_poll_errors: WatchConfig::DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS,
+        },
+    };
+
+    let message = run_tail::run_tail(&pool, &request, &provider).await;
+    ci_report::send_ci_result(&ci_result_socket, &message)
+        .await
+        .context("failed to deliver the CI result to warden")?;
+    Ok(())
+}
+
+/// Issue #15/ADR-0011: crash-recovery counterpart of `run_tail_cmd`.
+/// Independently re-reads `run_id`'s state before resuming anything -- never
+/// trusts that the caller's belief ("this run is stuck in AwaitingCi") is
+/// still true (code-standards.md: "warden-gated ... revérifie systématiquement
+/// l'état du run").
+async fn resume_watch_cmd(
+    run_id: String,
+    db: PathBuf,
+    bare_repo: PathBuf,
+    repo: Option<String>,
+    ci_result_socket: PathBuf,
+    poll_interval_secs: u64,
+    inactivity_timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let pool = db::connect_read_only(&db)
+        .await
+        .context("failed to open warden's database read-only")?;
+    let run = db::get_awaiting_ci_run_view(&pool, &run_id)
+        .await
+        .context("failed to re-read the run's state")?
+        .with_context(|| format!("run {run_id} not found"))?;
+
+    let pr_number = match (run.state, run.pr_number) {
+        (warden_core::RunState::AwaitingCi, Some(pr_number)) => pr_number,
+        (state, pr_number) => {
+            bail!(
+                "refusing to resume watching run {run_id}: state is {state:?} (expected \
+                 AwaitingCi) and pr_number is {pr_number:?} (expected Some) -- this run is no \
+                 longer a valid resume-watch target"
+            );
+        }
+    };
+
+    let provider = GhProvider::new(&bare_repo, repo.as_deref())
+        .await
+        .context("failed to resolve the GitHub repo for this run's PR")?;
+    let config = WatchConfig {
+        poll_interval: Duration::from_secs(poll_interval_secs),
+        inactivity_timeout: Duration::from_secs(inactivity_timeout_secs),
+        max_consecutive_poll_errors: WatchConfig::DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS,
+    };
+
+    let message = run_tail::resume_watch(&run_id, pr_number, &provider, &config).await;
+    ci_report::send_ci_result(&ci_result_socket, &message)
+        .await
+        .context("failed to deliver the CI result to warden")?;
+    Ok(())
 }
 
 fn init_tracing(verbosity: u8) {
