@@ -10,6 +10,7 @@
 //! ignored.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +19,16 @@ use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 use warden_core::{parse_ci_result_message, resolve_ci_result_socket_path, CiResultMessage};
 
-use crate::error::Result;
+use crate::error::{Result, WardenError};
+
+/// Issue #15 review, L1: caps how many bytes [`CiResultListener::receive`]
+/// will buffer from one connection before refusing it outright, rather than
+/// reading an unbounded stream to completion (`read_to_string` has no size
+/// limit of its own). A real `CiResultMessage` -- JSON, a handful of fields,
+/// at most a few dozen `ChecksFailed` findings -- is nowhere near this; a
+/// sender that exceeds it is either malfunctioning or hostile, not a
+/// legitimate delivery that just happens to be large.
+const MAX_CI_RESULT_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 /// A per-run reverse-channel listener, bound for the lifetime of that run's
 /// wait on `AwaitingCi` (opened when entering it, including during
@@ -58,20 +68,62 @@ impl CiResultListener {
         &self.socket_path
     }
 
-    /// Accepts exactly one connection, reads its payload to EOF, and parses
-    /// it into a [`CiResultMessage`] (ADR-0011: "un seul message terminal
-    /// par run", not a stream). No timeout of its own: `watch_pr`'s own
-    /// inactivity timeout bounds how long `warden-gated` can take before it
-    /// sends *something*, and GitHub is the durable source of truth if this
-    /// process is restarted before delivery completes -- crash recovery
-    /// re-requests the watch rather than this call ever needing to give up
-    /// on its own (ADR-0011 "Conséquences").
-    pub async fn receive(&self) -> Result<CiResultMessage> {
+    /// Accepts exactly one connection, reads its payload to EOF (capped at
+    /// [`MAX_CI_RESULT_PAYLOAD_BYTES`], issue #15 review, L1), and parses it
+    /// into a [`CiResultMessage`] (ADR-0011: "un seul message terminal par
+    /// run", not a stream).
+    ///
+    /// Bounded by `timeout` (issue #15 review, H1(b)): the accept-and-read
+    /// as a whole must complete within it, or this returns
+    /// [`WardenError::CiResultTimedOut`] rather than awaiting forever.
+    /// `watch_pr`'s own inactivity timeout bounds how long `warden-gated`
+    /// can take before it sends *something* in the common case, but this
+    /// call cannot simply trust that on its own -- `warden-gated` could be
+    /// dead, unreachable, or stuck before it even starts watching. GitHub
+    /// remains the durable source of truth if the run is later retried;
+    /// this timeout only stops `warden` itself from blocking indefinitely on
+    /// one run.
+    pub async fn receive(&self, timeout: Duration) -> Result<CiResultMessage> {
+        let run_or_timeout = tokio::time::timeout(timeout, self.receive_unbounded()).await;
+        match run_or_timeout {
+            Ok(result) => result,
+            Err(_elapsed) => Err(WardenError::CiResultTimedOut {
+                run_id: run_id_from_socket_path(&self.socket_path),
+                timeout_secs: timeout.as_secs(),
+            }),
+        }
+    }
+
+    async fn receive_unbounded(&self) -> Result<CiResultMessage> {
         let (mut stream, _addr) = self.listener.accept().await?;
+        // `.take(N)` caps how much `read_to_string` will ever buffer; +1
+        // lets an exactly-`N`-byte legitimate payload be told apart from one
+        // that keeps going past the cap (which would otherwise both read
+        // back as exactly `N` bytes with no way to distinguish them).
+        let mut limited = (&mut stream).take(MAX_CI_RESULT_PAYLOAD_BYTES as u64 + 1);
         let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).await?;
+        limited.read_to_string(&mut buffer).await?;
+        if buffer.len() > MAX_CI_RESULT_PAYLOAD_BYTES {
+            return Err(WardenError::CiResultPayloadTooLarge {
+                max_bytes: MAX_CI_RESULT_PAYLOAD_BYTES,
+            });
+        }
         Ok(parse_ci_result_message(&buffer)?)
     }
+}
+
+/// Best-effort extraction of the run id this listener's socket file name
+/// encodes, purely for [`WardenError::CiResultTimedOut`]'s error message --
+/// `resolve_ci_result_socket_path`'s own fallback-to-temp-dir naming means
+/// this isn't always recoverable from the path alone, so a failure here
+/// falls back to the literal path rather than erroring.
+fn run_id_from_socket_path(socket_path: &Path) -> String {
+    socket_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_suffix(".ci"))
+        .map(str::to_string)
+        .unwrap_or_else(|| socket_path.display().to_string())
 }
 
 impl Drop for CiResultListener {
@@ -156,7 +208,7 @@ mod tests {
             }
         };
 
-        let (_sent, received) = tokio::join!(sender, listener.receive());
+        let (_sent, received) = tokio::join!(sender, listener.receive(Duration::from_secs(5)));
         assert_eq!(received.unwrap(), message);
     }
 
@@ -172,7 +224,7 @@ mod tests {
             stream.shutdown().await.unwrap();
         };
 
-        let (_sent, received) = tokio::join!(sender, listener.receive());
+        let (_sent, received) = tokio::join!(sender, listener.receive(Duration::from_secs(5)));
         assert!(received.is_err());
     }
 
@@ -196,5 +248,43 @@ mod tests {
 
         let listener = CiResultListener::bind("run-1", dir.path()).await;
         assert!(listener.is_ok());
+    }
+
+    /// Issue #15 review, H1(b): `receive` must never await forever -- with
+    /// nothing ever connecting, it must give up after `timeout` with a
+    /// typed error, not hang the test (or, in production, `warden` itself).
+    #[tokio::test(start_paused = true)]
+    async fn receive_times_out_when_nothing_is_ever_delivered() {
+        let dir = TempDir::new().unwrap();
+        let listener = CiResultListener::bind("run-1", dir.path()).await.unwrap();
+
+        let result = listener.receive(Duration::from_secs(10)).await;
+
+        assert!(matches!(result, Err(WardenError::CiResultTimedOut { .. })));
+    }
+
+    /// Issue #15 review, L1: a payload past the size cap must be refused,
+    /// not buffered without bound.
+    #[tokio::test]
+    async fn receive_rejects_a_payload_past_the_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let listener = CiResultListener::bind("run-1", dir.path()).await.unwrap();
+        let socket_path = listener.socket_path().to_path_buf();
+
+        let sender = async move {
+            let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+            // Comfortably past MAX_CI_RESULT_PAYLOAD_BYTES; content doesn't
+            // matter, only its size does.
+            let oversized = vec![b'a'; MAX_CI_RESULT_PAYLOAD_BYTES + 1024];
+            stream.write_all(&oversized).await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+
+        let (_sent, received) = tokio::join!(sender, listener.receive(Duration::from_secs(5)));
+
+        assert!(matches!(
+            received,
+            Err(WardenError::CiResultPayloadTooLarge { .. })
+        ));
     }
 }

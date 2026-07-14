@@ -11,10 +11,34 @@
 //! SQLite (`Finalize`'s `verify_and_authorize`, `resume-watch`'s
 //! `get_awaiting_ci_run_view`) before doing anything -- the same trust
 //! boundary `warden` already crosses spawning `git`/agent CLIs (ADR-0005).
+//!
+//! **Exception to code-standards.md's "Inter-process Communication" rule**
+//! ("warden -> warden-gated : ... Aucun autre canal de commande entre les
+//! deux" -- no channel besides the git-push+hook one) and to ADR-0011's own
+//! phrasing ("`warden-gated` démarre `watch_pr` ... au `Finalize`, qu'il
+//! traite déjà via le hook `post-receive`"), justified here per
+//! code-standards.md's own "toute exception doit être justifiée en
+//! commentaire": the git-push+hook channel is one-directional and
+//! content-triggered -- a hook only fires on a genuine ref *update* (a new
+//! old-sha/new-sha pair). The first `run-tail` trigger *does* have new
+//! content (the just-converged commit) and could in principle ride that
+//! channel, but the Phase 6 crash-recovery `resume-watch` trigger has
+//! nothing new to push at all -- `warden` restarted, the run's content is
+//! unchanged, and forcing a spurious ref update just to get a hook to fire
+//! would be indistinguishable from (and easily confusable with) a genuine
+//! new push. Subprocess invocation is used for *both* triggers instead, for
+//! one consistent mechanism rather than two: it does not weaken the
+//! security boundary those rules protect (`warden` still never touches
+//! `origin`/PR credentials; `warden-gated` still independently re-verifies
+//! from its own read-only SQLite view before doing anything, exactly as it
+//! already does for the git-push+hook path), it only changes *how* the
+//! request reaches an already-untrusted-by-default `warden-gated`. See
+//! `docs/Architecture.md`'s ADR-0011 amendment for the recorded decision.
 
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
+use warden_core::EvidenceRow;
 
 use crate::error::{Result, WardenError};
 
@@ -30,6 +54,18 @@ pub struct RunTailTrigger<'a> {
     /// stdin, never as a CLI argument (arbitrary length/escaping).
     pub summary_body: &'a str,
     pub ci_result_socket: &'a Path,
+    /// Evidence captured across this run's cycles (issue #15 review, M2) --
+    /// folded into the finalized PR body's Evidence section (ADR-0009) when
+    /// non-empty. Delivered as a `--evidence-json` argument (structured,
+    /// bounded data, unlike `summary_body`).
+    pub evidence: &'a [EvidenceRow],
+    /// The PR already opened for this run in an earlier attempt (issue #15
+    /// review, H3): `Some` on a reboucle (this run has already been through
+    /// this tail once), `None` only on a run's first pass. See
+    /// `warden_gated::run_tail::RunTailRequest::existing_pr_number`'s docs
+    /// for why this matters (a real PR provider rejects a second draft PR
+    /// for the same branch).
+    pub existing_pr_number: Option<u64>,
 }
 
 /// Requests `warden-gated` to (re)start a run's post-`Converged` tail
@@ -101,6 +137,15 @@ impl GateTrigger for SubprocessGateTrigger {
             .arg(self.inactivity_timeout_secs.to_string());
         if let Some(repo_slug) = &self.repo_slug {
             command.arg("--repo").arg(repo_slug);
+        }
+        if !request.evidence.is_empty() {
+            let evidence_json = warden_core::serialize_evidence_rows(request.evidence)?;
+            command.arg("--evidence-json").arg(evidence_json);
+        }
+        if let Some(pr_number) = request.existing_pr_number {
+            command
+                .arg("--existing-pr-number")
+                .arg(pr_number.to_string());
         }
         spawn_detached_with_stdin(command, request.summary_body).await
     }
@@ -216,6 +261,8 @@ mod tests {
                 pushed_commit_sha: "deadbeef",
                 summary_body: "summary",
                 ci_result_socket: &socket_path,
+                evidence: &[],
+                existing_pr_number: None,
             })
             .await;
 

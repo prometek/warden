@@ -194,10 +194,30 @@ async fn run(
         );
     }
 
+    // The Ctrl-C handler is armed before anything else that could itself
+    // block startup (issue #15 review, H1(c)) -- otherwise a
+    // deterministically-failing/hanging step ahead of it (e.g. the
+    // AwaitingCi resume below) would make warden unresponsive to Ctrl-C
+    // during that entire window, on top of never reaching the new run at
+    // all.
+    let cancel = CancellationToken::new();
+    let cancel_on_ctrl_c = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received Ctrl-C, cancelling run");
+            cancel_on_ctrl_c.cancel();
+        }
+    });
+
     // Issue #15/ADR-0011 crash-recovery counterpart: any run left stuck in
     // `AwaitingCi` needs its watch re-requested, not treated as a crashed
     // agent process (see `recover_crashed_runs`'s own doc comment) --
     // requires a `GateTrigger`, so only runs when the gate is configured.
+    //
+    // Issue #15 review, H1(c)/M4: spawned in the background rather than
+    // awaited here -- a stuck run's watch can legitimately take up to its
+    // own receive timeout to resolve, and none of that may gate this
+    // process's own new run from starting.
     if let Some(gate_config) = &gate {
         let trigger = gate_trigger::SubprocessGateTrigger {
             gated_bin: gate_config.gated_bin.clone(),
@@ -207,22 +227,33 @@ async fn run(
             poll_interval_secs: gate_config.poll_interval_secs,
             inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
         };
-        let resumed = orchestrator::resume_awaiting_ci_runs(&pool, &warden_home, &trigger)
+        let receive_timeout = std::time::Duration::from_secs(gate_config.inactivity_timeout_secs)
+            + orchestrator::CI_RESULT_RECEIVE_TIMEOUT_MARGIN;
+        let resume_pool = pool.clone();
+        let resume_warden_home = warden_home.clone();
+        tokio::spawn(async move {
+            match orchestrator::resume_awaiting_ci_runs(
+                resume_pool,
+                resume_warden_home,
+                trigger,
+                receive_timeout,
+            )
             .await
-            .context("failed to resume runs stuck in AwaitingCi")?;
-        for run_id in &resumed {
-            tracing::warn!(run_id, "resumed a run stuck in AwaitingCi (crash recovery)");
-        }
+            {
+                Ok(resumed) => {
+                    for run_id in &resumed {
+                        tracing::warn!(
+                            run_id,
+                            "resumed a run stuck in AwaitingCi (crash recovery)"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to resume runs stuck in AwaitingCi");
+                }
+            }
+        });
     }
-
-    let cancel = CancellationToken::new();
-    let cancel_on_ctrl_c = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received Ctrl-C, cancelling run");
-            cancel_on_ctrl_c.cancel();
-        }
-    });
 
     let config = RunConfig {
         repo_path: repo,

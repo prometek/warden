@@ -303,13 +303,16 @@ pub async fn set_run_converged_commit(
 /// `AwaitingCi` watch after a crash without keeping any watch state itself.
 pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) -> Result<()> {
     let now = now_rfc3339();
-    let pr_number = i64::try_from(pr_number).map_err(|_| WardenError::InvalidStoredValue {
-        column: "runs.pr_number",
-        value: i64::MAX,
-    })?;
+    // Issue #15 review, L2: reports the real `u64` value that failed to
+    // convert -- `WardenError::InvalidStoredValue` (used elsewhere in this
+    // module for the *opposite* direction, i64 column -> smaller unsigned
+    // type) can only carry an `i64`, which would have silently misreported
+    // an overflowing pr_number as `i64::MAX` instead of its actual value.
+    let stored_pr_number =
+        i64::try_from(pr_number).map_err(|_| WardenError::PrNumberOverflow { pr_number })?;
     sqlx::query!(
         "UPDATE runs SET pr_number = ?, updated_at = ? WHERE id = ?",
-        pr_number,
+        stored_pr_number,
         now,
         run_id,
     )
@@ -1059,6 +1062,24 @@ mod tests {
 
         let run = get_run(&pool, "run-pr").await.unwrap().unwrap();
         assert_eq!(run.pr_number, Some(42));
+    }
+
+    /// Issue #15 review, L2: an overflowing pr_number must be reported with
+    /// its own real value, not a misleading placeholder like `i64::MAX`.
+    #[tokio::test]
+    async fn set_run_pr_number_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-pr-overflow", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = set_run_pr_number(&pool, "run-pr-overflow", overflowing).await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::PrNumberOverflow { pr_number }) if pr_number == overflowing
+        ));
     }
 
     #[tokio::test]

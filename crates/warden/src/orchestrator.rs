@@ -11,6 +11,7 @@
 //! polling SQLite itself. See [`Orchestrator::publish_event`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::Utc;
 use sqlx::SqlitePool;
@@ -29,6 +30,15 @@ use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateTrigger, RunTailTrigger};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::worktree::{self, WorktreeManager};
+
+/// Issue #15 review, H1(b): added on top of a watch's own configured
+/// inactivity timeout when bounding [`crate::ci_channel::CiResultListener::receive`].
+/// The tail's push/skeleton-commit/`OpenDraft`/`Finalize` steps all happen
+/// *before* `watch_pr` itself starts, so the receive timeout must cover more
+/// than just the watch's own inactivity budget -- this margin is a
+/// deliberately generous, fixed allowance for that upfront work, not a
+/// tuned/measured bound.
+pub const CI_RESULT_RECEIVE_TIMEOUT_MARGIN: Duration = Duration::from_secs(15 * 60);
 
 /// Static configuration for a single run of the convergence loop.
 ///
@@ -433,6 +443,18 @@ impl Orchestrator {
             unreachable!("drive_post_convergence_tail is only called when config.gate is Some");
         };
 
+        // Issue #15 review, H3: a reboucle re-enters this method for a run
+        // that already has a PR (a prior pass through this same method
+        // already set it) -- `Some` here skips `OpenDraft` on the
+        // `warden-gated` side entirely.
+        let existing_pr_number = db::get_run(&self.pool, run_id)
+            .await?
+            .and_then(|run| run.pr_number);
+        // Issue #15 review, M2: folded into the finalized PR body's
+        // Evidence section (ADR-0009) -- previously hardcoded to empty on
+        // the `warden-gated` side of this boundary.
+        let evidence = evidence_rows_for_run(&self.pool, run_id).await?;
+
         self.transition(run_id, RunState::Pushed).await?;
         push_converged_commit_to_bare_repo(
             &config.repo_path,
@@ -459,13 +481,54 @@ impl Orchestrator {
                 pushed_commit_sha: converged_commit,
                 summary_body: &summary_body,
                 ci_result_socket: listener.socket_path(),
+                evidence: &evidence,
+                existing_pr_number,
             })
             .await?;
 
         self.transition(run_id, RunState::AwaitingCi).await?;
 
-        let message = listener.receive().await?;
-        self.apply_ci_result_message(run_id, &message).await
+        // Issue #15 review, H1(b): bounded, not an infinite await -- a
+        // margin on top of the watch's own inactivity timeout, since the
+        // tail's push/OpenDraft/Finalize steps ahead of the watch itself
+        // also take real (if normally short) time. On expiry, this run is
+        // failed outright rather than left stuck in `AwaitingCi` forever;
+        // crash recovery's own `resume_awaiting_ci_runs` no longer applies
+        // once a run is `Failed` -- that's an intentional, visible stop, not
+        // silent data loss (GitHub remains queryable out-of-band if a human
+        // needs to check what actually happened to the PR).
+        let receive_timeout = Duration::from_secs(gate_config.inactivity_timeout_secs)
+            + CI_RESULT_RECEIVE_TIMEOUT_MARGIN;
+        match listener.receive(receive_timeout).await {
+            Ok(message) => self.apply_ci_result_message(run_id, &message).await,
+            Err(WardenError::CiResultTimedOut { .. }) => {
+                tracing::error!(
+                    run_id,
+                    timeout_secs = receive_timeout.as_secs(),
+                    "timed out waiting for warden-gated's terminal CI result; failing the run"
+                );
+                self.fail_awaiting_ci_run(run_id).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Fails a run still sitting in `AwaitingCi` (issue #15 review, H1(b)) --
+    /// a safe no-op (returns the run's actual current state) if it has
+    /// already left that state by the time this runs, mirroring
+    /// `apply_ci_result_message`'s own idempotency guard.
+    async fn fail_awaiting_ci_run(&self, run_id: &str) -> Result<PostConvergenceOutcome> {
+        let run =
+            db::get_run(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| WardenError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })?;
+        if run.state != RunState::AwaitingCi {
+            return Ok(PostConvergenceOutcome::Terminal(run.state));
+        }
+        self.transition(run_id, RunState::Failed).await?;
+        Ok(PostConvergenceOutcome::Terminal(RunState::Failed))
     }
 
     /// Applies one received [`CiResultMessage`] to `run_id`'s persisted
@@ -483,6 +546,19 @@ impl Orchestrator {
         run_id: &str,
         message: &CiResultMessage,
     ) -> Result<PostConvergenceOutcome> {
+        // Issue #15 review, M5: `run_id` is the identity of the socket this
+        // message was received on (bound per-run); `message.run_id` is
+        // whatever the sender's own payload claims. Never apply a message
+        // to a run other than the one its own transport already identifies
+        // -- untrusted input at the process boundary, cross-checked rather
+        // than silently taken on faith.
+        if message.run_id != run_id {
+            return Err(WardenError::CiResultRunIdMismatch {
+                expected: run_id.to_string(),
+                actual: message.run_id.clone(),
+            });
+        }
+
         let run =
             db::get_run(&self.pool, run_id)
                 .await?
@@ -1012,6 +1088,27 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
 /// on to real `origin`, onto the run's own PR branch, never `main` directly.
 const GATE_STAGING_REF_PREFIX: &str = "refs/warden-staging/";
 
+/// Issue #15 review, M2: reads back every evidence row captured across
+/// `run_id`'s cycles and converts it into the shared wire shape
+/// `gate_trigger::RunTailTrigger::evidence` carries -- previously never
+/// read here at all, so the finalized PR body's Evidence section (ADR-0009)
+/// was always empty regardless of what the run actually captured.
+async fn evidence_rows_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<warden_core::EvidenceRow>> {
+    let rows = db::list_evidence_for_run(pool, run_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| warden_core::EvidenceRow {
+            cycle_number: row.cycle_number,
+            evidence_type: row.evidence.evidence_type,
+            repo_relative_path: row.evidence.file_path,
+            description: row.evidence.description,
+        })
+        .collect())
+}
+
 /// Pushes `commit_sha` (already reachable in `repo_path`'s object store --
 /// `protect_cycle_commit` keeps it so) into the local bare gate repo under
 /// this run's staging ref ([`GATE_STAGING_REF_PREFIX`]), transferring the
@@ -1192,12 +1289,18 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
 /// Returns the ids of runs this call reached a terminal state for (`Done`
 /// or `Failed`) or reboucled to `CoderRunning`, purely for the caller's own
 /// startup logging (mirrors [`recover_crashed_runs`]'s return contract).
+/// Takes `pool`/`warden_home`/`trigger` by value (issue #15 review, H1(c)/M4)
+/// specifically so callers can move this whole call into a `tokio::spawn`ed
+/// task -- see this function's own module-level context: it must never gate
+/// `warden`'s own startup (a stuck run's watch can legitimately take up to
+/// `receive_timeout` to resolve).
 pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
-    pool: &SqlitePool,
-    warden_home: &Path,
-    trigger: &G,
+    pool: SqlitePool,
+    warden_home: PathBuf,
+    trigger: G,
+    receive_timeout: Duration,
 ) -> Result<Vec<String>> {
-    let intermediate_runs = db::list_intermediate_runs(pool).await?;
+    let intermediate_runs = db::list_intermediate_runs(&pool).await?;
     let orchestrator = Orchestrator::new(pool.clone());
     let mut resumed_run_ids = Vec::new();
 
@@ -1212,7 +1315,13 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
                 "run stuck in AwaitingCi with no pr_number recorded; nothing to resume watching, marking Failed"
             );
             run.state.validate_transition(RunState::Failed)?;
-            db::update_run_state(pool, &run.id, RunState::Failed).await?;
+            db::update_run_state(&pool, &run.id, RunState::Failed).await?;
+            // Issue #15 review, L3: mirrors recover_crashed_runs's own
+            // orphan reclaim for every other path that fails a run outright
+            // -- defensive (a run that legitimately reached AwaitingCi
+            // should already have no open agent_processes/worktree rows
+            // left), but confirms no leak rather than assuming it.
+            reclaim_orphan_resources(&pool, &run).await;
             resumed_run_ids.push(run.id);
             continue;
         };
@@ -1223,10 +1332,25 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
         trigger
             .trigger_resume_watch(&run.id, pr_number, listener.socket_path())
             .await?;
-        let message = listener.receive().await?;
-        orchestrator
-            .apply_ci_result_message(&run.id, &message)
-            .await?;
+
+        // Issue #15 review, H1(b): bounded, mirrors
+        // `drive_post_convergence_tail`'s identical handling.
+        match listener.receive(receive_timeout).await {
+            Ok(message) => {
+                orchestrator
+                    .apply_ci_result_message(&run.id, &message)
+                    .await?;
+            }
+            Err(WardenError::CiResultTimedOut { .. }) => {
+                tracing::error!(
+                    run_id = %run.id,
+                    timeout_secs = receive_timeout.as_secs(),
+                    "timed out resuming the CI watch; failing the run"
+                );
+                orchestrator.fail_awaiting_ci_run(&run.id).await?;
+            }
+            Err(error) => return Err(error),
+        }
         resumed_run_ids.push(run.id);
     }
 
@@ -2741,6 +2865,51 @@ mod tests {
         );
     }
 
+    /// Issue #15 review, M5: a message delivered on `run-a`'s own reverse
+    /// socket but whose payload claims a different `run_id` must never be
+    /// applied to `run-a` -- rejected as a typed error, and `run-a`'s state
+    /// must be left completely untouched.
+    #[tokio::test]
+    async fn apply_ci_result_message_rejects_a_run_id_mismatch() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(&pool, "run-a", "/tmp/repo", "main", "intent", 5)
+            .await
+            .unwrap();
+        for state in [
+            RunState::CoderRunning,
+            RunState::AwaitingReviewTest,
+            RunState::Converged,
+            RunState::Pushed,
+            RunState::AwaitingCi,
+        ] {
+            db::update_run_state(&pool, "run-a", state).await.unwrap();
+        }
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let message = CiResultMessage {
+            run_id: "run-b".to_string(),
+            pr_number: Some(99),
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+        };
+
+        let result = orchestrator
+            .apply_ci_result_message("run-a", &message)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::CiResultRunIdMismatch { .. })
+        ));
+        let run = db::get_run(&pool, "run-a").await.unwrap().unwrap();
+        assert_eq!(
+            run.state,
+            RunState::AwaitingCi,
+            "a run_id mismatch must leave the run's state completely untouched"
+        );
+        assert_eq!(run.pr_number, None);
+    }
+
     // ---- Issue #15/ADR-0011: crash-recovery resume of AwaitingCi ---------
 
     /// The bug `recover_crashed_runs` alone would have: `AwaitingCi` has no
@@ -2806,9 +2975,14 @@ mod tests {
             pr_number: Some(42),
         };
 
-        let resumed = resume_awaiting_ci_runs(&pool, warden_home.path(), &trigger)
-            .await
-            .unwrap();
+        let resumed = resume_awaiting_ci_runs(
+            pool.clone(),
+            warden_home.path().to_path_buf(),
+            trigger,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resumed, vec!["run-ci".to_string()]);
         let run = db::get_run(&pool, "run-ci").await.unwrap().unwrap();
@@ -2844,9 +3018,14 @@ mod tests {
             pr_number: None,
         };
 
-        let resumed = resume_awaiting_ci_runs(&pool, warden_home.path(), &trigger)
-            .await
-            .unwrap();
+        let resumed = resume_awaiting_ci_runs(
+            pool.clone(),
+            warden_home.path().to_path_buf(),
+            trigger,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resumed, vec!["run-no-pr".to_string()]);
         let run = db::get_run(&pool, "run-no-pr").await.unwrap().unwrap();
