@@ -128,6 +128,12 @@ pub enum GatedError {
     /// distinguish a `Blocked` outcome from every other kind of failure.
     #[error("Finalize was blocked by re-verification: {reason}")]
     FinalizeBlocked { reason: String },
+
+    /// A `runs.pr_number` value that doesn't fit in a `u64` -- a row written
+    /// by something other than `warden::db::set_run_pr_number`, or a
+    /// corrupted database (code-standards.md: "no silent fallback").
+    #[error("row column `{column}` = {value} does not fit in the expected numeric type")]
+    InvalidStoredValue { column: &'static str, value: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;

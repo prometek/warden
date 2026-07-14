@@ -78,6 +78,54 @@ pub async fn get_run_view(pool: &SqlitePool, run_id: &str) -> Result<Option<Gate
     .transpose()
 }
 
+/// The subset of a `runs` row the crash-recovery `resume-watch` path needs
+/// (issue #15/ADR-0011): its current state (must still be `AwaitingCi` --
+/// re-verified here rather than trusted from the caller, same "never trust
+/// the caller" principle as [`GateRunView`]/[`get_run_view`]) and the PR
+/// number `warden` persisted for it. A dedicated, narrower read rather than
+/// growing [`GateRunView`] itself, whose existing fields/tests are specific
+/// to the push-authorization path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingCiRunView {
+    pub state: RunState,
+    pub pr_number: Option<u64>,
+}
+
+struct AwaitingCiRunRow {
+    state: String,
+    pr_number: Option<i64>,
+}
+
+pub async fn get_awaiting_ci_run_view(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<AwaitingCiRunView>> {
+    let row = sqlx::query_as!(
+        AwaitingCiRunRow,
+        r#"SELECT state, pr_number FROM runs WHERE id = ?"#,
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| -> Result<AwaitingCiRunView> {
+        let pr_number = r
+            .pr_number
+            .map(|value| {
+                u64::try_from(value).map_err(|_| GatedError::InvalidStoredValue {
+                    column: "runs.pr_number",
+                    value,
+                })
+            })
+            .transpose()?;
+        Ok(AwaitingCiRunView {
+            state: RunState::parse(&r.state)?,
+            pr_number,
+        })
+    })
+    .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +206,77 @@ mod tests {
         let pool = connect_read_only(&db_path).await.unwrap();
         let view = get_run_view(&pool, "does-not-exist").await.unwrap();
         assert!(view.is_none());
+    }
+
+    /// A dedicated fixture (rather than growing [`seed_db_with_run`]) since
+    /// [`get_awaiting_ci_run_view`] reads a column (`pr_number`) the
+    /// push-authorization tests above have no reason to know about.
+    async fn seed_db_with_awaiting_ci_run(
+        dir: &Path,
+        run_id: &str,
+        state: RunState,
+        pr_number: Option<i64>,
+    ) -> std::path::PathBuf {
+        let db_path = dir.join("state.db");
+        let write_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true);
+        let write_pool = SqlitePoolOptions::new()
+            .connect_with(write_options)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE runs (
+                id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                pr_number INTEGER
+            )",
+        )
+        .execute(&write_pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO runs (id, state, pr_number) VALUES (?, ?, ?)")
+            .bind(run_id)
+            .bind(state.as_str())
+            .bind(pr_number)
+            .execute(&write_pool)
+            .await
+            .unwrap();
+
+        write_pool.close().await;
+        db_path
+    }
+
+    #[tokio::test]
+    async fn get_awaiting_ci_run_view_round_trips_state_and_pr_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path =
+            seed_db_with_awaiting_ci_run(dir.path(), "run-1", RunState::AwaitingCi, Some(42)).await;
+
+        let pool = connect_read_only(&db_path).await.unwrap();
+        let view = get_awaiting_ci_run_view(&pool, "run-1")
+            .await
+            .unwrap()
+            .expect("run-1 exists");
+
+        assert_eq!(view.state, RunState::AwaitingCi);
+        assert_eq!(view.pr_number, Some(42));
+    }
+
+    #[tokio::test]
+    async fn get_awaiting_ci_run_view_reports_no_pr_number_when_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path =
+            seed_db_with_awaiting_ci_run(dir.path(), "run-1", RunState::Pushed, None).await;
+
+        let pool = connect_read_only(&db_path).await.unwrap();
+        let view = get_awaiting_ci_run_view(&pool, "run-1")
+            .await
+            .unwrap()
+            .expect("run-1 exists");
+
+        assert_eq!(view.pr_number, None);
     }
 }
