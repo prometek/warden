@@ -134,6 +134,7 @@ struct RunContext {
 /// [`Orchestrator::apply_ci_result_message`]), or `ChecksFailed` reboucles to
 /// the coder within budget, carrying the CI findings to seed into the next
 /// cycle.
+#[derive(Debug)]
 enum PostConvergenceOutcome {
     Terminal(RunState),
     Reboucle { findings: Vec<Finding> },
@@ -2316,5 +2317,285 @@ mod tests {
         // coder's own commit -- no evidence-only commit is created on top.
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert!(run.converged_commit_sha.is_some());
+    }
+
+    // ---- Issue #15/ADR-0011: post-Converged tail -------------------------
+
+    /// A local bare repo standing in for `warden-gated`'s own bare gate repo
+    /// (ADR-0002) -- real git, no network, so `push_converged_commit_to_bare_repo`
+    /// exercises an actual `git push` (code-standards.md: "pas d'appel
+    /// réseau externe").
+    fn init_bare_repo_fixture() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        let status = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["init", "--bare", "--quiet"])
+            .status()
+            .expect("spawn git");
+        assert!(status.success());
+        dir
+    }
+
+    /// A [`GateTrigger`] fake that delivers a scripted [`CiResultMessage`]
+    /// synchronously within `trigger_run_tail`/`trigger_resume_watch`,
+    /// standing in for `warden-gated`'s real subprocess (which would need a
+    /// live `gh`/GitHub PR, code-standards.md: "pas d'appel réseau
+    /// externe"). Connecting before the caller's own `listener.receive()`
+    /// is safe: a Unix listener's accept backlog holds the connection
+    /// regardless of `accept()` timing.
+    struct FakeGateTrigger {
+        outcome: warden_core::CiWatchOutcome,
+        pr_number: Option<u64>,
+    }
+
+    impl GateTrigger for FakeGateTrigger {
+        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<()> {
+            self.deliver(request.run_id, request.ci_result_socket).await
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            run_id: &str,
+            _pr_number: u64,
+            ci_result_socket: &Path,
+        ) -> Result<()> {
+            self.deliver(run_id, ci_result_socket).await
+        }
+    }
+
+    impl FakeGateTrigger {
+        async fn deliver(&self, run_id: &str, ci_result_socket: &Path) -> Result<()> {
+            use tokio::io::AsyncWriteExt;
+
+            let message = CiResultMessage {
+                run_id: run_id.to_string(),
+                pr_number: self.pr_number,
+                outcome: self.outcome.clone(),
+            };
+            let json = message.to_json()?;
+            let mut stream = tokio::net::UnixStream::connect(ci_result_socket).await?;
+            stream.write_all(json.as_bytes()).await?;
+            stream.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    /// Builds a run already sitting in `Converged` (the state
+    /// `drive_post_convergence_tail`'s first transition, `-> Pushed`,
+    /// requires) with a real commit -- `init_test_repo`'s own initial
+    /// commit -- reachable in `repo_path`'s object store, so
+    /// `push_converged_commit_to_bare_repo` has something real to push.
+    async fn converged_run_fixture(
+        pool: &SqlitePool,
+        repo: &TempDir,
+        bare_repo: &TempDir,
+    ) -> (String, RunConfig, String) {
+        let run_id = Uuid::new_v4().to_string();
+        db::insert_run(pool, &run_id, "/tmp/repo", "main", "intent", 5)
+            .await
+            .unwrap();
+        db::update_run_state(pool, &run_id, RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::update_run_state(pool, &run_id, RunState::AwaitingReviewTest)
+            .await
+            .unwrap();
+        db::update_run_state(pool, &run_id, RunState::Converged)
+            .await
+            .unwrap();
+
+        let head_output = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let converged_commit = String::from_utf8_lossy(&head_output.stdout)
+            .trim()
+            .to_string();
+        db::set_run_converged_commit(pool, &run_id, &converged_commit)
+            .await
+            .unwrap();
+
+        let warden_home = TempDir::new().unwrap();
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "intent".to_string(),
+            max_cycles: 5,
+            coder_command: AgentCommand::new("sh", ["-c", "true"]),
+            reviewer_command: AgentCommand::new("sh", ["-c", "true"]),
+            tester_command: AgentCommand::new("sh", ["-c", "true"]),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: Some(GateConfig {
+                bare_repo_path: bare_repo.path().to_path_buf(),
+                gated_bin: PathBuf::from("/unused/in/this/test"),
+                repo_slug: None,
+                poll_interval_secs: 1,
+                inactivity_timeout_secs: 3600,
+            }),
+        };
+        // Leaked deliberately: `warden_home`'s TempDir must outlive the
+        // `CiResultListener` bound inside it for the duration of this test,
+        // and giving each test its own leaked TempDir is simpler than
+        // threading an extra return value through every caller.
+        std::mem::forget(warden_home);
+
+        (run_id, config, converged_commit)
+    }
+
+    #[tokio::test]
+    async fn drive_post_convergence_tail_reaches_done_on_checks_passed() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            pr_number: Some(42),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Done)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Done);
+        assert_eq!(run.pr_number, Some(42));
+    }
+
+    #[tokio::test]
+    async fn drive_post_convergence_tail_reboucles_to_coder_running_with_ci_findings_on_checks_failed(
+    ) {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let ci_finding = Finding {
+            source: warden_core::FindingSource::Ci,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "build failed".to_string(),
+            action: None,
+        };
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_failed(&[ci_finding]),
+            pr_number: Some(7),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        match outcome {
+            PostConvergenceOutcome::Reboucle { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].source, warden_core::FindingSource::Ci);
+                assert_eq!(findings[0].description, "build failed");
+            }
+            other => panic!("expected Reboucle, got {other:?}"),
+        }
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::CoderRunning);
+    }
+
+    #[tokio::test]
+    async fn drive_post_convergence_tail_maps_gate_failed_to_failed() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::gate_failed("skeleton push failed"),
+            pr_number: None,
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// ADR-0011's idempotency guard: a run that has already left
+    /// `AwaitingCi` (e.g. a duplicate/stale delivery racing an earlier one)
+    /// must not have its state clobbered by a second `CiResultMessage` --
+    /// this is a safe no-op, never an error.
+    #[tokio::test]
+    async fn apply_ci_result_message_is_a_noop_once_the_run_already_left_awaiting_ci() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 5)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::AwaitingReviewTest)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::Converged)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::Pushed)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::AwaitingCi)
+            .await
+            .unwrap();
+        // Already left AwaitingCi by the time this (stale/duplicate)
+        // message is applied.
+        db::update_run_state(&pool, &run_id, RunState::Done)
+            .await
+            .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let message = CiResultMessage {
+            run_id: run_id.clone(),
+            pr_number: Some(99),
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+        };
+
+        let outcome = orchestrator
+            .apply_ci_result_message(&run_id, &message)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Done)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Done);
+        assert_eq!(
+            run.pr_number, None,
+            "a stale delivery must not even record its pr_number once ignored"
+        );
     }
 }
