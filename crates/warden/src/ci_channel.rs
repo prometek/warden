@@ -71,18 +71,18 @@ impl CiResultListener {
     /// Accepts exactly one connection, reads its payload to EOF (capped at
     /// [`MAX_CI_RESULT_PAYLOAD_BYTES`], issue #15 review, L1), and parses it
     /// into a [`CiResultMessage`] (ADR-0011: "un seul message terminal par
-    /// run", not a stream).
+    /// run", not a stream), bounded by a wall-clock `timeout`.
     ///
-    /// Bounded by `timeout` (issue #15 review, H1(b)): the accept-and-read
-    /// as a whole must complete within it, or this returns
-    /// [`WardenError::CiResultTimedOut`] rather than awaiting forever.
-    /// `watch_pr`'s own inactivity timeout bounds how long `warden-gated`
-    /// can take before it sends *something* in the common case, but this
-    /// call cannot simply trust that on its own -- `warden-gated` could be
-    /// dead, unreachable, or stuck before it even starts watching. GitHub
-    /// remains the durable source of truth if the run is later retried;
-    /// this timeout only stops `warden` itself from blocking indefinitely on
-    /// one run.
+    /// **Not on the production path** (issue #15 review, M-new-1): the
+    /// orchestrator now bounds its wait by the triggered subprocess's
+    /// *liveness* via [`Self::receive_no_timeout`] inside a `select!` against
+    /// [`crate::gate_trigger::GateChild`], because `watch_pr`'s runtime has no
+    /// absolute cap that a wall-clock bound here could match without spuriously
+    /// failing a long-but-active CI. This bounded variant is retained as a
+    /// self-contained convenience exercised by this module's own tests (and
+    /// available to any caller that genuinely wants a hard time cap); on expiry
+    /// it returns [`WardenError::CiResultTimedOut`] rather than awaiting
+    /// forever.
     pub async fn receive(&self, timeout: Duration) -> Result<CiResultMessage> {
         let run_or_timeout = tokio::time::timeout(timeout, self.receive_unbounded()).await;
         match run_or_timeout {
