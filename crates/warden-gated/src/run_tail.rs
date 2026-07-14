@@ -45,6 +45,15 @@ pub struct RunTailRequest<'a> {
     pub evidence: &'a [EvidenceRow],
     pub repo_slug: &'a str,
     pub watch_config: WatchConfig,
+    /// The PR already opened for this run in an earlier attempt (issue #15
+    /// review, H3): a reboucled run (`ChecksFailed` -> `CoderRunning` -> ...
+    /// -> `Converged` again) re-enters this tail with the *same* run, so
+    /// `Some(pr_number)` here skips the skeleton commit and `OpenDraft`
+    /// entirely and goes straight to `Finalize` against the existing PR --
+    /// opening a second draft PR for the same branch would be rejected by a
+    /// real PR provider (one open PR per branch) and silently orphan the
+    /// first. `None` only for a run's first pass through this tail.
+    pub existing_pr_number: Option<u64>,
 }
 
 /// Runs the full fresh tail: skeleton commit -> `OpenDraft` -> `Finalize` ->
@@ -74,26 +83,34 @@ async fn run_tail_fallible<P: PrProvider + CiProvider>(
     request: &RunTailRequest<'_>,
     provider: &P,
 ) -> std::result::Result<CiResultMessage, (Option<u64>, GatedError)> {
-    let skeleton_commit_sha = create_skeleton_commit(
-        request.bare_repo_path,
-        request.base_branch,
-        request.pushed_commit_sha,
-    )
-    .await
-    .map_err(|error| (None, error))?;
+    let pr = match request.existing_pr_number {
+        // Issue #15 review, H3: a reboucle reuses the PR a prior pass
+        // through this tail already opened -- never call `OpenDraft` again
+        // for the same run.
+        Some(pr_number) => PrHandle { number: pr_number },
+        None => {
+            let skeleton_commit_sha = create_skeleton_commit(
+                request.bare_repo_path,
+                request.base_branch,
+                request.pushed_commit_sha,
+            )
+            .await
+            .map_err(|error| (None, error))?;
 
-    let pr = pr_manager::open_draft(
-        &OpenDraftRequest {
-            bare_repo_path: request.bare_repo_path,
-            skeleton_commit_sha: &skeleton_commit_sha,
-            branch: request.branch,
-            base_branch: request.base_branch,
-            intent: request.intent,
-        },
-        provider,
-    )
-    .await
-    .map_err(|error| (None, error))?;
+            pr_manager::open_draft(
+                &OpenDraftRequest {
+                    bare_repo_path: request.bare_repo_path,
+                    skeleton_commit_sha: &skeleton_commit_sha,
+                    branch: request.branch,
+                    base_branch: request.base_branch,
+                    intent: request.intent,
+                },
+                provider,
+            )
+            .await
+            .map_err(|error| (None, error))?
+        }
+    };
 
     let finalize_outcome = pr_manager::finalize(
         pool,
@@ -357,14 +374,31 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
         next_pr_number: u64,
         ci_responses: std::sync::Mutex<std::collections::VecDeque<PrStatus>>,
+        /// How many `open_draft` calls this provider tolerates before
+        /// rejecting, standing in for a real PR provider refusing a second
+        /// draft PR for a branch that already has one open (issue #15
+        /// review, H3). `usize::MAX` (via [`FakeProvider::new`]) means
+        /// "never reject".
+        open_draft_budget: usize,
+        open_draft_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeProvider {
         fn new(next_pr_number: u64, ci_responses: Vec<PrStatus>) -> Self {
+            Self::new_with_open_draft_budget(next_pr_number, ci_responses, usize::MAX)
+        }
+
+        fn new_with_open_draft_budget(
+            next_pr_number: u64,
+            ci_responses: Vec<PrStatus>,
+            open_draft_budget: usize,
+        ) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
                 next_pr_number,
                 ci_responses: std::sync::Mutex::new(ci_responses.into()),
+                open_draft_budget,
+                open_draft_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
     }
@@ -374,6 +408,21 @@ mod tests {
             &self,
             params: &crate::pr_manager::OpenDraftParams<'_>,
         ) -> Result<PrHandle> {
+            let call_number = self
+                .open_draft_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_number >= self.open_draft_budget {
+                // Mirrors the real `gh pr create` rejection for a branch
+                // that already has an open PR.
+                return Err(GatedError::GhCommandFailed {
+                    command: "gh pr create".to_string(),
+                    exit_code: Some(1),
+                    stderr: format!(
+                        "a pull request for branch \"{}\" into branch \"main\" already exists",
+                        params.branch
+                    ),
+                });
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -454,6 +503,7 @@ mod tests {
             evidence: &[],
             repo_slug: "owner/repo",
             watch_config: watch_config(),
+            existing_pr_number: None,
         };
 
         let message = run_tail(&pool, &request, &provider).await;
@@ -496,12 +546,103 @@ mod tests {
             evidence: &[],
             repo_slug: "owner/repo",
             watch_config: watch_config(),
+            existing_pr_number: None,
         };
 
         let message = run_tail(&pool, &request, &provider).await;
 
         assert_eq!(message.pr_number, Some(7));
         assert!(matches!(message.outcome, CiWatchOutcome::GateFailed { .. }));
+    }
+
+    /// Issue #15 review, H3: a reboucled run (`ChecksFailed` -> `CoderRunning`
+    /// -> ... -> `Converged` again) re-enters `run_tail` a second time. With
+    /// a provider whose `open_draft` REJECTS any call past the first (mirrors
+    /// a real PR provider refusing a duplicate draft PR for the same
+    /// branch), the second pass must still succeed by reusing
+    /// `existing_pr_number` -- never calling `open_draft` again.
+    #[tokio::test]
+    async fn run_tail_reboucle_reuses_the_existing_pr_and_never_calls_open_draft_again() {
+        let (_origin, gate_repo, business_sha) = converged_gate_repo_fixture();
+        let (_db_dir, pool) = seeded_db("run-1", &business_sha).await;
+        let provider = FakeProvider::new_with_open_draft_budget(
+            42,
+            vec![
+                PrStatus {
+                    lifecycle: PrLifecycle::Open,
+                    checks: vec![CheckRun {
+                        name: "build".to_string(),
+                        conclusion: CheckConclusion::Failed,
+                        details_url: None,
+                    }],
+                },
+                PrStatus {
+                    lifecycle: PrLifecycle::Open,
+                    checks: vec![CheckRun {
+                        name: "build".to_string(),
+                        conclusion: CheckConclusion::Passed,
+                        details_url: None,
+                    }],
+                },
+            ],
+            1,
+        );
+
+        // First pass: no PR yet, so `open_draft` is called (and allowed,
+        // this is call #1 within the budget of 1).
+        let first_request = RunTailRequest {
+            bare_repo_path: gate_repo.path(),
+            run_id: "run-1",
+            intent: "Add a feature",
+            branch: "warden/run-1",
+            base_branch: "main",
+            pushed_commit_sha: &business_sha,
+            summary_body: "Cycle summary",
+            evidence: &[],
+            repo_slug: "owner/repo",
+            watch_config: watch_config(),
+            existing_pr_number: None,
+        };
+        let first_message = run_tail(&pool, &first_request, &provider).await;
+        assert_eq!(first_message.pr_number, Some(42));
+        assert!(matches!(
+            first_message.outcome,
+            CiWatchOutcome::ChecksFailed { .. }
+        ));
+
+        // Second pass (the reboucle): the run converged again on the same
+        // commit (finalize/push are idempotent, see pr_manager::finalize's
+        // own docs) -- what matters here is that `existing_pr_number` is
+        // now `Some`, so this must NOT call `open_draft` again (the fake
+        // provider would reject a second call).
+        let second_request = RunTailRequest {
+            bare_repo_path: gate_repo.path(),
+            run_id: "run-1",
+            intent: "Add a feature",
+            branch: "warden/run-1",
+            base_branch: "main",
+            pushed_commit_sha: &business_sha,
+            summary_body: "Cycle summary",
+            evidence: &[],
+            repo_slug: "owner/repo",
+            watch_config: watch_config(),
+            existing_pr_number: Some(42),
+        };
+        let second_message = run_tail(&pool, &second_request, &provider).await;
+
+        assert_eq!(second_message.pr_number, Some(42));
+        assert_eq!(second_message.outcome, CiWatchOutcome::checks_passed());
+        assert_eq!(
+            provider
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.starts_with("open_draft"))
+                .count(),
+            1,
+            "open_draft must only ever be called once across both passes"
+        );
     }
 
     #[tokio::test]

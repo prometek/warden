@@ -42,6 +42,13 @@ pub enum CoreError {
     /// silently ignored).
     #[error("malformed CI result message: {0}")]
     MalformedCiResultMessage(String),
+
+    /// A `--evidence-json` argument (issue #15 review, M2) that isn't valid
+    /// JSON, or whose shape doesn't match the expected evidence-row wire
+    /// form -- untrusted input at the `warden` -> `warden-gated` process
+    /// boundary, never silently ignored.
+    #[error("malformed evidence rows: {0}")]
+    MalformedEvidenceRows(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

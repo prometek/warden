@@ -13,6 +13,7 @@ mod convergence;
 mod error;
 mod event;
 mod evidence;
+mod evidence_wire;
 mod pr_body;
 mod socket;
 mod state;
@@ -28,6 +29,7 @@ pub use evidence::{
     detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,
     ProjectType,
 };
+pub use evidence_wire::{parse_evidence_rows, serialize_evidence_rows};
 pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use state::{AgentRole, RunState};
