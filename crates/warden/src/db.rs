@@ -200,6 +200,11 @@ pub struct Run {
     /// The commit SHA the run converged on (see `set_run_converged_commit`,
     /// M4) — `None` until the run reaches `RunState::Converged`.
     pub converged_commit_sha: Option<String>,
+    /// The PR `warden-gated` opened for this run (see `set_run_pr_number`,
+    /// issue #15/ADR-0011) — `None` until `Pushed`'s tail successfully opens
+    /// one. Read back by crash recovery to resume a stuck `AwaitingCi` watch
+    /// without needing any watch state of `warden-gated`'s own.
+    pub pr_number: Option<u64>,
 }
 
 pub async fn insert_run(
@@ -291,6 +296,28 @@ pub async fn set_run_converged_commit(
     Ok(())
 }
 
+/// Records the PR `warden-gated` opened for this run (issue #15/ADR-0011),
+/// once the post-Converged tail's `OpenDraft` succeeds. `warden` is still
+/// the sole writer of this column -- `warden-gated` only ever reads it back
+/// read-only (`get_run_view`-style query), e.g. to resume a stuck
+/// `AwaitingCi` watch after a crash without keeping any watch state itself.
+pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) -> Result<()> {
+    let now = now_rfc3339();
+    let pr_number = i64::try_from(pr_number).map_err(|_| WardenError::InvalidStoredValue {
+        column: "runs.pr_number",
+        value: i64::MAX,
+    })?;
+    sqlx::query!(
+        "UPDATE runs SET pr_number = ?, updated_at = ? WHERE id = ?",
+        pr_number,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Raw shape of a `runs` row as decoded by sqlx, before `state` has been
 /// validated into a [`RunState`]. Kept private: [`Run`] is the only form
 /// that ever leaves this module.
@@ -305,9 +332,14 @@ struct RunRow {
     created_at: String,
     updated_at: String,
     converged_commit_sha: Option<String>,
+    pr_number: Option<i64>,
 }
 
 fn row_to_run(row: RunRow) -> Result<Run> {
+    let pr_number = row
+        .pr_number
+        .map(|value| checked_u32(value, "runs.pr_number").map(u64::from))
+        .transpose()?;
     Ok(Run {
         id: row.id,
         repo_path: row.repo_path,
@@ -319,13 +351,14 @@ fn row_to_run(row: RunRow) -> Result<Run> {
         created_at: row.created_at,
         updated_at: row.updated_at,
         converged_commit_sha: row.converged_commit_sha,
+        pr_number,
     })
 }
 
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -343,7 +376,7 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha
+        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
         WHERE state IN ('coder_running', 'awaiting_review_test', 'awaiting_ci')
         "#
@@ -373,7 +406,7 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha
+        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
         FROM runs
         WHERE runs.state = 'failed'
           AND (
@@ -1010,6 +1043,22 @@ mod tests {
         assert_eq!(run.max_cycles, 5);
         assert_eq!(run.current_cycle, 0);
         assert_eq!(run.intent, "do the thing");
+    }
+
+    #[tokio::test]
+    async fn pr_number_is_none_until_set_then_round_trips() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let run = get_run(&pool, "run-pr").await.unwrap().unwrap();
+        assert_eq!(run.pr_number, None);
+
+        set_run_pr_number(&pool, "run-pr", 42).await.unwrap();
+
+        let run = get_run(&pool, "run-pr").await.unwrap().unwrap();
+        assert_eq!(run.pr_number, Some(42));
     }
 
     #[tokio::test]
