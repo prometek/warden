@@ -17,13 +17,16 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, parse_findings, AgentRole, EvidenceTool, Finding, RunEvent, RunState,
+    decide_next_state, decide_next_state_after_ci, parse_findings, AgentRole, CiResultMessage,
+    EvidenceTool, Finding, RunEvent, RunState,
 };
 
+use crate::ci_channel::CiResultListener;
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
+use crate::gate_trigger::{GateTrigger, RunTailTrigger};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::worktree::{self, WorktreeManager};
 
@@ -55,6 +58,33 @@ pub struct RunConfig {
     /// rather than defaulted in this struct so every caller states its
     /// choice explicitly.
     pub evidence_store_in_repo: bool,
+    /// Issue #15/ADR-0011's post-`Converged` tail (push into the local bare
+    /// gate repo + PR open/finalize + CI watch). `None` preserves this
+    /// crate's original behaviour exactly: a converged run stops at
+    /// `Converged` and never reaches `Pushed`/`AwaitingCi`/`Done`.
+    pub gate: Option<GateConfig>,
+}
+
+/// Everything [`Orchestrator::drive_post_convergence_tail`] needs to trigger
+/// `warden-gated`'s side of issue #15/ADR-0011's tail. Deliberately plain
+/// data (no trigger trait object): the concrete
+/// [`crate::gate_trigger::SubprocessGateTrigger`] used in production is
+/// built from these fields at the one call site that needs it, and
+/// `drive_post_convergence_tail` itself stays generic over
+/// [`crate::gate_trigger::GateTrigger`] so tests can substitute a fake.
+#[derive(Debug, Clone)]
+pub struct GateConfig {
+    /// The local bare gate repo `warden` pushes the converged commit into
+    /// (ADR-0002) -- the same repo `warden-gated run-tail`/`resume-watch`
+    /// push the PR's content from.
+    pub bare_repo_path: PathBuf,
+    /// Absolute path to the installed `warden-gated` binary.
+    pub gated_bin: PathBuf,
+    /// Explicit `owner/repo` override; `None` lets `warden-gated` resolve it
+    /// from the bare repo's `origin` remote (`GhProvider::new`).
+    pub repo_slug: Option<String>,
+    pub poll_interval_secs: u64,
+    pub inactivity_timeout_secs: u64,
 }
 
 /// Parameters for a single coder invocation. Grouped into a struct (rather
@@ -97,6 +127,16 @@ struct FindingAgentInvocation<'a> {
 struct RunContext {
     run_id: String,
     event_bus: EventBus,
+}
+
+/// One [`Orchestrator::drive_post_convergence_tail`] call's verdict: either
+/// the run has reached a terminal [`RunState`] (`Done`/`Failed` -- see
+/// [`Orchestrator::apply_ci_result_message`]), or `ChecksFailed` reboucles to
+/// the coder within budget, carrying the CI findings to seed into the next
+/// cycle.
+enum PostConvergenceOutcome {
+    Terminal(RunState),
+    Reboucle { findings: Vec<Finding> },
 }
 
 /// Drives the convergence loop against a persisted [`SqlitePool`].
@@ -212,6 +252,13 @@ impl Orchestrator {
 
         let mut base_commit = "HEAD".to_string();
         let mut cycle_number: u32 = 1;
+        // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
+        // coder exactly like a reviewer/tester blocking finding does, just
+        // one step later in the pipeline -- these are seeded into the next
+        // cycle's `findings` rows right below, the one time this is
+        // non-empty (see the `PostConvergenceOutcome::Reboucle` arm further
+        // down).
+        let mut pending_ci_findings: Vec<Finding> = Vec::new();
 
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
@@ -219,6 +266,20 @@ impl Orchestrator {
             db::set_run_current_cycle(&self.pool, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
                 .await?;
+
+            for finding in pending_ci_findings.drain(..) {
+                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, &finding)
+                    .await?;
+                self.publish_event(RunEvent::FindingRaised {
+                    cycle_number,
+                    source: finding.source.as_str().to_string(),
+                    severity: finding.severity.as_str().to_string(),
+                    file: finding.file.clone(),
+                    description: finding.description.clone(),
+                    action: finding.action.clone(),
+                })
+                .await?;
+            }
 
             base_commit = self
                 .run_coder(CoderInvocation {
@@ -264,6 +325,7 @@ impl Orchestrator {
             db::close_cycle(&self.pool, &cycle_id).await?;
 
             let next_state = decide_next_state(&findings, cycle_number, config.max_cycles);
+            let mut converged_commit_for_tail: Option<String> = None;
             if next_state == RunState::Converged {
                 // Issue #7 / ADR-0009: fold any evidence captured across
                 // this run's cycles into the converged commit before
@@ -287,6 +349,7 @@ impl Orchestrator {
                 // persisting the state transition, so a reader that
                 // observes `Converged` can never see a missing SHA.
                 db::set_run_converged_commit(&self.pool, &run_id, &converged_commit).await?;
+                converged_commit_for_tail = Some(converged_commit);
             }
             self.transition(&run_id, next_state).await?;
 
@@ -294,6 +357,44 @@ impl Orchestrator {
                 RunState::CoderRunning => {
                     cycle_number += 1;
                     continue;
+                }
+                RunState::Converged => {
+                    // Documented strict invariant (code-standards.md): set
+                    // unconditionally a few lines above, in the
+                    // `if next_state == RunState::Converged` block --
+                    // reachable here only because `next_state` is that
+                    // exact same value.
+                    let converged_commit = converged_commit_for_tail
+                        .unwrap_or_else(|| unreachable!("converged_commit_for_tail is always Some when next_state == RunState::Converged"));
+                    match &config.gate {
+                        None => break RunState::Converged,
+                        Some(gate_config) => {
+                            let trigger = crate::gate_trigger::SubprocessGateTrigger {
+                                gated_bin: gate_config.gated_bin.clone(),
+                                db_path: config.warden_home.join("state.db"),
+                                bare_repo_path: gate_config.bare_repo_path.clone(),
+                                repo_slug: gate_config.repo_slug.clone(),
+                                poll_interval_secs: gate_config.poll_interval_secs,
+                                inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
+                            };
+                            match self
+                                .drive_post_convergence_tail(
+                                    &run_id,
+                                    &config,
+                                    &converged_commit,
+                                    &trigger,
+                                )
+                                .await?
+                            {
+                                PostConvergenceOutcome::Terminal(state) => break state,
+                                PostConvergenceOutcome::Reboucle { findings } => {
+                                    cycle_number += 1;
+                                    pending_ci_findings = findings;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
                 terminal => break terminal,
             }
@@ -305,6 +406,119 @@ impl Orchestrator {
         .await?;
 
         Ok((run_id, final_state))
+    }
+
+    /// Drives issue #15/ADR-0011's post-`Converged` tail: pushes the
+    /// converged commit into the local bare gate repo (the ADR-0002 forward
+    /// channel), triggers `warden-gated`'s fresh `run-tail` (skeleton commit
+    /// plus `OpenDraft`, `Finalize`, and `watch_pr`), and awaits the one
+    /// terminal `CiResultMessage` it delivers back over a freshly bound
+    /// reverse socket. Generic over [`GateTrigger`] so tests can inject a
+    /// fake that delivers a scripted message without spawning a real
+    /// `warden-gated` subprocess (code-standards.md: no network/subprocess
+    /// in tests).
+    ///
+    /// Every state transition here is write-ahead of the action it
+    /// authorizes (ADR-0004): `Pushed` is persisted before the push,
+    /// `AwaitingCi` before the (possibly long) wait for a result.
+    async fn drive_post_convergence_tail<G: GateTrigger>(
+        &self,
+        run_id: &str,
+        config: &RunConfig,
+        converged_commit: &str,
+        trigger: &G,
+    ) -> Result<PostConvergenceOutcome> {
+        let Some(gate_config) = &config.gate else {
+            unreachable!("drive_post_convergence_tail is only called when config.gate is Some");
+        };
+
+        self.transition(run_id, RunState::Pushed).await?;
+        push_converged_commit_to_bare_repo(
+            &config.repo_path,
+            &gate_config.bare_repo_path,
+            converged_commit,
+            run_id,
+        )
+        .await?;
+
+        let runs_dir = config.warden_home.join("runs");
+        let listener = CiResultListener::bind(run_id, &runs_dir).await?;
+
+        let branch = format!("warden/{run_id}");
+        let summary_body = format!(
+            "Run {run_id} converged.\n\nIntent:\n{}\n",
+            config.intent.trim()
+        );
+        trigger
+            .trigger_run_tail(&RunTailTrigger {
+                run_id,
+                branch: &branch,
+                base_branch: &config.branch,
+                intent: &config.intent,
+                pushed_commit_sha: converged_commit,
+                summary_body: &summary_body,
+                ci_result_socket: listener.socket_path(),
+            })
+            .await?;
+
+        self.transition(run_id, RunState::AwaitingCi).await?;
+
+        let message = listener.receive().await?;
+        self.apply_ci_result_message(run_id, &message).await
+    }
+
+    /// Applies one received [`CiResultMessage`] to `run_id`'s persisted
+    /// state (issue #15/ADR-0011): maps `CiWatchOutcome` -> `CiOutcome`
+    /// (`GateFailed` maps to an unconditional `Failed`, having no CI signal
+    /// of its own to interpret), calls `decide_next_state_after_ci`, and
+    /// writes the transition.
+    ///
+    /// **Idempotency guard**: applies the outcome only if the run is still
+    /// `AwaitingCi`. A duplicate/stale delivery for a run that already left
+    /// that state (e.g. a crash-recovery resume racing an earlier delivery)
+    /// is a safe no-op, never an error (ADR-0011).
+    async fn apply_ci_result_message(
+        &self,
+        run_id: &str,
+        message: &CiResultMessage,
+    ) -> Result<PostConvergenceOutcome> {
+        let run =
+            db::get_run(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| WardenError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })?;
+
+        if run.state != RunState::AwaitingCi {
+            tracing::info!(
+                run_id,
+                ?run.state,
+                "ignoring CI result: run already left AwaitingCi (stale/duplicate delivery)"
+            );
+            return Ok(PostConvergenceOutcome::Terminal(run.state));
+        }
+
+        if let Some(pr_number) = message.pr_number {
+            db::set_run_pr_number(&self.pool, run_id, pr_number).await?;
+        }
+
+        let next_state = match message.outcome.as_ci_outcome() {
+            Some(ci_outcome) => {
+                decide_next_state_after_ci(ci_outcome, run.current_cycle, run.max_cycles)
+            }
+            // GateFailed: no CI signal to interpret, and no cycle-budget
+            // reboucle either -- an infrastructure failure (push/PR/finalize)
+            // is not something re-running the coder can fix.
+            None => RunState::Failed,
+        };
+        self.transition(run_id, next_state).await?;
+
+        match next_state {
+            RunState::CoderRunning => Ok(PostConvergenceOutcome::Reboucle {
+                findings: message.outcome.findings()?,
+            }),
+            terminal => Ok(PostConvergenceOutcome::Terminal(terminal)),
+        }
     }
 
     async fn run_coder(&self, invocation: CoderInvocation<'_>) -> Result<String> {
@@ -775,6 +989,54 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The ref prefix `warden` pushes a converged run's branch under in the
+/// local bare gate repo -- **must** match
+/// `warden_gated::notification::GATE_REF_PREFIX` byte-for-byte. Duplicated
+/// as a literal rather than shared via `warden-core` because `warden` must
+/// not depend on `warden-gated` (ADR-0006); mirrors how `serve.rs`'s own
+/// tests already hardcode this identical literal on the receiving side.
+const GATE_REF_PREFIX: &str = "refs/heads/warden-run/";
+
+/// Pushes `commit_sha` (already reachable in `repo_path`'s object store --
+/// `protect_cycle_commit` keeps it so) into the local bare gate repo under
+/// this run's ref, transferring the objects `warden-gated`'s `run-tail`/
+/// `resume-watch` need before they can push anything onward to real
+/// `origin` (ADR-0002: `warden-gated`'s bare repo is a separate git
+/// repository from the user's own). `--force`: a reboucled run pushes a new
+/// converged commit onto the same per-run ref repeatedly, and this ref is
+/// exclusively `warden`-managed, so a rejected non-fast-forward push here
+/// would only ever be a false alarm, never a real conflict with anything
+/// else touching it.
+async fn push_converged_commit_to_bare_repo(
+    repo_path: &Path,
+    bare_repo_path: &Path,
+    commit_sha: &str,
+    run_id: &str,
+) -> Result<()> {
+    let refspec = format!("{commit_sha}:{GATE_REF_PREFIX}{run_id}");
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["push", "--force"])
+        .arg(bare_repo_path)
+        .arg(&refspec)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(WardenError::Worktree(WorktreeError::GitCommandFailed {
+            command: format!(
+                "git -C {} push --force {} {refspec}",
+                repo_path.display(),
+                bare_repo_path.display()
+            ),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
+    }
+    Ok(())
+}
+
 /// Creates a local ref pointing at `commit_sha` in the main repository
 /// (M4), so the commit produced by a cycle's coder stays reachable — and
 /// therefore safe from `git gc` — after its worktree is removed. Worktrees
@@ -1090,6 +1352,7 @@ mod tests {
             tester_command: always_passing_tester(),
             evidence_tool: None,
             evidence_store_in_repo: true,
+            gate: None,
         };
 
         let (run_id, final_state) = orchestrator
@@ -1156,6 +1419,7 @@ mod tests {
             tester_command: always_passing_tester(),
             evidence_tool: None,
             evidence_store_in_repo: true,
+            gate: None,
         };
 
         let (_run_id, final_state) = orchestrator
@@ -1502,6 +1766,7 @@ mod tests {
             tester_command,
             evidence_tool: None,
             evidence_store_in_repo: true,
+            gate: None,
         };
 
         let orchestrator = Orchestrator::new(pool.clone());
@@ -1587,6 +1852,7 @@ mod tests {
             tester_command: sleepy_agent,
             evidence_tool: None,
             evidence_store_in_repo: true,
+            gate: None,
         };
 
         let orchestrator = Orchestrator::new(pool.clone());
@@ -2026,6 +2292,7 @@ mod tests {
             tester_command: always_passing_tester(),
             evidence_tool: None,
             evidence_store_in_repo: true,
+            gate: None,
         };
 
         let (run_id, final_state) = orchestrator
