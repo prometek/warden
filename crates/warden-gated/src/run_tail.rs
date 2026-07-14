@@ -278,6 +278,24 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    /// Resolves `refname` (e.g. a branch name) to its commit sha within
+    /// `dir` -- used to inspect what a push actually landed on `origin`,
+    /// as opposed to `head_sha`'s own repo-local `HEAD`.
+    fn head_sha_of_ref(dir: &Path, refname: &str) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", refname])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git rev-parse {refname} failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     /// A bare gate repo whose local `main` sits one "business" commit ahead
     /// of `origin/main` -- the shape a real converged run leaves behind:
     /// `origin` only knows the pre-run baseline, while the bare gate repo
@@ -448,11 +466,11 @@ mod tests {
             Ok(())
         }
 
-        async fn update_body(&self, pr: &PrHandle, _body: &str) -> Result<()> {
+        async fn update_body(&self, pr: &PrHandle, body: &str) -> Result<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("update_body({})", pr.number));
+                .push(format!("update_body({}, {body})", pr.number));
             Ok(())
         }
     }
@@ -642,6 +660,147 @@ mod tests {
                 .count(),
             1,
             "open_draft must only ever be called once across both passes"
+        );
+    }
+
+    /// Adds a second, later commit on top of `gate_repo`'s existing
+    /// "business" commit (its local `main`) -- a fast-forward descendant,
+    /// simulating the coder producing genuinely new content on a reboucle's
+    /// next cycle. Returns the new commit's sha.
+    fn add_second_business_commit(gate_repo: &TempDir) -> String {
+        let work = TempDir::new().unwrap();
+        run_git(
+            work.path(),
+            &[
+                "clone",
+                "--quiet",
+                &gate_repo.path().display().to_string(),
+                ".",
+            ],
+        );
+        run_git(work.path(), &["config", "user.email", "test@warden.local"]);
+        run_git(work.path(), &["config", "user.name", "warden-test"]);
+        std::fs::write(work.path().join("fix.txt"), "fixed the build\n").unwrap();
+        run_git(work.path(), &["add", "."]);
+        run_git(work.path(), &["commit", "--quiet", "-m", "fix the build"]);
+        let sha = head_sha(work.path());
+        run_git(work.path(), &["push", "--quiet", "origin", "HEAD:main"]);
+        sha
+    }
+
+    /// Issue #15 review, H3: a reboucle must push the *new* cycle's content
+    /// to the existing PR, never silently re-finalize the previous (by now
+    /// stale) commit or PR body. Runs two genuinely different commits (and
+    /// two different summary bodies) through `run_tail`, reusing the same
+    /// PR via `existing_pr_number`, and asserts both that `origin`'s branch
+    /// actually moved to the second commit and that the PR body delivered
+    /// on the second pass carries the second pass's own text -- not the
+    /// first's.
+    #[tokio::test]
+    async fn run_tail_reboucle_pushes_the_new_cycles_content_not_the_stale_one() {
+        let (origin, gate_repo, first_commit_sha) = converged_gate_repo_fixture();
+        let second_commit_sha = add_second_business_commit(&gate_repo);
+        assert_ne!(
+            first_commit_sha, second_commit_sha,
+            "the fixture must produce two genuinely different commits"
+        );
+        let (_db_dir, pool) = seeded_db("run-1", &first_commit_sha).await;
+        let provider = FakeProvider::new_with_open_draft_budget(
+            42,
+            vec![
+                PrStatus {
+                    lifecycle: PrLifecycle::Open,
+                    checks: vec![CheckRun {
+                        name: "build".to_string(),
+                        conclusion: CheckConclusion::Failed,
+                        details_url: None,
+                    }],
+                },
+                PrStatus {
+                    lifecycle: PrLifecycle::Open,
+                    checks: vec![CheckRun {
+                        name: "build".to_string(),
+                        conclusion: CheckConclusion::Passed,
+                        details_url: None,
+                    }],
+                },
+            ],
+            1,
+        );
+
+        // First pass: opens the PR, pushes the first commit under the
+        // first pass's own summary.
+        let first_request = RunTailRequest {
+            bare_repo_path: gate_repo.path(),
+            run_id: "run-1",
+            intent: "Add a feature",
+            branch: "warden/run-1",
+            base_branch: "main",
+            pushed_commit_sha: &first_commit_sha,
+            summary_body: "Cycle 1 summary",
+            evidence: &[],
+            repo_slug: "owner/repo",
+            watch_config: watch_config(),
+            existing_pr_number: None,
+        };
+        let first_message = run_tail(&pool, &first_request, &provider).await;
+        assert_eq!(first_message.pr_number, Some(42));
+        assert!(matches!(
+            first_message.outcome,
+            CiWatchOutcome::ChecksFailed { .. }
+        ));
+
+        // Between passes: the run reboucled and re-converged on genuinely
+        // new content -- persisted state now points at the second commit,
+        // exactly what `warden`'s own `drive_post_convergence_tail` would
+        // have written before re-triggering this tail.
+        sqlx::query("UPDATE runs SET converged_commit_sha = ? WHERE id = ?")
+            .bind(&second_commit_sha)
+            .bind("run-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let second_request = RunTailRequest {
+            bare_repo_path: gate_repo.path(),
+            run_id: "run-1",
+            intent: "Add a feature",
+            branch: "warden/run-1",
+            base_branch: "main",
+            pushed_commit_sha: &second_commit_sha,
+            summary_body: "Cycle 2 summary (fixed the build)",
+            evidence: &[],
+            repo_slug: "owner/repo",
+            watch_config: watch_config(),
+            existing_pr_number: Some(42),
+        };
+        let second_message = run_tail(&pool, &second_request, &provider).await;
+
+        assert_eq!(second_message.pr_number, Some(42));
+        assert_eq!(second_message.outcome, CiWatchOutcome::checks_passed());
+
+        let origin_branch_head = head_sha_of_ref(origin.path(), "warden/run-1");
+        assert_eq!(
+            origin_branch_head, second_commit_sha,
+            "the reboucle must push the new cycle's commit to the existing PR's branch on \
+             origin, not leave it on the stale first-cycle commit"
+        );
+
+        let calls = provider.calls.lock().unwrap();
+        let last_update_body = calls
+            .iter()
+            .rev()
+            .find(|c| c.starts_with("update_body("))
+            .expect("update_body must have been called on the second pass");
+        assert!(
+            last_update_body.starts_with("update_body(42, Cycle 2 summary"),
+            "the reboucle's own (most recent) update_body call must carry the new cycle's own \
+             content, not be missing or stale: {calls:?}"
+        );
+        assert!(
+            !last_update_body.contains("Cycle 1 summary"),
+            "the reboucle's own (most recent) update_body call must not still carry the stale \
+             first-cycle PR body text: {calls:?}"
         );
     }
 

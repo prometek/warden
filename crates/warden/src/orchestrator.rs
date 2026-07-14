@@ -2808,6 +2808,98 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
+    /// A [`GateTrigger`] that reports its request as successfully issued
+    /// (mirrors `SubprocessGateTrigger` having spawned the child) but never
+    /// actually connects to `ci_result_socket` -- standing in for
+    /// `warden-gated` crashing, hanging, or otherwise going silent *after*
+    /// being triggered.
+    struct NeverDeliversGateTrigger;
+
+    impl GateTrigger for NeverDeliversGateTrigger {
+        async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            _run_id: &str,
+            _pr_number: u64,
+            _ci_result_socket: &Path,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #15 review, H1(b): if `warden-gated` never delivers a terminal
+    /// `CiResultMessage` at all (crash, hang, network partition -- anything
+    /// short of the process itself failing to spawn), `listener.receive`'s
+    /// bounded wait must still expire and the run must be failed outright,
+    /// never left hanging in `AwaitingCi` forever.
+    ///
+    /// This exercises `resume_awaiting_ci_runs` rather than
+    /// `drive_post_convergence_tail`, even though both contain the exact
+    /// same `match listener.receive(receive_timeout).await { ...
+    /// Err(CiResultTimedOut) => ... self.fail_awaiting_ci_run(...) }` shape
+    /// (see both call sites): `resume_awaiting_ci_runs` takes
+    /// `receive_timeout` as a plain parameter, so this test can use a small
+    /// *real* timeout and actually wait it out in milliseconds.
+    /// `drive_post_convergence_tail` instead always adds the fixed,
+    /// non-injectable `CI_RESULT_RECEIVE_TIMEOUT_MARGIN` (15 minutes) on
+    /// top of the run's configured `inactivity_timeout_secs`, so covering
+    /// its identical branch the same way would mean either really waiting
+    /// 15+ minutes (impractical) or driving it under a paused
+    /// (`start_paused = true`) clock -- which was tried here and found to
+    /// be unsafe together with a real `SqlitePool`: advancing virtual time
+    /// by 15 minutes in one jump races the pool's own real-time-based
+    /// connection acquisition/idle bookkeeping and produces spurious
+    /// `PoolTimedOut` errors unrelated to the behavior under test. Both
+    /// paths share the same code shape and are covered by the same review
+    /// finding (H1(b)), so this test is the deterministic proxy for both.
+    #[tokio::test]
+    async fn resume_awaiting_ci_runs_fails_the_run_when_the_ci_result_never_arrives() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let warden_home = TempDir::new().unwrap();
+
+        db::insert_run(&pool, "run-silent", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        for state in [
+            RunState::CoderRunning,
+            RunState::AwaitingReviewTest,
+            RunState::Converged,
+            RunState::Pushed,
+            RunState::AwaitingCi,
+        ] {
+            db::update_run_state(&pool, "run-silent", state)
+                .await
+                .unwrap();
+        }
+        db::set_run_pr_number(&pool, "run-silent", 42)
+            .await
+            .unwrap();
+
+        let trigger = NeverDeliversGateTrigger;
+
+        let resumed = resume_awaiting_ci_runs(
+            pool.clone(),
+            warden_home.path().to_path_buf(),
+            trigger,
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resumed, vec!["run-silent".to_string()]);
+        let run = db::get_run(&pool, "run-silent").await.unwrap().unwrap();
+        assert_eq!(
+            run.state,
+            RunState::Failed,
+            "a run stuck in AwaitingCi with no terminal message ever delivered must be failed \
+             outright once the bounded wait expires, not left hanging"
+        );
+    }
+
     /// ADR-0011's idempotency guard: a run that has already left
     /// `AwaitingCi` (e.g. a duplicate/stale delivery racing an earlier one)
     /// must not have its state clobbered by a second `CiResultMessage` --

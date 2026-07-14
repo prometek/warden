@@ -632,3 +632,122 @@ fn init_tracing(verbosity: u8) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("warden_gated={level}")));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixListener;
+
+    /// Issue #15 review, H1: an early setup failure -- `stdin`,
+    /// `db::connect_read_only`, `GhProvider::new`, `--evidence-json`
+    /// parsing, ... -- that returns a bare `Err` *before* `run_tail`/
+    /// `resume_watch` ever get a chance to run their own internal
+    /// `GateFailed` handling must still result in exactly one terminal
+    /// `CiResultMessage` delivered to `warden`'s reverse socket, carrying a
+    /// `GateFailed` outcome -- never silence, which would leave `warden`
+    /// blocked forever in `CiResultListener::receive()`. This exercises
+    /// `deliver_result_or_gate_failed` directly (the wrapper both
+    /// `run_tail_cmd` and `resume_watch_cmd` are built on) against a real
+    /// Unix socket, standing in for `warden`'s own listener.
+    #[tokio::test]
+    async fn deliver_result_or_gate_failed_still_delivers_a_terminal_message_on_early_setup_failure(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("warden.ci.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Bounded rather than an unbounded `accept().await`: if this
+        // regressed back to the bare-`Err`-with-no-delivery behavior this
+        // wrapper exists to close, nothing would ever connect, and an
+        // unbounded wait here would just hang this test (and, in
+        // production, `warden`'s own `CiResultListener::receive`) instead
+        // of failing it cleanly.
+        let receiver = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (mut stream, _addr) = listener.accept().await.unwrap();
+                let mut buffer = String::new();
+                stream.read_to_string(&mut buffer).await.unwrap();
+                buffer
+            })
+            .await
+        };
+
+        let attempt = async {
+            // Stands in for a setup step that fails before ever reaching
+            // run_tail/resume_watch's own internal GateFailed handling
+            // (e.g. GhProvider::new against an unreachable repo, or a
+            // malformed --evidence-json), returning a bare `Err` -- exactly
+            // the gap this wrapper closes.
+            Err(anyhow::anyhow!("simulated early setup failure"))
+        };
+
+        let (received_json, attempt_result) = tokio::join!(
+            receiver,
+            deliver_result_or_gate_failed("run-1", &socket_path, attempt)
+        );
+
+        assert!(
+            attempt_result.is_err(),
+            "a GateFailed outcome must still surface as an error to the caller (non-zero exit)"
+        );
+
+        let received_json = received_json.expect(
+            "no terminal message was ever delivered within the timeout -- this is exactly the \
+             hang this wrapper exists to prevent",
+        );
+        let message: CiResultMessage = warden_core::parse_ci_result_message(&received_json)
+            .expect("a terminal message must have been delivered and must parse");
+        assert_eq!(message.run_id, "run-1");
+        assert!(
+            matches!(
+                message.outcome,
+                warden_core::CiWatchOutcome::GateFailed { .. }
+            ),
+            "an early setup failure must be reported as GateFailed, not silently dropped: \
+             {message:?}"
+        );
+    }
+
+    /// The success path: when `attempt` itself already produced a terminal
+    /// message (mirrors `run_tail`/`resume_watch`'s own contract of never
+    /// returning a bare `Err`), that exact message is delivered unmodified
+    /// and `deliver_result_or_gate_failed` returns `Ok` for any non-
+    /// `GateFailed` outcome.
+    #[tokio::test]
+    async fn deliver_result_or_gate_failed_delivers_the_attempts_own_message_unmodified() {
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("warden.ci.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let receiver = async {
+            let (mut stream, _addr) = listener.accept().await.unwrap();
+            let mut buffer = String::new();
+            stream.read_to_string(&mut buffer).await.unwrap();
+            buffer
+        };
+
+        let attempt = async {
+            Ok(CiResultMessage {
+                run_id: "run-1".to_string(),
+                pr_number: Some(7),
+                outcome: warden_core::CiWatchOutcome::checks_passed(),
+            })
+        };
+
+        let (received_json, attempt_result) = tokio::join!(
+            receiver,
+            deliver_result_or_gate_failed("run-1", &socket_path, attempt)
+        );
+
+        assert!(attempt_result.is_ok());
+        let message: CiResultMessage =
+            warden_core::parse_ci_result_message(&received_json).unwrap();
+        assert_eq!(message.pr_number, Some(7));
+        assert_eq!(
+            message.outcome,
+            warden_core::CiWatchOutcome::checks_passed()
+        );
+    }
+}
