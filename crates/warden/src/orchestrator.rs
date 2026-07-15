@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
     decide_next_state, decide_next_state_after_ci, parse_findings, AgentRole, CiResultMessage,
-    EvidenceTool, Finding, RunEvent, RunState,
+    EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
 };
 
 use crate::ci_channel::CiResultListener;
@@ -1217,15 +1217,11 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
 /// repository-sized rewrite.
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
-/// Appended to a diff that exceeded [`MAX_DIFF_BYTES`] so the reviewer/tester
-/// can tell a truncated diff from a genuinely small one (M1, issue #20
-/// review): silently cutting the diff without a marker would be its own
-/// silent fallback.
-const DIFF_TRUNCATED_MARKER: &str = "\n\n[warden: diff truncated at the 8 MiB payload cap]\n";
-
 /// Applies [`MAX_DIFF_BYTES`] to a raw diff capture, appending
-/// [`DIFF_TRUNCATED_MARKER`] only when truncation actually happened. Pulled
-/// out of [`read_diff`] so the truncation behaviour itself is unit-testable
+/// [`DIFF_TRUNCATED_MARKER`] (`warden_core::agent_wire`, part of the wire
+/// contract so an agent-side consumer can discover it -- fix cycle 2, issue
+/// #20 review, BUG 4) only when truncation actually happened. Pulled out of
+/// [`read_diff`] so the truncation behaviour itself is unit-testable
 /// without spawning `git` against a multi-megabyte fixture (M1/M3, issue
 /// #20 review).
 fn cap_diff(raw: &[u8], max_bytes: usize) -> String {
@@ -1251,14 +1247,35 @@ fn cap_diff(raw: &[u8], max_bytes: usize) -> String {
 ///
 /// Capped at [`MAX_DIFF_BYTES`] (M1, issue #20 review) via a bounded read
 /// off `git diff`'s stdout pipe -- mirrors `ci_channel::receive_unbounded`'s
-/// `.take(N + 1)` convention, so memory use is bounded by the cap rather
-/// than by however large the real diff happens to be. `-c color.ui=false`,
-/// `-c diff.external=`, `-c core.textconv=false`, `--no-color` and
-/// `--no-ext-diff` neutralize the repo's (or the invoking user's global)
-/// git config, which would otherwise be free to inject ANSI escapes or run
-/// an arbitrary textconv filter over the payload an agent has to parse as
-/// plain JSON; `--` separates `range` from a (here absent, but
-/// defense-in-depth) pathspec.
+/// `.take(N + 1)` convention. Fix cycle 2 (issue #20 review, BUG 1): the
+/// cap alone only bounds the *first* `MAX_DIFF_BYTES + 1` bytes read off the
+/// pipe -- everything past that still has to be drained so `git diff` never
+/// blocks writing to a pipe nobody is reading, and draining into another
+/// `Vec` would silently re-buffer however much the diff exceeds the cap by,
+/// exactly what the cap exists to prevent. The drain goes to
+/// `tokio::io::sink()` instead, so peak memory use actually is bounded by
+/// the cap regardless of how far over it the real diff is.
+///
+/// `-c color.ui=false`, `--no-color`, `--no-ext-diff` and `--no-textconv`
+/// neutralize the repo's (or the invoking user's global) git config, which
+/// would otherwise be free to inject ANSI escapes, run an external diff
+/// driver, or substitute a `.gitattributes`-configured `textconv` filter's
+/// output for the real file content in the payload an agent has to parse as
+/// plain JSON. Fix cycle 2 (issue #20 review, BUG 2): the previous
+/// `-c core.textconv=false` did none of this -- `core.textconv` isn't a
+/// real git config key, so git silently ignored it and a repo-local
+/// `.gitattributes` `textconv` filter still ran; `--no-textconv` is the
+/// actual flag that disables it. `-c diff.external=` is also dropped here,
+/// not just renamed: verified against real git that it does not neutralize
+/// a configured `diff.external` the way it looks like it should -- git
+/// tries to run the empty string as the diff command and `git diff` exits
+/// non-zero (`fatal: external diff died`) instead of falling back to the
+/// builtin differ. `--no-ext-diff` alone is the flag that actually
+/// disables it without that failure mode, and was already present.
+/// `-c color.ui=false` and `--no-color` were each independently verified to
+/// suppress ANSI output on their own; kept together as defense-in-depth
+/// since neither is broken like the two flags above were. `--` separates
+/// `range` from a (here absent, but defense-in-depth) pathspec.
 async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<String> {
     use tokio::io::AsyncReadExt;
 
@@ -1267,13 +1284,27 @@ async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<Str
         .arg("-C")
         .arg(worktree_path)
         .args(["-c", "color.ui=false"])
-        .args(["-c", "diff.external="])
-        .args(["-c", "core.textconv=false"])
-        .args(["diff", "--no-color", "--no-ext-diff", &range, "--"])
+        .args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            &range,
+            "--",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
+    // `.expect()` rather than `if let Some` (unlike `process::spawn`, which
+    // handles the identical `Option` that way): there this same `Option` is
+    // `None` whenever a caller opts out of piping a given stream, a normal
+    // runtime configuration. Here `Stdio::piped()` is requested
+    // unconditionally two lines above with no caller-configurable path that
+    // could skip it, so `None` would mean `tokio::process::Command` itself
+    // broke its documented contract -- a strict invariant, not a runtime
+    // condition (code-standards.md permits `expect()` for exactly this
+    // case).
     let mut stdout_handle = child
         .stdout
         .take()
@@ -1283,28 +1314,35 @@ async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<Str
         .take()
         .expect("git diff spawned with a piped stderr");
 
-    // Bounded read (M1): caps how much of `git diff`'s stdout is ever
-    // buffered in memory, then drains (and discards) anything left past the
-    // cap so `git` never blocks writing to a full stdout pipe nobody is
-    // still reading -- the same pipe-deadlock hazard `process::wait`
-    // documents for stdin/stdout.
+    // Bounded read (M1, tightened in fix cycle 2 / BUG 1): caps how much of
+    // `git diff`'s stdout is ever buffered in memory, then drains anything
+    // left past the cap straight to `tokio::io::sink()` -- discarded as
+    // it's read, never buffered -- so `git` never blocks writing to a full
+    // stdout pipe nobody is still reading (the same pipe-deadlock hazard
+    // `process::wait` documents for stdin/stdout), without the drain itself
+    // reintroducing unbounded buffering. A read error on either half is
+    // propagated rather than swallowed (fix cycle 2, BUG 3): a partial
+    // `buffer` from a mid-read I/O failure must not be handed back to the
+    // caller indistinguishable from a genuinely complete (or cap-truncated)
+    // diff.
     let stdout_task = async move {
         let mut limited = (&mut stdout_handle).take(MAX_DIFF_BYTES as u64 + 1);
         let mut buffer = Vec::new();
-        let _ = limited.read_to_end(&mut buffer).await;
-        let mut rest = Vec::new();
-        let _ = stdout_handle.read_to_end(&mut rest).await;
-        buffer
+        limited.read_to_end(&mut buffer).await?;
+        tokio::io::copy(&mut stdout_handle, &mut tokio::io::sink()).await?;
+        Ok::<Vec<u8>, std::io::Error>(buffer)
     };
     let stderr_task = async move {
         let mut buffer = Vec::new();
-        let _ = stderr_handle.read_to_end(&mut buffer).await;
-        buffer
+        stderr_handle.read_to_end(&mut buffer).await?;
+        Ok::<Vec<u8>, std::io::Error>(buffer)
     };
 
-    let (stdout_buf, stderr_buf, status_result) =
+    let (stdout_result, stderr_result, status_result) =
         tokio::join!(stdout_task, stderr_task, child.wait());
     let status = status_result?;
+    let stdout_buf = stdout_result?;
+    let stderr_buf = stderr_result?;
 
     if !status.success() {
         return Err(WardenError::Worktree(WorktreeError::GitCommandFailed {

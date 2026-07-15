@@ -28,6 +28,17 @@ use crate::state::AgentRole;
 /// consumer must branch on.
 pub const AGENT_INPUT_VERSION: u32 = 1;
 
+/// Appended to [`AgentInputMessage::diff`] when `warden` truncated it at its
+/// size cap (`warden::orchestrator::MAX_DIFF_BYTES`) before handing it to a
+/// reviewer/tester (M1, issue #20 review). Lives here rather than as a
+/// private const in `warden::orchestrator` (fix cycle 2, issue #20 review,
+/// BUG 4) because this is where an agent-side consumer of the wire contract
+/// actually looks: a marker an agent needs to detect but that isn't
+/// documented on the field it appears in isn't part of the contract at all,
+/// silently cutting the diff without a discoverable marker would be its own
+/// silent fallback.
+pub const DIFF_TRUNCATED_MARKER: &str = "\n\n[warden: diff truncated at the 8 MiB payload cap]\n";
+
 /// Wire shape of one [`Finding`] riding inside the agent input payload --
 /// mirrors `ci_channel::CiFindingWire`'s convention (the already-validated
 /// `as_str()` string form for `source`/`severity`, re-validated back into the
@@ -83,6 +94,14 @@ pub struct AgentInputMessage {
     pub role: AgentRole,
     pub intent: Option<String>,
     pub target_commit: Option<String>,
+    /// Reviewer/tester only (`None` for coder input, [`Self::for_coder`]):
+    /// `git diff base..target` for this cycle's changes. An empty string
+    /// is a legitimate value in its own right (a cycle whose coder
+    /// committed no changes), distinct from `None`. May be truncated at
+    /// `warden::orchestrator::MAX_DIFF_BYTES` -- a truncated diff has
+    /// [`DIFF_TRUNCATED_MARKER`] appended, so a reviewer/tester agent can
+    /// tell a truncated diff from a genuinely small one rather than acting
+    /// on a silently incomplete payload.
     pub diff: Option<String>,
     pub findings: Vec<Finding>,
 }
