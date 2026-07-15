@@ -1296,23 +1296,16 @@ async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<Str
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // `.expect()` rather than `if let Some` (unlike `process::spawn`, which
-    // handles the identical `Option` that way): there this same `Option` is
-    // `None` whenever a caller opts out of piping a given stream, a normal
-    // runtime configuration. Here `Stdio::piped()` is requested
-    // unconditionally two lines above with no caller-configurable path that
-    // could skip it, so `None` would mean `tokio::process::Command` itself
-    // broke its documented contract -- a strict invariant, not a runtime
-    // condition (code-standards.md permits `expect()` for exactly this
-    // case).
-    let mut stdout_handle = child
-        .stdout
-        .take()
-        .expect("git diff spawned with a piped stdout");
-    let mut stderr_handle = child
-        .stderr
-        .take()
-        .expect("git diff spawned with a piped stderr");
+    // Both streams are requested `Stdio::piped()` two lines above, so `None`
+    // would mean `tokio::process::Command` broke its own contract. Surface it
+    // as an error anyway rather than panicking (code-standards.md: "Aucun
+    // `unwrap()` ni `expect()` hors tests").
+    let mut stdout_handle = child.stdout.take().ok_or_else(|| {
+        std::io::Error::other("git diff child has no stdout despite being spawned with a pipe")
+    })?;
+    let mut stderr_handle = child.stderr.take().ok_or_else(|| {
+        std::io::Error::other("git diff child has no stderr despite being spawned with a pipe")
+    })?;
 
     // Bounded read (M1, tightened in fix cycle 2 / BUG 1): caps how much of
     // `git diff`'s stdout is ever buffered in memory, then drains anything
