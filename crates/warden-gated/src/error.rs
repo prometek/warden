@@ -108,6 +108,32 @@ pub enum GatedError {
     /// unrecognized as either, so its outcome can't be classified.
     #[error("CI check {0:?} has neither a Checks API nor a Statuses API shape")]
     MalformedCheckEntry(String),
+
+    /// Delivering the terminal CI result (issue #15/ADR-0011) to `warden`'s
+    /// reverse socket failed -- surfaced loudly rather than swallowed, per
+    /// ADR-0011's "channel failure semantics": exactly like the forward
+    /// relay already surfaces an undelivered push notification in the
+    /// hook's exit code.
+    #[error("failed to deliver CI result to warden's socket at {socket_path}: {source}")]
+    CiResultDeliveryFailed {
+        socket_path: PathBuf,
+        #[source]
+        source: Box<GatedError>,
+    },
+
+    /// `pr_manager::finalize`'s own independent re-verification refused the
+    /// push (state drifted, hash mismatch, ...) -- issue #15's `run-tail`
+    /// composition surfaces this as part of the run's terminal
+    /// `CiWatchOutcome::GateFailed` rather than leaving the caller to
+    /// distinguish a `Blocked` outcome from every other kind of failure.
+    #[error("Finalize was blocked by re-verification: {reason}")]
+    FinalizeBlocked { reason: String },
+
+    /// A `runs.pr_number` value that doesn't fit in a `u64` -- a row written
+    /// by something other than `warden::db::set_run_pr_number`, or a
+    /// corrupted database (code-standards.md: "no silent fallback").
+    #[error("row column `{column}` = {value} does not fit in the expected numeric type")]
+    InvalidStoredValue { column: &'static str, value: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, GatedError>;

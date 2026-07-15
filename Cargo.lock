@@ -3266,6 +3266,7 @@ dependencies = [
  "chrono",
  "clap",
  "predicates",
+ "serde",
  "serde_json",
  "sqlx",
  "sysinfo",

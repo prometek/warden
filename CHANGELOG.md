@@ -227,3 +227,54 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   réelle pour les exercer.
 - Cache `sqlx` offline propre au crate (`crates/warden-tui/.sqlx/`),
   indépendant de celui de `warden` et de `warden-gated`.
+
+### Fixed — réparation d'un merge cassé sur `main`
+
+- Un merge antérieur des Phases 7/8 (evidence + événements) avait laissé
+  `main` **non compilable** : fonctions tronquées dans
+  `crates/warden/src/db.rs`, blocs `use` dupliqués, dépendance `serde`
+  perdue, et deux migrations en collision sur le même numéro
+  (`0004_events.sql` contre `0004_evidence.sql`). La migration `events` a
+  été renumérotée en `0005_events.sql` et le reste du merge corrigé pour
+  rétablir un `main` qui compile et dont les tests passent, avant toute
+  reprise de travail dessus.
+
+### Added — Issue #15 / ADR-0011 : câblage du CI Watcher dans la boucle de convergence
+
+- `warden` pilote désormais lui-même toute la suite de la state machine
+  après `Converged` : `Converged` → `Pushed` (push du commit convergé vers
+  le dépôt bare local de `warden-gated`) → ouverture/finalisation
+  automatique de la PR (`OpenDraft`/`Finalize`, déclenchées par la nouvelle
+  sous-commande `warden-gated run-tail`) → `AwaitingCi` → `Done` /
+  `CoderRunning` / `Failed`, selon le résultat terminal remonté par le CI
+  Watcher (Phase 5). Auparavant, un run convergé s'arrêtait à `Converged`
+  sans suite automatique.
+- Nouveau canal de retour : un socket Unix inverse dont `warden` est
+  l'écouteur — miroir du relais existant côté hook — sur lequel
+  `warden-gated` livre un unique `CiResultMessage` terminal par run.
+  `warden` mappe ce message en `CiOutcome`, appelle la fonction pure
+  existante `decide_next_state_after_ci`, et écrit lui-même la transition
+  qui en résulte : `warden` reste seul writer de son état SQLite,
+  `warden-gated` reste strictement en lecture seule (ADR-0006 préservé).
+- `ChecksFailed` reboucle vers le coder (`AwaitingCi` → `CoderRunning`) en
+  réutilisant la PR déjà ouverte (jamais une seconde ouverture) si le
+  budget de cycles le permet, sinon le run passe `Failed`. Aucun merge
+  automatique, quel que soit le statut observé.
+- Reprise après crash : tout run retrouvé bloqué en `AwaitingCi` au
+  redémarrage de `warden` voit sa surveillance CI redemandée à
+  `warden-gated` (nouvelle sous-commande `warden-gated resume-watch`)
+  plutôt que d'être marqué `Failed` à tort.
+- Nouvelle colonne `runs.pr_number` (migration `0006_pr_number.sql`), qui
+  permet à la reprise après crash de retrouver la PR d'un run sans que
+  `warden-gated` n'ait à conserver le moindre état de surveillance entre
+  deux tentatives (GitHub reste la seule source de vérité).
+- Les preuves d'exécution capturées (Phase 7, ADR-0009) sont désormais
+  transmises jusqu'à la PR finalisée par `run-tail`, qui les fait
+  apparaître dans sa section Evidence.
+- L'attente côté `warden` du résultat CI est bornée par la durée de vie du
+  sous-processus `warden-gated` déclenché (le tail se termine forcément
+  quand ce processus sort), et non par un timeout mur-à-mur indépendant.
+- Nouveaux flags `--gate-bare-repo`, `--gate-gated-bin`, `--gate-repo-slug`,
+  `--gate-poll-interval-secs`, `--gate-inactivity-timeout-secs` sur
+  `warden run` : ce câblage est optionnel, son omission préserve le
+  comportement antérieur (arrêt à `Converged`).

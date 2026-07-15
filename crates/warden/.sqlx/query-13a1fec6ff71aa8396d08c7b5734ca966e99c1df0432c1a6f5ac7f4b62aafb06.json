@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT DISTINCT runs.id as \"id!\", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha\n        FROM runs\n        WHERE runs.state = 'failed'\n          AND (\n            EXISTS (\n                SELECT 1 FROM agent_processes\n                JOIN cycles ON cycles.id = agent_processes.cycle_id\n                WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL\n            )\n            OR EXISTS (\n                SELECT 1 FROM cycles\n                WHERE cycles.run_id = runs.id\n                  AND (cycles.coder_worktree_path IS NOT NULL\n                       OR cycles.reviewer_worktree_path IS NOT NULL\n                       OR cycles.tester_worktree_path IS NOT NULL)\n            )\n          )\n        ",
+  "query": "\n        SELECT DISTINCT runs.id as \"id!\", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number\n        FROM runs\n        WHERE runs.state = 'failed'\n          AND (\n            EXISTS (\n                SELECT 1 FROM agent_processes\n                JOIN cycles ON cycles.id = agent_processes.cycle_id\n                WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL\n            )\n            OR EXISTS (\n                SELECT 1 FROM cycles\n                WHERE cycles.run_id = runs.id\n                  AND (cycles.coder_worktree_path IS NOT NULL\n                       OR cycles.reviewer_worktree_path IS NOT NULL\n                       OR cycles.tester_worktree_path IS NOT NULL)\n            )\n          )\n        ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,17 @@
             "name": "converged_commit_sha"
           }
         }
+      },
+      {
+        "name": "pr_number",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "pr_number"
+          }
+        }
       }
     ],
     "parameters": {
@@ -127,8 +138,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "c9e71eb5c02e5ee2601799c35e32f8a1558785a609ee211a0a25c89398f274c3"
+  "hash": "13a1fec6ff71aa8396d08c7b5734ca966e99c1df0432c1a6f5ac7f4b62aafb06"
 }

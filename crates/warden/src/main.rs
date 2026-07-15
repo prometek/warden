@@ -7,6 +7,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use warden::db;
+use warden::gate_trigger;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
 use warden::process::AgentCommand;
 
@@ -80,6 +81,29 @@ enum Commands {
         /// lands in the finalized PR (ADR-0009). Enabled by default.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         evidence_store_in_repo: bool,
+
+        /// Issue #15/ADR-0011: the local bare gate repo to push a converged
+        /// run's tail into. Omitted means the post-Converged tail (push +
+        /// PR open/finalize + CI watch) is skipped entirely -- a converged
+        /// run stops at `Converged`, exactly like before this issue.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        gate_bare_repo: Option<PathBuf>,
+
+        /// Absolute path to the installed `warden-gated` binary -- required
+        /// alongside `--gate-bare-repo` to spawn `run-tail`/`resume-watch`.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        gate_gated_bin: Option<PathBuf>,
+
+        /// Explicit `owner/repo` override for the PR provider, bypassing
+        /// `origin` remote detection.
+        #[arg(long)]
+        gate_repo_slug: Option<String>,
+
+        #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+        gate_poll_interval_secs: u64,
+
+        #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+        gate_inactivity_timeout_secs: u64,
     },
 }
 
@@ -100,7 +124,26 @@ async fn main() -> anyhow::Result<()> {
             tester_cmd,
             evidence_tool,
             evidence_store_in_repo,
+            gate_bare_repo,
+            gate_gated_bin,
+            gate_repo_slug,
+            gate_poll_interval_secs,
+            gate_inactivity_timeout_secs,
         } => {
+            // Issue #15/ADR-0011: the post-Converged tail only runs when
+            // both paths it needs are configured; omitting either preserves
+            // this crate's original behaviour (stop at `Converged`).
+            let gate = match (gate_bare_repo, gate_gated_bin) {
+                (Some(bare_repo_path), Some(gated_bin)) => Some(orchestrator::GateConfig {
+                    bare_repo_path,
+                    gated_bin,
+                    repo_slug: gate_repo_slug,
+                    poll_interval_secs: gate_poll_interval_secs,
+                    inactivity_timeout_secs: gate_inactivity_timeout_secs,
+                }),
+                _ => None,
+            };
+
             run(
                 repo,
                 intent,
@@ -112,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 tester_cmd,
                 evidence_tool,
                 evidence_store_in_repo,
+                gate,
             )
             .await
         }
@@ -130,6 +174,7 @@ async fn run(
     tester_cmd: String,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
+    gate: Option<orchestrator::GateConfig>,
 ) -> anyhow::Result<()> {
     let warden_home = warden_home.unwrap_or(default_warden_home()?);
     let db_path = warden_home.join("state.db");
@@ -149,6 +194,12 @@ async fn run(
         );
     }
 
+    // The Ctrl-C handler is armed before anything else that could itself
+    // block startup (issue #15 review, H1(c)) -- otherwise a
+    // deterministically-failing/hanging step ahead of it (e.g. the
+    // AwaitingCi resume below) would make warden unresponsive to Ctrl-C
+    // during that entire window, on top of never reaching the new run at
+    // all.
     let cancel = CancellationToken::new();
     let cancel_on_ctrl_c = cancel.clone();
     tokio::spawn(async move {
@@ -157,6 +208,51 @@ async fn run(
             cancel_on_ctrl_c.cancel();
         }
     });
+
+    // Issue #15/ADR-0011 crash-recovery counterpart: any run left stuck in
+    // `AwaitingCi` needs its watch re-requested, not treated as a crashed
+    // agent process (see `recover_crashed_runs`'s own doc comment) --
+    // requires a `GateTrigger`, so only runs when the gate is configured.
+    //
+    // Issue #15 review, H1(c)/M4: spawned in the background rather than
+    // awaited here -- a stuck run's watch can legitimately take up to its
+    // own receive timeout to resolve, and none of that may gate this
+    // process's own new run from starting.
+    if let Some(gate_config) = &gate {
+        let trigger = gate_trigger::SubprocessGateTrigger {
+            gated_bin: gate_config.gated_bin.clone(),
+            db_path: db_path.clone(),
+            bare_repo_path: gate_config.bare_repo_path.clone(),
+            repo_slug: gate_config.repo_slug.clone(),
+            poll_interval_secs: gate_config.poll_interval_secs,
+            inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
+        };
+        let resume_pool = pool.clone();
+        let resume_warden_home = warden_home.clone();
+        let resume_bare_repo = gate_config.bare_repo_path.clone();
+        tokio::spawn(async move {
+            match orchestrator::resume_awaiting_ci_runs(
+                resume_pool,
+                resume_warden_home,
+                trigger,
+                resume_bare_repo,
+            )
+            .await
+            {
+                Ok(resumed) => {
+                    for run_id in &resumed {
+                        tracing::warn!(
+                            run_id,
+                            "resumed a run stuck in AwaitingCi (crash recovery)"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to resume runs stuck in AwaitingCi");
+                }
+            }
+        });
+    }
 
     let config = RunConfig {
         repo_path: repo,
@@ -169,6 +265,7 @@ async fn run(
         tester_command: parse_agent_command(&tester_cmd)?,
         evidence_tool,
         evidence_store_in_repo,
+        gate,
     };
 
     let orchestrator = Orchestrator::new(pool);

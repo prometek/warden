@@ -309,7 +309,7 @@ pub struct OpenDraftRequest<'a> {
 /// (`tree\0` with no entries). Used as the net-tree comparison point when
 /// `base_branch` doesn't exist on `origin` yet: in that case the only
 /// content-free skeleton is one whose own tip tree is also empty.
-const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+pub(crate) const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Independently determines whether `skeleton_commit_sha` changes anything
 /// relative to `base_branch`'s current tip on `origin`. Returns the list of
@@ -413,7 +413,7 @@ async fn diff_name_only(repo_path: &Path, from: &str, to: &str) -> Result<Vec<St
 /// `refs/heads/main`), and taking the first output line unconditionally
 /// could silently pick a sibling branch's sha as the "base" (issue #4
 /// review, follow-up finding).
-async fn remote_branch_head(
+pub(crate) async fn remote_branch_head(
     repo_path: &Path,
     remote: &str,
     branch: &str,
@@ -446,7 +446,7 @@ async fn remote_branch_head(
 
 /// Fetches `branch` from `remote` into `repo_path`'s local object store
 /// (read-only) so its history can be walked/diffed locally.
-async fn fetch_branch(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
+pub(crate) async fn fetch_branch(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
     run_git(repo_path, &["fetch", "--quiet", remote, branch]).await
 }
 

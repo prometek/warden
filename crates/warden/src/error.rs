@@ -180,6 +180,41 @@ pub enum WardenError {
         #[source]
         source: serde_json::Error,
     },
+
+    /// Issue #15 review, H1(b): `CiResultListener::receive` waited longer
+    /// than `timeout` for `warden-gated` to deliver a run's terminal CI
+    /// result. Never an infinite await -- the caller maps this to failing
+    /// the run outright rather than leaving it stuck in `AwaitingCi`.
+    #[error("timed out after {timeout_secs}s waiting for a CI result on run {run_id}")]
+    CiResultTimedOut { run_id: String, timeout_secs: u64 },
+
+    /// Issue #15 review, M-new-1: the triggered `warden-gated` subprocess for
+    /// this run exited without ever delivering a terminal CI result (a hard
+    /// crash/kill before it could send even a `GateFailed`). The caller maps
+    /// this to failing the run outright -- unlike a still-live child, whose
+    /// wait is bounded only by its own watch inactivity timeout, a dead child
+    /// will never deliver, so waiting further would hang the run forever.
+    #[error("warden-gated for run {run_id} exited without delivering a CI result")]
+    GateChildDiedWithoutResult { run_id: String },
+
+    /// Issue #15 review, L1: a reverse-channel payload exceeded the size
+    /// cap before `warden-gated` ever closed its write half -- refused
+    /// outright rather than buffered without bound (OOM risk).
+    #[error("CI result payload exceeded the {max_bytes}-byte cap")]
+    CiResultPayloadTooLarge { max_bytes: usize },
+
+    /// Issue #15 review, M5: a `CiResultMessage` delivered over a run's
+    /// *own* reverse socket named a different `run_id` than the run that
+    /// socket was bound for -- untrusted input at a process boundary, never
+    /// applied to the wrong run.
+    #[error("CI result message run_id {actual:?} does not match the expected run {expected:?}")]
+    CiResultRunIdMismatch { expected: String, actual: String },
+
+    /// Issue #15 review, L2: a `runs.pr_number` value too large for `i64`
+    /// (SQLite's native integer type) to hold -- surfaces the real `u64`
+    /// value that failed to convert, not a placeholder.
+    #[error("PR number {pr_number} does not fit in the column's numeric type")]
+    PrNumberOverflow { pr_number: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;

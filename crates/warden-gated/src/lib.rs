@@ -10,6 +10,7 @@
 //! pas la logique de vérification — dupliquée volontairement côté gate)").
 
 pub mod bare_repo;
+pub mod ci_report;
 pub mod ci_watcher;
 pub mod db;
 pub mod error;
@@ -20,5 +21,6 @@ pub mod notification;
 pub mod pr_manager;
 pub mod push;
 pub mod relay;
+pub mod run_tail;
 pub mod serve;
 pub mod verify;

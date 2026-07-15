@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id as \"id!\", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha\n        FROM runs\n        WHERE state IN ('coder_running', 'awaiting_review_test', 'awaiting_ci')\n        ",
+  "query": "SELECT id as \"id!\", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -112,10 +112,21 @@
             "name": "converged_commit_sha"
           }
         }
+      },
+      {
+        "name": "pr_number",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "pr_number"
+          }
+        }
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       true,
@@ -127,8 +138,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "c1692d89720441718f9f3a9e2cdb356f207b3cd9285465241cd048c472eb78d0"
+  "hash": "9a1b32a4f6d6cbb7e541ab99963783d6b72c2e2eb680ebf3fb47ea09f3a934ec"
 }

@@ -24,32 +24,43 @@ run et le hash validé en SQLite (connexion strictement lecture seule) avant tou
 `warden-tui`, permet de suivre un run en direct depuis un terminal séparé, strictement en
 lecture seule (ADR-0008) — voir "`warden-tui` (moniteur en lecture seule)" ci-dessous.
 
-**Ce qui n'est pas encore câblé (Phase 4)** : `warden` lui-même ne pousse pas encore
-automatiquement les runs convergés vers le dépôt bare de `warden-gated`, et la transition
-`Converged` → `Pushed` de la state machine n'est pas encore déclenchée par l'orchestrateur.
-`warden-gated` (hook, socket, revérification, push vers `origin`) est entièrement
-fonctionnel et testé de bout en bout indépendamment, mais le déclenchement du premier push
-(`git push` vers le dépôt bare local à la convergence) reste, pour l'instant, une étape
-manuelle ou scriptée — voir "Le gate git" ci-dessous.
+**Câblage complet post-convergence (issue #15/ADR-0011)** : `warden` pilote désormais
+lui-même toute la suite de la state machine après `Converged` — il pousse le commit
+convergé vers le dépôt bare local de `warden-gated` (`Converged` → `Pushed`), déclenche en
+sous-processus `warden-gated run-tail`, qui ouvre/finalise la PR (`OpenDraft`/`Finalize`,
+voir "Gestion des PR" ci-dessous) puis surveille la CI (`watch_pr`, voir "CI Watcher"
+ci-dessous) jusqu'à un statut terminal. Ce résultat est renvoyé à `warden` par un socket
+Unix inverse (`warden` écouteur, `warden-gated` émetteur) ; `warden` le mappe via la
+fonction pure `warden_core::decide_next_state_after_ci` et écrit lui-même la transition qui
+en découle (`AwaitingCi` → `Done` / `CoderRunning` / `Failed`) — il reste le seul writer de
+son état SQLite, `warden-gated` reste en lecture seule (ADR-0006). Un `ChecksFailed`
+reboucle vers le coder en réutilisant la PR déjà ouverte (jamais une seconde ouverture) si
+le budget de cycles le permet, sinon le run passe `Failed`. Un run resté bloqué en
+`AwaitingCi` après un crash de `warden` voit sa surveillance CI redemandée automatiquement
+au redémarrage plutôt que d'être marqué `Failed` à tort. Ce câblage est optionnel : sans
+`--gate-bare-repo`/`--gate-gated-bin` (voir "Flags de `warden run`" ci-dessous), un run
+s'arrête toujours à `Converged`, comme avant cette livraison. **Aucun merge automatique** :
+la décision de merger reste entièrement humaine, quel que soit le statut observé.
 
-Le **PR Manager** (`OpenDraft` / `PostCycleUpdate` / `Finalize`) a lui aussi livré côté
-bibliothèque dans `warden-gated` — voir "Gestion des PR" ci-dessous — mais, de la même
-manière, aucun déclenchement CLI/IPC ne l'invoque encore depuis `warden` : ce câblage reste
-une décision d'architecture distincte, non couverte par cette livraison.
+Le **PR Manager** (`OpenDraft` / `PostCycleUpdate` / `Finalize`) — voir "Gestion des PR"
+ci-dessous — a ses actions `OpenDraft`/`Finalize` désormais invoquées automatiquement par ce
+câblage ; `PostCycleUpdate` reste, elle, une capacité de bibliothèque non encore invoquée
+automatiquement par `warden`.
 
-Le **CI Watcher** (Phase 5) est livré et utilisable de bout en bout via la sous-commande
-`warden-gated watch-pr` — voir "CI Watcher" ci-dessous. Le câblage de sa décision
-(reboucler vers le coder ou non) dans la boucle de convergence de `warden` reste, comme
-pour le PR Manager, une décision d'architecture distincte hors périmètre de cette livraison.
-Warden ne merge **jamais** automatiquement une PR, quel que soit le statut observé.
+Le **CI Watcher** (Phase 5) — voir "CI Watcher" ci-dessous — est désormais invoqué
+automatiquement par ce même câblage plutôt qu'uniquement via la sous-commande de diagnostic
+`warden-gated watch-pr`, qui reste disponible pour rejouer une surveillance indépendamment
+de tout run.
 
 L'**Evidence Capture Adapter** (Phase 7, ADR-0009) est livré et entièrement câblé dans la
 boucle de convergence de `warden` : chaque cycle dont le tester réussit son test e2e produit
 une preuve (Playwright ou asciinema selon le projet), committée dans le dépôt à la
 convergence si `--evidence-store-in-repo` (défaut) — voir "Preuve d'exécution (Evidence)"
 ci-dessous. Le renderer de la section Evidence du corps de PR est lui aussi livré et appelé
-par `warden-gated::pr_manager::finalize`, mais son affichage dans une vraie PR GitHub dépend
-du câblage `Finalize` du PR Manager décrit au paragraphe précédent, qui n'existe pas encore.
+par `warden-gated::pr_manager::finalize` ; `Finalize` étant désormais déclenché
+automatiquement à la convergence (issue #15/ADR-0011, voir ci-dessus), cette section
+Evidence apparaît réellement dans la PR finalisée d'un run convergé avec
+`--evidence-store-in-repo` (défaut) et le câblage `--gate-*` activé.
 
 **Limite d'isolation à connaître avant tout déploiement** : dans la configuration par
 défaut documentée ici, `warden` et `warden-gated` tournent sous le **même utilisateur OS**.
@@ -125,6 +136,16 @@ Flags de `warden run` :
 - `--evidence-store-in-repo <true|false>` — commite les preuves capturées sous
   `.warden/evidence/<cycle>/` pour qu'elles apparaissent dans la PR finalisée. Activé
   par défaut (ADR-0009).
+- `--gate-bare-repo <PATH>` — dépôt bare local de `warden-gated` (issue #15/ADR-0011).
+  Omis, le câblage post-`Converged` entier est désactivé : un run s'arrête à `Converged`,
+  exactement comme avant cette livraison.
+- `--gate-gated-bin <PATH>` — chemin absolu du binaire `warden-gated` installé, requis avec
+  `--gate-bare-repo` pour déclencher `run-tail`/`resume-watch` en sous-processus.
+- `--gate-repo-slug <owner/repo>` — surcharge explicite du dépôt PR, au lieu de la
+  résolution automatique depuis le remote `origin`.
+- `--gate-poll-interval-secs <N>` (défaut `15`) et `--gate-inactivity-timeout-secs <N>`
+  (défaut `1800`) — mêmes réglages que `warden-gated watch-pr` (voir "CI Watcher"
+  ci-dessous), transmis tels quels au `run-tail`/`resume-watch` déclenché.
 - `-v`, `-vv`, `-vvv` — verbosité des logs (`warn` par défaut, jusqu'à `trace`).
 
 ### Preuve d'exécution (Evidence)
@@ -294,9 +315,12 @@ GitHub.
 Ce module fournit également le formatage des attributs de commit structurés
 (`Warden-Cycle`, `Warden-Findings-Resolved`, `Warden-Agent`) destinés aux commits coder/doc.
 
-**Ce qui n'est pas encore câblé** : ces trois actions existent uniquement comme capacité de
-bibliothèque — aucun déclenchement CLI/IPC ne les invoque encore depuis `warden`. Ce câblage
-est une décision d'architecture distincte, hors périmètre de cette livraison.
+**Câblage (issue #15/ADR-0011)** : `OpenDraft` et `Finalize` sont désormais invoquées
+automatiquement par `warden-gated run-tail`/`resume-watch`, que `warden` déclenche en
+sous-processus une fois un run convergé poussé dans le dépôt bare local (voir "Le câblage
+`run-tail`/`resume-watch`" ci-dessous) — plus besoin d'un déclenchement manuel.
+`PostCycleUpdate`, elle, reste pour l'instant une capacité de bibliothèque non invoquée
+automatiquement par `warden` (hors périmètre de cette livraison).
 
 ### CI Watcher (`watch-pr`)
 
@@ -345,11 +369,33 @@ configurée (`TIMED-OUT` déclenché proprement au bout du délai configuré, sa
 
 La fonction pure `warden_core::decide_next_state_after_ci` décide le `RunState`
 (`Done` / `CoderRunning` / `Failed`) qu'implique un résultat de watch — miroir de
-`decide_next_state` pour les findings reviewer/tester. **Ce qui n'est pas encore câblé** :
-`warden-gated` ne fait que remonter le résultat de `watch-pr` ; brancher cette décision dans
-la boucle de convergence de `warden` (pour reboucler automatiquement vers le coder sur un
-`ChecksFailed`) est, comme pour le PR Manager, une décision d'architecture distincte hors
-périmètre de cette livraison.
+`decide_next_state` pour les findings reviewer/tester. **Câblage (issue #15/ADR-0011)** :
+cette décision est désormais appliquée automatiquement par `warden` lui-même — voir
+"Le câblage `run-tail`/`resume-watch`" ci-dessous.
+
+### Le câblage `run-tail`/`resume-watch` (issue #15/ADR-0011)
+
+`warden` ne lance plus jamais `watch-pr` en diagnostic pour driver un run réel : ce sont les
+deux sous-commandes `warden-gated run-tail` et `warden-gated resume-watch` qui encapsulent
+la suite `OpenDraft`/`Finalize` (ou juste `Finalize` si une PR existe déjà pour ce run) puis
+`watch_pr`, et qui livrent le résultat terminal à `warden` par le socket Unix inverse décrit
+plus haut :
+
+- `warden-gated run-tail` — chemin nominal, déclenché par `warden` juste après avoir poussé
+  le commit convergé dans le dépôt bare local. Ouvre une nouvelle PR (`OpenDraft`) sauf si le
+  run en a déjà une (`runs.pr_number`, cas d'un reboucle sur `ChecksFailed`), auquel cas il
+  saute directement à `Finalize` plutôt que de rouvrir une seconde PR draft.
+- `warden-gated resume-watch` — contrepartie de reprise après crash : pour un run retrouvé
+  bloqué en `AwaitingCi` au redémarrage de `warden` (la PR est déjà ouverte/finalisée), ne
+  fait que reprendre `watch_pr` sur la PR existante et en délivrer le résultat.
+
+Les deux sous-commandes revérifient indépendamment l'état du run depuis leur propre lecture
+seule de la SQLite avant d'agir (jamais confiance aveugle envers ce que `warden` prétend,
+ADR-0006) et acceptent les mêmes options `--poll-interval-secs`/`--inactivity-timeout-secs`
+que `watch-pr` ci-dessus. L'attente de leur résultat côté `warden` est bornée par la durée de
+vie du sous-processus déclenché (pas un timeout mur-à-mur indépendant côté `warden`) : tant
+que le sous-processus est vivant, `warden` continue d'attendre son message terminal ; s'il
+sort sans en avoir délivré un, le run est marqué `Failed`.
 
 ### Service managé
 

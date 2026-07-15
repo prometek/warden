@@ -41,6 +41,14 @@ impl GhProvider {
         };
         Ok(Self { repo_slug })
     }
+
+    /// The `owner/repo` this provider is scoped to -- needed by callers that
+    /// compose a `pr_manager::FinalizeRequest` themselves (e.g. `run_tail`'s
+    /// `run-tail`/`resume-watch` CLI dispatch) and so can't re-derive it
+    /// independently without duplicating `new`'s own resolution.
+    pub fn repo_slug(&self) -> &str {
+        &self.repo_slug
+    }
 }
 
 impl PrProvider for GhProvider {

@@ -1,7 +1,7 @@
 //! SQLite persistence (ADR-0004). `warden` is the only writer; schema
-//! covers `runs`, `cycles`, `findings`, `agent_processes`, and (Phase 8,
-//! ADR-0008) `events` -- `evidence` is still deferred to Phase 7 (issue #7).
-//! Every row read back is reparsed into a strongly-typed Rust value before
+//! covers `runs`, `cycles`, `findings`, `agent_processes`, `evidence`
+//! (Phase 7, ADR-0009, issue #7), and (Phase 8, ADR-0008) `events`. Every
+//! row read back is reparsed into a strongly-typed Rust value before
 //! leaving this module — callers never see raw strings for
 //! `state`/`role`/`source`/`severity`/`event_type`.
 
@@ -12,7 +12,8 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    AgentRole, EventKind, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
+    AgentRole, EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState,
+    Severity,
 };
 
 use crate::error::{Result, WardenError};
@@ -199,6 +200,11 @@ pub struct Run {
     /// The commit SHA the run converged on (see `set_run_converged_commit`,
     /// M4) — `None` until the run reaches `RunState::Converged`.
     pub converged_commit_sha: Option<String>,
+    /// The PR `warden-gated` opened for this run (see `set_run_pr_number`,
+    /// issue #15/ADR-0011) — `None` until `Pushed`'s tail successfully opens
+    /// one. Read back by crash recovery to resume a stuck `AwaitingCi` watch
+    /// without needing any watch state of `warden-gated`'s own.
+    pub pr_number: Option<u64>,
 }
 
 pub async fn insert_run(
@@ -290,6 +296,31 @@ pub async fn set_run_converged_commit(
     Ok(())
 }
 
+/// Records the PR `warden-gated` opened for this run (issue #15/ADR-0011),
+/// once the post-Converged tail's `OpenDraft` succeeds. `warden` is still
+/// the sole writer of this column -- `warden-gated` only ever reads it back
+/// read-only (`get_run_view`-style query), e.g. to resume a stuck
+/// `AwaitingCi` watch after a crash without keeping any watch state itself.
+pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) -> Result<()> {
+    let now = now_rfc3339();
+    // Issue #15 review, L2: reports the real `u64` value that failed to
+    // convert -- `WardenError::InvalidStoredValue` (used elsewhere in this
+    // module for the *opposite* direction, i64 column -> smaller unsigned
+    // type) can only carry an `i64`, which would have silently misreported
+    // an overflowing pr_number as `i64::MAX` instead of its actual value.
+    let stored_pr_number =
+        i64::try_from(pr_number).map_err(|_| WardenError::PrNumberOverflow { pr_number })?;
+    sqlx::query!(
+        "UPDATE runs SET pr_number = ?, updated_at = ? WHERE id = ?",
+        stored_pr_number,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Raw shape of a `runs` row as decoded by sqlx, before `state` has been
 /// validated into a [`RunState`]. Kept private: [`Run`] is the only form
 /// that ever leaves this module.
@@ -304,9 +335,14 @@ struct RunRow {
     created_at: String,
     updated_at: String,
     converged_commit_sha: Option<String>,
+    pr_number: Option<i64>,
 }
 
 fn row_to_run(row: RunRow) -> Result<Run> {
+    let pr_number = row
+        .pr_number
+        .map(|value| checked_u32(value, "runs.pr_number").map(u64::from))
+        .transpose()?;
     Ok(Run {
         id: row.id,
         repo_path: row.repo_path,
@@ -318,13 +354,14 @@ fn row_to_run(row: RunRow) -> Result<Run> {
         created_at: row.created_at,
         updated_at: row.updated_at,
         converged_commit_sha: row.converged_commit_sha,
+        pr_number,
     })
 }
 
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -342,7 +379,7 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha
+        SELECT id as "id!", repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
         WHERE state IN ('coder_running', 'awaiting_review_test', 'awaiting_ci')
         "#
@@ -372,7 +409,7 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha
+        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
         FROM runs
         WHERE runs.state = 'failed'
           AND (
@@ -681,6 +718,12 @@ pub async fn insert_event(
         event_type,
         payload_json,
         created_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A `evidence` row, with `type` already validated into
 /// [`EvidenceType`] (ADR-0009, issue #7).
 #[derive(Debug, Clone)]
@@ -773,6 +816,15 @@ pub async fn list_events_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<
         FROM events
         WHERE run_id = ?
         ORDER BY created_at ASC, id ASC
+        "#,
+        run_id,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(row_to_event_record).collect()
+}
+
 /// One `evidence` row together with the `cycle_number` it belongs to -- the
 /// bare `evidence` table only carries `cycle_id`, but `pr_summary`'s
 /// Evidence section formatting (issue #7) groups/orders by cycle number.
@@ -994,6 +1046,40 @@ mod tests {
         assert_eq!(run.max_cycles, 5);
         assert_eq!(run.current_cycle, 0);
         assert_eq!(run.intent, "do the thing");
+    }
+
+    #[tokio::test]
+    async fn pr_number_is_none_until_set_then_round_trips() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let run = get_run(&pool, "run-pr").await.unwrap().unwrap();
+        assert_eq!(run.pr_number, None);
+
+        set_run_pr_number(&pool, "run-pr", 42).await.unwrap();
+
+        let run = get_run(&pool, "run-pr").await.unwrap().unwrap();
+        assert_eq!(run.pr_number, Some(42));
+    }
+
+    /// Issue #15 review, L2: an overflowing pr_number must be reported with
+    /// its own real value, not a misleading placeholder like `i64::MAX`.
+    #[tokio::test]
+    async fn set_run_pr_number_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-pr-overflow", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = set_run_pr_number(&pool, "run-pr-overflow", overflowing).await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::PrNumberOverflow { pr_number }) if pr_number == overflowing
+        ));
     }
 
     #[tokio::test]
