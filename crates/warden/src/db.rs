@@ -1193,6 +1193,55 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    /// Re-test cycle (issue #20 review fix, fdcaa4e): `ORDER BY id ASC`
+    /// must actually determine the returned order, not merely happen to
+    /// agree with insertion order. Deliberately inserts the
+    /// lexicographically-later id first, so a query without the `ORDER BY`
+    /// clause (which SQLite would otherwise satisfy via a plain rowid/
+    /// insertion-order table scan here, since neither `cycle_id` nor `id`
+    /// has a covering index driving this query) would return the rows in
+    /// the opposite order from what's asserted here.
+    #[tokio::test]
+    async fn list_findings_for_cycle_orders_findings_by_id_ascending_not_insertion_order() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-order", "run-order", 1)
+            .await
+            .unwrap();
+
+        let finding_z = Finding {
+            source: FindingSource::Reviewer,
+            severity: Severity::Blocking,
+            file: None,
+            description: "inserted first, id sorts last".to_string(),
+            action: None,
+        };
+        let finding_a = Finding {
+            source: FindingSource::Tester,
+            severity: Severity::Blocking,
+            file: None,
+            description: "inserted second, id sorts first".to_string(),
+            action: None,
+        };
+
+        insert_finding(&pool, "zzz-finding", "cycle-order", &finding_z)
+            .await
+            .unwrap();
+        insert_finding(&pool, "aaa-finding", "cycle-order", &finding_a)
+            .await
+            .unwrap();
+
+        let findings = list_findings_for_cycle(&pool, "cycle-order").await.unwrap();
+        assert_eq!(
+            findings,
+            vec![finding_a, finding_z],
+            "findings must be ordered by id ascending (aaa- before zzz-), regardless of \
+             insertion order"
+        );
+    }
+
     #[tokio::test]
     async fn latest_open_agent_process_is_none_when_run_has_no_processes() {
         let (_dir, pool) = test_pool().await;

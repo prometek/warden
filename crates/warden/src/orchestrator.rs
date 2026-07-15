@@ -3986,4 +3986,543 @@ mod tests {
             "a run's first cycle has no previous cycle to report on"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Re-test cycle (issue #20 review fix, fdcaa4e): tests derived from
+    // intent, independent of the coder's own tests above.
+    // -----------------------------------------------------------------
+
+    /// `cap_diff`'s exact boundary: cap-1 and cap-exact bytes must survive
+    /// untouched and unmarked; cap+1 must truncate at exactly `max_bytes`
+    /// and be marked. Complements the coder's own `cap_diff` tests (which
+    /// used a 4-byte cap with 10/4-byte inputs) with the literal ±1
+    /// boundary the task calls out.
+    #[test]
+    fn cap_diff_boundary_is_exact_at_cap_minus_one_cap_and_cap_plus_one() {
+        let cap = 16;
+
+        let under = vec![b'a'; cap - 1];
+        let result = cap_diff(&under, cap);
+        assert_eq!(result, String::from_utf8_lossy(&under));
+        assert!(!result.contains(DIFF_TRUNCATED_MARKER));
+
+        let exact = vec![b'a'; cap];
+        let result = cap_diff(&exact, cap);
+        assert_eq!(result, String::from_utf8_lossy(&exact));
+        assert!(
+            !result.contains(DIFF_TRUNCATED_MARKER),
+            "input exactly at the cap must not be treated as truncated"
+        );
+
+        let over = vec![b'a'; cap + 1];
+        let result = cap_diff(&over, cap);
+        assert!(result.starts_with(&"a".repeat(cap)));
+        assert!(result.contains(DIFF_TRUNCATED_MARKER));
+        assert_eq!(
+            result.len(),
+            cap + DIFF_TRUNCATED_MARKER.len(),
+            "exactly one byte over the cap must still truncate to exactly `cap` content bytes"
+        );
+    }
+
+    /// M1 intent: a diff under the cap must reach the agent byte-exact, not
+    /// merely "close enough" -- compares `read_diff`'s output directly
+    /// against a plain `git diff` invocation over the same range, not just
+    /// a substring check.
+    #[tokio::test]
+    async fn read_diff_under_the_cap_is_byte_exact_against_plain_git_diff() {
+        let dir = init_test_repo();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        std::fs::write(dir.path().join("small.txt"), "line one\nline two\n").unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "small.txt"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add small file",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let expected = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                &format!("{base_sha}..{target_sha}"),
+            ])
+            .output()
+            .unwrap();
+        let expected_text = String::from_utf8_lossy(&expected.stdout).into_owned();
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        assert_eq!(
+            diff, expected_text,
+            "a diff under the cap must be byte-exact, not just 'contain' the change"
+        );
+        assert!(!diff.contains(DIFF_TRUNCATED_MARKER));
+    }
+
+    /// M1 intent, end-to-end through the real `git diff` subprocess (not
+    /// just `cap_diff` in isolation): a diff over `MAX_DIFF_BYTES` must
+    /// actually be truncated at the cap and carry the marker so the
+    /// reviewer/tester can tell a truncated diff from a genuinely small
+    /// one. Generates a real >8 MiB diff via git rather than asserting
+    /// against a synthetic byte slice.
+    #[tokio::test]
+    async fn read_diff_over_the_cap_is_truncated_and_marked_via_real_git_diff() {
+        let dir = init_test_repo();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        // A single ~9 MiB added file guarantees the diff itself exceeds
+        // MAX_DIFF_BYTES (8 MiB) once the unified-diff framing (`+` prefix
+        // per line, headers) is added on top of the file's own content.
+        let line = "x".repeat(120);
+        let mut content = String::with_capacity(9 * 1024 * 1024);
+        while content.len() < 9 * 1024 * 1024 {
+            content.push_str(&line);
+            content.push('\n');
+        }
+        std::fs::write(dir.path().join("huge.txt"), &content).unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "huge.txt"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add huge file",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        assert!(
+            diff.contains(DIFF_TRUNCATED_MARKER),
+            "a real diff exceeding MAX_DIFF_BYTES must be marked truncated"
+        );
+        assert_eq!(
+            diff.len(),
+            MAX_DIFF_BYTES + DIFF_TRUNCATED_MARKER.len(),
+            "truncated diff length must be exactly the cap plus the marker, never more"
+        );
+    }
+
+    /// M1 intent: the cap must bound *memory*, not just the returned
+    /// string's length -- a `.take()`-based streaming read discards excess
+    /// bytes without ever holding them all in memory at once, so this
+    /// process's peak RSS growth while reading a diff should stay roughly
+    /// constant regardless of how far over the cap the real diff is. A test
+    /// that only checked `read_diff`'s output length would pass even if the
+    /// implementation buffered the *entire* diff (or the entire excess)
+    /// before truncating -- this samples this process's own RSS (via `ps`,
+    /// no extra crate dependency) concurrently with the `read_diff` call to
+    /// catch exactly that.
+    ///
+    /// Compares two diffs, one with a small excess over the cap and one
+    /// with a much larger excess: a bounded implementation's RSS growth is
+    /// close for both; an implementation that still buffers the excess (in
+    /// full or in large chunks) shows growth that scales with the larger
+    /// diff's size.
+    fn self_rss_kb() -> i64 {
+        let pid = std::process::id().to_string();
+        let output = SyncCommand::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .expect("spawn ps");
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("ps -o rss= output must be an integer number of KiB")
+    }
+
+    /// Isolated worker for
+    /// `read_diff_peak_memory_growth_is_bounded_regardless_of_how_far_over_the_cap_the_diff_is`
+    /// below: measures *this process's* own peak RSS growth while
+    /// `read_diff` reads a single diff whose size (in MiB) comes from
+    /// `WARDEN_TEST_DIFF_TOTAL_MIB`, printing `RSS_GROWTH_KB=<n>` to
+    /// stdout. `#[ignore]`d so ordinary `cargo test` runs never execute it
+    /// directly -- it only runs when the parent test re-invokes this exact
+    /// test binary (`std::env::current_exe`) as a fresh, single-test
+    /// subprocess with `--test-threads=1`. That isolation is the point: RSS
+    /// sampled from *this* shared test binary while dozens of unrelated
+    /// tests run concurrently under `cargo test`'s default parallelism is
+    /// too noisy to attribute to one test's own allocations (confirmed
+    /// empirically -- an in-process version of this test flaked under
+    /// `cargo test --workspace`, alternating pass/fail across runs with the
+    /// same diff sizes and thresholds).
+    #[tokio::test]
+    #[ignore]
+    async fn peak_rss_diff_worker_isolated_process() {
+        let total_mib: usize = std::env::var("WARDEN_TEST_DIFF_TOTAL_MIB")
+            .expect("WARDEN_TEST_DIFF_TOTAL_MIB must be set by the parent test")
+            .parse()
+            .expect("WARDEN_TEST_DIFF_TOTAL_MIB must be an integer");
+
+        let dir = init_test_repo();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        let line = "y".repeat(120);
+        let mut content = String::with_capacity(total_mib * 1024 * 1024);
+        while content.len() < total_mib * 1024 * 1024 {
+            content.push_str(&line);
+            content.push('\n');
+        }
+        std::fs::write(dir.path().join("huge.txt"), &content).unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "huge.txt"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add huge file",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let baseline = self_rss_kb();
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(baseline));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak_clone = peak.clone();
+        let stop_clone = stop.clone();
+        let sampler = std::thread::spawn(move || {
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                let rss = self_rss_kb();
+                peak_clone.fetch_max(rss, std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().unwrap();
+        assert!(diff.contains(DIFF_TRUNCATED_MARKER), "sanity: over the cap");
+
+        let growth_kb = peak.load(std::sync::atomic::Ordering::Relaxed) - baseline;
+        println!("RSS_GROWTH_KB={growth_kb}");
+    }
+
+    /// M1 intent: the cap must bound *memory*, not just the returned
+    /// string's length -- a `.take()`-based streaming read discards excess
+    /// bytes without ever holding them all in memory at once, so peak RSS
+    /// growth while reading a diff should stay roughly constant regardless
+    /// of how far over the cap the real diff is. A test that only checked
+    /// `read_diff`'s output length would pass even if the implementation
+    /// buffered the *entire* diff (or the entire excess) before truncating
+    /// -- this measures actual peak RSS via [`peak_rss_diff_worker_isolated_process`]
+    /// (re-invoked as an isolated subprocess so unrelated tests running
+    /// concurrently under `cargo test` can't pollute the measurement) to
+    /// catch exactly that.
+    ///
+    /// Compares two diffs, one with a small excess over the cap and one
+    /// with a much larger excess: a bounded implementation's RSS growth is
+    /// close for both; an implementation that still buffers the excess (in
+    /// full or in large chunks) shows growth that scales with the larger
+    /// diff's size.
+    #[test]
+    fn read_diff_peak_memory_growth_is_bounded_regardless_of_how_far_over_the_cap_the_diff_is() {
+        fn measure_rss_growth_kb(total_mib: usize) -> i64 {
+            let exe = std::env::current_exe().expect("current_exe available for this test binary");
+            let output = SyncCommand::new(&exe)
+                .args([
+                    "--exact",
+                    "orchestrator::tests::peak_rss_diff_worker_isolated_process",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("WARDEN_TEST_DIFF_TOTAL_MIB", total_mib.to_string())
+                .output()
+                .expect("spawn isolated subprocess for the RSS worker test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Under `--nocapture` libtest prints "test <name> ... " on the
+            // same line immediately before the test's own stdout, so the
+            // marker isn't necessarily at the start of a line -- search for
+            // it as a substring instead.
+            let after_marker = stdout.split("RSS_GROWTH_KB=").nth(1).unwrap_or_else(|| {
+                panic!(
+                    "isolated RSS worker subprocess did not print RSS_GROWTH_KB=... \
+                         (exit status {:?}); stdout: {stdout:?}, stderr: {:?}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            after_marker
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .filter(|digits| !digits.is_empty())
+                .expect("RSS_GROWTH_KB=... must be followed by an integer number of KiB")
+                .parse()
+                .expect("RSS_GROWTH_KB=... must be an integer number of KiB")
+        }
+
+        // ~9 MiB diff (~1 MiB excess over the 8 MiB cap) vs. ~90 MiB diff
+        // (~82 MiB excess). If the excess is fully buffered rather than
+        // streamed/discarded, the larger diff's peak RSS growth would be
+        // many tens of MiB higher than the smaller diff's.
+        let small_excess_growth_kb = measure_rss_growth_kb(9);
+        let large_excess_growth_kb = measure_rss_growth_kb(90);
+
+        let delta_kb = large_excess_growth_kb - small_excess_growth_kb;
+        assert!(
+            delta_kb < 20 * 1024,
+            "peak RSS growth must stay roughly constant regardless of how far over the \
+             cap the diff is (the excess must be streamed/discarded, never buffered in \
+             full) -- small-excess growth {small_excess_growth_kb} KiB, \
+             large-excess growth {large_excess_growth_kb} KiB, delta {delta_kb} KiB"
+        );
+    }
+
+    /// M1 intent: the repo's `diff.<driver>.textconv` (opted into via
+    /// `.gitattributes`) must not be allowed to substitute the real file
+    /// content in the diff payload -- a textconv filter runs arbitrary
+    /// output in place of the actual change, which is exactly the kind of
+    /// git-config-driven corruption `read_diff`'s doc comment claims to
+    /// neutralize alongside `color.ui`/`diff.external`. Uses a textconv
+    /// filter that emits the *same* fixed marker for every blob (so if it
+    /// were applied, the "converted" before/after would be textually
+    /// identical and the diff would come back empty) to prove textconv ran
+    /// at all, distinct from just checking the marker text is absent.
+    #[tokio::test]
+    async fn read_diff_ignores_gitattributes_configured_textconv() {
+        let dir = init_test_repo();
+
+        std::fs::write(
+            dir.path().join(".gitattributes"),
+            "tracked.bin diff=faketextconv\n",
+        )
+        .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", ".gitattributes"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add gitattributes",
+            ])
+            .status()
+            .unwrap();
+
+        std::fs::write(dir.path().join("tracked.bin"), "real-content-v1\n").unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "tracked.bin"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add tracked.bin v1",
+            ])
+            .status()
+            .unwrap();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        // A textconv filter that ignores its actual input and always
+        // prints the same fixed line -- if applied, both sides of the diff
+        // would "convert" to identical text and the diff would be empty.
+        let script_path = dir.path().join("fake_textconv.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\necho textconv-marker-always-the-same\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "config",
+                "diff.faketextconv.textconv",
+                script_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+
+        std::fs::write(dir.path().join("tracked.bin"), "real-content-v2\n").unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "tracked.bin"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "modify tracked.bin",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        assert!(
+            diff.contains("real-content-v1") && diff.contains("real-content-v2"),
+            "the diff must show the real file content, not have been swallowed by a \
+             textconv filter that maps every blob to the same marker text: {diff:?}"
+        );
+        assert!(
+            !diff.contains("textconv-marker-always-the-same"),
+            "the textconv filter's output must never appear in the payload: {diff:?}"
+        );
+    }
+
+    /// M3 intent: `ORDER BY id ASC` in `db::list_findings_for_cycle` must
+    /// actually produce a deterministic order that the coder's own
+    /// `select_prior_findings` tests never exercised (each of those inserts
+    /// only one finding per cycle, so ordering between rows is never
+    /// observed). Inserts two findings whose *insertion* order is the
+    /// reverse of their *id* order, proving the returned order tracks `id`
+    /// ascending rather than insertion/rowid order.
+    #[tokio::test]
+    async fn select_prior_findings_returns_findings_in_ascending_id_order_not_insertion_order() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(&pool, "run-order-1", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "cycle-order-1", "run-order-1", 1)
+            .await
+            .unwrap();
+
+        let finding_z = Finding {
+            source: warden_core::FindingSource::Reviewer,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "inserted first, sorts last by id".to_string(),
+            action: None,
+        };
+        let finding_a = Finding {
+            source: warden_core::FindingSource::Tester,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "inserted second, sorts first by id".to_string(),
+            action: None,
+        };
+
+        // Deliberately insert the lexicographically-later id first.
+        db::insert_finding(&pool, "zzz-finding", "cycle-order-1", &finding_z)
+            .await
+            .unwrap();
+        db::insert_finding(&pool, "aaa-finding", "cycle-order-1", &finding_a)
+            .await
+            .unwrap();
+
+        let selected = select_prior_findings(&pool, Vec::new(), Some("cycle-order-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            selected,
+            vec![finding_a, finding_z],
+            "findings must come back in ascending id order (aaa- before zzz-), not the \
+             reverse order they were inserted in"
+        );
+
+        // Determinism: repeated calls against unchanged data return the
+        // exact same order.
+        let selected_again = select_prior_findings(&pool, Vec::new(), Some("cycle-order-1"))
+            .await
+            .unwrap();
+        assert_eq!(selected, selected_again);
+    }
 }

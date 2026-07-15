@@ -926,6 +926,138 @@ fn e2e_empty_agent_command_is_a_clean_cli_error_not_a_panic() {
         .stderr(contains("agent command must not be empty"));
 }
 
+/// Re-test cycle (issue #20 review fix, fdcaa4e), M2 intent: warden must
+/// never emit a payload its own parser would reject, and that starts with
+/// rejecting a blank `--intent` at the CLI boundary -- before any `runs`
+/// row is written, not deep inside the first cycle when
+/// `AgentInputMessage::for_coder` builds the coder's stdin payload. Driven
+/// through the real CLI entry point (`Cli::parse()`'s `parse_intent` value
+/// parser), not a direct call into `AgentInputMessage::for_coder`.
+#[test]
+fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            "sh -c true",
+            "--reviewer-cmd",
+            "sh -c true",
+            "--tester-cmd",
+            "sh -c true",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("run intent must not be blank"));
+
+    // No SQLite db should have been created at all: the CLI must reject the
+    // blank intent during arg parsing, before `main.rs::run` ever opens
+    // (and migrates) the state db.
+    let db_path = warden_home.path().join("state.db");
+    assert!(
+        !db_path.exists(),
+        "a blank --intent must be rejected before any state db (let alone a run row) is created"
+    );
+}
+
+/// Whitespace-only intent is equally blank (`str::trim`), not merely a
+/// literal empty string -- covers the exact validation rule
+/// `AgentInputMessage::for_coder` mirrors on the construction side.
+#[test]
+fn e2e_whitespace_only_intent_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "   \t  ",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            "sh -c true",
+            "--reviewer-cmd",
+            "sh -c true",
+            "--tester-cmd",
+            "sh -c true",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("run intent must not be blank"));
+}
+
+/// Re-test cycle (issue #20 review fix, fdcaa4e), H1 intent, driven through
+/// the real CLI end-to-end: a coder that never reads stdin at all and exits
+/// immediately must not fail the run, even when the stdin payload is large
+/// enough (over a typical 64KiB OS pipe buffer) to guarantee the write is
+/// still in flight when the agent exits and closes its read end (a genuine
+/// broken pipe, not a small payload that just happens to fit unread in the
+/// buffer). The existing e2e fixtures' reviewer/tester scripts also ignore
+/// stdin, but their payloads are tiny (a short diff), so they never
+/// actually exercise this path -- this test forces it with a >64KiB
+/// `--intent`.
+#[tokio::test]
+async fn e2e_coder_ignoring_a_large_stdin_payload_and_exiting_immediately_still_converges() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+
+    // Never reads stdin at all; commits immediately and exits.
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        r#"#!/bin/sh
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+exit 0
+"#,
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    // Comfortably over a typical 64KiB pipe buffer.
+    let large_intent = format!("large intent payload: {}", "x".repeat(200_000));
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            &large_intent,
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+}
+
 /// A `--repo` that isn't a git repository must fail cleanly with an
 /// actionable error rather than a panic or a silently-created worktree.
 #[test]

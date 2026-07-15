@@ -521,6 +521,65 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Re-test cycle (issue #20 review fix, fdcaa4e): adversarial stdin
+    // write-failure angles beyond the coder's own "never reads at all"
+    // case, derived from the task's intent independent of the coder's
+    // tests above.
+    // -----------------------------------------------------------------
+
+    /// Adversarial angle: an agent that reads only *part* of a large
+    /// payload before exiting (not "never reads at all") must still be a
+    /// non-fatal, logged outcome -- the broken pipe fires once the agent's
+    /// read end closes regardless of how much it already consumed.
+    #[tokio::test]
+    async fn an_agent_that_reads_only_part_of_the_payload_then_exits_does_not_fail_the_invocation()
+    {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "head -c 100 > /dev/null; exit 0"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let large_payload = "x".repeat(200_000);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait(child, "sh", Some(large_payload), CancellationToken::new()),
+        )
+        .await
+        .expect("wait must not hang when the agent only partially reads stdin");
+
+        let outcome = result.expect(
+            "an agent reading only part of the payload before exiting must not fail the run",
+        );
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    /// Adversarial angle: an agent that explicitly closes its stdin file
+    /// descriptor mid-run (rather than exiting outright) must still see the
+    /// write fail as a non-fatal broken pipe -- and `wait` must not hang
+    /// waiting for the write to somehow complete once the read side is
+    /// gone, even though the process itself keeps running for a while
+    /// afterwards.
+    #[tokio::test]
+    async fn an_agent_that_closes_stdin_mid_write_while_continuing_to_run_does_not_fail_the_invocation(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "exec 0<&-; sleep 0.3; exit 0"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let large_payload = "x".repeat(200_000);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait(child, "sh", Some(large_payload), CancellationToken::new()),
+        )
+        .await
+        .expect("wait must not hang when the agent closes stdin mid-write and keeps running");
+
+        let outcome = result.expect(
+            "an agent that closes stdin mid-write but keeps running must not fail the invocation",
+        );
+        assert_eq!(outcome.exit_code, 0);
+    }
+
     #[test]
     fn current_process_is_reported_alive() {
         let pid = std::process::id();
