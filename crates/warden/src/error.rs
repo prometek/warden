@@ -64,6 +64,20 @@ pub enum ProcessError {
     /// instead of silently believing an orphan agent process was cleaned up.
     #[error("failed to terminate orphan process (pid {pid})")]
     KillFailed { pid: u32 },
+
+    /// Issue #20 review, H1: writing the `AgentInputMessage` payload to the
+    /// agent's stdin failed with something other than a broken pipe (an
+    /// agent that closes/never reads stdin is legitimate and handled
+    /// separately, see `process::wait`). The payload is a single JSON
+    /// object, so a partial write is unparsable by construction — running
+    /// the agent anyway would silently run it with no intent/context at
+    /// all, exactly the "no silent fallback" case code-standards.md forbids.
+    #[error("failed to write payload to `{command}` stdin: {source}")]
+    StdinWrite {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).

@@ -673,9 +673,16 @@ pub async fn insert_finding(
     Ok(())
 }
 
+/// LOW (issue #20 review): `ORDER BY id ASC` makes the returned order
+/// deterministic -- without it, SQLite is free to return `findings` rows in
+/// any order for a given `cycle_id`, which fed straight into
+/// `AgentInputMessage::for_finding_agent`'s `findings` field (ADR-0012)
+/// would make the reviewer/tester's prior-findings context vary run to run
+/// for identical data. `id` (not a timestamp -- `findings` has none) is
+/// good enough for determinism; it doesn't need to reflect insertion order.
 pub async fn list_findings_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<Vec<Finding>> {
     let rows = sqlx::query!(
-        "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ?",
+        "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ? ORDER BY id ASC",
         cycle_id,
     )
     .fetch_all(pool)
@@ -1184,6 +1191,55 @@ mod tests {
 
         let findings = list_findings_for_cycle(&pool, "cycle-empty").await.unwrap();
         assert!(findings.is_empty());
+    }
+
+    /// Re-test cycle (issue #20 review fix, fdcaa4e): `ORDER BY id ASC`
+    /// must actually determine the returned order, not merely happen to
+    /// agree with insertion order. Deliberately inserts the
+    /// lexicographically-later id first, so a query without the `ORDER BY`
+    /// clause (which SQLite would otherwise satisfy via a plain rowid/
+    /// insertion-order table scan here, since neither `cycle_id` nor `id`
+    /// has a covering index driving this query) would return the rows in
+    /// the opposite order from what's asserted here.
+    #[tokio::test]
+    async fn list_findings_for_cycle_orders_findings_by_id_ascending_not_insertion_order() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-order", "run-order", 1)
+            .await
+            .unwrap();
+
+        let finding_z = Finding {
+            source: FindingSource::Reviewer,
+            severity: Severity::Blocking,
+            file: None,
+            description: "inserted first, id sorts last".to_string(),
+            action: None,
+        };
+        let finding_a = Finding {
+            source: FindingSource::Tester,
+            severity: Severity::Blocking,
+            file: None,
+            description: "inserted second, id sorts first".to_string(),
+            action: None,
+        };
+
+        insert_finding(&pool, "zzz-finding", "cycle-order", &finding_z)
+            .await
+            .unwrap();
+        insert_finding(&pool, "aaa-finding", "cycle-order", &finding_a)
+            .await
+            .unwrap();
+
+        let findings = list_findings_for_cycle(&pool, "cycle-order").await.unwrap();
+        assert_eq!(
+            findings,
+            vec![finding_a, finding_z],
+            "findings must be ordered by id ascending (aaa- before zzz-), regardless of \
+             insertion order"
+        );
     }
 
     #[tokio::test]
