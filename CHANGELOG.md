@@ -278,3 +278,36 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `--gate-poll-interval-secs`, `--gate-inactivity-timeout-secs` sur
   `warden run` : ce câblage est optionnel, son omission préserve le
   comportement antérieur (arrêt à `Converged`).
+
+### Added — Issue #20 Scope B / ADR-0012 : propagation de l'intent/contexte aux agents via stdin JSON
+
+- Chaque agent lancé par `warden` (`--coder-cmd`/`--reviewer-cmd`/`--tester-cmd`, inchangés —
+  aucun nouveau flag CLI dans cette livraison) reçoit désormais sur son `stdin` un payload
+  JSON versionné (`warden_core::AgentInputMessage`), puis `stdin` est fermé (EOF) : le coder
+  reçoit l'intent du run ; le reviewer et le tester reçoivent le commit cible, le diff du
+  cycle et les findings qui ont déclenché ce cycle (y compris les findings CI injectés sur un
+  reboucle post-convergence, ADR-0011). Auparavant l'intent n'atteignait le coder par aucun
+  canal géré par Warden (l'utilisateur devait l'embarquer hors-bande dans sa commande), et le
+  reviewer/tester ne recevaient ni commit, ni diff, ni findings.
+- `process::spawn`/`process::wait` pipent désormais stdin en plus de stdout/stderr ; l'écriture
+  du payload, le drain de stdout/stderr et l'attente de fin de process tournent concurremment
+  pour éviter un deadlock si un agent entrelace lecture de stdin et écriture de sortie
+  volumineuse. `env_clear()` (seul `PATH` transmis) reste inchangé — l'intent ne transite
+  jamais par une variable d'environnement ni par un argument de ligne de commande.
+- Un échec d'écriture stdin autre qu'une pipe cassée (agent qui ferme ou n'ouvre jamais son
+  côté lecture — cas légitime, non fatal) fait désormais échouer l'invocation
+  (`ProcessError::StdinWrite`) plutôt que de laisser tourner silencieusement un agent qui n'a
+  jamais reçu son payload.
+- Le diff transmis au reviewer/tester est borné à 8 Mio (`MAX_DIFF_BYTES`), mémoire réellement
+  bornée (le surplus est drainé vers `tokio::io::sink()`, jamais rebufferisé) ; un diff tronqué
+  porte un marqueur explicite (`DIFF_TRUNCATED_MARKER`) que l'agent peut détecter. `git diff`
+  est invoqué avec `--no-color --no-ext-diff --no-textconv -c color.ui=false` et un séparateur
+  `--`, pour empêcher la configuration git du dépôt ou de l'utilisateur (dont un `textconv`
+  défini via `.gitattributes`) de corrompre ou de masquer le diff reçu par l'agent.
+- `--intent` est désormais validé (rejet d'une valeur vide/blanche) dès la frontière CLI
+  plutôt qu'en profondeur du premier cycle, une fois la ligne `runs` déjà créée.
+- Hors périmètre de cette livraison : le scope A de l'issue #20 (agents définis par fichier
+  markdown, seam de runner pluggable, flags `--*-agent`) ; aucun timeout par invocation
+  d'agent (différé, documenté dans les Conséquences d'ADR-0012) ; le coder ne reçoit toujours
+  pas les findings du cycle précédent qu'il est censé corriger, seul l'intent du run l'est
+  (lacune connue, également documentée dans ADR-0012).

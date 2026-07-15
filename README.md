@@ -118,7 +118,9 @@ Flags de `warden run` :
 
 - `--repo <PATH>` — dépôt de l'utilisateur, jamais écrit directement (seuls les
   worktrees créés sous `--warden-home` le sont).
-- `--intent <TEXT>` — description de la tâche transmise à l'agent coder.
+- `--intent <TEXT>` — description de la tâche transmise à l'agent coder sur son `stdin`
+  (voir "Protocole d'entrée des agents (stdin)" ci-dessous, ADR-0012). Doit être non vide
+  (espaces exclus) — validé dès la frontière CLI plutôt qu'en profondeur du premier cycle.
 - `--coder-cmd <CMD>`, `--reviewer-cmd <CMD>`, `--tester-cmd <CMD>` — commandes shell
   (programme + arguments, découpées sur les espaces) lançant respectivement l'agent
   coder, reviewer et tester en sous-processus.
@@ -180,6 +182,33 @@ Un outil de capture absent ou en échec (Playwright/asciinema non installés, au
 artefact produit, ...) est loggé (`tracing::warn!`) et n'interrompt jamais un run par
 ailleurs convergent — l'absence de preuve pour un cycle donné n'est pas traitée comme un
 finding bloquant.
+
+### Protocole d'entrée des agents (stdin)
+
+Chaque agent lancé par `warden` (coder, reviewer, tester) reçoit sur son `stdin` un unique
+payload JSON versionné (`warden_core::AgentInputMessage`, ADR-0012), puis `stdin` est fermé
+(EOF) — un agent qui n'ouvre ou ne lit jamais stdin est un comportement légitime, non fatal
+au run :
+
+```json
+{"version": 1, "role": "coder", "intent": "Ajouter la validation d'email au formulaire d'inscription", "target_commit": null, "diff": null, "findings": []}
+```
+
+- `role` : `"coder"`, `"reviewer"` ou `"tester"` — toujours présent.
+- Coder : `intent` (la tâche du run, cf. `--intent`) ; `target_commit`/`diff` valent `null` et
+  `findings` est vide — le coder ne reçoit pas encore les findings du cycle précédent qu'il
+  est censé corriger (lacune connue, voir ADR-0012).
+- Reviewer/tester : `target_commit` (le commit produit par le coder de ce cycle), `diff`
+  (`git diff` entre le début et la fin du cycle — peut être vide si le coder n'a rien
+  committé) et `findings` (ceux qui ont déclenché ce cycle, y compris les findings CI sur un
+  reboucle post-convergence ; liste vide sur le premier cycle d'un run) ; `intent` vaut
+  `null`. Le `diff` est tronqué à 8 Mio ; un diff tronqué porte le marqueur
+  `\n\n[warden: diff truncated at the 8 MiB payload cap]\n` en fin de champ, détectable côté
+  agent plutôt que silencieusement coupé.
+- L'environnement du sous-processus reste construit par `env_clear()` (seul `PATH` transmis,
+  voir "Sécurité" dans `docs/Architecture.md`) : ce payload stdin est le seul canal par
+  lequel l'intent/le contexte atteignent l'agent — jamais une variable d'environnement ni un
+  argument de ligne de commande.
 
 ### Protocole de sortie des agents (findings)
 
