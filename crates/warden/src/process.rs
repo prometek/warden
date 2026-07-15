@@ -62,9 +62,13 @@ pub struct AgentOutcome {
 ///
 /// stdin is piped (ADR-0012, issue #20 Scope B) rather than inherited, so
 /// the intent/target-commit/diff/findings payload [`wait`] writes never
-/// leaks the orchestrator's own stdin into the agent, and an agent that
-/// doesn't read stdin at all is unaffected (it simply never reads from the
-/// pipe before it's closed).
+/// leaks the orchestrator's own stdin into the agent. An agent that never
+/// reads stdin at all is *not* unconditionally unaffected: a payload small
+/// enough to fit in the OS pipe buffer (typically 64KiB) is written without
+/// blocking and simply sits there unread until the agent exits, but a
+/// larger payload blocks [`wait`]'s write until either the agent reads
+/// enough to make room or exits and closes its read end (a broken pipe,
+/// handled explicitly — see [`wait`]).
 ///
 /// Returns the still-running [`Child`] so the caller can read its PID
 /// (`child.id()`) and persist it before calling [`wait`].
@@ -110,6 +114,15 @@ pub fn spawn(command: &AgentCommand, cwd: &Path) -> Result<Child, ProcessError> 
 /// means each blocked read/write just yields to the executor, and progress
 /// on any one of them unblocks the others.
 ///
+/// **Stdin write failures** (H1, issue #20 review): a broken pipe (the
+/// agent closed or never read stdin before exiting) is logged at `warn` and
+/// treated as a normal, non-fatal outcome — see
+/// [`classify_stdin_write_error`]. Any other write error fails this call
+/// with [`ProcessError::StdinWrite`] instead of letting the run continue
+/// silently: `stdin_payload` is always a single JSON object, so a partial
+/// write is unparsable by the agent by construction, and there is no
+/// recovery short of failing the invocation.
+///
 /// Uses `child.wait()` (borrows `&mut self`) rather than
 /// `wait_with_output()` (which consumes `self`) so `child` is still
 /// available to `kill()` in the cancellation branch of the `select!` below.
@@ -128,34 +141,31 @@ pub async fn wait(
     let stdin_task = async move {
         if let Some(mut stdin_handle) = stdin_handle {
             if let Some(payload) = stdin_payload {
-                // A write failure (e.g. the agent closed stdin early
-                // without reading all of it) is not fatal to the run — the
-                // agent may already have read everything it needed. Logged,
-                // never silently swallowed.
                 if let Err(error) = stdin_handle.write_all(payload.as_bytes()).await {
-                    tracing::debug!(
-                        command = command_name,
-                        %error,
-                        "failed to write full payload to agent stdin"
-                    );
+                    classify_stdin_write_error(error, command_name)?;
                 }
             }
             // Dropping `stdin_handle` here (end of scope) closes the write
             // half, signalling EOF — required even with no payload to
             // write.
         }
+        Ok::<(), std::io::Error>(())
     };
     let stdout_task = async move {
         let mut buf = Vec::new();
         if let Some(mut stdout_handle) = stdout_handle {
-            let _ = stdout_handle.read_to_end(&mut buf).await;
+            if let Err(error) = stdout_handle.read_to_end(&mut buf).await {
+                tracing::warn!(command = command_name, %error, "failed to read agent stdout to completion");
+            }
         }
         buf
     };
     let stderr_task = async move {
         let mut buf = Vec::new();
         if let Some(mut stderr_handle) = stderr_handle {
-            let _ = stderr_handle.read_to_end(&mut buf).await;
+            if let Err(error) = stderr_handle.read_to_end(&mut buf).await {
+                tracing::warn!(command = command_name, %error, "failed to read agent stderr to completion");
+            }
         }
         buf
     };
@@ -167,9 +177,18 @@ pub async fn wait(
             Err(ProcessError::Cancelled { command: command_name.to_string() })
         }
         result = async {
-            let (_, stdout_buf, stderr_buf, status_result) =
+            let (stdin_result, stdout_buf, stderr_buf, status_result) =
                 tokio::join!(stdin_task, stdout_task, stderr_task, child.wait());
             let status = status_result.map_err(|source| ProcessError::Wait {
+                command: command_name.to_string(),
+                source,
+            })?;
+            // H1: a non-broken-pipe stdin write failure fails the
+            // invocation outright rather than silently running the agent
+            // with a partial (unparsable) or absent payload — the child has
+            // already been awaited above via the same `join!`, so nothing
+            // is left running when this returns.
+            stdin_result.map_err(|source| ProcessError::StdinWrite {
                 command: command_name.to_string(),
                 source,
             })?;
@@ -179,6 +198,33 @@ pub async fn wait(
                 stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
             })
         } => result,
+    }
+}
+
+/// Classifies a stdin write failure (H1, issue #20 review): a broken pipe
+/// means the agent closed or never opened its read side of stdin — e.g. it
+/// exited before reading everything, or ignores stdin entirely and exits on
+/// its own — which is a legitimate agent behaviour, logged at `warn` (never
+/// silently dropped) but not fatal to the run. Any other error (disk full on
+/// a buffered pipe implementation, permission error, etc.) is fatal: the
+/// payload is a single JSON object, so a partial write is unparsable by the
+/// agent by construction, and continuing would mean the agent runs with no
+/// intent/context at all — exactly the silent fallback code-standards.md
+/// forbids.
+fn classify_stdin_write_error(
+    error: std::io::Error,
+    command_name: &str,
+) -> Result<(), std::io::Error> {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        tracing::warn!(
+            command = command_name,
+            %error,
+            "agent closed stdin before the full payload was written; continuing without a \
+             guarantee it read the payload"
+        );
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -425,6 +471,54 @@ mod tests {
         .expect("wait must not hang when both stdin and stdout exceed the pipe buffer size");
 
         assert_eq!(result.unwrap().exit_code, 0);
+    }
+
+    /// H1 (issue #20 review): an agent that exits immediately without ever
+    /// reading stdin at all must not fail the invocation — a broken pipe is
+    /// a legitimate outcome (logged, not silently swallowed), not a reason
+    /// to fail the run. The payload is deliberately larger than a typical
+    /// OS pipe buffer (64KiB) so the write is guaranteed to still be in
+    /// progress when the child exits and closes its read end, forcing a
+    /// genuine `ErrorKind::BrokenPipe` rather than racing a write that might
+    /// complete before the child even schedules to exit.
+    #[tokio::test]
+    async fn an_agent_that_never_reads_stdin_and_exits_immediately_does_not_fail_the_invocation() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "exit 0"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let large_payload = "x".repeat(200_000);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait(child, "sh", Some(large_payload), CancellationToken::new()),
+        )
+        .await
+        .expect("wait must not hang on a broken pipe");
+
+        let outcome = result
+            .expect("a broken pipe from an agent that ignores stdin must not fail the invocation");
+        assert_eq!(outcome.exit_code, 0);
+    }
+
+    /// H1 unit coverage for [`classify_stdin_write_error`]'s two branches.
+    /// The fatal (non-`BrokenPipe`) branch is exercised here rather than
+    /// through a real subprocess: deterministically forcing a write error
+    /// other than a broken pipe out of a genuine OS pipe isn't practical
+    /// (`EPIPE` is by far the dominant real-world case, already covered
+    /// end-to-end by `an_agent_that_never_reads_stdin_and_exits_immediately_does_not_fail_the_invocation`
+    /// above), so this isolates the classification decision itself.
+    #[test]
+    fn classify_stdin_write_error_treats_broken_pipe_as_non_fatal_and_anything_else_as_fatal() {
+        let broken_pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(classify_stdin_write_error(broken_pipe, "agent").is_ok());
+
+        let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let result = classify_stdin_write_error(other, "agent");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

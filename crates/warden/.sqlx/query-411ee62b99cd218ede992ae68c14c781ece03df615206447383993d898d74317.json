@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ?",
+  "query": "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ? ORDER BY id ASC",
   "describe": {
     "columns": [
       {
@@ -70,5 +70,5 @@
       true
     ]
   },
-  "hash": "8d00eaaf8fe8f433bd96f6c018314c2df3c9346b6de28f644f5b65253988c8bc"
+  "hash": "411ee62b99cd218ede992ae68c14c781ece03df615206447383993d898d74317"
 }

@@ -673,9 +673,16 @@ pub async fn insert_finding(
     Ok(())
 }
 
+/// LOW (issue #20 review): `ORDER BY id ASC` makes the returned order
+/// deterministic -- without it, SQLite is free to return `findings` rows in
+/// any order for a given `cycle_id`, which fed straight into
+/// `AgentInputMessage::for_finding_agent`'s `findings` field (ADR-0012)
+/// would make the reviewer/tester's prior-findings context vary run to run
+/// for identical data. `id` (not a timestamp -- `findings` has none) is
+/// good enough for determinism; it doesn't need to reflect insertion order.
 pub async fn list_findings_for_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<Vec<Finding>> {
     let rows = sqlx::query!(
-        "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ?",
+        "SELECT source, severity, file, description, action FROM findings WHERE cycle_id = ? ORDER BY id ASC",
         cycle_id,
     )
     .fetch_all(pool)

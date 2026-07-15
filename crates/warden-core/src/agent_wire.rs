@@ -92,20 +92,39 @@ impl AgentInputMessage {
     /// managed context this scope propagates to the coder. Findings-driven
     /// coder re-invocation is a separate, not-yet-built concern -- reviewer/
     /// tester get commit/diff/findings instead, via [`Self::for_finding_agent`].
-    pub fn for_coder(intent: impl Into<String>) -> Self {
-        Self {
+    ///
+    /// Rejects a blank (empty or all-whitespace) `intent` with the same
+    /// rigor [`parse_agent_input_message`] applies on the read side (M2,
+    /// issue #20 review) -- without this, `to_json` could hand
+    /// `parse_agent_input_message`'s own caller a payload the parser
+    /// refuses to accept, since it enforces exactly this invariant.
+    pub fn for_coder(intent: impl Into<String>) -> Result<Self> {
+        let intent = intent.into();
+        if intent.trim().is_empty() {
+            return Err(CoreError::MalformedAgentInput(
+                "coder input intent must not be blank".to_string(),
+            ));
+        }
+        Ok(Self {
             role: AgentRole::Coder,
-            intent: Some(intent.into()),
+            intent: Some(intent),
             target_commit: None,
             diff: None,
             findings: Vec::new(),
-        }
+        })
     }
 
     /// Reviewer/tester input: the commit under review, the diff this cycle's
     /// coder introduced against the cycle's starting commit, and the
     /// findings that triggered this cycle (including CI findings on a
     /// post-convergence reboucle, ADR-0011) -- empty on a run's first cycle.
+    ///
+    /// Rejects a blank `target_commit` with the same rigor
+    /// [`parse_agent_input_message`] applies on the read side (M2, issue
+    /// #20 review). `diff` is deliberately not validated the same way -- an
+    /// empty diff (a cycle whose coder committed no changes) is a
+    /// legitimate value, mirrored by the parser accepting an absent `diff`
+    /// as `""`.
     pub fn for_finding_agent(
         role: AgentRole,
         target_commit: impl Into<String>,
@@ -117,10 +136,17 @@ impl AgentInputMessage {
                 "for_finding_agent must be called with Reviewer or Tester, not Coder".to_string(),
             ));
         }
+        let target_commit = target_commit.into();
+        if target_commit.trim().is_empty() {
+            return Err(CoreError::MalformedAgentInput(format!(
+                "{} input target_commit must not be blank",
+                role.as_str()
+            )));
+        }
         Ok(Self {
             role,
             intent: None,
-            target_commit: Some(target_commit.into()),
+            target_commit: Some(target_commit),
             diff: Some(diff.into()),
             findings,
         })
@@ -232,7 +258,7 @@ mod tests {
 
     #[test]
     fn coder_input_round_trips_through_json() {
-        let message = AgentInputMessage::for_coder("implement the thing");
+        let message = AgentInputMessage::for_coder("implement the thing").unwrap();
         let json = message.to_json().unwrap();
         let decoded = parse_agent_input_message(&json).unwrap();
         assert_eq!(decoded, message);
@@ -282,6 +308,36 @@ mod tests {
     fn for_finding_agent_rejects_the_coder_role() {
         let result = AgentInputMessage::for_finding_agent(AgentRole::Coder, "abc123", "", vec![]);
         assert!(matches!(result, Err(CoreError::MalformedAgentInput(_))));
+    }
+
+    /// M2 (issue #20 review): construction must validate with the same
+    /// rigor `parse_agent_input_message` applies on the read side --
+    /// otherwise `for_coder` could hand its own caller a payload
+    /// `to_json`+`parse_agent_input_message` round-trips into something the
+    /// parser rejects outright.
+    #[test]
+    fn for_coder_rejects_a_blank_intent() {
+        assert!(matches!(
+            AgentInputMessage::for_coder(""),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+        assert!(matches!(
+            AgentInputMessage::for_coder("   \n\t "),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    /// M2 counterpart for the reviewer/tester constructor.
+    #[test]
+    fn for_finding_agent_rejects_a_blank_target_commit() {
+        assert!(matches!(
+            AgentInputMessage::for_finding_agent(AgentRole::Reviewer, "", "", vec![]),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+        assert!(matches!(
+            AgentInputMessage::for_finding_agent(AgentRole::Tester, "   ", "", vec![]),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
     }
 
     #[test]

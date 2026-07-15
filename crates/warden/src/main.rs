@@ -37,8 +37,12 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         repo: PathBuf,
 
-        /// The task description passed to the coder agent.
-        #[arg(long)]
+        /// The task description passed to the coder agent (ADR-0012, issue
+        /// #20 Scope B: propagated over the coder's stdin). Must not be
+        /// blank -- validated here rather than left to fail deep inside the
+        /// first cycle (M2, issue #20 review), where
+        /// `AgentInputMessage::for_coder` enforces the same rule.
+        #[arg(long, value_parser = parse_intent)]
         intent: String,
 
         /// Branch name recorded for this run (informational in Phase 1;
@@ -296,6 +300,18 @@ fn parse_agent_command(raw: &str) -> anyhow::Result<AgentCommand> {
 /// "valider toute entrée externe... à la frontière").
 fn parse_evidence_tool(raw: &str) -> Result<warden_core::EvidenceTool, String> {
     warden_core::EvidenceTool::parse(raw).map_err(|error| error.to_string())
+}
+
+/// M2 (issue #20 review): rejects a blank/all-whitespace `--intent` at the
+/// CLI boundary, with the same rule `AgentInputMessage::for_coder` enforces
+/// -- a run started with `--intent ""` would otherwise create its `runs`
+/// row, transition to `CoderRunning`, and only then fail once the first
+/// cycle tries to build the coder's stdin payload.
+fn parse_intent(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("run intent must not be blank".to_string());
+    }
+    Ok(raw.to_string())
 }
 
 fn default_warden_home() -> anyhow::Result<PathBuf> {

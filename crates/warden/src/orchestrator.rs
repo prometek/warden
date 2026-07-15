@@ -324,16 +324,10 @@ impl Orchestrator {
             }
 
             // ADR-0012: what the reviewer/tester are told triggered this
-            // cycle. A normal (non-CI) reboucle has no seeded findings above
-            // -- its prior findings instead live under the previous cycle's
-            // own row, inserted there after *its* review/test ran.
-            let prior_findings: Vec<Finding> = if !ci_seeded_findings.is_empty() {
-                ci_seeded_findings
-            } else if let Some(prev_cycle_id) = &previous_cycle_id {
-                db::list_findings_for_cycle(&self.pool, prev_cycle_id).await?
-            } else {
-                Vec::new()
-            };
+            // cycle.
+            let prior_findings =
+                select_prior_findings(&self.pool, ci_seeded_findings, previous_cycle_id.as_deref())
+                    .await?;
 
             let coder_result = self
                 .run_coder(CoderInvocation {
@@ -696,7 +690,7 @@ impl Orchestrator {
         let base_commit_sha = read_head_commit(worktree.path()).await?;
 
         let stdin_payload =
-            warden_core::AgentInputMessage::for_coder(config.intent.clone()).to_json()?;
+            warden_core::AgentInputMessage::for_coder(config.intent.clone())?.to_json()?;
         let outcome = self
             .run_agent(
                 cycle_id,
@@ -1128,6 +1122,30 @@ impl Orchestrator {
     }
 }
 
+/// Selects the findings a cycle's reviewer/tester are told triggered it
+/// (ADR-0012, M3 review finding: pulled out of `run_convergence_loop`'s
+/// loop body so this precedence decision is independently unit-testable).
+///
+/// `ci_seeded_findings` (a `ChecksFailed` reboucle, ADR-0011) take
+/// precedence when non-empty, since they *are* what triggered this cycle --
+/// correct without even needing to query SQLite. Otherwise falls back to
+/// the previous cycle's own persisted findings (a normal reviewer/tester
+/// reboucle), or an empty list when there is no previous cycle (a run's
+/// first cycle has nothing to report).
+async fn select_prior_findings(
+    pool: &SqlitePool,
+    ci_seeded_findings: Vec<Finding>,
+    previous_cycle_id: Option<&str>,
+) -> Result<Vec<Finding>> {
+    if !ci_seeded_findings.is_empty() {
+        return Ok(ci_seeded_findings);
+    }
+    match previous_cycle_id {
+        Some(prev_cycle_id) => db::list_findings_for_cycle(pool, prev_cycle_id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Bounds how much of an agent's stderr is embedded in an error message —
 /// full output is already logged via `tracing` before this is constructed;
 /// this is just what surfaces in `Display`/CLI output.
@@ -1188,7 +1206,41 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Reads the full `git diff base..target` text from `worktree_path` (ADR-0012,
+/// Hard cap on how many bytes of a cycle's diff [`read_diff`] will ever hand
+/// to a reviewer/tester over stdin (M1, issue #20 review): the coder runs
+/// against a real repository the user chose, so nothing bounds how large a
+/// single cycle's diff can be -- reading it unbounded into memory, then
+/// JSON-escaping it (another full copy, `agent_wire::to_json`), then piping
+/// it, risks a single outsized commit wedging a run. 8 MiB comfortably
+/// covers any diff a reviewer/tester could plausibly act on; a legitimate
+/// review/test cycle operates on a handful of files at a time, never a
+/// repository-sized rewrite.
+const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Appended to a diff that exceeded [`MAX_DIFF_BYTES`] so the reviewer/tester
+/// can tell a truncated diff from a genuinely small one (M1, issue #20
+/// review): silently cutting the diff without a marker would be its own
+/// silent fallback.
+const DIFF_TRUNCATED_MARKER: &str = "\n\n[warden: diff truncated at the 8 MiB payload cap]\n";
+
+/// Applies [`MAX_DIFF_BYTES`] to a raw diff capture, appending
+/// [`DIFF_TRUNCATED_MARKER`] only when truncation actually happened. Pulled
+/// out of [`read_diff`] so the truncation behaviour itself is unit-testable
+/// without spawning `git` against a multi-megabyte fixture (M1/M3, issue
+/// #20 review).
+fn cap_diff(raw: &[u8], max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    // `from_utf8_lossy` already handles a byte-offset cut that lands mid
+    // multi-byte character (replaces it with U+FFFD), the same convention
+    // used everywhere else agent-adjacent bytes are decoded in this file.
+    let mut diff = String::from_utf8_lossy(&raw[..max_bytes]).into_owned();
+    diff.push_str(DIFF_TRUNCATED_MARKER);
+    diff
+}
+
+/// Reads the `git diff base..target` text from `worktree_path` (ADR-0012,
 /// issue #20 Scope B) -- this is the reviewer/tester's `AgentInputMessage::diff`.
 /// Run against the worktree that's already checked out at `target` rather
 /// than the main repo: both commits are equally reachable from either
@@ -1196,24 +1248,73 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
 /// the worktree is removed, while `target` is still guaranteed reachable
 /// there. An empty result (identical `base`/`target`, e.g. a coder that
 /// committed no changes) is a normal outcome, not an error.
+///
+/// Capped at [`MAX_DIFF_BYTES`] (M1, issue #20 review) via a bounded read
+/// off `git diff`'s stdout pipe -- mirrors `ci_channel::receive_unbounded`'s
+/// `.take(N + 1)` convention, so memory use is bounded by the cap rather
+/// than by however large the real diff happens to be. `-c color.ui=false`,
+/// `-c diff.external=`, `-c core.textconv=false`, `--no-color` and
+/// `--no-ext-diff` neutralize the repo's (or the invoking user's global)
+/// git config, which would otherwise be free to inject ANSI escapes or run
+/// an arbitrary textconv filter over the payload an agent has to parse as
+/// plain JSON; `--` separates `range` from a (here absent, but
+/// defense-in-depth) pathspec.
 async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
     let range = format!("{base}..{target}");
-    let output = tokio::process::Command::new("git")
+    let mut child = tokio::process::Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["diff", &range])
-        .output()
-        .await?;
+        .args(["-c", "color.ui=false"])
+        .args(["-c", "diff.external="])
+        .args(["-c", "core.textconv=false"])
+        .args(["diff", "--no-color", "--no-ext-diff", &range, "--"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
 
-    if !output.status.success() {
+    let mut stdout_handle = child
+        .stdout
+        .take()
+        .expect("git diff spawned with a piped stdout");
+    let mut stderr_handle = child
+        .stderr
+        .take()
+        .expect("git diff spawned with a piped stderr");
+
+    // Bounded read (M1): caps how much of `git diff`'s stdout is ever
+    // buffered in memory, then drains (and discards) anything left past the
+    // cap so `git` never blocks writing to a full stdout pipe nobody is
+    // still reading -- the same pipe-deadlock hazard `process::wait`
+    // documents for stdin/stdout.
+    let stdout_task = async move {
+        let mut limited = (&mut stdout_handle).take(MAX_DIFF_BYTES as u64 + 1);
+        let mut buffer = Vec::new();
+        let _ = limited.read_to_end(&mut buffer).await;
+        let mut rest = Vec::new();
+        let _ = stdout_handle.read_to_end(&mut rest).await;
+        buffer
+    };
+    let stderr_task = async move {
+        let mut buffer = Vec::new();
+        let _ = stderr_handle.read_to_end(&mut buffer).await;
+        buffer
+    };
+
+    let (stdout_buf, stderr_buf, status_result) =
+        tokio::join!(stdout_task, stderr_task, child.wait());
+    let status = status_result?;
+
+    if !status.success() {
         return Err(WardenError::Worktree(WorktreeError::GitCommandFailed {
             command: format!("git -C {} diff {range}", worktree_path.display()),
-            exit_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: status.code(),
+            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
         }));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(cap_diff(&stdout_buf, MAX_DIFF_BYTES))
 }
 
 /// The ref prefix `warden` stages a converged run's commit under in the
@@ -3643,5 +3744,246 @@ mod tests {
         ));
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Failed);
+    }
+
+    // -----------------------------------------------------------------
+    // M1/M3 (issue #20 review): `read_diff`/`cap_diff` and the
+    // `select_prior_findings` precedence logic had no direct tests --
+    // every existing call site went through the full convergence loop with
+    // `""`/empty findings, which the e2e stdin-propagation tests in
+    // `tests/cli.rs` cover for the "happy path" shape of the payload but
+    // can't reach these decisions in isolation.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cap_diff_returns_the_input_unchanged_when_under_the_cap() {
+        let raw = b"diff --git a/x b/x\n+hello\n";
+        assert_eq!(cap_diff(raw, 1024), String::from_utf8_lossy(raw));
+    }
+
+    #[test]
+    fn cap_diff_truncates_and_appends_a_marker_when_over_the_cap() {
+        let raw = vec![b'x'; 10];
+        let capped = cap_diff(&raw, 4);
+        assert!(
+            capped.starts_with("xxxx"),
+            "expected the first 4 bytes to survive truncation: {capped:?}"
+        );
+        assert!(
+            capped.contains(DIFF_TRUNCATED_MARKER),
+            "expected the truncation marker to be appended: {capped:?}"
+        );
+        // Exactly-at-the-cap input must not be treated as truncated.
+        let exact = vec![b'x'; 4];
+        assert!(!cap_diff(&exact, 4).contains(DIFF_TRUNCATED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn read_diff_returns_the_textual_change_between_two_commits() {
+        let dir = init_test_repo();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        std::fs::write(dir.path().join("notes.txt"), "distinctive-marker-line\n").unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add notes",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        assert!(
+            diff.contains("distinctive-marker-line"),
+            "expected the diff to contain the change: {diff:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_diff_returns_an_empty_string_for_identical_commits() {
+        let dir = init_test_repo();
+        let head = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let diff = read_diff(dir.path(), &head_sha, &head_sha).await.unwrap();
+        assert_eq!(
+            diff, "",
+            "a no-op diff must be an empty string, not an error"
+        );
+    }
+
+    /// LOW (issue #20 review): the repo's own `color.ui=always` (which would
+    /// normally make `git diff` emit ANSI escape codes) must be neutralized
+    /// by `read_diff`, since the result rides inside a JSON payload an agent
+    /// parses as plain text.
+    #[tokio::test]
+    async fn read_diff_ignores_the_repos_color_ui_always_config() {
+        let dir = init_test_repo();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["config", "color.ui", "always"])
+            .status()
+            .unwrap();
+        let base = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
+
+        std::fs::write(dir.path().join("notes.txt"), "some content\n").unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "notes.txt"])
+            .status()
+            .unwrap();
+        SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args([
+                "-c",
+                "user.email=test@warden.local",
+                "-c",
+                "user.name=warden-test",
+                "commit",
+                "-q",
+                "-m",
+                "add notes",
+            ])
+            .status()
+            .unwrap();
+        let target = SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let target_sha = String::from_utf8_lossy(&target.stdout).trim().to_string();
+
+        let diff = read_diff(dir.path(), &base_sha, &target_sha).await.unwrap();
+        assert!(
+            !diff.contains('\u{1b}'),
+            "diff must contain no ANSI escape codes despite color.ui=always: {diff:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_prior_findings_prefers_ci_seeded_findings_over_the_previous_cycle() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(&pool, "run-select-1", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "cycle-select-1", "run-select-1", 1)
+            .await
+            .unwrap();
+        let previous_cycle_finding = Finding {
+            source: warden_core::FindingSource::Reviewer,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "from the previous cycle".to_string(),
+            action: None,
+        };
+        db::insert_finding(
+            &pool,
+            "finding-prev",
+            "cycle-select-1",
+            &previous_cycle_finding,
+        )
+        .await
+        .unwrap();
+
+        let ci_finding = Finding {
+            source: warden_core::FindingSource::Ci,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "from CI".to_string(),
+            action: None,
+        };
+
+        let selected =
+            select_prior_findings(&pool, vec![ci_finding.clone()], Some("cycle-select-1"))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            selected,
+            vec![ci_finding],
+            "CI-seeded findings must win even though a previous cycle also has findings"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_prior_findings_falls_back_to_the_previous_cycles_findings_when_none_are_ci_seeded(
+    ) {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(&pool, "run-select-2", "/tmp/repo", "main", "intent", 3)
+            .await
+            .unwrap();
+        db::insert_cycle(&pool, "cycle-select-2", "run-select-2", 1)
+            .await
+            .unwrap();
+        let previous_cycle_finding = Finding {
+            source: warden_core::FindingSource::Tester,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "from the previous cycle".to_string(),
+            action: None,
+        };
+        db::insert_finding(
+            &pool,
+            "finding-prev-2",
+            "cycle-select-2",
+            &previous_cycle_finding,
+        )
+        .await
+        .unwrap();
+
+        let selected = select_prior_findings(&pool, Vec::new(), Some("cycle-select-2"))
+            .await
+            .unwrap();
+
+        assert_eq!(selected, vec![previous_cycle_finding]);
+    }
+
+    #[tokio::test]
+    async fn select_prior_findings_is_empty_on_a_runs_first_cycle() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let selected = select_prior_findings(&pool, Vec::new(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            selected.is_empty(),
+            "a run's first cycle has no previous cycle to report on"
+        );
     }
 }
