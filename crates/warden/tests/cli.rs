@@ -1446,3 +1446,401 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
     let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
     assert_eq!(run.state, RunState::Converged);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #20 Scope B / ADR-0012: run-intent propagation to spawned agents over
+// a warden-managed stdin channel. These drive the real `warden` binary,
+// which spawns real `sh` subprocesses through `process::spawn`/`wait` — the
+// same real subprocess/stdin path a real coder/reviewer/tester CLI would be
+// invoked through, not a call into `Orchestrator`/`AgentInputMessage`
+// directly.
+// ---------------------------------------------------------------------------
+
+/// Scope B's core promise: "Feed the run intent to the coder through a
+/// warden-managed channel ... so the role no longer depends on the user
+/// embedding it." Proven by having the coder subprocess itself read and
+/// persist its own stdin, then asserting the parsed payload the *coder saw*
+/// (version, role, intent) rather than anything warden's own DB records.
+#[tokio::test]
+async fn e2e_coder_receives_the_run_intent_on_stdin_as_a_versioned_role_tagged_payload() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        &format!(
+            r#"#!/bin/sh
+cat > "{captures}/coder_stdin.json"
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    let intent = "implement the widget described in issue 20 scope B";
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            intent,
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let raw = std::fs::read_to_string(captures.path().join("coder_stdin.json"))
+        .expect("coder must have received a stdin payload to capture");
+    let payload: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!("coder's captured stdin was not valid JSON: {error}\nraw: {raw:?}")
+    });
+
+    assert_eq!(payload["version"], 1);
+    assert_eq!(payload["role"], "coder");
+    assert_eq!(payload["intent"], intent);
+    assert!(payload["target_commit"].is_null());
+    assert!(payload["diff"].is_null());
+    assert_eq!(payload["findings"].as_array().unwrap().len(), 0);
+}
+
+/// Scope B's second promise: "Feed the reviewer/tester their context (target
+/// commit/diff, prior-cycle findings ...) the same way", plus role identity
+/// ("Inject the role identity into the payload so a single runner can serve
+/// all three roles"). Proven by having both real reviewer and tester
+/// subprocesses capture their own stdin and asserting target_commit/diff/role
+/// against what warden itself recorded for that cycle (`cycles.coder_commit_sha`)
+/// and the diff the coder actually introduced.
+#[tokio::test]
+async fn e2e_reviewer_and_tester_receive_target_commit_diff_and_role_on_stdin() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        r#"#!/bin/sh
+echo "distinctive-marker-line" >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+    );
+    let reviewer = write_script(
+        scripts_dir.path(),
+        "reviewer.sh",
+        &format!(
+            "#!/bin/sh\ncat > \"{}/reviewer_stdin.json\"\ntrue\n",
+            captures.path().display()
+        ),
+    );
+    let tester = write_script(
+        scripts_dir.path(),
+        "tester.sh",
+        &format!(
+            "#!/bin/sh\ncat > \"{}/tester_stdin.json\"\ntrue\n",
+            captures.path().display()
+        ),
+    );
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "single converging cycle for stdin context propagation",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let (expected_commit,): (String,) =
+        sqlx::query_as("SELECT coder_commit_sha FROM cycles WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    for (role, file) in [
+        ("reviewer", "reviewer_stdin.json"),
+        ("tester", "tester_stdin.json"),
+    ] {
+        let raw = std::fs::read_to_string(captures.path().join(file))
+            .unwrap_or_else(|error| panic!("{role} must have captured a stdin payload: {error}"));
+        let payload: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("{role}'s captured stdin was not valid JSON: {error}"));
+
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["role"], role);
+        assert!(payload["intent"].is_null());
+        assert_eq!(
+            payload["target_commit"], expected_commit,
+            "{role} must receive the exact commit warden recorded for this cycle"
+        );
+        assert!(
+            payload["diff"]
+                .as_str()
+                .unwrap()
+                .contains("distinctive-marker-line"),
+            "{role}'s diff must contain the change the coder actually introduced"
+        );
+        assert_eq!(payload["findings"].as_array().unwrap().len(), 0);
+    }
+}
+
+/// Scope B's third promise: prior-cycle findings (the ones that triggered a
+/// reboucle) must reach the *next* cycle's reviewer/tester over this same
+/// channel — not just be recorded in SQLite. A naive implementation could
+/// easily thread the run intent/commit/diff through correctly while leaving
+/// `findings` empty or stale; this is the case the task flags as "easy to
+/// wire wrong". Both reviewer and tester capture every stdin payload they
+/// receive (one per cycle, via a counter file) so this test can inspect
+/// cycle 1's (no prior findings) and cycle 2's (the reboucle-triggering
+/// finding from cycle 1) payloads independently.
+#[tokio::test]
+async fn e2e_prior_cycle_findings_from_a_reboucle_reach_the_next_cycles_reviewer_and_tester_stdin()
+{
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    // Deterministic two-cycle reboucle, mirroring the orchestrator unit
+    // test's `flip_status_coder`/`status_gated_reviewer` fixtures: cycle 1
+    // leaves status.txt "broken" (reviewer blocks), cycle 2 leaves it
+    // "fixed" (reviewer passes).
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        r#"#!/bin/sh
+if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+    echo fixed > status.txt
+else
+    echo broken > status.txt
+fi
+git add status.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+    );
+    let reviewer = write_script(
+        scripts_dir.path(),
+        "reviewer.sh",
+        &format!(
+            r#"#!/bin/sh
+INPUT=$(cat)
+N=$(ls "{captures}"/reviewer_stdin_*.json 2>/dev/null | wc -l | tr -d ' ')
+NEXT=$((N + 1))
+printf '%s' "$INPUT" > "{captures}/reviewer_stdin_$NEXT.json"
+if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+    echo '{{"source":"reviewer","severity":"blocking","description":"status is broken"}}'
+fi
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let tester = write_script(
+        scripts_dir.path(),
+        "tester.sh",
+        &format!(
+            r#"#!/bin/sh
+INPUT=$(cat)
+N=$(ls "{captures}"/tester_stdin_*.json 2>/dev/null | wc -l | tr -d ' ')
+NEXT=$((N + 1))
+printf '%s' "$INPUT" > "{captures}/tester_stdin_$NEXT.json"
+true
+"#,
+            captures = captures.path().display()
+        ),
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "flip status to fixed via a reboucle",
+            "--branch",
+            "main",
+            "--max-cycles",
+            "5",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let cycle1: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("reviewer_stdin_1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cycle1["findings"].as_array().unwrap().len(),
+        0,
+        "cycle 1 has no prior cycle, so the reviewer must see no prior findings"
+    );
+
+    let cycle2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("reviewer_stdin_2.json")).unwrap(),
+    )
+    .unwrap();
+    let cycle2_findings = cycle2["findings"].as_array().unwrap();
+    assert_eq!(
+        cycle2_findings.len(),
+        1,
+        "cycle 2's reviewer must receive exactly the one finding that triggered the reboucle"
+    );
+    assert_eq!(cycle2_findings[0]["source"], "reviewer");
+    assert_eq!(cycle2_findings[0]["severity"], "blocking");
+    assert_eq!(cycle2_findings[0]["description"], "status is broken");
+    assert_ne!(
+        cycle1["target_commit"], cycle2["target_commit"],
+        "cycle 2 must be reviewing a different (later) commit than cycle 1"
+    );
+
+    // The tester gets the exact same prior-findings context as the reviewer
+    // (code-standards.md / ADR-0012: both roles are fed identically) --
+    // proven independently rather than assumed from the reviewer's payload.
+    let tester_cycle2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("tester_stdin_2.json")).unwrap(),
+    )
+    .unwrap();
+    let tester_cycle2_findings = tester_cycle2["findings"].as_array().unwrap();
+    assert_eq!(tester_cycle2_findings.len(), 1);
+    assert_eq!(tester_cycle2_findings[0]["description"], "status is broken");
+}
+
+/// Negative counterpart of the above (Architecture.md §10, "Isolation
+/// environnement des sous-processus"): the run intent must reach the agent
+/// *only* over the stdin channel, never via an inherited/synthesized
+/// environment variable or as a CLI argument. `process::spawn` already
+/// `env_clear()`s and only ever passes `PATH` through, and `--coder-cmd`'s
+/// args are a fixed, user-supplied command line the intent is never spliced
+/// into -- this test proves both from the coder subprocess's own point of
+/// view (its real `env` output and its real `$0 $*`), with the stdin capture
+/// alongside as a positive control so this isn't a vacuous "found nothing
+/// because nothing was captured" negative.
+#[tokio::test]
+async fn e2e_run_intent_never_leaks_via_environment_variables_or_argv() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        &format!(
+            r#"#!/bin/sh
+env > "{captures}/coder_env.txt"
+printf '%s' "$0 $*" > "{captures}/coder_argv.txt"
+cat > "{captures}/coder_stdin.json"
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", "#!/bin/sh\ntrue\n");
+    let tester = write_script(scripts_dir.path(), "tester.sh", "#!/bin/sh\ntrue\n");
+
+    let marker = "WARDEN_SECRET_INTENT_MARKER_9f3d21";
+    let intent = format!("do the thing ({marker})");
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            &intent,
+            "--branch",
+            "main",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-cmd",
+            &format!("sh {}", coder.display()),
+            "--reviewer-cmd",
+            &format!("sh {}", reviewer.display()),
+            "--tester-cmd",
+            &format!("sh {}", tester.display()),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let env_dump = std::fs::read_to_string(captures.path().join("coder_env.txt")).unwrap();
+    assert!(
+        env_dump.contains("PATH="),
+        "sanity check that the env dump actually captured something: {env_dump:?}"
+    );
+    assert!(
+        !env_dump.contains(marker),
+        "the run intent must never leak into the coder's environment variables: {env_dump:?}"
+    );
+
+    let argv_dump = std::fs::read_to_string(captures.path().join("coder_argv.txt")).unwrap();
+    assert!(
+        !argv_dump.contains(marker),
+        "the run intent must never leak into the coder's argv: {argv_dump:?}"
+    );
+
+    // Positive control: the same marker must have arrived over stdin, so an
+    // empty/broken capture above wouldn't be mistaken for success.
+    let stdin_dump = std::fs::read_to_string(captures.path().join("coder_stdin.json")).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&stdin_dump).unwrap();
+    assert_eq!(payload["intent"], intent);
+}
