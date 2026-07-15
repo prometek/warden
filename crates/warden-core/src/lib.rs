@@ -8,6 +8,7 @@
 //! filesystem access) -- see its module docs for why it lives here rather
 //! than duplicated per-crate like the rest of the I/O layer.
 
+mod agent_wire;
 mod ci_channel;
 mod convergence;
 mod error;
@@ -18,6 +19,7 @@ mod pr_body;
 mod socket;
 mod state;
 
+pub use agent_wire::{parse_agent_input_message, AgentInputMessage, AGENT_INPUT_VERSION};
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{
     decide_next_state, decide_next_state_after_ci, parse_findings, CiOutcome, Finding,

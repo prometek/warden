@@ -123,11 +123,29 @@ struct FindingAgentInvocation<'a> {
     command: &'a AgentCommand,
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
+    /// The diff this cycle's coder introduced against the cycle's starting
+    /// commit -- fed to the agent as `AgentInputMessage::diff` (ADR-0012,
+    /// issue #20 Scope B).
+    diff: &'a str,
+    /// Findings that triggered this cycle (including CI findings on a
+    /// post-convergence reboucle, ADR-0011) -- fed to the agent as
+    /// `AgentInputMessage::findings` (ADR-0012). Empty on a run's first
+    /// cycle.
+    prior_findings: &'a [Finding],
     /// Only consulted for `AgentRole::Tester` (evidence capture,
     /// `evidence_tool`/`evidence_store_in_repo`/`warden_home`) -- carried
     /// through here rather than threading four separate fields.
     config: &'a RunConfig,
     cancel: CancellationToken,
+}
+
+/// Outcome of a single coder invocation within a cycle: the commit it
+/// produced, and the diff introduced against the cycle's starting commit --
+/// the latter is fed to the reviewer/tester as `AgentInputMessage::diff`
+/// (ADR-0012, issue #20 Scope B).
+struct CoderCycleResult {
+    commit: String,
+    diff: String,
 }
 
 /// The run this [`Orchestrator`] instance is currently driving, and the
@@ -271,6 +289,11 @@ impl Orchestrator {
         // non-empty (see the `PostConvergenceOutcome::Reboucle` arm further
         // down).
         let mut pending_ci_findings: Vec<Finding> = Vec::new();
+        // ADR-0012/issue #20: the cycle_id of the most recently *closed*
+        // cycle, used to fetch its findings as the reviewer/tester's
+        // "prior-cycle findings" context below (`None` on a run's first
+        // cycle, which has no prior cycle to report on).
+        let mut previous_cycle_id: Option<String> = None;
 
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
@@ -278,6 +301,13 @@ impl Orchestrator {
             db::set_run_current_cycle(&self.pool, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
                 .await?;
+
+            // ADR-0012: captured before the drain below empties
+            // `pending_ci_findings` -- on a CI reboucle these *are* this
+            // cycle's prior findings (they're what triggered it), so the
+            // reviewer/tester gets them directly rather than via a
+            // (would-be-empty) previous-cycle DB lookup.
+            let ci_seeded_findings = pending_ci_findings.clone();
 
             for finding in pending_ci_findings.drain(..) {
                 db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, &finding)
@@ -293,7 +323,19 @@ impl Orchestrator {
                 .await?;
             }
 
-            base_commit = self
+            // ADR-0012: what the reviewer/tester are told triggered this
+            // cycle. A normal (non-CI) reboucle has no seeded findings above
+            // -- its prior findings instead live under the previous cycle's
+            // own row, inserted there after *its* review/test ran.
+            let prior_findings: Vec<Finding> = if !ci_seeded_findings.is_empty() {
+                ci_seeded_findings
+            } else if let Some(prev_cycle_id) = &previous_cycle_id {
+                db::list_findings_for_cycle(&self.pool, prev_cycle_id).await?
+            } else {
+                Vec::new()
+            };
+
+            let coder_result = self
                 .run_coder(CoderInvocation {
                     run_id: &run_id,
                     cycle_id: &cycle_id,
@@ -304,6 +346,7 @@ impl Orchestrator {
                     cancel: cancel.clone(),
                 })
                 .await?;
+            base_commit = coder_result.commit;
 
             // Write-ahead: about to launch reviewer + tester.
             self.transition(&run_id, RunState::AwaitingReviewTest)
@@ -317,6 +360,8 @@ impl Orchestrator {
                     &config,
                     &worktree_manager,
                     &base_commit,
+                    &coder_result.diff,
+                    &prior_findings,
                     cancel.clone(),
                 )
                 .await?;
@@ -335,6 +380,9 @@ impl Orchestrator {
                 .await?;
             }
             db::close_cycle(&self.pool, &cycle_id).await?;
+            // ADR-0012: this cycle is now the "previous cycle" the next
+            // iteration's reviewer/tester (if there is one) reports on.
+            previous_cycle_id = Some(cycle_id.clone());
 
             let next_state = decide_next_state(&findings, cycle_number, config.max_cycles);
             let mut converged_commit_for_tail: Option<String> = None;
@@ -618,7 +666,7 @@ impl Orchestrator {
         }
     }
 
-    async fn run_coder(&self, invocation: CoderInvocation<'_>) -> Result<String> {
+    async fn run_coder(&self, invocation: CoderInvocation<'_>) -> Result<CoderCycleResult> {
         let CoderInvocation {
             run_id,
             cycle_id,
@@ -640,12 +688,22 @@ impl Orchestrator {
         )
         .await?;
 
+        // ADR-0012: resolved right after the worktree is created (before
+        // the coder runs), so it's a concrete SHA rather than the possibly
+        // ambiguous `base_commit` ref (e.g. the literal string `"HEAD"` on a
+        // run's first cycle) -- needed below to compute the diff this
+        // cycle's coder introduces, once it has run.
+        let base_commit_sha = read_head_commit(worktree.path()).await?;
+
+        let stdin_payload =
+            warden_core::AgentInputMessage::for_coder(config.intent.clone()).to_json()?;
         let outcome = self
             .run_agent(
                 cycle_id,
                 AgentRole::Coder,
                 &config.coder_command,
                 worktree.path(),
+                stdin_payload,
                 cancel,
             )
             .await?;
@@ -686,6 +744,12 @@ impl Orchestrator {
 
         let new_commit = read_head_commit(worktree.path()).await?;
 
+        // ADR-0012: computed while the worktree still exists (both commits
+        // are reachable from it, since worktrees share the main repo's
+        // object store) -- this is what the reviewer/tester's
+        // `AgentInputMessage::diff` carries.
+        let diff = read_diff(worktree.path(), &base_commit_sha, &new_commit).await?;
+
         // M4: protect the commit from `git gc` (worktrees share the main
         // repo's object store, so this commit becomes unreachable garbage
         // the moment its worktree is removed) and persist its SHA so it
@@ -698,7 +762,10 @@ impl Orchestrator {
             tracing::warn!(%error, "failed to clean up coder worktree after cycle");
         }
 
-        Ok(new_commit)
+        Ok(CoderCycleResult {
+            commit: new_commit,
+            diff,
+        })
     }
 
     /// Runs reviewer and tester **concurrently** (ADR-0003) via
@@ -722,6 +789,8 @@ impl Orchestrator {
         config: &RunConfig,
         worktree_manager: &WorktreeManager,
         commit: &str,
+        diff: &str,
+        prior_findings: &[Finding],
         cancel: CancellationToken,
     ) -> Result<Vec<Finding>> {
         // ADR-0003 / issue #2 explicitly permit "tokio::join! ou
@@ -742,6 +811,8 @@ impl Orchestrator {
                 command: &config.reviewer_command,
                 worktree_manager,
                 commit,
+                diff,
+                prior_findings,
                 config,
                 cancel: cancel.clone(),
             }),
@@ -753,6 +824,8 @@ impl Orchestrator {
                 command: &config.tester_command,
                 worktree_manager,
                 commit,
+                diff,
+                prior_findings,
                 config,
                 cancel,
             })
@@ -775,6 +848,8 @@ impl Orchestrator {
             command,
             worktree_manager,
             commit,
+            diff,
+            prior_findings,
             config,
             cancel,
         } = invocation;
@@ -790,8 +865,28 @@ impl Orchestrator {
         )
         .await?;
 
+        // ADR-0012: the reviewer/tester's own role, target commit, this
+        // cycle's diff, and the findings that triggered the cycle --
+        // `for_finding_agent` refuses `AgentRole::Coder`, which can never
+        // happen here since `role` is always `Reviewer`/`Tester` at this
+        // call site.
+        let stdin_payload = warden_core::AgentInputMessage::for_finding_agent(
+            role,
+            commit,
+            diff,
+            prior_findings.to_vec(),
+        )?
+        .to_json()?;
+
         let outcome = self
-            .run_agent(cycle_id, role, command, worktree.path(), cancel.clone())
+            .run_agent(
+                cycle_id,
+                role,
+                command,
+                worktree.path(),
+                stdin_payload,
+                cancel.clone(),
+            )
             .await?;
 
         // Agent stdout is untrusted input: a parse failure becomes a
@@ -966,12 +1061,18 @@ impl Orchestrator {
     /// Spawns `command`, persisting its PID to `agent_processes` before
     /// awaiting completion so a crash of the orchestrator itself (not the
     /// agent) is still detectable on restart via [`recover_crashed_runs`].
+    ///
+    /// `stdin_payload` is the serialized `warden_core::AgentInputMessage`
+    /// (ADR-0012, issue #20 Scope B) fed to the agent's stdin and then
+    /// closed by [`process::wait`] -- the coder's run intent, or the
+    /// reviewer/tester's target commit/diff/prior findings.
     async fn run_agent(
         &self,
         cycle_id: &str,
         role: AgentRole,
         command: &AgentCommand,
         cwd: &Path,
+        stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
         let child = process::spawn(command, cwd)?;
@@ -1001,7 +1102,8 @@ impl Orchestrator {
         })
         .await?;
 
-        let outcome_result = process::wait(child, &command.program, cancel).await;
+        let outcome_result =
+            process::wait(child, &command.program, Some(stdin_payload), cancel).await;
         let exit_code_for_db = match &outcome_result {
             Ok(outcome) => outcome.exit_code,
             Err(_) => -1,
@@ -1084,6 +1186,34 @@ async fn read_head_commit(worktree_path: &Path) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Reads the full `git diff base..target` text from `worktree_path` (ADR-0012,
+/// issue #20 Scope B) -- this is the reviewer/tester's `AgentInputMessage::diff`.
+/// Run against the worktree that's already checked out at `target` rather
+/// than the main repo: both commits are equally reachable from either
+/// (worktrees share the main repo's object store), but this must run before
+/// the worktree is removed, while `target` is still guaranteed reachable
+/// there. An empty result (identical `base`/`target`, e.g. a coder that
+/// committed no changes) is a normal outcome, not an error.
+async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<String> {
+    let range = format!("{base}..{target}");
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["diff", &range])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(WardenError::Worktree(WorktreeError::GitCommandFailed {
+            command: format!("git -C {} diff {range}", worktree_path.display()),
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// The ref prefix `warden` stages a converged run's commit under in the
@@ -2066,6 +2196,8 @@ mod tests {
                 &config,
                 &worktree_manager,
                 "HEAD",
+                "",
+                &[],
                 CancellationToken::new(),
             )
             .await
@@ -2173,6 +2305,8 @@ mod tests {
                 command: &config.reviewer_command,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
+                diff: "",
+                prior_findings: &[],
                 config: &config,
                 cancel: CancellationToken::new(),
             })
@@ -2187,6 +2321,8 @@ mod tests {
                 command: &config.tester_command,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
+                diff: "",
+                prior_findings: &[],
                 config: &config,
                 cancel: CancellationToken::new(),
             })
@@ -2219,6 +2355,8 @@ mod tests {
                 &config,
                 &worktree_manager,
                 "HEAD",
+                "",
+                &[],
                 CancellationToken::new(),
             )
             .await

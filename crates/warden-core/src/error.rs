@@ -49,6 +49,15 @@ pub enum CoreError {
     /// boundary, never silently ignored.
     #[error("malformed evidence rows: {0}")]
     MalformedEvidenceRows(String),
+
+    /// A stdin JSON payload fed to (or read back from) an agent subprocess
+    /// (ADR-0012, issue #20 Scope B) that isn't valid JSON, carries an
+    /// unsupported `version`, or violates the role/field invariant
+    /// `AgentInputMessage::for_coder`/`for_finding_agent` enforce at
+    /// construction (e.g. a `coder` payload missing `intent`) -- validated
+    /// with the same rigor as `MalformedCiResultMessage`.
+    #[error("malformed agent input: {0}")]
+    MalformedAgentInput(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
