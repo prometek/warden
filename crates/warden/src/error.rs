@@ -106,10 +106,13 @@ pub enum EvidenceError {
     InvalidStoredEvidencePath { file_path: String },
 }
 
-/// Errors loading a markdown agent definition (ADR-0013, issue #22): the
-/// `--coder-agent`/`--reviewer-agent`/`--tester-agent` file. Both variants
-/// name the path -- with three definitions per run, an error that doesn't
-/// say *which* file is barely actionable.
+/// Errors resolving a role's markdown agent definition (issue #24): the
+/// `<repo>/.warden/agents/<role>.md` convention file, when present (see
+/// `crate::agent_def::resolve_agent_definition`). Both variants name the
+/// path -- with three definitions per run, an error that doesn't say
+/// *which* file is barely actionable. A **missing** file is not one of these
+/// -- it falls back to the selected tool adapter's own default prompt
+/// instead.
 #[derive(Debug, Error)]
 pub enum AgentDefinitionError {
     #[error("failed to read agent definition {path}: {source}")]
@@ -120,9 +123,9 @@ pub enum AgentDefinitionError {
     },
 
     /// The file was read but isn't a valid definition (no frontmatter fence,
-    /// malformed TOML, an unknown key, an unknown runner, a blank system
-    /// prompt, ...). Wraps `warden_core`'s own reason rather than
-    /// restating it -- the boundary rules live there.
+    /// malformed YAML, an unknown key, a blank-but-present optional field, a
+    /// blank system prompt, ...). Wraps `warden_core`'s own reason rather
+    /// than restating it -- the boundary rules live there.
     #[error("invalid agent definition {path}: {source}")]
     Invalid {
         path: PathBuf,

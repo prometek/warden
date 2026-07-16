@@ -18,11 +18,10 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, decide_next_state_after_ci, parse_findings, AgentDefinition, AgentRole,
-    CiResultMessage, EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
+    decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiResultMessage,
+    EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
 };
 
-use crate::agent_runner::AgentRunner;
 use crate::ci_channel::CiResultListener;
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
@@ -30,6 +29,7 @@ use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
 use crate::process::{self, AgentCommand, AgentOutcome};
+use crate::tool_adapter::ToolAdapter;
 use crate::worktree::{self, WorktreeManager};
 
 /// Issue #15 review, M-new-1: once the triggered `warden-gated` subprocess is
@@ -45,11 +45,15 @@ const GATE_CHILD_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// Static configuration for a single run of the convergence loop.
 ///
 /// `coder_agent`/`reviewer_agent`/`tester_agent` are the markdown
-/// definitions of each role (ADR-0013, issue #22): what the role *is* (its
-/// system prompt) plus how to invoke it (its runner). An [`AgentRunner`]
-/// maps each onto the concrete CLI to spawn -- ADR-0005: Warden spawns
-/// whatever CLI the caller configures, never calls an LLM API directly, and
-/// hardcodes no agent binary.
+/// definitions of each role (issue #24): what the role *is* (its system
+/// prompt, and optionally its `tools`/`model`). Resolved once, from the
+/// run's base repo, before this run's `runs` row is even written --
+/// `warden::agent_def::resolve_agent_definition`'s own docs explain why
+/// that resolve-once-at-the-base-repo timing matters for reviewer/tester
+/// independence. A [`ToolAdapter`] maps each onto the concrete CLI to spawn
+/// -- ADR-0005: Warden spawns whatever CLI a `--tool` adapter builds, never
+/// calls an LLM API directly, and hardcodes no agent binary of its own (the
+/// adapter is what knows the binary name).
 pub struct RunConfig {
     /// The user's pre-existing repository. Never written to directly — only
     /// read to resolve the starting commit and to run `git worktree`.
@@ -101,11 +105,11 @@ pub struct GateConfig {
     pub inactivity_timeout_secs: u64,
 }
 
-/// One role's markdown definition (ADR-0013), already mapped onto the
+/// One role's markdown definition (issue #24), already mapped onto the
 /// command to spawn for it: what to run, and what to tell it it is.
 ///
 /// Resolved once per run rather than per invocation — a definition is static
-/// for a run's whole lifetime and an [`AgentRunner`] is a pure mapping, so
+/// for a run's whole lifetime and a [`ToolAdapter`] is a pure mapping, so
 /// re-running it per cycle would produce the identical command.
 struct ResolvedAgent {
     command: AgentCommand,
@@ -115,19 +119,23 @@ struct ResolvedAgent {
     system_prompt: String,
 }
 
-/// The three roles' definitions, resolved through this run's
-/// [`AgentRunner`].
+/// The three roles' definitions, resolved through this run's [`ToolAdapter`].
 struct ResolvedAgents {
     coder: ResolvedAgent,
     reviewer: ResolvedAgent,
     tester: ResolvedAgent,
+    /// This run's `--tool` adapter's own env allowlist (issue #24), resolved
+    /// once here since it's a property of the tool, not of any one role --
+    /// `--tool` is global for a run (issue #24, "Sélection d'outil par
+    /// rôle... hors scope"), so all three roles share it.
+    env_allowlist: &'static [&'static str],
 }
 
 impl ResolvedAgents {
     /// Maps all three definitions up-front, before the loop spawns anything:
-    /// a definition the runner cannot honour must fail the run at its start,
-    /// not two cycles in when that role first happens to be invoked.
-    fn resolve<R: AgentRunner>(runner: &R, config: &RunConfig) -> Result<Self> {
+    /// a definition the adapter cannot honour must fail the run at its
+    /// start, not two cycles in when that role first happens to be invoked.
+    fn resolve<R: ToolAdapter>(runner: &R, config: &RunConfig) -> Result<Self> {
         let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
             Ok(ResolvedAgent {
                 command: runner.build_command(definition)?,
@@ -138,6 +146,7 @@ impl ResolvedAgents {
             coder: resolve_one(&config.coder_agent)?,
             reviewer: resolve_one(&config.reviewer_agent)?,
             tester: resolve_one(&config.tester_agent)?,
+            env_allowlist: runner.env_allowlist(),
         })
     }
 }
@@ -150,8 +159,11 @@ struct CoderInvocation<'a> {
     cycle_id: &'a str,
     cycle_number: u32,
     config: &'a RunConfig,
-    /// This run's coder command + system prompt (ADR-0013).
+    /// This run's coder command + system prompt (issue #24).
     agent: &'a ResolvedAgent,
+    /// This run's `--tool` adapter's env allowlist (issue #24) --
+    /// `ResolvedAgents::env_allowlist`.
+    env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
     base_commit: &'a str,
     /// A2 (ADR-0013, issue #22): the findings that triggered this cycle —
@@ -175,9 +187,9 @@ struct EvidenceCapture<'a> {
     cycle_number: u32,
     config: &'a RunConfig,
     /// The command the tester was invoked with, mapped from its definition
-    /// by this run's `AgentRunner` (ADR-0013) — what `asciinema rec` records
-    /// as the session. Passed explicitly because `RunConfig` holds
-    /// definitions rather than commands: only the runner can map one to the
+    /// by this run's `ToolAdapter` (issue #24) — what `asciinema rec`
+    /// records as the session. Passed explicitly because `RunConfig` holds
+    /// definitions rather than commands: only the adapter can map one to the
     /// other.
     tester_command: &'a AgentCommand,
     tester_worktree_path: &'a Path,
@@ -193,8 +205,11 @@ struct FindingAgentInvocation<'a> {
     cycle_id: &'a str,
     cycle_number: u32,
     role: AgentRole,
-    /// This role's command + system prompt (ADR-0013).
+    /// This role's command + system prompt (issue #24).
     agent: &'a ResolvedAgent,
+    /// This run's `--tool` adapter's env allowlist (issue #24) --
+    /// `ResolvedAgents::env_allowlist`.
+    env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
     /// The diff this cycle's coder introduced against the cycle's starting
@@ -316,10 +331,11 @@ impl Orchestrator {
     /// final [`RunState`].
     ///
     /// `runner` maps each role's markdown definition onto the command to
-    /// spawn for it (ADR-0013 / Q1). Injected as a generic parameter, the
-    /// same compile-time seam [`crate::gate_trigger::GateTrigger`] uses, so
-    /// tests can substitute a fake without spawning anything real.
-    pub async fn run_convergence_loop<R: AgentRunner>(
+    /// spawn for it, and transforms a reviewer/tester's raw output into
+    /// findings (issue #24). Injected as a generic parameter, the same
+    /// compile-time seam [`crate::gate_trigger::GateTrigger`] uses, so tests
+    /// can substitute a fake without spawning anything real.
+    pub async fn run_convergence_loop<R: ToolAdapter>(
         &self,
         config: RunConfig,
         runner: R,
@@ -421,6 +437,7 @@ impl Orchestrator {
                     cycle_number,
                     config: &config,
                     agent: &agents.coder,
+                    env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     base_commit: &base_commit,
                     prior_findings: &prior_findings,
@@ -435,6 +452,7 @@ impl Orchestrator {
 
             let findings = self
                 .run_review_and_test(
+                    &runner,
                     &run_id,
                     &cycle_id,
                     cycle_number,
@@ -755,6 +773,7 @@ impl Orchestrator {
             cycle_number,
             config,
             agent,
+            env_allowlist,
             worktree_manager,
             base_commit,
             prior_findings,
@@ -795,6 +814,7 @@ impl Orchestrator {
                 cycle_id,
                 AgentRole::Coder,
                 &agent.command,
+                env_allowlist,
                 worktree.path(),
                 stdin_payload,
                 cancel,
@@ -874,8 +894,9 @@ impl Orchestrator {
     /// `kill_on_drop` on the spawned child process and `Worktree`'s `Drop`
     /// impl, both of which clean up best-effort even on an ungraceful exit).
     #[allow(clippy::too_many_arguments)]
-    async fn run_review_and_test(
+    async fn run_review_and_test<R: ToolAdapter>(
         &self,
+        runner: &R,
         run_id: &str,
         cycle_id: &str,
         cycle_number: u32,
@@ -897,32 +918,40 @@ impl Orchestrator {
         // the child process is already the isolation boundary, and its
         // worktree already gives it a private working directory.
         let (reviewer_result, tester_result) = tokio::join!(
-            self.run_finding_agent(FindingAgentInvocation {
-                run_id,
-                cycle_id,
-                cycle_number,
-                role: AgentRole::Reviewer,
-                agent: &agents.reviewer,
-                worktree_manager,
-                commit,
-                diff,
-                prior_findings,
-                config,
-                cancel: cancel.clone(),
-            }),
-            self.run_finding_agent(FindingAgentInvocation {
-                run_id,
-                cycle_id,
-                cycle_number,
-                role: AgentRole::Tester,
-                agent: &agents.tester,
-                worktree_manager,
-                commit,
-                diff,
-                prior_findings,
-                config,
-                cancel,
-            })
+            self.run_finding_agent(
+                runner,
+                FindingAgentInvocation {
+                    run_id,
+                    cycle_id,
+                    cycle_number,
+                    role: AgentRole::Reviewer,
+                    agent: &agents.reviewer,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager,
+                    commit,
+                    diff,
+                    prior_findings,
+                    config,
+                    cancel: cancel.clone(),
+                }
+            ),
+            self.run_finding_agent(
+                runner,
+                FindingAgentInvocation {
+                    run_id,
+                    cycle_id,
+                    cycle_number,
+                    role: AgentRole::Tester,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager,
+                    commit,
+                    diff,
+                    prior_findings,
+                    config,
+                    cancel,
+                }
+            )
         );
 
         let mut findings = reviewer_result?;
@@ -930,8 +959,9 @@ impl Orchestrator {
         Ok(findings)
     }
 
-    async fn run_finding_agent(
+    async fn run_finding_agent<R: ToolAdapter>(
         &self,
+        runner: &R,
         invocation: FindingAgentInvocation<'_>,
     ) -> Result<Vec<Finding>> {
         let FindingAgentInvocation {
@@ -940,6 +970,7 @@ impl Orchestrator {
             cycle_number,
             role,
             agent,
+            env_allowlist,
             worktree_manager,
             commit,
             diff,
@@ -979,6 +1010,7 @@ impl Orchestrator {
                 cycle_id,
                 role,
                 &agent.command,
+                env_allowlist,
                 worktree.path(),
                 stdin_payload,
                 cancel.clone(),
@@ -988,8 +1020,11 @@ impl Orchestrator {
         // Agent stdout is untrusted input: a parse failure becomes a
         // blocking finding describing the problem, never a run-ending
         // panic (code-standards.md: "Ne jamais faire confiance à la sortie
-        // d'un agent CLI").
-        let findings = match parse_findings(&outcome.stdout) {
+        // d'un agent CLI"). `runner.extract_findings` is this run's
+        // `--tool` adapter's own translation from its CLI's raw output into
+        // findings NDJSON (issue #24 point 1, third bullet) -- the user no
+        // longer writes that translation as a wrapper script.
+        let findings = match runner.extract_findings(&outcome.stdout) {
             Ok(findings) => findings,
             Err(parse_error) => {
                 tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable output");
@@ -1152,16 +1187,23 @@ impl Orchestrator {
     /// (ADR-0012, issue #20 Scope B) fed to the agent's stdin and then
     /// closed by [`process::wait`] -- the coder's run intent, or the
     /// reviewer/tester's target commit/diff/prior findings.
+    ///
+    /// `env_allowlist` is this run's `--tool` adapter's own
+    /// `ToolAdapter::env_allowlist` (issue #24) -- forwarded to
+    /// [`process::spawn_with_extra_env`] on top of the always-forwarded
+    /// `PATH`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_agent(
         &self,
         cycle_id: &str,
         role: AgentRole,
         command: &AgentCommand,
+        env_allowlist: &[&str],
         cwd: &Path,
         stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
-        let child = process::spawn(command, cwd)?;
+        let child = process::spawn_with_extra_env(command, cwd, env_allowlist)?;
         // H1: never persist pid 0. A missing `Child::id()` right after
         // spawn is a typed error, not a silent fallback — a persisted pid
         // 0 would make `is_process_alive` misreport this run as having a
@@ -1908,7 +1950,6 @@ async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_runner::CommandRunner;
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
@@ -1976,26 +2017,82 @@ mod tests {
         AgentCommand::new("sh", ["-c", "true"])
     }
 
-    /// Wraps an `AgentCommand` fixture in the markdown definition
-    /// `RunConfig` now takes (ADR-0013) -- the `command` runner is exactly
-    /// the escape hatch that keeps these plain-`sh` fixtures (and any real
-    /// user script) valid targets after `--*-cmd`'s removal.
-    fn definition(command: AgentCommand) -> AgentDefinition {
-        AgentDefinition::new(
-            warden_core::RunnerKind::Command {
-                program: command.program,
-                args: command.args,
-            },
-            "test agent system prompt",
-        )
-        .unwrap()
+    /// A test-only wire shape smuggling an `AgentCommand` fixture through an
+    /// `AgentDefinition`'s `name` field (issue #24: the real schema has no
+    /// `program`/`args` at all -- those are entirely a `ToolAdapter`'s own
+    /// business now). JSON round-trips losslessly, unlike a naive
+    /// space-join/split, so a fixture with a whitespace-/newline-containing
+    /// arg (every `sh -c "<script>"` fixture in this file) survives intact.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SmuggledCommand {
+        program: String,
+        args: Vec<String>,
     }
 
-    /// The runner seam (ADR-0013 / Q1): the orchestrator spawns what the
-    /// *runner* returns for a definition, not something read straight out of
-    /// `RunConfig` -- so a fake runner can serve every role from abstract
-    /// definitions that name no real binary at all. Records what it was
-    /// handed, to prove all three roles are resolved through it.
+    /// Wraps an `AgentCommand` fixture in the markdown definition
+    /// `RunConfig` now takes (issue #24), with a fixed test system prompt.
+    /// See [`definition_with_prompt`] for a caller that needs its own.
+    fn definition(command: AgentCommand) -> AgentDefinition {
+        definition_with_prompt(command, "test agent system prompt")
+    }
+
+    fn definition_with_prompt(command: AgentCommand, prompt: &str) -> AgentDefinition {
+        let encoded = serde_json::to_string(&SmuggledCommand {
+            program: command.program,
+            args: command.args,
+        })
+        .unwrap();
+        AgentDefinition::new(Some(encoded), None, None, None, prompt).unwrap()
+    }
+
+    /// The other half of [`definition`]/[`definition_with_prompt`]'s
+    /// smuggling.
+    fn decode_smuggled_command(definition: &AgentDefinition) -> AgentCommand {
+        let encoded = definition
+            .name
+            .as_deref()
+            .expect("test definitions always smuggle a command via `name`");
+        let smuggled: SmuggledCommand =
+            serde_json::from_str(encoded).expect("valid smuggled command");
+        AgentCommand::new(smuggled.program, smuggled.args)
+    }
+
+    /// The identity-mapping fake: decodes exactly what [`definition`]
+    /// encoded and runs it verbatim. Fills the role the removed, real,
+    /// shipped-in-production `CommandRunner` (ADR-0013's generic
+    /// any-program/args runner) used to fill in these tests -- issue #24
+    /// replaces that generic runner with tool-specific adapters
+    /// (`ClaudeAdapter` in production), so an identity mapping is now only
+    /// ever a test double, never something Warden ships.
+    struct FakeCommandAdapter;
+
+    impl ToolAdapter for FakeCommandAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+    }
+
+    /// The tool-adapter seam (issue #24): the orchestrator spawns what the
+    /// *adapter* returns for a definition, not something read straight out
+    /// of `RunConfig` -- so a fake adapter can serve every role from
+    /// abstract definitions that name no real binary at all. Records what it
+    /// was handed, to prove all three roles are resolved through it.
     struct FakeRunner {
         resolved_programs: std::sync::Mutex<Vec<String>>,
     }
@@ -2008,13 +2105,11 @@ mod tests {
         }
     }
 
-    impl AgentRunner for FakeRunner {
+    impl ToolAdapter for FakeRunner {
         fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
-            let program = match &definition.runner {
-                warden_core::RunnerKind::Command { program, .. } => program.clone(),
-            };
+            let program = decode_smuggled_command(definition).program;
             self.resolved_programs.lock().unwrap().push(program.clone());
-            // The mapping a real runner does: an abstract definition onto
+            // The mapping a real adapter does: an abstract definition onto
             // whatever CLI actually implements that role.
             Ok(match program.as_str() {
                 "the-coder" => AgentCommand::new(
@@ -2031,17 +2126,52 @@ mod tests {
                 _ => AgentCommand::new("sh", ["-c", "true"]),
             })
         }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
     }
 
-    /// A runner that refuses every definition -- models a definition naming
-    /// a runner this build cannot honour.
+    /// An adapter that refuses every definition -- models a definition this
+    /// build cannot honour (e.g. one written for a tool this binary has no
+    /// adapter for).
     struct FailingRunner;
 
-    impl AgentRunner for FailingRunner {
+    impl ToolAdapter for FailingRunner {
         fn build_command(&self, _definition: &AgentDefinition) -> Result<AgentCommand> {
-            Err(WardenError::Core(warden_core::CoreError::UnknownRunner(
-                "telepathy".to_string(),
-            )))
+            Err(WardenError::Core(
+                warden_core::CoreError::MalformedAgentDefinition(
+                    "no adapter available for this definition".to_string(),
+                ),
+            ))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, _stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            unreachable!("build_command always fails first")
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            unreachable!("build_command always fails first")
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            unreachable!("build_command always fails first")
         }
     }
 
@@ -2121,7 +2251,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(WardenError::Core(warden_core::CoreError::UnknownRunner(_)))
+            Err(WardenError::Core(
+                warden_core::CoreError::MalformedAgentDefinition(_)
+            ))
         ));
         assert_eq!(count_runs(&pool).await, 0);
     }
@@ -2184,7 +2316,7 @@ mod tests {
         };
 
         let (_run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(final_state, RunState::Converged);
@@ -2250,16 +2382,8 @@ mod tests {
             "#,
         );
 
-        let prompted = |command: AgentCommand, prompt: &str| {
-            AgentDefinition::new(
-                warden_core::RunnerKind::Command {
-                    program: command.program,
-                    args: command.args,
-                },
-                prompt,
-            )
-            .unwrap()
-        };
+        let prompted =
+            |command: AgentCommand, prompt: &str| definition_with_prompt(command, prompt);
 
         let orchestrator = Orchestrator::new(pool.clone());
         let config = RunConfig {
@@ -2277,7 +2401,7 @@ mod tests {
         };
 
         let (_run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(final_state, RunState::Converged);
@@ -2317,7 +2441,7 @@ mod tests {
         };
 
         let (run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
 
@@ -2384,7 +2508,7 @@ mod tests {
         };
 
         let (_run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
 
@@ -2729,11 +2853,12 @@ mod tests {
             evidence_store_in_repo: true,
             gate: None,
         };
-        let agents = ResolvedAgents::resolve(&CommandRunner, &config).unwrap();
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
         let findings = orchestrator
             .run_review_and_test(
+                &FakeCommandAdapter,
                 "collision-run",
                 "collision-cycle",
                 1,
@@ -2820,7 +2945,7 @@ mod tests {
             gate: None,
         };
 
-        let agents = ResolvedAgents::resolve(&CommandRunner, &config).unwrap();
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
 
@@ -2844,35 +2969,43 @@ mod tests {
 
         let sequential_start = std::time::Instant::now();
         orchestrator
-            .run_finding_agent(FindingAgentInvocation {
-                run_id: "sequential-run",
-                cycle_id: "sequential-cycle",
-                cycle_number: 1,
-                role: AgentRole::Reviewer,
-                agent: &agents.reviewer,
-                worktree_manager: &worktree_manager,
-                commit: "HEAD",
-                diff: "",
-                prior_findings: &[],
-                config: &config,
-                cancel: CancellationToken::new(),
-            })
+            .run_finding_agent(
+                &FakeCommandAdapter,
+                FindingAgentInvocation {
+                    run_id: "sequential-run",
+                    cycle_id: "sequential-cycle",
+                    cycle_number: 1,
+                    role: AgentRole::Reviewer,
+                    agent: &agents.reviewer,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
             .await
             .unwrap();
         orchestrator
-            .run_finding_agent(FindingAgentInvocation {
-                run_id: "sequential-run",
-                cycle_id: "sequential-cycle",
-                cycle_number: 1,
-                role: AgentRole::Tester,
-                agent: &agents.tester,
-                worktree_manager: &worktree_manager,
-                commit: "HEAD",
-                diff: "",
-                prior_findings: &[],
-                config: &config,
-                cancel: CancellationToken::new(),
-            })
+            .run_finding_agent(
+                &FakeCommandAdapter,
+                FindingAgentInvocation {
+                    run_id: "sequential-run",
+                    cycle_id: "sequential-cycle",
+                    cycle_number: 1,
+                    role: AgentRole::Tester,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
             .await
             .unwrap();
         let sequential_elapsed = sequential_start.elapsed();
@@ -2896,6 +3029,7 @@ mod tests {
         let parallel_start = std::time::Instant::now();
         orchestrator
             .run_review_and_test(
+                &FakeCommandAdapter,
                 "timing-run",
                 "timing-cycle",
                 1,
@@ -3270,7 +3404,7 @@ mod tests {
         };
 
         let (run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
 

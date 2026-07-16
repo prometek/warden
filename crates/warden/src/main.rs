@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use warden::agent_def::load_agent_definition;
-use warden::agent_runner::CommandRunner;
+use warden::agent_def::resolve_agent_definition;
 use warden::db;
 use warden::gate_trigger;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
+use warden::tool_adapter::{ClaudeAdapter, ToolAdapter};
+use warden_core::AgentRole;
 
 #[derive(Parser)]
 #[command(
@@ -62,27 +63,16 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         warden_home: Option<PathBuf>,
 
-        /// Path to the coder's markdown agent definition (ADR-0013, issue
-        /// #22): TOML frontmatter (`runner`, plus that runner's keys --
-        /// `runner = "command"` takes `program`/`args`) followed by the
-        /// role's system prompt as the markdown body. Replaces the removed
-        /// `--coder-cmd`; a plain script stays a valid target via the
-        /// `command` runner.
-        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
-        coder_agent: PathBuf,
-
-        /// Path to the reviewer's markdown agent definition; the invoked
-        /// agent's stdout must be the findings JSON protocol described in
-        /// `warden_core::parse_findings`. Replaces the removed
-        /// `--reviewer-cmd`.
-        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
-        reviewer_agent: PathBuf,
-
-        /// Path to the tester's markdown agent definition; same findings
-        /// JSON protocol as the reviewer. Replaces the removed
-        /// `--tester-cmd`.
-        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
-        tester_agent: PathBuf,
+        /// Selects the built-in tool adapter every role runs through this
+        /// run (issue #24): the invocation, env allowlist, output-to-
+        /// findings translation, and default prompt for all three roles all
+        /// come from this one adapter. Global for the whole run --
+        /// per-role tool selection (`--coder-tool`...) is out of scope.
+        /// Replaces the removed `--coder-agent`/`--reviewer-agent`/
+        /// `--tester-agent` flags and the warden-native runner they
+        /// selected (ADR-0013, issue #22).
+        #[arg(long, value_parser = parse_tool)]
+        tool: ToolName,
 
         /// Overrides automatic project-type detection for the Evidence
         /// Capture Adapter (ADR-0009): `playwright` for web/UI projects,
@@ -121,6 +111,27 @@ enum Commands {
     },
 }
 
+/// The closed set of `--tool` values this build understands (issue #24):
+/// each variant owns exactly one [`ToolAdapter`] impl, resolved at compile
+/// time -- not a config-declared registry, mirroring
+/// `warden_core::AgentRole`/`RunState` string parsing. `claude` is the only
+/// variant today; `aider` and others are meant to gain their own variant +
+/// adapter later, never by adding a runtime lookup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolName {
+    Claude,
+}
+
+/// clap `value_parser` for `--tool`: validated against the closed set above
+/// at the CLI boundary (code-standards.md: "valider toute entrée externe...
+/// à la frontière"), mirroring `parse_evidence_tool`.
+fn parse_tool(raw: &str) -> Result<ToolName, String> {
+    match raw {
+        "claude" => Ok(ToolName::Claude),
+        other => Err(format!("unknown --tool {other:?} (supported: \"claude\")")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -133,9 +144,7 @@ async fn main() -> anyhow::Result<()> {
             branch,
             max_cycles,
             warden_home,
-            coder_agent,
-            reviewer_agent,
-            tester_agent,
+            tool,
             evidence_tool,
             evidence_store_in_repo,
             gate_bare_repo,
@@ -158,34 +167,38 @@ async fn main() -> anyhow::Result<()> {
                 _ => None,
             };
 
-            run(
-                repo,
-                intent,
-                branch,
-                max_cycles,
-                warden_home,
-                coder_agent,
-                reviewer_agent,
-                tester_agent,
-                evidence_tool,
-                evidence_store_in_repo,
-                gate,
-            )
-            .await
+            // One arm today (`ToolName::Claude`); a future adapter gets its
+            // own arm here rather than a runtime lookup, so the concrete
+            // `R: ToolAdapter` `run_convergence_loop` needs stays resolved
+            // at compile time (see `ToolName`'s own docs).
+            match tool {
+                ToolName::Claude => {
+                    run(
+                        repo,
+                        intent,
+                        branch,
+                        max_cycles,
+                        warden_home,
+                        ClaudeAdapter,
+                        evidence_tool,
+                        evidence_store_in_repo,
+                        gate,
+                    )
+                    .await
+                }
+            }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run(
+async fn run<R: ToolAdapter>(
     repo: PathBuf,
     intent: String,
     branch: String,
     max_cycles: u32,
     warden_home: Option<PathBuf>,
-    coder_agent: PathBuf,
-    reviewer_agent: PathBuf,
-    tester_agent: PathBuf,
+    adapter: R,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
@@ -268,15 +281,23 @@ async fn run(
         });
     }
 
+    // Issue #24: resolved once, from the base repo (`repo`, not any
+    // worktree), before this run's `runs` row is even written -- see
+    // `warden::agent_def::resolve_agent_definition`'s own docs for why that
+    // timing is the security-relevant part of this call.
+    let coder_agent = resolve_agent_definition(&repo, AgentRole::Coder, &adapter).await?;
+    let reviewer_agent = resolve_agent_definition(&repo, AgentRole::Reviewer, &adapter).await?;
+    let tester_agent = resolve_agent_definition(&repo, AgentRole::Tester, &adapter).await?;
+
     let config = RunConfig {
         repo_path: repo,
         warden_home,
         branch,
         intent,
         max_cycles,
-        coder_agent: load_agent_definition(&coder_agent).await?,
-        reviewer_agent: load_agent_definition(&reviewer_agent).await?,
-        tester_agent: load_agent_definition(&tester_agent).await?,
+        coder_agent,
+        reviewer_agent,
+        tester_agent,
         evidence_tool,
         evidence_store_in_repo,
         gate,
@@ -284,7 +305,7 @@ async fn run(
 
     let orchestrator = Orchestrator::new(pool);
     let (run_id, final_state) = orchestrator
-        .run_convergence_loop(config, CommandRunner, cancel)
+        .run_convergence_loop(config, adapter, cancel)
         .await
         .context("convergence loop failed")?;
 

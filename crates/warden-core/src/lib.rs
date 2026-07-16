@@ -20,7 +20,7 @@ mod pr_body;
 mod socket;
 mod state;
 
-pub use agent_def::{parse_agent_definition, AgentDefinition, RunnerKind};
+pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
     parse_agent_input_message, AgentInputMessage, AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
 };

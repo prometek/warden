@@ -55,20 +55,23 @@ pub struct AgentOutcome {
 
 /// Spawns `command` with `cwd` pointed at the agent's isolated worktree
 /// (code-standards.md: "Agent Subprocess Protocol"). The environment is not
-/// inherited from the current process — only `PATH` is passed through, so
+/// inherited from the current process — `env_clear()` always runs first, so
 /// agents never see credentials sitting in the orchestrator's shell
-/// environment (Architecture.md §10, "Isolation environnement des
-/// sous-processus").
+/// environment by default (Architecture.md §10, "Isolation environnement des
+/// sous-processus"). Convenience wrapper over [`spawn_with_extra_env`] with
+/// an empty allowlist — every call site that doesn't need extra env vars
+/// (evidence capture, every test in this module) uses this directly.
 ///
 /// **A relative `command.program` resolves against `cwd`**, i.e. against the
 /// worktree — the child chdirs before exec, so `./reviewer.sh` means *the
 /// repo's own copy of that script at the commit under review*, which the
-/// coder can rewrite and commit. Long-standing behaviour (it predates
-/// markdown agent definitions: `--reviewer-cmd "sh ./reviewer.sh"` resolved
-/// exactly the same way), documented here rather than changed — refusing
-/// relative paths is a product decision, and it would break the plain-script
-/// case `RunnerKind::Command` exists to serve. See `warden_core::RunnerKind`
-/// and ADR-0013's Conséquences.
+/// coder can rewrite and commit. Long-standing behaviour, documented here
+/// rather than changed — refusing relative paths is a product decision, and
+/// it would break the plain-script case a custom `AgentCommand` might still
+/// exist to serve outside a built-in `warden::tool_adapter::ToolAdapter`
+/// (which, for the adapters Warden ships, always names an absolute-lookup
+/// binary like `claude`, resolved via `PATH`, never a path relative to the
+/// worktree under review).
 ///
 /// stdin is piped (ADR-0012, issue #20 Scope B) rather than inherited, so
 /// the intent/target-commit/diff/findings payload [`wait`] writes never
@@ -83,6 +86,28 @@ pub struct AgentOutcome {
 /// Returns the still-running [`Child`] so the caller can read its PID
 /// (`child.id()`) and persist it before calling [`wait`].
 pub fn spawn(command: &AgentCommand, cwd: &Path) -> Result<Child, ProcessError> {
+    spawn_with_extra_env(command, cwd, &[])
+}
+
+/// Like [`spawn`], but also forwards each variable named in
+/// `extra_env_vars` — if it is actually set in `warden`'s own environment —
+/// on top of the always-forwarded `PATH`.
+///
+/// This is the Architecture.md §10 relaxation issue #24 asks for by name,
+/// implementing `warden_core`-agnostic infrastructure for
+/// `warden::tool_adapter::ToolAdapter::env_allowlist` (e.g. `claude` needs
+/// `HOME` to find its own auth/config): **`env_clear()` still runs first,
+/// unconditionally** — this is a small, explicit, per-invocation opt-in
+/// allowlist layered back on top, never a switch to inheriting the full
+/// environment. A caller that doesn't pass an adapter-provided allowlist
+/// (every non-agent subprocess: evidence capture, git plumbing) is
+/// unaffected and gets exactly the previous `PATH`-only behaviour via
+/// [`spawn`].
+pub fn spawn_with_extra_env(
+    command: &AgentCommand,
+    cwd: &Path,
+    extra_env_vars: &[&str],
+) -> Result<Child, ProcessError> {
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(cwd)
@@ -94,6 +119,11 @@ pub fn spawn(command: &AgentCommand, cwd: &Path) -> Result<Child, ProcessError> 
 
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", path);
+    }
+    for var_name in extra_env_vars {
+        if let Ok(value) = std::env::var(var_name) {
+            cmd.env(var_name, value);
+        }
     }
 
     cmd.spawn().map_err(|source| ProcessError::Spawn {

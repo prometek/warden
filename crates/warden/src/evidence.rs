@@ -203,10 +203,15 @@ impl EvidenceAdapter for AsciinemaAdapter {
 
 /// Renders `command` back into a single shell-invocable string, so the
 /// tester's program + args can be handed to `asciinema rec --command`. No
-/// quoting/escaping support: an `AgentCommand`'s args come from the `command`
-/// runner's explicit `args` list (`warden_core::RunnerKind::Command`), and
-/// anything that would need shell quoting belongs in its own wrapper script
-/// rather than in this naive space-join.
+/// quoting/escaping support: this predates issue #24 and is unchanged by it,
+/// but is worth re-flagging now that `AgentCommand`'s args routinely
+/// originate from a `warden::tool_adapter::ToolAdapter` rather than a
+/// user-authored script -- `ClaudeAdapter::build_command` puts the full,
+/// potentially multi-line system prompt directly into `args`
+/// (`--append-system-prompt <prompt>`), which this naive space-join does
+/// not shell-quote at all. Recording a `claude` tester invocation as an
+/// asciinema session is not addressed by this issue; left as-is pending a
+/// dedicated look at evidence capture for LLM-tool testers specifically.
 fn shell_join(command: &AgentCommand) -> String {
     std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
