@@ -442,6 +442,22 @@ Read the JSON payload on stdin.
         ));
     }
 
+    /// The two-pass parse reads the `runner` selector first (`RunnerSelector`);
+    /// a frontmatter with no `runner` key at all has nothing to dispatch on,
+    /// so it must be a typed error at the boundary rather than a panic or a
+    /// default-runner fallback. Probes the first pass in isolation -- every
+    /// other rejection test names a runner, so none of them exercised a
+    /// wholly absent selector.
+    #[test]
+    fn rejects_frontmatter_with_no_runner_key_at_all() {
+        let raw = "+++\nprogram = \"sh\"\nargs = [\"-c\", \"true\"]\n+++\nprompt\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(
+            matches!(error, CoreError::MalformedAgentDefinition(_)),
+            "a frontmatter with no runner selector must be a typed error, got {error:?}"
+        );
+    }
+
     #[test]
     fn rejects_a_command_runner_without_a_program() {
         let raw = "+++\nrunner = \"command\"\n+++\nprompt\n";

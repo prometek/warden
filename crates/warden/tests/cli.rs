@@ -2810,3 +2810,139 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
         "a non-ASCII intent must reach the agent intact"
     );
 }
+
+/// Issue #22 fix-cycle-1 probe, at the real CLI boundary: a definition file
+/// saved with CRLF line endings (a `.gitattributes text eol=crlf` checkout
+/// makes this reachable) has a first line that visibly *is* `+++`, so the
+/// naive fence error would be loud but actively misleading. Driven through
+/// the real binary: the error must name the line endings and the file, not
+/// misdirect to the fence.
+#[test]
+fn e2e_a_crlf_definition_file_is_rejected_naming_the_line_endings_not_the_fence() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let crlf = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &crlf,
+        "+++\r\nrunner = \"command\"\r\nprogram = \"sh\"\r\n+++\r\n\r\nbe a coder\r\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            crlf.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("coder.agent.md"))
+        .stderr(contains("CRLF"));
+}
+
+/// Issue #22 fix-cycle-1 probe: same misdirection, invisible cause. A UTF-8
+/// BOM sits before the fence, so "must start with a `+++` fence" would be
+/// baffling. Through the real binary the error must name the BOM.
+#[test]
+fn e2e_a_bom_prefixed_definition_file_is_rejected_naming_the_bom_not_the_fence() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let bom = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &bom,
+        "\u{feff}+++\nrunner = \"command\"\nprogram = \"sh\"\n+++\n\nbe a coder\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            bom.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("coder.agent.md"))
+        .stderr(contains("byte order mark"));
+}
+
+/// Issue #22 fix-cycle-1 probe, at the real CLI boundary: a key that belongs
+/// to a different/hypothetical runner under `runner = "command"` must be a
+/// typed error naming the key -- the two-pass scoping
+/// (`CommandRunnerFrontmatter` with per-runner `deny_unknown_fields`) exists
+/// so this can't be accepted-then-ignored once a second runner lands. With
+/// one runner today the observable consequence is identical to any unknown
+/// key, so this pins the behaviour through the user-facing stderr rather than
+/// trusting the internal struct layout.
+#[test]
+fn e2e_a_foreign_runner_key_is_rejected_at_the_cli_naming_the_key() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let bad = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &bad,
+        "+++\nrunner = \"command\"\nprogram = \"sh\"\nendpoint = \"https://api.example\"\n+++\n\nbe a coder\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            bad.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("endpoint"));
+}
