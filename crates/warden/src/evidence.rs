@@ -627,6 +627,46 @@ mod tests {
         );
     }
 
+    /// Combines both of the previous two tests' concerns in one prompt --
+    /// a `$(...)` command substitution *and* embedded newlines together
+    /// (a real `ClaudeAdapter`-built system prompt routinely has both at
+    /// once) -- and, unlike the multi-line test above (`sh -n`, parse-only),
+    /// actually executes the joined string through a real shell and checks
+    /// the literal text comes back byte-for-byte. Proves neither the
+    /// `$(...)` is evaluated nor a newline is left unquoted in a way that
+    /// could split the joined string into multiple shell commands.
+    #[test]
+    fn shell_join_executes_a_multiline_prompt_containing_a_command_substitution_as_pure_literal_text(
+    ) {
+        // Deliberately a *benign* substitution/backtick payload (`$(echo
+        // pwned)`, not something destructive like `$(rm -rf /)`): if
+        // `shell_join`'s quoting ever regressed, this test would actually
+        // execute whatever's embedded here via the real `sh -c` below.
+        let prompt =
+            "You are Warden's tester agent.\n\nDo not run $(echo pwned) or `id`.\nLine three.";
+        let command = AgentCommand::new("printf", ["%s".to_string(), prompt.to_string()]);
+
+        let joined = shell_join(&command).unwrap();
+
+        let output = SyncCommand::new("sh")
+            .arg("-c")
+            .arg(&joined)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the quoted command must still run successfully: {joined:?}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            prompt,
+            "the shell must see the literal multi-line prompt text, with the embedded \
+             $(...) never evaluated and the newlines never splitting it into separate \
+             commands: joined={joined:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // scan_project_markers: the I/O boundary that feeds
     // warden_core::detect_project_type.
