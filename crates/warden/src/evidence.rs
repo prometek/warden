@@ -201,11 +201,12 @@ impl EvidenceAdapter for AsciinemaAdapter {
     }
 }
 
-/// Renders `command` back into a single shell-invocable string -- the
-/// inverse of `main.rs`'s `parse_agent_command` whitespace split. Good
-/// enough for the same reason that split is: no quoting/escaping support is
-/// needed yet (main.rs: "agents that need quoting/escaping should be
-/// wrapped in their own script").
+/// Renders `command` back into a single shell-invocable string, so the
+/// tester's program + args can be handed to `asciinema rec --command`. No
+/// quoting/escaping support: an `AgentCommand`'s args come from the `command`
+/// runner's explicit `args` list (`warden_core::RunnerKind::Command`), and
+/// anything that would need shell quoting belongs in its own wrapper script
+/// rather than in this naive space-join.
 fn shell_join(command: &AgentCommand) -> String {
     std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
