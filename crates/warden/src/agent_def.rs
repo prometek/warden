@@ -46,10 +46,37 @@
 //!
 //! This reading of the ticket's otherwise-unwritten security requirement
 //! ("dépend des décisions de sécurité ci-dessous (isolation filesystem,
-//! définitions coder-controllables)", issue #24 -- no such section exists in
-//! the issue body, and there are no comments on it) is the conservative one
-//! and should be confirmed with the issue's owner; it is not itself
-//! something this module can verify at compile time or in a test.
+//! définitions coder-controllables)", issue #24) was confirmed with the
+//! issue's owner (issue #24 review, M4). The snapshot documented above
+//! closes the *within-run* half of it: a coder cannot rewrite the very
+//! reviewer/tester that will judge its own current run, because that
+//! judgement was already resolved before the coder ever ran. It does
+//! **not** close the *cross-run* half by itself: nothing stops a coder from
+//! committing a change under `.warden/agents/` that this run's reviewer/
+//! tester happily approves (it's just a file to them, same as any other),
+//! and once that commit merges, it becomes the convention file the *next*
+//! `warden run` against this repo resolves -- unreviewed by anything but
+//! the very cycle whose coder wrote it.
+//!
+//! The owner's ruling on that second half: `.warden/agents/` stays writable
+//! and committable by the coder -- banning writes there outright was
+//! rejected, since it would break the legitimate "improve our own agent
+//! prompts" workflow issue #24 exists to enable in the first place, and
+//! deferring the whole question to a follow-up ticket was also rejected, as
+//! cheap enough to close in this same pass. Instead, detection: a cycle
+//! whose coder diff touches anything under `.warden/agents/` (add, modify,
+//! delete, or rename in either direction) raises a **blocking**
+//! `FindingSource::Warden` finding (`orchestrator::agent_definition_tampering_finding`),
+//! through the exact same findings/severity machinery a reviewer/tester/CI
+//! finding already goes through -- so the change can never merge, and thus
+//! can never reach a future run, without a human noticing and reviewing it
+//! first. Together, the two halves are: within-run isolation (this
+//! module's snapshot) + cross-run detection (the blocking finding). Neither
+//! is a credential/filesystem sandbox around the coder itself -- the coder
+//! still runs with real repo access and whatever the selected `--tool`
+//! adapter's default grants allow (`ClaudeAdapter::default_tools`, `Bash`
+//! included); that broader exposure is an accepted, owner-reviewed trade
+//! for now, tracked for real isolation in issue #28.
 
 use std::path::Path;
 
@@ -61,7 +88,13 @@ use crate::tool_adapter::ToolAdapter;
 /// The directory, relative to a repo's root, that holds convention-based
 /// agent definitions (issue #24 point 3): `.warden/agents/coder.md`,
 /// `.warden/agents/reviewer.md`, `.warden/agents/tester.md`.
-const AGENTS_DIR: &str = ".warden/agents";
+///
+/// `pub(crate)`: also read by `orchestrator::agent_definition_tampering_finding`
+/// (issue #24 review, M4) to recognize a coder diff touching this same
+/// convention directory -- kept as this module's one definition of the
+/// convention path rather than duplicated as a second string literal
+/// elsewhere in the crate, so the two can never silently drift apart.
+pub(crate) const AGENTS_DIR: &str = ".warden/agents";
 
 /// Resolves `role`'s definition for this run: `<repo>/.warden/agents/
 /// <role>.md` if present, else `adapter`'s own default prompt and `tools`

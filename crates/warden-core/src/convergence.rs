@@ -9,15 +9,20 @@ use serde::Deserialize;
 use crate::error::{CoreError, Result};
 use crate::state::RunState;
 
-/// Which agent (or, for CI, which non-agent process) raised a finding
-/// (`FINDINGS.source`). `Ci` (issue #5) covers a failing check surfaced by
-/// `warden-gated`'s CI watcher -- distinct from `Reviewer`/`Tester` since
-/// it never comes from an agent subprocess at all.
+/// Which agent (or, for CI/Warden itself, which non-agent process) raised a
+/// finding (`FINDINGS.source`). `Ci` (issue #5) covers a failing check
+/// surfaced by `warden-gated`'s CI watcher; `Warden` (issue #24 review, M4)
+/// covers a finding the orchestrator raises directly from a structural check
+/// against the coder's own diff (currently: a cycle's coder commit touching
+/// `.warden/agents/`, `warden::orchestrator::agent_definition_tampering_finding`)
+/// -- both are distinct from `Reviewer`/`Tester` since neither ever comes
+/// from an agent subprocess's own judgement at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
     Reviewer,
     Tester,
     Ci,
+    Warden,
 }
 
 impl FindingSource {
@@ -26,6 +31,7 @@ impl FindingSource {
             FindingSource::Reviewer => "reviewer",
             FindingSource::Tester => "tester",
             FindingSource::Ci => "ci",
+            FindingSource::Warden => "warden",
         }
     }
 
@@ -34,6 +40,7 @@ impl FindingSource {
             "reviewer" => Ok(FindingSource::Reviewer),
             "tester" => Ok(FindingSource::Tester),
             "ci" => Ok(FindingSource::Ci),
+            "warden" => Ok(FindingSource::Warden),
             other => Err(CoreError::UnknownFindingSource(other.to_string())),
         }
     }
@@ -381,6 +388,17 @@ mod tests {
     fn ci_finding_source_round_trips_through_its_string_form() {
         assert_eq!(FindingSource::Ci.as_str(), "ci");
         assert_eq!(FindingSource::parse("ci").unwrap(), FindingSource::Ci);
+    }
+
+    // ---- FindingSource::Warden (issue #24 review, M4) ----------------------
+
+    #[test]
+    fn warden_finding_source_round_trips_through_its_string_form() {
+        assert_eq!(FindingSource::Warden.as_str(), "warden");
+        assert_eq!(
+            FindingSource::parse("warden").unwrap(),
+            FindingSource::Warden
+        );
     }
 
     // ---- decide_next_state_after_ci (issue #5) -----------------------------
