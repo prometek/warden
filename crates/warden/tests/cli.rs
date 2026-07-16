@@ -801,7 +801,7 @@ async fn e2e_run_intent_never_leaks_into_argv() {
     write_fake_claude(
         bin_dir.path(),
         &format!(
-            "printf '%s' \"$0 $*\" > \"{captures}/coder_argv.txt\"\n{APPEND_NOTES_CODER_BODY}",
+            "printf '%s' \"$0 $*\" > \"{captures}/coder_argv.txt\"\ncp \"$stdin_file\" \"{captures}/coder_stdin.json\"\n{APPEND_NOTES_CODER_BODY}",
             captures = captures.path().display()
         ),
         NOOP_BODY,
@@ -834,6 +834,16 @@ async fn e2e_run_intent_never_leaks_into_argv() {
         !argv_dump.contains(marker),
         "the run intent must never leak into the coder's argv: {argv_dump:?}"
     );
+
+    // Positive control (issue #24 review, cycle 2, NIT): without this, the
+    // negative assertion above would pass just as happily if the intent were
+    // never delivered to the coder at all (e.g. a regression that drops
+    // `--intent` on the floor before stdin is ever written) -- a test that
+    // can't fail for the right reason. Proves the marker actually arrived
+    // over stdin, the one channel it's supposed to use.
+    let stdin_dump = std::fs::read_to_string(captures.path().join("coder_stdin.json")).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&stdin_dump).unwrap();
+    assert_eq!(payload["intent"], intent);
 }
 
 /// Issue #24 point 1, third bullet: the adapter itself transforms `claude`'s

@@ -185,13 +185,31 @@ pub struct CycleSummary {
 /// status or content (that boundary is enforced by `post_cycle_update` only
 /// ever calling `PrProvider::post_comment`, never `mark_ready`/
 /// `update_body`).
+///
+/// Issue #24 review, cycle 2, MINOR: every [`FindingSource`] variant is
+/// listed explicitly here, not just `Reviewer`/`Tester` -- the original
+/// two-source grouping silently rendered a **blank** comment (just the
+/// header and the trailing "informational only" line, no findings section
+/// at all) for a cycle whose only findings came from a source outside that
+/// list, e.g. `FindingSource::Warden` (issue #24 review M4, the
+/// `.warden/agents/` tampering check) once `post_cycle_update` gains a
+/// production caller. Latent today (nothing calls `post_cycle_update` in
+/// production yet -- `warden`'s own `pr_summary::format_cycles_section`
+/// renders the Finalize-time PR body and never filtered by source at all),
+/// but there is no reason a *new* `FindingSource` variant should ever have
+/// to remember to add itself here to avoid silently vanishing.
 pub fn format_cycle_comment(summary: &CycleSummary) -> String {
     let mut body = format!("## Warden — cycle {} update\n\n", summary.cycle_number);
 
     if summary.findings.is_empty() {
         body.push_str("No findings raised this cycle.\n\n");
     } else {
-        for source in [FindingSource::Reviewer, FindingSource::Tester] {
+        for source in [
+            FindingSource::Reviewer,
+            FindingSource::Tester,
+            FindingSource::Warden,
+            FindingSource::Ci,
+        ] {
             let from_source: Vec<&Finding> = summary
                 .findings
                 .iter()

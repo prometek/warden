@@ -26,8 +26,8 @@ pub use agent_wire::{
 };
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{
-    decide_next_state, decide_next_state_after_ci, parse_findings, CiOutcome, Finding,
-    FindingSource, Severity,
+    decide_next_state, decide_next_state_after_ci, parse_findings,
+    validate_finding_sources_for_role, CiOutcome, Finding, FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
 pub use event::{EventKind, RunEvent, RunEventRecord};

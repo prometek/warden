@@ -7,7 +7,7 @@
 use serde::Deserialize;
 
 use crate::error::{CoreError, Result};
-use crate::state::RunState;
+use crate::state::{AgentRole, RunState};
 
 /// Which agent (or, for CI/Warden itself, which non-agent process) raised a
 /// finding (`FINDINGS.source`). `Ci` (issue #5) covers a failing check
@@ -135,6 +135,63 @@ pub fn parse_findings(agent_stdout: &str) -> Result<Vec<Finding>> {
             })
         })
         .collect()
+}
+
+/// Rejects any finding whose `source` isn't the one `role` is entitled to
+/// claim -- `parse_findings` only validates that `source` is *some* known
+/// value (issue #24 review, cycle 2, MAJOR 2), not that it's the value the
+/// role that actually produced this stdout is allowed to use. Without this,
+/// a reviewer/tester agent (whose raw output is untrusted input,
+/// code-standards.md "Ne jamais faire confiance à la sortie d'un agent CLI")
+/// could forge `source: "warden"` -- impersonating the structural finding
+/// only Warden itself may raise
+/// (`warden::orchestrator::agent_definition_tampering_finding`, issue #24
+/// review M4) -- or `source: "ci"`, or its sibling role's own source. That
+/// last one is the sharper, non-hypothetical case: a tester could mask a
+/// real failure by emitting it as `source: "reviewer"` instead of
+/// `"tester"`, since `warden::orchestrator::tester_succeeded` (the signal
+/// that gates evidence capture) keys off `FindingSource::Tester` findings
+/// specifically -- reviewer-mislabelled output would sail straight past it.
+///
+/// A reviewer may only ever emit [`FindingSource::Reviewer`]; a tester only
+/// [`FindingSource::Tester`]. [`FindingSource::Warden`]/[`FindingSource::Ci`]
+/// may never legitimately arrive from an agent subprocess's own stdout at
+/// all -- both are raised by Warden's own code, never parsed from untrusted
+/// agent output (`Ci` crosses a different, non-agent channel entirely,
+/// `crate::ci_channel`). `role` is only ever `Reviewer`/`Tester` at this
+/// validator's one call site (`warden::orchestrator::run_finding_agent`);
+/// `AgentRole::Coder` is accepted defensively and always rejected, since the
+/// coder role produces commits, never findings of its own.
+///
+/// Rejects the *whole* batch on the first mismatch found (index order),
+/// rather than silently dropping just the offending line or silently
+/// relabelling it to the expected source -- code-standards.md: "Valider
+/// toute entrée externe à la frontière, avant qu'elle n'atteigne la state
+/// machine", and once a stream has shown itself willing to misrepresent
+/// even one finding's own origin, none of the rest of that same stream's
+/// claims are trustworthy either (the same "don't salvage the parts that
+/// looked fine" stance [`parse_findings`] already takes for a shape error).
+pub fn validate_finding_sources_for_role(findings: &[Finding], role: AgentRole) -> Result<()> {
+    let expected = match role {
+        AgentRole::Reviewer => FindingSource::Reviewer,
+        AgentRole::Tester => FindingSource::Tester,
+        AgentRole::Coder => {
+            return Err(CoreError::MalformedAgentOutput(
+                "the coder role never raises findings of its own".to_string(),
+            ));
+        }
+    };
+    for (index, finding) in findings.iter().enumerate() {
+        if finding.source != expected {
+            return Err(CoreError::MalformedAgentOutput(format!(
+                "finding at index {index} claims source {:?}, but the {role:?} role may only \
+                 raise findings with source {:?}",
+                finding.source.as_str(),
+                expected.as_str(),
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decides the next [`RunState`] once reviewer + tester findings for a cycle
@@ -374,6 +431,79 @@ mod tests {
     #[test]
     fn parse_findings_rejects_a_top_level_json_array_instead_of_object() {
         assert!(parse_findings("[]").is_err());
+    }
+
+    // ---- validate_finding_sources_for_role (issue #24 review, cycle 2,
+    // MAJOR 2) ----------------------------------------------------------
+
+    fn finding_with_source(source: FindingSource) -> Finding {
+        Finding {
+            source,
+            severity: Severity::Blocking,
+            file: None,
+            description: "x".to_string(),
+            action: None,
+        }
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_accepts_a_reviewer_finding_with_the_reviewer_source() {
+        let findings = vec![finding_with_source(FindingSource::Reviewer)];
+        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_ok());
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_accepts_a_tester_finding_with_the_tester_source() {
+        let findings = vec![finding_with_source(FindingSource::Tester)];
+        assert!(validate_finding_sources_for_role(&findings, AgentRole::Tester).is_ok());
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_accepts_no_findings_at_all() {
+        assert!(validate_finding_sources_for_role(&[], AgentRole::Reviewer).is_ok());
+        assert!(validate_finding_sources_for_role(&[], AgentRole::Tester).is_ok());
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_rejects_a_reviewer_finding_claiming_the_warden_source() {
+        let findings = vec![finding_with_source(FindingSource::Warden)];
+        let error = validate_finding_sources_for_role(&findings, AgentRole::Reviewer).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_rejects_a_reviewer_finding_claiming_the_ci_source() {
+        let findings = vec![finding_with_source(FindingSource::Ci)];
+        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_err());
+    }
+
+    /// The sibling-role impersonation case: a tester claiming the
+    /// reviewer's own source (issue #24 review Minor 2, `tester_succeeded`
+    /// trusting an agent-controlled `source`).
+    #[test]
+    fn validate_finding_sources_for_role_rejects_a_tester_finding_claiming_the_reviewer_source() {
+        let findings = vec![finding_with_source(FindingSource::Reviewer)];
+        let error = validate_finding_sources_for_role(&findings, AgentRole::Tester).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
+    }
+
+    /// The whole batch is rejected on the first mismatch, even when an
+    /// earlier finding in the same batch was legitimate -- no salvaging
+    /// the parts that looked fine, mirroring `parse_findings`' own stance
+    /// on a shape error.
+    #[test]
+    fn validate_finding_sources_for_role_rejects_the_whole_batch_on_one_bad_finding() {
+        let findings = vec![
+            finding_with_source(FindingSource::Reviewer),
+            finding_with_source(FindingSource::Warden),
+        ];
+        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_err());
+    }
+
+    #[test]
+    fn validate_finding_sources_for_role_rejects_the_coder_role_defensively() {
+        let error = validate_finding_sources_for_role(&[], AgentRole::Coder).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
     }
 
     #[test]
