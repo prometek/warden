@@ -75,6 +75,29 @@ const AGENTS_DIR: &str = ".warden/agents";
 /// (`io::ErrorKind::NotFound`) falls back; any other read failure is a
 /// [`AgentDefinitionError::Read`] naming the path, exactly like a parse
 /// failure is an [`AgentDefinitionError::Invalid`] naming it.
+///
+/// # A *present* file that omits `tools` still gets the adapter's default
+/// grant (issue #24 review finding B2)
+///
+/// "Every frontmatter key is optional" (issue #24 point 3, pinned by
+/// `warden_core::agent_def::tests::every_frontmatter_key_is_optional`) is a
+/// deliberately supported case: a `.warden/agents/reviewer.md` that only
+/// wants to override the system prompt, leaving `tools`/`model` to the
+/// adapter, must work. But `warden_core::AgentDefinition::tools` being
+/// `None` is not a neutral "no opinion" for every adapter -- verified
+/// directly against the real CLI (`ClaudeAdapter`'s own docs), a `claude -p`
+/// invocation with no `--allowedTools` at all denies every tool call
+/// outright. If a *present* file's omitted `tools` reached
+/// `ToolAdapter::build_command` as `None` unchanged, the agent would be
+/// silently muzzled: a reviewer that can't call any tool raises zero
+/// findings, a coder that can't `Write`/`Bash` commits nothing, and
+/// `decide_next_state` sees a clean cycle and converges -- a false pass, not
+/// a real one. So this only ever calls `parse_agent_definition` for a
+/// *present* file, then merges `adapter.default_tools(role)` in wherever the
+/// parsed `tools` came back `None` -- exactly as if the file had spelled the
+/// default out itself. A file that *does* set `tools` (even to something the
+/// adapter wouldn't have chosen) is never touched: only an omitted key is
+/// filled in, never an explicit one overridden.
 pub async fn resolve_agent_definition(
     repo_path: &Path,
     role: AgentRole,
@@ -86,12 +109,12 @@ pub async fn resolve_agent_definition(
 
     match tokio::fs::read_to_string(&path).await {
         Ok(raw) => {
-            Ok(
+            let definition =
                 parse_agent_definition(&raw).map_err(|source| AgentDefinitionError::Invalid {
                     path: path.clone(),
                     source,
-                })?,
-            )
+                })?;
+            Ok(apply_default_tools_when_unset(definition, role, adapter))
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             // `AgentDefinition::new` enforces the exact same invariants
@@ -110,6 +133,25 @@ pub async fn resolve_agent_definition(
             )?)
         }
         Err(source) => Err(AgentDefinitionError::Read { path, source }.into()),
+    }
+}
+
+/// See [`resolve_agent_definition`]'s own docs (B2): a file that explicitly
+/// wrote `tools: ...` keeps exactly that value; a file that omitted the key
+/// entirely (`definition.tools == None`) has `adapter.default_tools(role)`
+/// merged in instead of being left `None`, so a prompt-only override still
+/// runs with a working tool grant.
+fn apply_default_tools_when_unset(
+    definition: AgentDefinition,
+    role: AgentRole,
+    adapter: &impl ToolAdapter,
+) -> AgentDefinition {
+    if definition.tools.is_some() {
+        return definition;
+    }
+    AgentDefinition {
+        tools: adapter.default_tools(role).map(str::to_string),
+        ..definition
     }
 }
 
@@ -150,7 +192,7 @@ mod tests {
         }
 
         fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
-            None
+            Some("fake-default-tools")
         }
     }
 
@@ -172,6 +214,58 @@ mod tests {
 
         assert_eq!(definition.model.as_deref(), Some("opus"));
         assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+    }
+
+    /// B2 regression (issue #24 review): a convention file that overrides
+    /// only the prompt (or any other key) but omits `tools` entirely must
+    /// still receive the adapter's own default tools grant -- not `None`,
+    /// which for an adapter like `claude` denies every tool call outright
+    /// and produces a false convergence (the muzzled agent raises/does
+    /// nothing, `decide_next_state` sees a clean cycle). See
+    /// `apply_default_tools_when_unset`'s own docs.
+    #[tokio::test]
+    async fn a_prompt_only_definition_still_gets_the_adapters_default_tools_grant() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo.path().join(AGENTS_DIR).join("reviewer.md"),
+            "---\n---\nreview it\n",
+        )
+        .await
+        .unwrap();
+
+        let definition = resolve_agent_definition(repo.path(), AgentRole::Reviewer, &FakeAdapter)
+            .await
+            .unwrap();
+
+        assert_eq!(definition.tools.as_deref(), Some("fake-default-tools"));
+        assert_eq!(definition.system_prompt, "review it");
+    }
+
+    /// The other half of the B2 fix: a definition that *does* set `tools`
+    /// explicitly must keep exactly what it wrote, never overridden by the
+    /// adapter's own default.
+    #[tokio::test]
+    async fn a_definition_that_sets_tools_explicitly_keeps_its_own_value_not_the_adapters_default()
+    {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo.path().join(AGENTS_DIR).join("coder.md"),
+            "---\ntools: Read, Edit\n---\nimplement it\n",
+        )
+        .await
+        .unwrap();
+
+        let definition = resolve_agent_definition(repo.path(), AgentRole::Coder, &FakeAdapter)
+            .await
+            .unwrap();
+
+        assert_eq!(definition.tools.as_deref(), Some("Read, Edit"));
     }
 
     /// The zero-`.md` UX (issue #24): no convention file at all falls back

@@ -101,8 +101,21 @@ pub struct AgentDefinition {
     /// operational use for it.
     pub description: Option<String>,
     /// Passed to `--allowedTools`/equivalent by the tool adapter, verbatim.
-    /// `None` means "let the tool decide" (Claude Code's own convention when
-    /// the key is omitted: inherit every tool).
+    /// `None` here means only "this definition file did not itself set a
+    /// `tools:` key" -- it does **not** mean "let the tool decide". Claude
+    /// Code's own docs describe an omitted `tools:` key as "inherits every
+    /// tool", but verified directly against the real CLI in non-interactive
+    /// `-p` mode, `None`/no `--allowedTools` at all denies every mutating
+    /// tool call outright (see `warden::tool_adapter::ClaudeAdapter`'s own
+    /// docs). Because of that, `warden::agent_def::resolve_agent_definition`
+    /// never lets a `None` here reach `ToolAdapter::build_command` as-is: a
+    /// definition file that omits `tools` still has the adapter's own
+    /// default grant merged in after parsing (issue #24 review finding B2 --
+    /// a `tools: None` invocation silently muzzles the agent, which then
+    /// raises/does nothing and produces a false convergence). This field
+    /// being `None` on a freshly-`parse_agent_definition`d value only means
+    /// "the file didn't say"; what an adapter actually does with that is the
+    /// adapter's call, made once, at resolution time -- not here.
     pub tools: Option<String>,
     /// Passed to `--model`/equivalent by the tool adapter, verbatim. `None`
     /// means "let the tool pick its own default model".

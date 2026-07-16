@@ -121,8 +121,26 @@ pub fn spawn_with_extra_env(
         cmd.env("PATH", path);
     }
     for var_name in extra_env_vars {
-        if let Ok(value) = std::env::var(var_name) {
-            cmd.env(var_name, value);
+        match std::env::var(var_name) {
+            Ok(value) => {
+                cmd.env(var_name, value);
+            }
+            Err(_) => {
+                // Not fatal (a missing allowlisted var is not necessarily
+                // wrong -- `USER` may genuinely be unset in some
+                // environments), but silent otherwise: the observable
+                // symptom downstream is the *tool's own* cryptic failure
+                // (e.g. claude's "Not logged in" when `HOME` never made it
+                // through), not anything naming Warden or the missing var.
+                // code-standards.md forbids exactly this catch-and-ignore
+                // shape without at least a named, actionable trace.
+                tracing::warn!(
+                    var = var_name,
+                    program = %command.program,
+                    "adapter-requested environment variable is not set in warden's own \
+                     process environment; the child will run without it"
+                );
+            }
         }
     }
 

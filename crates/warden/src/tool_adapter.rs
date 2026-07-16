@@ -286,8 +286,10 @@ intent, findings) before closing stdin. Read it before doing anything else. \
 (if non-empty) are blocking issues a prior reviewer/tester/CI raised against \
 your last attempt -- fix all of them.\n\n\
 Implement the change directly in this working tree and commit it locally \
-with git before exiting (no push, no remote access, and none is available). \
-Do not open or interact with any pull request.";
+with git before exiting. Do not push this commit anywhere and do not open or \
+interact with any pull request -- pushing (and opening a PR) happens later, \
+only after this run converges, and is gated separately from this \
+invocation.";
 
 const DEFAULT_REVIEWER_PROMPT: &str = "You are Warden's reviewer agent.\n\n\
 Warden will send a single JSON object on stdin (fields: version, role, \

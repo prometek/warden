@@ -104,6 +104,19 @@ pub enum EvidenceError {
     /// corrupted database (code-standards.md: "no silent fallback").
     #[error("stored evidence file_path {file_path:?} has no file name component")]
     InvalidStoredEvidencePath { file_path: String },
+
+    /// Issue #24 review, M1: `AsciinemaAdapter` renders the tester's own
+    /// program/args back into a single string for `asciinema rec --command`,
+    /// which executes it via a shell -- every part must be shell-quoted
+    /// before joining (`evidence::shell_join`). The only way that quoting can
+    /// fail is a NUL byte in one of the parts (`shlex::QuoteError::Nul`; a
+    /// shell command line fundamentally cannot carry one, quoted or not).
+    #[error("cannot shell-quote the recorded command for asciinema (part {part:?}): {source}")]
+    UnshellableRecordCommand {
+        part: String,
+        #[source]
+        source: shlex::QuoteError,
+    },
 }
 
 /// Errors resolving a role's markdown agent definition (issue #24): the

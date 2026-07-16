@@ -159,7 +159,7 @@ pub struct AsciinemaAdapter;
 impl EvidenceAdapter for AsciinemaAdapter {
     async fn capture(&self, ctx: &EvidenceCaptureContext<'_>) -> Result<Vec<CapturedEvidence>> {
         let scratch_path = ctx.scratch_dir.join(ASCIINEMA_CAST_FILE_NAME);
-        let recorded_command = shell_join(ctx.record_command);
+        let recorded_command = shell_join(ctx.record_command)?;
 
         let command = AgentCommand::new(
             "asciinema",
@@ -202,21 +202,52 @@ impl EvidenceAdapter for AsciinemaAdapter {
 }
 
 /// Renders `command` back into a single shell-invocable string, so the
-/// tester's program + args can be handed to `asciinema rec --command`. No
-/// quoting/escaping support: this predates issue #24 and is unchanged by it,
-/// but is worth re-flagging now that `AgentCommand`'s args routinely
-/// originate from a `warden::tool_adapter::ToolAdapter` rather than a
-/// user-authored script -- `ClaudeAdapter::build_command` puts the full,
-/// potentially multi-line system prompt directly into `args`
-/// (`--append-system-prompt <prompt>`), which this naive space-join does
-/// not shell-quote at all. Recording a `claude` tester invocation as an
-/// asciinema session is not addressed by this issue; left as-is pending a
-/// dedicated look at evidence capture for LLM-tool testers specifically.
-fn shell_join(command: &AgentCommand) -> String {
+/// tester's program + args can be handed to `asciinema rec --command`
+/// (`asciinema` execs it via a shell).
+///
+/// # Every part is shell-quoted (issue #24 review, M1)
+///
+/// This sink predates issue #24, but issue #24 is what arms it: before this
+/// issue, `command`'s args always came from a user-authored, fixed argument
+/// list (ADR-0013), so a naive space-join was merely inelegant. Now
+/// `ClaudeAdapter::build_command` puts the full, potentially multi-line
+/// system prompt directly into `args` (`--append-system-prompt <prompt>`),
+/// and the default/convention-file prompts routinely contain shell
+/// metacharacters of their own (backticks around field names like `` `diff` ``,
+/// apostrophes in "Warden's tester agent", ...). A naive space-join would
+/// hand all of that straight to a shell via `asciinema rec --command`,
+/// making every prompt an arbitrary-command-injection vector into whatever
+/// account runs the evidence capture -- and, even without any adversarial
+/// intent, would simply break (mismatched quotes) on the very prompts this
+/// codebase ships by default, which is exactly what asciinema capture for a
+/// `--tool claude` CLI project hit in review.
+///
+/// Each part (`command.program`, then every `command.args` entry) is
+/// shell-quoted independently via `shlex::try_quote` (POSIX single-quote
+/// style, correctly re-quoting an embedded single quote by closing/
+/// reopening the quoted run) before being space-joined, so the resulting
+/// string round-trips through a shell as the exact same argv, with no part
+/// of it ever interpreted as shell syntax. The only way quoting can fail is
+/// a part containing a NUL byte (`shlex::QuoteError::Nul`) -- a shell
+/// command line cannot represent one at all, quoted or not -- surfaced as
+/// [`EvidenceError::UnshellableRecordCommand`] naming the offending part
+/// rather than silently truncating or stripping it.
+fn shell_join(command: &AgentCommand) -> Result<String> {
     std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|part| {
+            shlex::try_quote(part)
+                .map(|quoted| quoted.into_owned())
+                .map_err(|source| {
+                    EvidenceError::UnshellableRecordCommand {
+                        part: part.to_string(),
+                        source,
+                    }
+                    .into()
+                })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|parts| parts.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +553,78 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    // -----------------------------------------------------------------
+    // shell_join (issue #24 review, M1): every part must be shell-quoted,
+    // proven by actually executing the joined string through a real shell
+    // rather than just inspecting the escaped text.
+    // -----------------------------------------------------------------
+
+    /// A command whose args carry exactly the shell metacharacters review
+    /// finding M1 flagged as reachable in practice (backticks and an
+    /// apostrophe from the default prompts' own text, plus a `$(...)`
+    /// command substitution as the sharper adversarial case): the joined
+    /// string, run through a real `sh -c`, must echo the literal text back
+    /// -- proving none of it was interpreted as shell syntax.
+    #[test]
+    fn shell_join_quotes_every_part_so_shell_metacharacters_are_never_executed() {
+        let dangerous = "it's `whoami` and $(id) and a trailing backtick `";
+        let command = AgentCommand::new("printf", ["%s", dangerous]);
+
+        let joined = shell_join(&command).unwrap();
+
+        let output = SyncCommand::new("sh")
+            .arg("-c")
+            .arg(&joined)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the quoted command must still run successfully: {joined:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            dangerous,
+            "the shell must see the literal text, not execute the embedded \
+             backticks/$()/apostrophe: joined={joined:?}"
+        );
+    }
+
+    /// The exact shape review finding M1 named: `ClaudeAdapter::build_command`
+    /// puts the whole (potentially multi-line) system prompt into `args`
+    /// after `--append-system-prompt` -- this pins that a prompt with
+    /// embedded backticks and an unmatched apostrophe (like
+    /// `DEFAULT_TESTER_PROMPT`'s own text) still round-trips through a real
+    /// shell as the literal prompt, not a broken or hijacked command line.
+    #[test]
+    fn shell_join_handles_a_claude_style_multiline_prompt_with_backticks_and_an_apostrophe() {
+        let prompt = "You are Warden's tester agent.\n\nRun `diff` at `target_commit`.";
+        let command = AgentCommand::new(
+            "claude",
+            [
+                "-p".to_string(),
+                "--append-system-prompt".to_string(),
+                prompt.to_string(),
+            ],
+        );
+
+        let joined = shell_join(&command).unwrap();
+
+        // `sh -n` parses without executing -- enough to prove the quoting
+        // produced syntactically valid shell input (the previous, unescaped
+        // space-join would fail here on the stray apostrophe alone).
+        let output = SyncCommand::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&joined)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "expected valid shell syntax from a quoted multi-line prompt: {joined:?}, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // -----------------------------------------------------------------
