@@ -43,22 +43,47 @@ use crate::error::{CoreError, Result};
 /// warden-native anyway (ADR-0013 / Q1), TOML is already this workspace's
 /// configuration language, and the maintained YAML crates in the Rust
 /// ecosystem are a worse dependency than `toml` for a block this small.
-pub const FRONTMATTER_FENCE: &str = "+++";
-
-/// On-disk shape of the frontmatter block, before validation into
-/// [`RunnerKind`]. Private, exactly like `agent_wire`'s wire structs: the
-/// public type is the validated one.
 ///
-/// `deny_unknown_fields` is the project's stated default (ADR-0013 / Q3): a
-/// key Warden does not understand is a definition whose author expected
-/// something Warden will not do -- accepting it silently is the fallback
-/// code-standards.md forbids, so it is rejected outright with the offending
-/// key named.
+/// Private: the fence is an implementation detail of
+/// [`parse_agent_definition`], which is the only way in. Callers parse
+/// definitions, they don't assemble them.
+const FRONTMATTER_FENCE: &str = "+++";
+
+/// Step 1 of parsing the frontmatter: read *only* the runner selector, so
+/// the runner-specific shape to validate against is known before any of its
+/// keys are looked at. Deliberately **not** `deny_unknown_fields` -- judging
+/// keys is step 2's job, and it cannot happen until the runner is known.
+#[derive(Debug, Deserialize)]
+struct RunnerSelector {
+    runner: String,
+}
+
+/// Step 2 for `runner = "command"`: the keys that runner -- and only that
+/// runner -- understands. Private, exactly like `agent_wire`'s wire structs:
+/// the public type is the validated one.
+///
+/// **Each runner gets its own struct**, rather than one flat struct holding
+/// every runner's keys (ADR-0013 amendment, issue #22 review): with a flat
+/// shape, `deny_unknown_fields` only rejects keys *no* runner knows, so the
+/// moment a second runner lands, `runner = "command"` plus a key belonging
+/// to that other runner would be accepted by serde (the field is known) and
+/// then silently dropped by the `Command` arm -- precisely the
+/// accepted-then-ignored failure `deny_unknown_fields` was chosen to
+/// prevent, and precisely what the runner seam exists to make likely. Keys
+/// scoped per runner make that a typed error instead, naming the key.
+///
+/// `runner` is repeated here because `deny_unknown_fields` sees the whole
+/// frontmatter table, tag included.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentDefinitionFrontmatter {
+struct CommandRunnerFrontmatter {
+    #[allow(
+        dead_code,
+        reason = "consumed by RunnerSelector; declared so \
+        deny_unknown_fields accepts the tag it dispatched on"
+    )]
     runner: String,
-    program: Option<String>,
+    program: String,
     #[serde(default)]
     args: Vec<String>,
 }
@@ -80,6 +105,20 @@ pub enum RunnerKind {
     /// Arguments are an explicit list -- no shell-style whitespace splitting
     /// (the naive split `parse_agent_command` did, which mangled any
     /// argument containing a space, is gone with those flags).
+    ///
+    /// **A relative `program` (or a path in `args`) resolves against the
+    /// agent's worktree** -- `warden::process::spawn` sets the child's `cwd`
+    /// to it before exec (code-standards.md § Agent Subprocess Protocol), so
+    /// `program = "./reviewer.sh"` runs *the repository's own copy of that
+    /// script, as committed at the commit under review*. For a
+    /// reviewer/tester that is a real hazard: the coder can rewrite and
+    /// commit that file, and the reviewer would then execute coder-authored
+    /// code, defeating the independence the pipeline rests on. Prefer an
+    /// absolute path for those two roles. Not enforced here: the behaviour
+    /// predates markdown definitions (`--reviewer-cmd "sh ./reviewer.sh"`
+    /// resolved identically) and refusing relative paths is a product call
+    /// that would break the plain-script case this escape hatch exists for
+    /// -- see ADR-0013's Conséquences.
     Command { program: String, args: Vec<String> },
 }
 
@@ -144,13 +183,13 @@ impl AgentDefinition {
 /// (code-standards.md: "valider toute entrée externe ... à la frontière").
 pub fn parse_agent_definition(raw: &str) -> Result<AgentDefinition> {
     let (frontmatter, body) = split_frontmatter(raw)?;
-
-    let frontmatter: AgentDefinitionFrontmatter = toml::from_str(frontmatter).map_err(|error| {
-        CoreError::MalformedAgentDefinition(format!("invalid frontmatter: {error}"))
-    })?;
-
     AgentDefinition::new(parse_runner(frontmatter)?, body)
 }
+
+/// A UTF-8 BOM: legal in a text file, and invisible in an editor, but it
+/// sits *before* the opening fence and would make the fence check fail while
+/// the first line visibly reads `+++`.
+const BYTE_ORDER_MARK: &str = "\u{feff}";
 
 /// Splits `+++\n<frontmatter>\n+++\n<body>` into its two halves.
 ///
@@ -159,6 +198,32 @@ pub fn parse_agent_definition(raw: &str) -> Result<AgentDefinition> {
 /// naming what was expected, rather than being silently read as a
 /// prompt-only file with default configuration.
 fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
+    // A CRLF or BOM file would otherwise fail the fence check below with
+    // "must start with a `+++` fence on its own first line" -- about a file
+    // whose first line *is* visibly `+++` (issue #22 review, LOW). Loud but
+    // actively misleading is its own bug, and a `.gitattributes`
+    // `text eol=crlf` checkout makes it reachable. Named explicitly instead;
+    // deliberately *not* normalised away, since silently rewriting the input
+    // would also rewrite the system prompt (stray `\r` in every line of the
+    // body) rather than just the fences.
+    if let Some(rest) = raw.strip_prefix(BYTE_ORDER_MARK) {
+        let hint = if rest.starts_with(FRONTMATTER_FENCE) {
+            " (the `+++` fence itself looks fine -- the BOM is what precedes it)"
+        } else {
+            ""
+        };
+        return Err(CoreError::MalformedAgentDefinition(format!(
+            "agent definition starts with a UTF-8 byte order mark{hint}; save it without a BOM"
+        )));
+    }
+    if raw.starts_with(&format!("{FRONTMATTER_FENCE}\r\n")) {
+        return Err(CoreError::MalformedAgentDefinition(format!(
+            "agent definition uses CRLF line endings; warden agent definitions must use LF \
+             (the `{FRONTMATTER_FENCE}` fence itself looks fine -- the line ending is what \
+             doesn't)"
+        )));
+    }
+
     let opening_fence = format!("{FRONTMATTER_FENCE}\n");
     let rest = raw.strip_prefix(&opening_fence).ok_or_else(|| {
         CoreError::MalformedAgentDefinition(format!(
@@ -183,29 +248,41 @@ fn split_frontmatter(raw: &str) -> Result<(&str, &str)> {
     )))
 }
 
-/// Validates the frontmatter's runner selector plus that runner's own keys
-/// into a [`RunnerKind`]. An unknown runner name is a typed error against a
-/// closed set (`EvidenceTool::parse`'s convention), never a fallback to
-/// whatever the single runner of the day happens to be.
-fn parse_runner(frontmatter: AgentDefinitionFrontmatter) -> Result<RunnerKind> {
-    match frontmatter.runner.as_str() {
+/// Validates the frontmatter's runner selector, then that runner's own keys,
+/// into a [`RunnerKind`].
+///
+/// Two passes over the same table, deliberately: which keys are legal is a
+/// function of *which runner* the definition names, so the selector has to be
+/// read before anything else can be judged (see
+/// [`CommandRunnerFrontmatter`]). An unknown runner name is a typed error
+/// against a closed set (`EvidenceTool::parse`'s convention), never a
+/// fallback to whatever the single runner of the day happens to be -- and it
+/// is reported *before* any key complaint, since a key can't be wrong until
+/// it's known what it was supposed to configure.
+fn parse_runner(frontmatter: &str) -> Result<RunnerKind> {
+    let selector: RunnerSelector = toml::from_str(frontmatter).map_err(invalid_frontmatter)?;
+
+    match selector.runner.as_str() {
         RunnerKind::COMMAND => {
-            let program = frontmatter
-                .program
-                .filter(|program| !program.trim().is_empty())
-                .ok_or_else(|| {
-                    CoreError::MalformedAgentDefinition(format!(
-                        "`runner = \"{}\"` requires a non-blank `program`",
-                        RunnerKind::COMMAND
-                    ))
-                })?;
+            let command: CommandRunnerFrontmatter =
+                toml::from_str(frontmatter).map_err(invalid_frontmatter)?;
+            if command.program.trim().is_empty() {
+                return Err(CoreError::MalformedAgentDefinition(format!(
+                    "`runner = \"{}\"` requires a non-blank `program`",
+                    RunnerKind::COMMAND
+                )));
+            }
             Ok(RunnerKind::Command {
-                program,
-                args: frontmatter.args,
+                program: command.program,
+                args: command.args,
             })
         }
         unknown => Err(CoreError::UnknownRunner(unknown.to_string())),
     }
+}
+
+fn invalid_frontmatter(error: toml::de::Error) -> CoreError {
+    CoreError::MalformedAgentDefinition(format!("invalid frontmatter: {error}"))
 }
 
 #[cfg(test)]
@@ -244,15 +321,21 @@ Read the JSON payload on stdin.
     }
 
     /// The `args` list is optional -- a definition naming a bare program
-    /// (the common "just run my script" case) needs no ceremony.
+    /// needs no ceremony.
+    ///
+    /// The fixture is deliberately an *absolute* path: a relative `program`
+    /// parses just as well (nothing here resolves it), but it would resolve
+    /// against the worktree under review at spawn time, which is the wrong
+    /// thing to model as "typical" for a reviewer -- see [`RunnerKind`].
     #[test]
     fn args_default_to_an_empty_list_when_omitted() {
-        let raw = "+++\nrunner = \"command\"\nprogram = \"./reviewer.sh\"\n+++\nreview it\n";
+        let raw =
+            "+++\nrunner = \"command\"\nprogram = \"/opt/warden/reviewer.sh\"\n+++\nreview it\n";
         let definition = parse_agent_definition(raw).unwrap();
         assert_eq!(
             definition.runner,
             RunnerKind::Command {
-                program: "./reviewer.sh".to_string(),
+                program: "/opt/warden/reviewer.sh".to_string(),
                 args: Vec::new(),
             }
         );
@@ -295,6 +378,59 @@ Read the JSON payload on stdin.
         let error = parse_agent_definition(raw).unwrap_err();
         assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
         assert!(error.to_string().contains("timeout"), "{error}");
+    }
+
+    /// Runner keys are scoped to their runner (ADR-0013 amendment, issue
+    /// #22 review): `program`/`args` are the `command` runner's own keys, so
+    /// they are validated against *that* runner's shape rather than a flat
+    /// table every runner shares. With a flat table, a second runner's key
+    /// would be accepted-then-ignored under `runner = "command"` -- exactly
+    /// what `deny_unknown_fields` is here to prevent. Pinned via the
+    /// observable consequence: anything outside the command runner's own key
+    /// set is refused, naming the key.
+    #[test]
+    fn a_key_outside_the_command_runners_own_set_is_rejected_naming_it() {
+        let raw =
+            "+++\nrunner = \"command\"\nprogram = \"sh\"\nendpoint = \"https://x\"\n+++\nprompt\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
+        assert!(error.to_string().contains("endpoint"), "{error}");
+    }
+
+    /// Precedence of the two-pass parse: the runner is judged first. A key
+    /// can't be reported as wrong before it's known what runner it was meant
+    /// to configure, so an unknown runner wins over any key complaint.
+    #[test]
+    fn an_unknown_runner_is_reported_before_its_keys_are_judged() {
+        let raw = "+++\nrunner = \"telepathy\"\nbrainwave = \"alpha\"\n+++\nprompt\n";
+        assert!(matches!(
+            parse_agent_definition(raw),
+            Err(CoreError::UnknownRunner(runner)) if runner == "telepathy"
+        ));
+    }
+
+    /// LOW (issue #22 review): a CRLF file's first line visibly *is* `+++`,
+    /// so "must start with a `+++` fence" would be loud but actively
+    /// misdirecting. The error must name the real cause -- and the file must
+    /// still be rejected, not silently normalised (that would rewrite the
+    /// system prompt too, not just the fences).
+    #[test]
+    fn a_crlf_definition_is_rejected_naming_the_line_endings_not_the_fence() {
+        let raw = "+++\r\nrunner = \"command\"\r\nprogram = \"sh\"\r\n+++\r\nprompt\r\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("CRLF"), "{rendered}");
+    }
+
+    /// Same misdirection, invisible cause: a BOM sits before the fence.
+    #[test]
+    fn a_bom_prefixed_definition_is_rejected_naming_the_bom_not_the_fence() {
+        let raw = "\u{feff}+++\nrunner = \"command\"\nprogram = \"sh\"\n+++\nprompt\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
+        let rendered = error.to_string();
+        assert!(rendered.contains("byte order mark"), "{rendered}");
     }
 
     #[test]

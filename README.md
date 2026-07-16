@@ -207,13 +207,24 @@ implémente la tâche demandée, puis commite dans le worktree courant.
   argument).
 - Le corps markdown après le frontmatter est le system prompt. Il ne doit pas être vide.
 
+> ⚠️ **Chemin relatif = code du dépôt sous revue.** Warden lance chaque agent avec son
+> `cwd` positionné sur le worktree du rôle (un checkout du dépôt sous revue). Un `program`
+> (ou un chemin dans `args`) **relatif** se résout donc contre ce worktree : `program =
+> "./reviewer.sh"` exécute la copie du script *telle que committée au commit sous revue* —
+> que le coder peut réécrire et committer. Pour le **reviewer** et le **tester**, préférez
+> un **chemin absolu** : sinon le reviewer exécuterait du code écrit par le coder, ce qui
+> ruine l'indépendance sur laquelle repose le pipeline. Comportement non contraint (il
+> préexiste aux définitions markdown) — voir ADR-0013.
+
 Le schéma est **warden-natif**, délibérément pas celui de `.claude/agents/*.md` : Warden
 reste agnostique de l'agent (ADR-0005), et c'est le runner qui fait le pont vers le CLI
 réellement utilisé. Toute entrée est validée à la frontière : **clé inconnue rejetée**
 (il n'y a par exemple pas de clé `timeout` — le timeout par invocation d'agent est un
-sujet à part entière, non livré ici, et une clé acceptée l'implémenterait à moitié),
-runner inconnu, `program` vide, fence manquante ou non fermée, system prompt blanc →
-erreur typée, jamais de valeur par défaut silencieuse.
+sujet à part entière, non livré ici, et une clé acceptée l'implémenterait à moitié ; ni de
+clé `tools` ou `model`, pour la même raison : aucun runner ne les consomme aujourd'hui),
+**clé d'un autre runner rejetée** (les clés sont scopées à leur runner), runner inconnu,
+`program` vide, fence manquante ou non fermée, system prompt blanc → erreur typée, jamais
+de valeur par défaut silencieuse.
 
 ### Protocole d'entrée des agents (stdin)
 

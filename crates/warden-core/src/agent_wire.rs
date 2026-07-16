@@ -265,9 +265,9 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
         AgentRole::Coder => {
             // A2 (ADR-0013): the coder branch is validated with exactly the
             // rigor it always was -- a coder payload still must carry a
-            // non-blank intent. Only `findings` relaxed: they may now be
-            // present (the reboucle's fix list) *or* empty (a run's first
-            // cycle), so there is nothing more to enforce about them here.
+            // non-blank intent. `findings` is the only invariant A2 relaxed:
+            // they may now be present (the reboucle's fix list) *or* empty (a
+            // run's first cycle).
             let intent = wire
                 .intent
                 .filter(|intent| !intent.trim().is_empty())
@@ -276,6 +276,21 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
                         "coder input is missing a non-blank intent".to_string(),
                     )
                 })?;
+            // "Intent + findings only" is an invariant `for_coder` enforces
+            // (it hardcodes both to `None`), so the parse side must enforce
+            // it too rather than quietly discard whatever a payload carried
+            // -- dropping data the sender meant to send is the silent
+            // fallback code-standards.md forbids, and the exact
+            // construction/parse asymmetry ADR-0012's M2 amendment exists to
+            // prevent. Inherited from v1, where the coder arm hardcoded the
+            // same `None`s but no constructor contradicted them; A2 is what
+            // turned it into a real invariant with a real violation.
+            if let Some(field) = coder_only_violation(&wire.target_commit, &wire.diff) {
+                return Err(CoreError::MalformedAgentInput(format!(
+                    "coder input must not carry a {field} (the coder's own worktree is already \
+                     checked out at that commit; it runs `git diff` itself)"
+                )));
+            }
             Ok(AgentInputMessage {
                 role,
                 system_prompt,
@@ -307,6 +322,20 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
                 findings,
             })
         }
+    }
+}
+
+/// Names the reviewer/tester-only field a coder payload wrongly carries, if
+/// any (A2, ADR-0013) -- so the error can say *which* field was rejected
+/// rather than just that something was wrong.
+fn coder_only_violation(
+    target_commit: &Option<String>,
+    diff: &Option<String>,
+) -> Option<&'static str> {
+    match (target_commit, diff) {
+        (Some(_), _) => Some("target_commit"),
+        (_, Some(_)) => Some("diff"),
+        _ => None,
     }
 }
 
@@ -508,12 +537,18 @@ mod tests {
         ));
     }
 
-    /// The 1 -> 2 bump (ADR-0013) is a real break, not a formality: a v1
-    /// payload carries no `system_prompt` at all, so it must be refused
-    /// outright rather than read as a prompt-less v2 payload.
+    /// The 1 -> 2 bump (ADR-0013) is a real break, not a formality: a
+    /// payload announcing v1 is refused on its *version*, never read as a
+    /// best-effort v2.
+    ///
+    /// The fixture deliberately carries a `system_prompt` even though no
+    /// real v1 payload ever did: without it, `serde_json` would reject the
+    /// missing field before the version gate is ever reached, and this test
+    /// would pass for a reason that has nothing to do with what it claims to
+    /// prove. Everything here is valid v2 except the `version` itself.
     #[test]
     fn rejects_a_version_1_payload() {
-        let json = r#"{"version":1,"role":"coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":1,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -565,6 +600,37 @@ mod tests {
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
         ));
+    }
+
+    /// A2 (issue #22): "the coder gets **intent + findings ONLY**:
+    /// `target_commit` and `diff` MUST be null/None for the coder", and the
+    /// ticket asks for that invariant to hold *both* at construction and in
+    /// `parse_agent_input_message`. A coder payload that carries a
+    /// `target_commit`/`diff` violates the invariant the constructor
+    /// enforces, so the parser must refuse it with the same rigor rather
+    /// than quietly discarding the fields (code-standards.md: no silent
+    /// fallback -- dropping data the sender meant is exactly that).
+    #[test]
+    fn rejects_a_coder_payload_that_carries_a_target_commit_or_diff() {
+        let with_commit = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":"abc123","diff":null,"findings":[]}"#;
+        assert!(
+            matches!(
+                parse_agent_input_message(with_commit),
+                Err(CoreError::MalformedAgentInput(_))
+            ),
+            "a coder payload with a target_commit must be rejected, not silently stripped: {:?}",
+            parse_agent_input_message(with_commit)
+        );
+
+        let with_diff = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":"diff --git a/x b/x","findings":[]}"#;
+        assert!(
+            matches!(
+                parse_agent_input_message(with_diff),
+                Err(CoreError::MalformedAgentInput(_))
+            ),
+            "a coder payload with a diff must be rejected, not silently stripped: {:?}",
+            parse_agent_input_message(with_diff)
+        );
     }
 
     #[test]

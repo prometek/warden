@@ -366,9 +366,12 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   pas le format `.claude/agents/*.md` de Claude Code : l'adopter coupleraient Warden à
   un CLI d'agent précis et casserait l'agnosticisme d'agent (ADR-0005). Validation à la
   frontière avec la même rigueur que `parse_agent_input_message` : clé inconnue
-  (`deny_unknown_fields`), runner inconnu, `program` manquant/vide, fence absente ou non
-  fermée, ou system prompt vide/blanc → erreur typée, jamais de valeur par défaut
-  silencieuse.
+  (`deny_unknown_fields`), **clé d'un autre runner** (les clés sont scopées à leur runner,
+  parsées en deux passes — sélecteur `runner` puis structure propre au runner — pour
+  qu'une clé destinée à un autre runner soit une erreur typée et non acceptée-puis-ignorée),
+  runner inconnu, `program` manquant/vide, fence absente ou non fermée, fichier CRLF ou
+  préfixé d'un BOM (erreur nommant la vraie cause, la fence n'étant pas en tort), ou system
+  prompt vide/blanc → erreur typée, jamais de valeur par défaut silencieuse.
 - Nouveau seam de **runner** (`warden::agent_runner::AgentRunner`), trait résolu à la
   compilation sur le modèle de `GateTrigger` : il reçoit la définition parsée et renvoie
   la commande à lancer. `CommandRunner` est l'implémentation de production.
@@ -383,7 +386,14 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   reboucle post-convergence, ADR-0011) — la même liste que reçoivent le reviewer et le
   tester (`select_prior_findings`, inchangé). Toujours **ni `target_commit` ni `diff`**
   pour le coder : son worktree est déjà checkouté sur ce commit, il peut faire son
-  `git diff` lui-même. `for_coder` refuse toujours un intent vide/blanc.
+  `git diff` lui-même. `for_coder` refuse toujours un intent vide/blanc, et
+  `parse_agent_input_message` **rejette** désormais un payload coder qui porterait un
+  `target_commit`/`diff` (en nommant le champ) plutôt que de l'écarter en silence — « intent
+  + findings seulement » est un invariant, donc validé aussi à la lecture.
+- Note de sécurité (documentée, non contrainte) : un `program`/`args` relatif dans une
+  définition se résout contre le worktree du rôle, un checkout du dépôt sous revue —
+  `program = "./reviewer.sh"` exécute donc du code que le coder peut committer. Chemin
+  absolu recommandé pour reviewer/tester (README, `warden_core::RunnerKind`, ADR-0013).
 - **Hors périmètre, inchangé** : aucun timeout par invocation d'agent (la définition
   markdown n'expose **pas** de clé `timeout` — une clé acceptée ici l'implémenterait à
   moitié ; ticket dédié) ; aucun auto-merge ni changement de la frontière credentials

@@ -164,6 +164,26 @@ struct CoderInvocation<'a> {
     cancel: CancellationToken,
 }
 
+/// Parameters for one cycle's evidence capture (ADR-0009). Grouped into a
+/// struct (rather than passed positionally) purely to keep
+/// `capture_evidence_for_cycle`/`try_capture_evidence_for_cycle`'s
+/// signatures readable — the same convention as [`CoderInvocation`] /
+/// [`FindingAgentInvocation`]; it has no behaviour of its own.
+struct EvidenceCapture<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    config: &'a RunConfig,
+    /// The command the tester was invoked with, mapped from its definition
+    /// by this run's `AgentRunner` (ADR-0013) — what `asciinema rec` records
+    /// as the session. Passed explicitly because `RunConfig` holds
+    /// definitions rather than commands: only the runner can map one to the
+    /// other.
+    tester_command: &'a AgentCommand,
+    tester_worktree_path: &'a Path,
+    cancel: CancellationToken,
+}
+
 /// Parameters for a single reviewer/tester invocation. Grouped into a
 /// struct (rather than passed positionally) purely to keep
 /// `run_finding_agent`'s signature readable — it has no behaviour of its
@@ -987,19 +1007,17 @@ impl Orchestrator {
         // tester run, still inside its worktree -- which is about to be
         // removed below, so this must happen before that, not after.
         if role == AgentRole::Tester && tester_succeeded(&findings) {
-            // `agent.command` *is* the tester command here (this branch only
-            // runs for `AgentRole::Tester`) -- passed explicitly now that
-            // `RunConfig` holds definitions rather than commands, since only
-            // the runner can map one to the other.
-            self.capture_evidence_for_cycle(
+            // `agent.command` *is* the tester command here: this branch only
+            // runs for `AgentRole::Tester`.
+            self.capture_evidence_for_cycle(EvidenceCapture {
                 run_id,
                 cycle_id,
                 cycle_number,
                 config,
-                &agent.command,
-                worktree.path(),
+                tester_command: &agent.command,
+                tester_worktree_path: worktree.path(),
                 cancel,
-            )
+            })
             .await;
         }
 
@@ -1056,29 +1074,11 @@ impl Orchestrator {
     /// "nice to have" proof. Still logged loudly (`tracing::warn!` with the
     /// full error), never swallowed silently (code-standards.md:
     /// "catch-and-ignore ... qui jette l'erreur sans la logger").
-    #[allow(clippy::too_many_arguments)]
-    async fn capture_evidence_for_cycle(
-        &self,
-        run_id: &str,
-        cycle_id: &str,
-        cycle_number: u32,
-        config: &RunConfig,
-        tester_command: &AgentCommand,
-        tester_worktree_path: &Path,
-        cancel: CancellationToken,
-    ) {
-        if let Err(error) = self
-            .try_capture_evidence_for_cycle(
-                run_id,
-                cycle_id,
-                cycle_number,
-                config,
-                tester_command,
-                tester_worktree_path,
-                cancel,
-            )
-            .await
-        {
+    async fn capture_evidence_for_cycle(&self, capture: EvidenceCapture<'_>) {
+        // Copied out before `capture` is consumed below -- both are `&str`,
+        // and the log line needs them on the failure path.
+        let (run_id, cycle_id) = (capture.run_id, capture.cycle_id);
+        if let Err(error) = self.try_capture_evidence_for_cycle(capture).await {
             tracing::warn!(
                 %error,
                 run_id,
@@ -1088,20 +1088,17 @@ impl Orchestrator {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn try_capture_evidence_for_cycle(
-        &self,
-        run_id: &str,
-        cycle_id: &str,
-        cycle_number: u32,
-        config: &RunConfig,
-        // The command the tester was invoked with, mapped from its
-        // definition by this run's `AgentRunner` -- what `asciinema rec`
-        // records as the session (ADR-0009).
-        tester_command: &AgentCommand,
-        tester_worktree_path: &Path,
-        cancel: CancellationToken,
-    ) -> Result<()> {
+    async fn try_capture_evidence_for_cycle(&self, capture: EvidenceCapture<'_>) -> Result<()> {
+        let EvidenceCapture {
+            run_id,
+            cycle_id,
+            cycle_number,
+            config,
+            tester_command,
+            tester_worktree_path,
+            cancel,
+        } = capture;
+
         let scratch_dir = config
             .warden_home
             .join("evidence")
