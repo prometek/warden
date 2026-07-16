@@ -311,3 +311,90 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   d'agent (différé, documenté dans les Conséquences d'ADR-0012) ; le coder ne reçoit toujours
   pas les findings du cycle précédent qu'il est censé corriger, seul l'intent du run l'est
   (lacune connue, également documentée dans ADR-0012).
+
+### Changed — Issue #22 / ADR-0013 : agents définis par fichier markdown (seam de runner) + findings au coder
+
+#### BREAKING (CLI) — `--coder-cmd`/`--reviewer-cmd`/`--tester-cmd` supprimés
+
+- Un rôle n'est plus une chaîne shell découpée sur les espaces : il est décrit par un
+  **fichier markdown** (frontmatter TOML fencé par `+++`, puis le corps markdown = le
+  **system prompt** du rôle). Les flags `--coder-cmd`/`--reviewer-cmd`/`--tester-cmd`
+  sont **supprimés** (migration complète annoncée dans ADR-0012, Q4) et remplacés par
+  `--coder-agent`/`--reviewer-agent`/`--tester-agent`, qui prennent le chemin d'une
+  définition. `parse_agent_command` (et son découpage naïf sur les espaces, qui
+  mutilait tout argument contenant une espace) disparaît avec eux.
+- **Migration** — chaque `--*-cmd` devient une définition markdown pointée par le
+  `--*-agent` correspondant. Aucune capacité perdue : le runner `command` est un
+  échappatoire de première classe (programme + arguments bruts), donc un simple script
+  reste une cible valide.
+
+  Avant :
+
+  ```sh
+  warden run --repo . --intent "..." \
+    --coder-cmd "claude -p coder.md" \
+    --reviewer-cmd "sh ./reviewer.sh" \
+    --tester-cmd "sh ./tester.sh"
+  ```
+
+  Après — `agents/coder.md` :
+
+  ```markdown
+  +++
+  runner = "command"
+  program = "claude"
+  args = ["-p"]
+  +++
+
+  Tu es le coder de Warden. Lis le payload JSON sur stdin (`intent`, `findings`),
+  implémente la tâche et commite dans le worktree courant.
+  ```
+
+  ```sh
+  warden run --repo . --intent "..." \
+    --coder-agent agents/coder.md \
+    --reviewer-agent agents/reviewer.md \
+    --tester-agent agents/tester.md
+  ```
+
+  Note : les arguments sont désormais une **liste explicite** (`args = ["-p", "mon
+  fichier.md"]`), plus une chaîne découpée sur les espaces.
+
+#### Autres changements
+
+- Nouveau schéma **warden-natif** (`warden_core::parse_agent_definition`), délibérément
+  pas le format `.claude/agents/*.md` de Claude Code : l'adopter coupleraient Warden à
+  un CLI d'agent précis et casserait l'agnosticisme d'agent (ADR-0005). Validation à la
+  frontière avec la même rigueur que `parse_agent_input_message` : clé inconnue
+  (`deny_unknown_fields`), **clé d'un autre runner** (les clés sont scopées à leur runner,
+  parsées en deux passes — sélecteur `runner` puis structure propre au runner — pour
+  qu'une clé destinée à un autre runner soit une erreur typée et non acceptée-puis-ignorée),
+  runner inconnu, `program` manquant/vide, fence absente ou non fermée, fichier CRLF ou
+  préfixé d'un BOM (erreur nommant la vraie cause, la fence n'étant pas en tort), ou system
+  prompt vide/blanc → erreur typée, jamais de valeur par défaut silencieuse.
+- Nouveau seam de **runner** (`warden::agent_runner::AgentRunner`), trait résolu à la
+  compilation sur le modèle de `GateTrigger` : il reçoit la définition parsée et renvoie
+  la commande à lancer. `CommandRunner` est l'implémentation de production.
+  `run_convergence_loop` prend désormais un runner en paramètre générique.
+- **Payload agent v2** (`AGENT_INPUT_VERSION` : 1 → 2, breaking pour un consommateur
+  côté agent) : chaque payload porte désormais `system_prompt` (le corps markdown de la
+  définition du rôle), transmis sur stdin — jamais par argv (fuite dans `ps`) ni par un
+  fichier de prompt temporaire, exactement les canaux qu'ADR-0012 avait déjà écartés.
+- **Le coder reçoit enfin les findings qu'il doit corriger** (lacune documentée dans les
+  Conséquences d'ADR-0012) : sur un reboucle, `AgentInputMessage::for_coder` porte
+  l'intent **et** les findings du cycle précédent (y compris les findings CI d'un
+  reboucle post-convergence, ADR-0011) — la même liste que reçoivent le reviewer et le
+  tester (`select_prior_findings`, inchangé). Toujours **ni `target_commit` ni `diff`**
+  pour le coder : son worktree est déjà checkouté sur ce commit, il peut faire son
+  `git diff` lui-même. `for_coder` refuse toujours un intent vide/blanc, et
+  `parse_agent_input_message` **rejette** désormais un payload coder qui porterait un
+  `target_commit`/`diff` (en nommant le champ) plutôt que de l'écarter en silence — « intent
+  + findings seulement » est un invariant, donc validé aussi à la lecture.
+- Note de sécurité (documentée, non contrainte) : un `program`/`args` relatif dans une
+  définition se résout contre le worktree du rôle, un checkout du dépôt sous revue —
+  `program = "./reviewer.sh"` exécute donc du code que le coder peut committer. Chemin
+  absolu recommandé pour reviewer/tester (README, `warden_core::RunnerKind`, ADR-0013).
+- **Hors périmètre, inchangé** : aucun timeout par invocation d'agent (la définition
+  markdown n'expose **pas** de clé `timeout` — une clé acceptée ici l'implémenterait à
+  moitié ; ticket dédié) ; aucun auto-merge ni changement de la frontière credentials
+  (ADR-0002/0006) ; Warden ne livre toujours aucune implémentation d'agent (ADR-0005).

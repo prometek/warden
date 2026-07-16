@@ -109,9 +109,9 @@ de convergence complète sur un dépôt existant :
 warden run \
   --repo /chemin/vers/mon-projet \
   --intent "Ajouter la validation d'email au formulaire d'inscription" \
-  --coder-cmd "claude -p coder.md" \
-  --reviewer-cmd "claude -p reviewer.md" \
-  --tester-cmd "claude -p tester.md"
+  --coder-agent agents/coder.md \
+  --reviewer-agent agents/reviewer.md \
+  --tester-agent agents/tester.md
 ```
 
 Flags de `warden run` :
@@ -121,9 +121,9 @@ Flags de `warden run` :
 - `--intent <TEXT>` — description de la tâche transmise à l'agent coder sur son `stdin`
   (voir "Protocole d'entrée des agents (stdin)" ci-dessous, ADR-0012). Doit être non vide
   (espaces exclus) — validé dès la frontière CLI plutôt qu'en profondeur du premier cycle.
-- `--coder-cmd <CMD>`, `--reviewer-cmd <CMD>`, `--tester-cmd <CMD>` — commandes shell
-  (programme + arguments, découpées sur les espaces) lançant respectivement l'agent
-  coder, reviewer et tester en sous-processus.
+- `--coder-agent <PATH>`, `--reviewer-agent <PATH>`, `--tester-agent <PATH>` — chemin de
+  la **définition markdown** de chaque rôle (voir "Définir un agent" ci-dessous,
+  ADR-0013). Remplacent `--coder-cmd`/`--reviewer-cmd`/`--tester-cmd`, supprimés.
 - `--branch <NAME>` — nom de branche enregistré pour ce run. `warden` lui-même ne pousse
   toujours rien vers un remote (aucun credential remote côté orchestrateur, ADR-0006) ;
   c'est `warden-gated` qui reçoit un push vers son dépôt bare local et décide seul de le
@@ -183,21 +183,68 @@ artefact produit, ...) est loggé (`tracing::warn!`) et n'interrompt jamais un r
 ailleurs convergent — l'absence de preuve pour un cycle donné n'est pas traitée comme un
 finding bloquant.
 
+### Définir un agent (fichier markdown)
+
+Un rôle est décrit par un fichier markdown (ADR-0013) : un frontmatter **TOML** fencé par
+`+++`, puis le corps markdown — le **system prompt** du rôle.
+
+```markdown
++++
+runner = "command"
+program = "claude"
+args = ["-p"]
++++
+
+Tu es le coder de Warden. Lis le payload JSON sur stdin (`intent`, `findings`),
+implémente la tâche demandée, puis commite dans le worktree courant.
+```
+
+- `runner` — quel runner traduit cette définition en invocation concrète. Seul
+  `"command"` existe aujourd'hui : il lance `program` avec `args` verbatim, ce qui fait
+  qu'un simple script reste une cible de première classe.
+- `program` (requis par le runner `command`) et `args` (liste explicite, optionnelle —
+  plus de découpage sur les espaces : `args = ["-c", "echo une deux"]` passe bien **un**
+  argument).
+- Le corps markdown après le frontmatter est le system prompt. Il ne doit pas être vide.
+
+> ⚠️ **Chemin relatif = code du dépôt sous revue.** Warden lance chaque agent avec son
+> `cwd` positionné sur le worktree du rôle (un checkout du dépôt sous revue). Un `program`
+> (ou un chemin dans `args`) **relatif** se résout donc contre ce worktree : `program =
+> "./reviewer.sh"` exécute la copie du script *telle que committée au commit sous revue* —
+> que le coder peut réécrire et committer. Pour le **reviewer** et le **tester**, préférez
+> un **chemin absolu** : sinon le reviewer exécuterait du code écrit par le coder, ce qui
+> ruine l'indépendance sur laquelle repose le pipeline. Comportement non contraint (il
+> préexiste aux définitions markdown) — voir ADR-0013.
+
+Le schéma est **warden-natif**, délibérément pas celui de `.claude/agents/*.md` : Warden
+reste agnostique de l'agent (ADR-0005), et c'est le runner qui fait le pont vers le CLI
+réellement utilisé. Toute entrée est validée à la frontière : **clé inconnue rejetée**
+(il n'y a par exemple pas de clé `timeout` — le timeout par invocation d'agent est un
+sujet à part entière, non livré ici, et une clé acceptée l'implémenterait à moitié ; ni de
+clé `tools` ou `model`, pour la même raison : aucun runner ne les consomme aujourd'hui),
+**clé d'un autre runner rejetée** (les clés sont scopées à leur runner), runner inconnu,
+`program` vide, fence manquante ou non fermée, system prompt blanc → erreur typée, jamais
+de valeur par défaut silencieuse.
+
 ### Protocole d'entrée des agents (stdin)
 
 Chaque agent lancé par `warden` (coder, reviewer, tester) reçoit sur son `stdin` un unique
-payload JSON versionné (`warden_core::AgentInputMessage`, ADR-0012), puis `stdin` est fermé
-(EOF) — un agent qui n'ouvre ou ne lit jamais stdin est un comportement légitime, non fatal
-au run :
+payload JSON versionné (`warden_core::AgentInputMessage`, ADR-0012/ADR-0013), puis `stdin`
+est fermé (EOF) — un agent qui n'ouvre ou ne lit jamais stdin est un comportement légitime,
+non fatal au run :
 
 ```json
-{"version": 1, "role": "coder", "intent": "Ajouter la validation d'email au formulaire d'inscription", "target_commit": null, "diff": null, "findings": []}
+{"version": 2, "role": "coder", "system_prompt": "Tu es le coder de Warden. ...", "intent": "Ajouter la validation d'email au formulaire d'inscription", "target_commit": null, "diff": null, "findings": []}
 ```
 
 - `role` : `"coder"`, `"reviewer"` ou `"tester"` — toujours présent.
-- Coder : `intent` (la tâche du run, cf. `--intent`) ; `target_commit`/`diff` valent `null` et
-  `findings` est vide — le coder ne reçoit pas encore les findings du cycle précédent qu'il
-  est censé corriger (lacune connue, voir ADR-0012).
+- `system_prompt` : le corps markdown de la définition du rôle (ADR-0013) — toujours présent,
+  jamais vide. C'est le seul canal par lequel il transite : ni argv (fuite dans `ps`), ni
+  fichier de prompt temporaire.
+- Coder : `intent` (la tâche du run, cf. `--intent`) et `findings` (ceux qui ont déclenché ce
+  cycle — ce qu'il doit corriger ; liste vide sur le premier cycle d'un run).
+  `target_commit`/`diff` valent `null` : le worktree du coder est déjà checkouté sur le commit
+  concerné, il fait son `git diff` lui-même.
 - Reviewer/tester : `target_commit` (le commit produit par le coder de ce cycle), `diff`
   (`git diff` entre le début et la fin du cycle — peut être vide si le coder n'a rien
   committé) et `findings` (ceux qui ont déclenché ce cycle, y compris les findings CI sur un

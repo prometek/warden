@@ -106,10 +106,38 @@ pub enum EvidenceError {
     InvalidStoredEvidencePath { file_path: String },
 }
 
+/// Errors loading a markdown agent definition (ADR-0013, issue #22): the
+/// `--coder-agent`/`--reviewer-agent`/`--tester-agent` file. Both variants
+/// name the path -- with three definitions per run, an error that doesn't
+/// say *which* file is barely actionable.
+#[derive(Debug, Error)]
+pub enum AgentDefinitionError {
+    #[error("failed to read agent definition {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The file was read but isn't a valid definition (no frontmatter fence,
+    /// malformed TOML, an unknown key, an unknown runner, a blank system
+    /// prompt, ...). Wraps `warden_core`'s own reason rather than
+    /// restating it -- the boundary rules live there.
+    #[error("invalid agent definition {path}: {source}")]
+    Invalid {
+        path: PathBuf,
+        #[source]
+        source: warden_core::CoreError,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum WardenError {
     #[error(transparent)]
     Worktree(#[from] WorktreeError),
+
+    #[error(transparent)]
+    AgentDefinition(#[from] AgentDefinitionError),
 
     #[error(transparent)]
     Process(#[from] ProcessError),

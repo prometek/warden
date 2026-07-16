@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
+use warden::agent_def::load_agent_definition;
+use warden::agent_runner::CommandRunner;
 use warden::db;
 use warden::gate_trigger;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
-use warden::process::AgentCommand;
 
 #[derive(Parser)]
 #[command(
@@ -61,18 +62,27 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         warden_home: Option<PathBuf>,
 
-        /// Coder agent command, e.g. `--coder-cmd "claude -p coder.md"`.
-        #[arg(long)]
-        coder_cmd: String,
+        /// Path to the coder's markdown agent definition (ADR-0013, issue
+        /// #22): TOML frontmatter (`runner`, plus that runner's keys --
+        /// `runner = "command"` takes `program`/`args`) followed by the
+        /// role's system prompt as the markdown body. Replaces the removed
+        /// `--coder-cmd`; a plain script stays a valid target via the
+        /// `command` runner.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        coder_agent: PathBuf,
 
-        /// Reviewer agent command; stdout must be the findings JSON
-        /// protocol described in `warden_core::parse_findings`.
-        #[arg(long)]
-        reviewer_cmd: String,
+        /// Path to the reviewer's markdown agent definition; the invoked
+        /// agent's stdout must be the findings JSON protocol described in
+        /// `warden_core::parse_findings`. Replaces the removed
+        /// `--reviewer-cmd`.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        reviewer_agent: PathBuf,
 
-        /// Tester agent command; same findings JSON protocol as reviewer.
-        #[arg(long)]
-        tester_cmd: String,
+        /// Path to the tester's markdown agent definition; same findings
+        /// JSON protocol as the reviewer. Replaces the removed
+        /// `--tester-cmd`.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        tester_agent: PathBuf,
 
         /// Overrides automatic project-type detection for the Evidence
         /// Capture Adapter (ADR-0009): `playwright` for web/UI projects,
@@ -123,9 +133,9 @@ async fn main() -> anyhow::Result<()> {
             branch,
             max_cycles,
             warden_home,
-            coder_cmd,
-            reviewer_cmd,
-            tester_cmd,
+            coder_agent,
+            reviewer_agent,
+            tester_agent,
             evidence_tool,
             evidence_store_in_repo,
             gate_bare_repo,
@@ -154,9 +164,9 @@ async fn main() -> anyhow::Result<()> {
                 branch,
                 max_cycles,
                 warden_home,
-                coder_cmd,
-                reviewer_cmd,
-                tester_cmd,
+                coder_agent,
+                reviewer_agent,
+                tester_agent,
                 evidence_tool,
                 evidence_store_in_repo,
                 gate,
@@ -173,9 +183,9 @@ async fn run(
     branch: String,
     max_cycles: u32,
     warden_home: Option<PathBuf>,
-    coder_cmd: String,
-    reviewer_cmd: String,
-    tester_cmd: String,
+    coder_agent: PathBuf,
+    reviewer_agent: PathBuf,
+    tester_agent: PathBuf,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
@@ -264,9 +274,9 @@ async fn run(
         branch,
         intent,
         max_cycles,
-        coder_command: parse_agent_command(&coder_cmd)?,
-        reviewer_command: parse_agent_command(&reviewer_cmd)?,
-        tester_command: parse_agent_command(&tester_cmd)?,
+        coder_agent: load_agent_definition(&coder_agent).await?,
+        reviewer_agent: load_agent_definition(&reviewer_agent).await?,
+        tester_agent: load_agent_definition(&tester_agent).await?,
         evidence_tool,
         evidence_store_in_repo,
         gate,
@@ -274,7 +284,7 @@ async fn run(
 
     let orchestrator = Orchestrator::new(pool);
     let (run_id, final_state) = orchestrator
-        .run_convergence_loop(config, cancel)
+        .run_convergence_loop(config, CommandRunner, cancel)
         .await
         .context("convergence loop failed")?;
 
@@ -282,16 +292,6 @@ async fn run(
     println!("run {run_id} finished: {final_state:?}");
 
     Ok(())
-}
-
-/// Splits a shell-style command string (e.g. `"claude -p coder.md"`) into
-/// program + args. Simple whitespace splitting is enough for Phase 1;
-/// agents that need quoting/escaping should be wrapped in their own
-/// script.
-fn parse_agent_command(raw: &str) -> anyhow::Result<AgentCommand> {
-    let mut parts = raw.split_whitespace();
-    let program = parts.next().context("agent command must not be empty")?;
-    Ok(AgentCommand::new(program, parts))
 }
 
 /// clap `value_parser` for `--evidence-tool`: delegates to

@@ -1,5 +1,5 @@
 //! End-to-end tests driving the actual `warden` binary as a user/CI caller
-//! would (`warden run --repo ... --coder-cmd ... `), not the internal
+//! would (`warden run --repo ... --coder-agent ... `), not the internal
 //! `Orchestrator` API directly. These exercise the acceptance criteria from
 //! issue #1 through the real entry point: CLI arg parsing (`main.rs`),
 //! startup crash recovery, the convergence loop, and the SQLite state left
@@ -33,13 +33,65 @@ fn init_test_repo() -> TempDir {
     dir
 }
 
-/// The CLI splits `--coder-cmd`/etc. on whitespace (see `main.rs`,
-/// `parse_agent_command`), so a script with embedded logic must live in its
-/// own file rather than being passed as an inline `sh -c "..."` string.
+/// A script with embedded logic lives in its own file, and a markdown agent
+/// definition (ADR-0013) points at it -- see [`script_agent_definition`].
 fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, body).unwrap();
     path
+}
+
+/// Writes the markdown agent definition the CLI now takes (ADR-0013, issue
+/// #22): TOML frontmatter naming the runner and its program/args, then the
+/// role's system prompt as the markdown body.
+fn write_agent_definition(
+    dir: &Path,
+    name: &str,
+    program: &str,
+    args: &[&str],
+    system_prompt: &str,
+) -> PathBuf {
+    let args_toml = args
+        .iter()
+        .map(|arg| format!("{arg:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!(
+            "+++\nrunner = \"command\"\nprogram = {program:?}\nargs = [{args_toml}]\n+++\n\n{system_prompt}\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// Wraps a test script in a definition that runs it via `sh` -- the
+/// `command` runner is the escape hatch (ADR-0013 / Q4) that keeps a plain
+/// script a first-class agent target now that `--*-cmd` is gone. Named after
+/// the script, so a test with several scripts gets one definition each.
+fn script_agent_definition(script: &Path, role: &str) -> PathBuf {
+    let name = format!("{}.agent.md", script.file_stem().unwrap().to_str().unwrap());
+    write_agent_definition(
+        script.parent().unwrap(),
+        &name,
+        "sh",
+        &[script.to_str().unwrap()],
+        &format!("You are Warden's {role}."),
+    )
+}
+
+/// A definition whose agent must never actually run: for tests where the CLI
+/// itself has to reject the invocation first.
+fn noop_agent_definition(dir: &Path, role: &str) -> PathBuf {
+    write_agent_definition(
+        dir,
+        &format!("{role}.agent.md"),
+        "sh",
+        &["-c", "true"],
+        &format!("You are Warden's {role}."),
+    )
 }
 
 fn always_converging_scripts(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -133,12 +185,14 @@ fi
             "5",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -252,12 +306,14 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -309,12 +365,14 @@ async fn e2e_failing_coder_marks_run_failed_and_never_reaches_review() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .failure();
@@ -396,12 +454,14 @@ async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_b
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -560,12 +620,14 @@ echo "{\"source\":\"tester\",\"severity\":\"info\",\"description\":\"test_target
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -773,12 +835,14 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -864,12 +928,14 @@ async fn e2e_restart_backs_up_db_before_applying_pending_migrations_via_cli() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -897,12 +963,15 @@ async fn e2e_restart_backs_up_db_before_applying_pending_migrations_via_cli() {
     assert_eq!(run.state, RunState::Converged);
 }
 
-/// A malformed `--coder-cmd` (empty string) must be a clean CLI error, not a
-/// panic — realistic misuse from a human typo or a bad config file.
+/// A `--coder-agent` pointing at a file that isn't there must be a clean CLI
+/// error naming the path, not a panic — the realistic misuse (a typo, a
+/// moved file) now that a role is configured by file rather than by string.
 #[test]
-fn e2e_empty_agent_command_is_a_clean_cli_error_not_a_panic() {
+fn e2e_a_missing_agent_definition_is_a_clean_cli_error_not_a_panic() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let missing = definitions.path().join("coder.agent.md");
 
     Command::cargo_bin("warden")
         .unwrap()
@@ -914,16 +983,105 @@ fn e2e_empty_agent_command_is_a_clean_cli_error_not_a_panic() {
             "irrelevant",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            "",
-            "--reviewer-cmd",
-            "sh -c true",
-            "--tester-cmd",
-            "sh -c true",
+            "--coder-agent",
+            missing.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
         ])
         .assert()
         .failure()
-        .stderr(contains("agent command must not be empty"));
+        .stderr(contains("failed to read agent definition"))
+        .stderr(contains("coder.agent.md"));
+}
+
+/// ADR-0013 / Q3 through the real entry point: an unknown frontmatter key is
+/// rejected outright (`deny_unknown_fields`), naming the offending key —
+/// never silently ignored, which would run an agent configured differently
+/// than its author asked for.
+#[test]
+fn e2e_an_agent_definition_with_an_unknown_key_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let bad = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &bad,
+        "+++\nrunner = \"command\"\nprogram = \"sh\"\nmodel = \"opus\"\n+++\n\nbe a coder\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            bad.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("model"));
+}
+
+/// ADR-0013 / Q3: a definition whose markdown body says nothing configures
+/// nothing — a typed error at the boundary, not an agent silently invoked
+/// with an empty system prompt.
+#[test]
+fn e2e_an_agent_definition_with_a_blank_system_prompt_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let blank = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &blank,
+        "+++\nrunner = \"command\"\nprogram = \"sh\"\n+++\n\n   \n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            blank.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("system prompt"));
 }
 
 /// Re-test cycle (issue #20 review fix, fdcaa4e), M2 intent: warden must
@@ -937,6 +1095,7 @@ fn e2e_empty_agent_command_is_a_clean_cli_error_not_a_panic() {
 fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
 
     Command::cargo_bin("warden")
         .unwrap()
@@ -948,12 +1107,18 @@ fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
             "",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            "sh -c true",
-            "--reviewer-cmd",
-            "sh -c true",
-            "--tester-cmd",
-            "sh -c true",
+            "--coder-agent",
+            noop_agent_definition(definitions.path(), "coder")
+                .to_str()
+                .unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
         ])
         .assert()
         .failure()
@@ -976,6 +1141,7 @@ fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
 fn e2e_whitespace_only_intent_is_a_clean_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
 
     Command::cargo_bin("warden")
         .unwrap()
@@ -987,12 +1153,18 @@ fn e2e_whitespace_only_intent_is_a_clean_cli_error() {
             "   \t  ",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            "sh -c true",
-            "--reviewer-cmd",
-            "sh -c true",
-            "--tester-cmd",
-            "sh -c true",
+            "--coder-agent",
+            noop_agent_definition(definitions.path(), "coder")
+                .to_str()
+                .unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
         ])
         .assert()
         .failure()
@@ -1046,12 +1218,14 @@ exit 0
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1064,6 +1238,7 @@ exit 0
 fn e2e_non_git_repo_path_is_a_clean_cli_error() {
     let not_a_repo = TempDir::new().unwrap();
     let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
 
     Command::cargo_bin("warden")
         .unwrap()
@@ -1075,12 +1250,18 @@ fn e2e_non_git_repo_path_is_a_clean_cli_error() {
             "irrelevant",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            "sh -c true",
-            "--reviewer-cmd",
-            "sh -c true",
-            "--tester-cmd",
-            "sh -c true",
+            "--coder-agent",
+            noop_agent_definition(definitions.path(), "coder")
+                .to_str()
+                .unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
         ])
         .assert()
         .failure();
@@ -1201,12 +1382,14 @@ async fn e2e_cli_project_selects_asciinema_and_evidence_is_stored_and_committed_
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1315,12 +1498,14 @@ async fn e2e_web_project_marker_selects_playwright_and_evidence_is_committed() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1398,12 +1583,14 @@ async fn e2e_evidence_tool_override_wins_over_web_auto_detection() {
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
             "--evidence-tool",
             "asciinema",
         ])
@@ -1456,12 +1643,14 @@ async fn e2e_evidence_store_in_repo_false_keeps_evidence_local_and_never_commits
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
             "--evidence-store-in-repo",
             "false",
         ])
@@ -1548,12 +1737,14 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1632,12 +1823,14 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1649,8 +1842,13 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
         panic!("coder's captured stdin was not valid JSON: {error}\nraw: {raw:?}")
     });
 
-    assert_eq!(payload["version"], 1);
+    // ADR-0013: version 2 -- every payload now carries the role's
+    // `system_prompt` from its markdown definition, and a coder payload may
+    // carry the findings it must fix (none here: this run converges on its
+    // first cycle, so nothing triggered it).
+    assert_eq!(payload["version"], 2);
     assert_eq!(payload["role"], "coder");
+    assert_eq!(payload["system_prompt"], "You are Warden's coder.");
     assert_eq!(payload["intent"], intent);
     assert!(payload["target_commit"].is_null());
     assert!(payload["diff"].is_null());
@@ -1711,12 +1909,14 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1743,8 +1943,13 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
         let payload: serde_json::Value = serde_json::from_str(&raw)
             .unwrap_or_else(|error| panic!("{role}'s captured stdin was not valid JSON: {error}"));
 
-        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["version"], 2);
         assert_eq!(payload["role"], role);
+        assert_eq!(
+            payload["system_prompt"],
+            format!("You are Warden's {role}."),
+            "{role} must receive its own definition's system prompt (ADR-0013)"
+        );
         assert!(payload["intent"].is_null());
         assert_eq!(
             payload["target_commit"], expected_commit,
@@ -1762,17 +1967,18 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
 }
 
 /// Scope B's third promise: prior-cycle findings (the ones that triggered a
-/// reboucle) must reach the *next* cycle's reviewer/tester over this same
-/// channel — not just be recorded in SQLite. A naive implementation could
-/// easily thread the run intent/commit/diff through correctly while leaving
+/// reboucle) must reach the *next* cycle's agents over this same channel —
+/// not just be recorded in SQLite. A naive implementation could easily
+/// thread the run intent/commit/diff through correctly while leaving
 /// `findings` empty or stale; this is the case the task flags as "easy to
-/// wire wrong". Both reviewer and tester capture every stdin payload they
+/// wire wrong". Extended for A2 (ADR-0013, issue #22): the coder — the role
+/// that must actually fix them — is now fed the same list, so it captures
+/// its payloads here too. All three agents capture every stdin payload they
 /// receive (one per cycle, via a counter file) so this test can inspect
 /// cycle 1's (no prior findings) and cycle 2's (the reboucle-triggering
 /// finding from cycle 1) payloads independently.
 #[tokio::test]
-async fn e2e_prior_cycle_findings_from_a_reboucle_reach_the_next_cycles_reviewer_and_tester_stdin()
-{
+async fn e2e_prior_cycle_findings_from_a_reboucle_reach_the_next_cycles_agents_stdin() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let scripts_dir = TempDir::new().unwrap();
@@ -1785,7 +1991,12 @@ async fn e2e_prior_cycle_findings_from_a_reboucle_reach_the_next_cycles_reviewer
     let coder = write_script(
         scripts_dir.path(),
         "coder.sh",
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
+INPUT=$(cat)
+N=$(ls "{captures}"/coder_stdin_*.json 2>/dev/null | wc -l | tr -d ' ')
+NEXT=$((N + 1))
+printf '%s' "$INPUT" > "{captures}/coder_stdin_$NEXT.json"
 if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
     echo fixed > status.txt
 else
@@ -1794,6 +2005,8 @@ fi
 git add status.txt
 git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
 "#,
+            captures = captures.path().display()
+        ),
     );
     let reviewer = write_script(
         scripts_dir.path(),
@@ -1840,12 +2053,14 @@ true
             "5",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1889,6 +2104,47 @@ true
     let tester_cycle2_findings = tester_cycle2["findings"].as_array().unwrap();
     assert_eq!(tester_cycle2_findings.len(), 1);
     assert_eq!(tester_cycle2_findings[0]["description"], "status is broken");
+
+    // A2 (ADR-0013, issue #22): the role that must actually *fix* the
+    // findings finally receives them. Cycle 1's coder has nothing to fix;
+    // cycle 2's gets exactly the finding that triggered the reboucle -- and
+    // still no `target_commit`/`diff`, which it can read from its own
+    // worktree.
+    let coder_cycle1: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("coder_stdin_1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        coder_cycle1["findings"].as_array().unwrap().len(),
+        0,
+        "cycle 1 has no prior cycle, so the coder must see no findings to fix"
+    );
+
+    let coder_cycle2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("coder_stdin_2.json")).unwrap(),
+    )
+    .unwrap();
+    let coder_cycle2_findings = coder_cycle2["findings"].as_array().unwrap();
+    assert_eq!(
+        coder_cycle2_findings.len(),
+        1,
+        "cycle 2's coder must receive exactly the finding it is being asked to fix"
+    );
+    assert_eq!(coder_cycle2_findings[0]["source"], "reviewer");
+    assert_eq!(coder_cycle2_findings[0]["severity"], "blocking");
+    assert_eq!(coder_cycle2_findings[0]["description"], "status is broken");
+    assert_eq!(
+        coder_cycle2["intent"], "flip status to fixed via a reboucle",
+        "the run intent must still reach the coder alongside its findings"
+    );
+    assert!(
+        coder_cycle2["target_commit"].is_null(),
+        "A2: the coder gets intent + findings only, never a target_commit"
+    );
+    assert!(
+        coder_cycle2["diff"].is_null(),
+        "A2: the coder reads its own worktree's diff rather than being sent one"
+    );
 }
 
 /// Negative counterpart of the above (Architecture.md §10, "Isolation
@@ -1943,12 +2199,14 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
-            "--coder-cmd",
-            &format!("sh {}", coder.display()),
-            "--reviewer-cmd",
-            &format!("sh {}", reviewer.display()),
-            "--tester-cmd",
-            &format!("sh {}", tester.display()),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -1975,4 +2233,716 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
     let stdin_dump = std::fs::read_to_string(captures.path().join("coder_stdin.json")).unwrap();
     let payload: serde_json::Value = serde_json::from_str(&stdin_dump).unwrap();
     assert_eq!(payload["intent"], intent);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #22 verification suite (derived from the ticket's promises, not from
+// the implementation): A1 (md-defined agents behind a runner seam, `--*-cmd`
+// removed) and A2 (the coder receives the findings it must fix).
+// ---------------------------------------------------------------------------
+
+/// A1 / Q4 (ticket: "`--coder-cmd`/`--reviewer-cmd`/`--tester-cmd` are
+/// **removed** in this ticket, not kept alongside"). A removed flag that is
+/// silently ignored is the worst outcome of a breaking migration: the user's
+/// hand-wired command would vanish while the run proceeds with something
+/// else. Each removed flag must make the CLI *fail*, and fail before any
+/// state db exists.
+#[test]
+fn e2e_the_removed_cmd_flags_are_rejected_by_the_cli_not_silently_ignored() {
+    for removed_flag in ["--coder-cmd", "--reviewer-cmd", "--tester-cmd"] {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let definitions = TempDir::new().unwrap();
+
+        Command::cargo_bin("warden")
+            .unwrap()
+            .args([
+                "run",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--intent",
+                "irrelevant",
+                "--warden-home",
+                warden_home.path().to_str().unwrap(),
+                "--coder-agent",
+                noop_agent_definition(definitions.path(), "coder")
+                    .to_str()
+                    .unwrap(),
+                "--reviewer-agent",
+                noop_agent_definition(definitions.path(), "reviewer")
+                    .to_str()
+                    .unwrap(),
+                "--tester-agent",
+                noop_agent_definition(definitions.path(), "tester")
+                    .to_str()
+                    .unwrap(),
+                removed_flag,
+                "sh -c true",
+            ])
+            .assert()
+            .failure()
+            .stderr(contains("unexpected argument"));
+
+        assert!(
+            !warden_home.path().join("state.db").exists(),
+            "{removed_flag} must be rejected during arg parsing, before any state db is created"
+        );
+    }
+}
+
+/// A1 end-to-end through the real binary, driven by three real `.md`
+/// definition files: each role's *own* system prompt reaches its agent over
+/// stdin, and the invocation each agent observes (`$0 $*`) is the one the
+/// **runner** built from that definition's `program`/`args` — proven from the
+/// subprocess's own point of view, not from warden's internals.
+///
+/// Each role gets a distinct prompt and a distinct extra argument, so a
+/// mix-up between roles fails rather than passing by coincidence.
+#[tokio::test]
+async fn e2e_three_md_definitions_drive_the_runner_built_invocation_and_each_roles_prompt() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    // Each script dumps its stdin payload and its own argv, then behaves.
+    let dump = |role: &str, extra: &str| {
+        format!(
+            r#"#!/bin/sh
+printf '%s' "$(cat)" > "{captures}/{role}_stdin.json"
+printf '%s' "$*" > "{captures}/{role}_argv.txt"
+{extra}
+"#,
+            captures = captures.path().display(),
+            role = role,
+            extra = extra,
+        )
+    };
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        &dump(
+            "coder",
+            r#"echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+        ),
+    );
+    let reviewer = write_script(scripts_dir.path(), "reviewer.sh", &dump("reviewer", "true"));
+    let tester = write_script(scripts_dir.path(), "tester.sh", &dump("tester", "true"));
+
+    // `sh <script> --role-marker-<role>`: the trailing marker is an argument
+    // only the definition's `args` list can put there, so observing it in the
+    // child's `$*` proves the runner built the invocation from the `.md`.
+    let definition_for = |script: &PathBuf, role: &str, prompt: &str| {
+        write_agent_definition(
+            scripts_dir.path(),
+            &format!("{role}.agent.md"),
+            "sh",
+            &[script.to_str().unwrap(), &format!("--role-marker-{role}")],
+            prompt,
+        )
+    };
+
+    let coder_prompt = "You are the CODER. Prompt marker: alpha-coder-prompt.";
+    let reviewer_prompt = "You are the REVIEWER. Prompt marker: beta-reviewer-prompt.";
+    let tester_prompt = "You are the TESTER. Prompt marker: gamma-tester-prompt.";
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "drive three md-defined agents",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            definition_for(&coder, "coder", coder_prompt)
+                .to_str()
+                .unwrap(),
+            "--reviewer-agent",
+            definition_for(&reviewer, "reviewer", reviewer_prompt)
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            definition_for(&tester, "tester", tester_prompt)
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    for (role, expected_prompt) in [
+        ("coder", coder_prompt),
+        ("reviewer", reviewer_prompt),
+        ("tester", tester_prompt),
+    ] {
+        let payload: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(captures.path().join(format!("{role}_stdin.json")))
+                .unwrap_or_else(|error| panic!("{role} never dumped its stdin: {error}")),
+        )
+        .unwrap();
+
+        assert_eq!(payload["role"], role);
+        assert_eq!(payload["version"], 2, "AGENT_INPUT_VERSION is 2 (A1)");
+        assert_eq!(
+            payload["system_prompt"], expected_prompt,
+            "the {role}'s own definition's system prompt must reach it over stdin"
+        );
+
+        // The invocation the runner built from the definition's args list.
+        let argv = std::fs::read_to_string(captures.path().join(format!("{role}_argv.txt")))
+            .unwrap_or_else(|error| panic!("{role} never dumped its argv: {error}"));
+        assert!(
+            argv.contains(&format!("--role-marker-{role}")),
+            "the {role}'s invocation must be the one its definition declared; argv was {argv:?}"
+        );
+        assert!(
+            !argv.contains("Prompt marker"),
+            "the system prompt must ride stdin, never argv (visible in `ps`); argv was {argv:?}"
+        );
+    }
+}
+
+/// A2 end-to-end, the ticket's full stdin contract for a reboucle coder:
+/// the reviewer raises a blocking finding in cycle 1, and cycle 2's coder
+/// payload must carry that finding **and** `version: 2`, **and** its
+/// definition's `system_prompt`, **and** null `target_commit`/`diff`
+/// (decided design: intent + findings only).
+#[tokio::test]
+async fn e2e_coder_reboucle_payload_carries_findings_version_2_a_prompt_and_no_commit_or_diff() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    let coder = write_script(
+        scripts_dir.path(),
+        "coder.sh",
+        &format!(
+            r#"#!/bin/sh
+INPUT=$(cat)
+N=$(ls "{captures}"/coder_stdin_*.json 2>/dev/null | wc -l | tr -d ' ')
+NEXT=$((N + 1))
+printf '%s' "$INPUT" > "{captures}/coder_stdin_$NEXT.json"
+if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+    echo fixed > status.txt
+else
+    echo broken > status.txt
+fi
+git add status.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let reviewer = write_script(
+        scripts_dir.path(),
+        "reviewer.sh",
+        r#"#!/bin/sh
+cat > /dev/null
+if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+    echo '{"source":"reviewer","severity":"blocking","description":"status is broken","action":"write fixed"}'
+fi
+"#,
+    );
+    let tester = write_script(
+        scripts_dir.path(),
+        "tester.sh",
+        "#!/bin/sh\ncat > /dev/null\ntrue\n",
+    );
+
+    let coder_prompt = "You are Warden's coder. Fix what the reviewer found.";
+    let coder_def = write_agent_definition(
+        scripts_dir.path(),
+        "coder.agent.md",
+        "sh",
+        &[coder.to_str().unwrap()],
+        coder_prompt,
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "flip status to fixed",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            coder_def.to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let cycle2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("coder_stdin_2.json"))
+            .expect("the run must have reboucled into a second coder cycle"),
+    )
+    .unwrap();
+
+    assert_eq!(cycle2["version"], 2, "A1: AGENT_INPUT_VERSION is 2");
+    assert_eq!(cycle2["role"], "coder");
+    assert_eq!(
+        cycle2["system_prompt"], coder_prompt,
+        "A1: the coder's definition prompt rides every payload, reboucle included"
+    );
+    assert_eq!(cycle2["intent"], "flip status to fixed");
+
+    let findings = cycle2["findings"].as_array().unwrap();
+    assert_eq!(
+        findings.len(),
+        1,
+        "A2: cycle 2's coder must receive the blocking finding it is asked to fix"
+    );
+    assert_eq!(findings[0]["source"], "reviewer");
+    assert_eq!(findings[0]["severity"], "blocking");
+    assert_eq!(findings[0]["description"], "status is broken");
+    assert_eq!(findings[0]["action"], "write fixed");
+
+    assert!(
+        cycle2["target_commit"].is_null(),
+        "A2 decided design: the coder gets intent + findings only"
+    );
+    assert!(
+        cycle2["diff"].is_null(),
+        "A2 decided design: no diff for the coder"
+    );
+
+    // The payload warden emits must be one warden's own boundary parser
+    // accepts -- the round-trip invariant the ticket asks for.
+    let raw = std::fs::read_to_string(captures.path().join("coder_stdin_2.json")).unwrap();
+    let parsed = warden_core::parse_agent_input_message(&raw)
+        .expect("warden must never emit a payload its own parser rejects");
+    assert_eq!(parsed.role, AgentRole::Coder);
+    assert_eq!(parsed.findings.len(), 1);
+    assert_eq!(parsed.findings[0].source, FindingSource::Reviewer);
+    assert!(parsed.target_commit.is_none());
+    assert!(parsed.diff.is_none());
+}
+
+/// Ticket probe: are definitions resolved **before** the `runs` row is
+/// written? A bad `--tester-agent` path (the *last* one resolved) must fail
+/// fast, leaving no half-started run behind for crash recovery to reap.
+#[tokio::test]
+async fn e2e_a_bad_definition_path_fails_before_any_run_row_is_written() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "should never start",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            noop_agent_definition(definitions.path(), "coder")
+                .to_str()
+                .unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            definitions.path().join("nope.md").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("nope.md"));
+
+    let db_path = warden_home.path().join("state.db");
+    if db_path.exists() {
+        let pool = warden::db::connect(&db_path).await.unwrap();
+        let (runs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            runs, 0,
+            "an unresolvable agent definition must fail before a runs row is written"
+        );
+    }
+}
+
+/// Ticket probe: a definition path that is a **directory**. Must be a clean,
+/// path-naming error, not a panic and not a confusing parse error.
+#[test]
+fn e2e_a_definition_path_that_is_a_directory_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let a_directory = definitions.path().join("coder.agent.md");
+    std::fs::create_dir(&a_directory).unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            a_directory.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("agent definition"))
+        .stderr(contains("coder.agent.md"));
+}
+
+/// Ticket probe: an **empty** definition file. No frontmatter fence at all,
+/// so it must be rejected as malformed, naming the file.
+#[test]
+fn e2e_an_empty_definition_file_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let empty = definitions.path().join("coder.agent.md");
+    std::fs::write(&empty, "").unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            empty.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("coder.agent.md"))
+        .stderr(contains("frontmatter"));
+}
+
+/// Ticket probe: the **same** `.md` passed for two roles. Nothing in the
+/// ticket forbids it, so it must work -- and each role must still be told its
+/// own `role`, since that is the only thing distinguishing the two payloads.
+#[tokio::test]
+async fn e2e_the_same_definition_file_reused_for_reviewer_and_tester_still_tags_each_role() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    let (coder, _, _) = always_converging_scripts(scripts_dir.path());
+    // One script, one definition, both finding roles: dumps per-role so the
+    // two invocations can be told apart.
+    let shared = write_script(
+        scripts_dir.path(),
+        "shared.sh",
+        &format!(
+            r#"#!/bin/sh
+INPUT=$(cat)
+ROLE=$(printf '%s' "$INPUT" | sed 's/.*"role":"\([a-z]*\)".*/\1/')
+printf '%s' "$INPUT" > "{captures}/shared_$ROLE.json"
+true
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let shared_definition = write_agent_definition(
+        scripts_dir.path(),
+        "shared.agent.md",
+        "sh",
+        &[shared.to_str().unwrap()],
+        "You are a Warden finding agent.",
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "share one definition across two roles",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            script_agent_definition(&coder, "coder").to_str().unwrap(),
+            "--reviewer-agent",
+            shared_definition.to_str().unwrap(),
+            "--tester-agent",
+            shared_definition.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    for role in ["reviewer", "tester"] {
+        let payload: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(captures.path().join(format!("shared_{role}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("{role} never ran from the shared definition: {error}")
+                }),
+        )
+        .unwrap();
+        assert_eq!(payload["role"], role);
+        assert_eq!(payload["system_prompt"], "You are a Warden finding agent.");
+    }
+}
+
+/// Ticket probe: a non-ASCII, multi-line system prompt and intent must
+/// survive the stdin round-trip byte-for-byte -- JSON encoding of the payload
+/// is the only channel carrying them, and a mangled prompt would silently
+/// misconfigure the agent.
+#[tokio::test]
+async fn e2e_non_ascii_multiline_prompt_and_intent_survive_the_stdin_round_trip() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let scripts_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    // Written after nothing else touches `coder.sh` -- `always_converging_scripts`
+    // would overwrite it with its own non-capturing coder.
+    let coder = write_script(
+        scripts_dir.path(),
+        "capturing_coder.sh",
+        &format!(
+            r#"#!/bin/sh
+printf '%s' "$(cat)" > "{captures}/coder_stdin.json"
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#,
+            captures = captures.path().display()
+        ),
+    );
+    let reviewer = write_script(
+        scripts_dir.path(),
+        "reviewer.sh",
+        "#!/bin/sh\ncat > /dev/null\ntrue\n",
+    );
+    let tester = write_script(
+        scripts_dir.path(),
+        "tester.sh",
+        "#!/bin/sh\ncat > /dev/null\ntrue\n",
+    );
+
+    // Multi-line, accented, emoji, quotes, and a tab: the body is the prompt.
+    let prompt = "Tu es le codeur de Warden.\n\nRègles : « ne jamais » deviner 🤖\n\tIndenté.";
+    let intent = "Ajouter le résumé « fin » — avec un tiret cadratin 🚀";
+    let coder_definition = write_agent_definition(
+        scripts_dir.path(),
+        "coder.agent.md",
+        "sh",
+        &[coder.to_str().unwrap()],
+        prompt,
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            intent,
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            coder_definition.to_str().unwrap(),
+            "--reviewer-agent",
+            script_agent_definition(&reviewer, "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            script_agent_definition(&tester, "tester").to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let payload: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("coder_stdin.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["system_prompt"], prompt,
+        "a non-ASCII multi-line prompt must reach the agent intact"
+    );
+    assert_eq!(
+        payload["intent"], intent,
+        "a non-ASCII intent must reach the agent intact"
+    );
+}
+
+/// Issue #22 fix-cycle-1 probe, at the real CLI boundary: a definition file
+/// saved with CRLF line endings (a `.gitattributes text eol=crlf` checkout
+/// makes this reachable) has a first line that visibly *is* `+++`, so the
+/// naive fence error would be loud but actively misleading. Driven through
+/// the real binary: the error must name the line endings and the file, not
+/// misdirect to the fence.
+#[test]
+fn e2e_a_crlf_definition_file_is_rejected_naming_the_line_endings_not_the_fence() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let crlf = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &crlf,
+        "+++\r\nrunner = \"command\"\r\nprogram = \"sh\"\r\n+++\r\n\r\nbe a coder\r\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            crlf.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("coder.agent.md"))
+        .stderr(contains("CRLF"));
+}
+
+/// Issue #22 fix-cycle-1 probe: same misdirection, invisible cause. A UTF-8
+/// BOM sits before the fence, so "must start with a `+++` fence" would be
+/// baffling. Through the real binary the error must name the BOM.
+#[test]
+fn e2e_a_bom_prefixed_definition_file_is_rejected_naming_the_bom_not_the_fence() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let bom = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &bom,
+        "\u{feff}+++\nrunner = \"command\"\nprogram = \"sh\"\n+++\n\nbe a coder\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            bom.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("coder.agent.md"))
+        .stderr(contains("byte order mark"));
+}
+
+/// Issue #22 fix-cycle-1 probe, at the real CLI boundary: a key that belongs
+/// to a different/hypothetical runner under `runner = "command"` must be a
+/// typed error naming the key -- the two-pass scoping
+/// (`CommandRunnerFrontmatter` with per-runner `deny_unknown_fields`) exists
+/// so this can't be accepted-then-ignored once a second runner lands. With
+/// one runner today the observable consequence is identical to any unknown
+/// key, so this pins the behaviour through the user-facing stderr rather than
+/// trusting the internal struct layout.
+#[test]
+fn e2e_a_foreign_runner_key_is_rejected_at_the_cli_naming_the_key() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let definitions = TempDir::new().unwrap();
+    let bad = definitions.path().join("coder.agent.md");
+    std::fs::write(
+        &bad,
+        "+++\nrunner = \"command\"\nprogram = \"sh\"\nendpoint = \"https://api.example\"\n+++\n\nbe a coder\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--coder-agent",
+            bad.to_str().unwrap(),
+            "--reviewer-agent",
+            noop_agent_definition(definitions.path(), "reviewer")
+                .to_str()
+                .unwrap(),
+            "--tester-agent",
+            noop_agent_definition(definitions.path(), "tester")
+                .to_str()
+                .unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid agent definition"))
+        .stderr(contains("endpoint"));
 }

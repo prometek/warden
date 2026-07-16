@@ -18,10 +18,11 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, decide_next_state_after_ci, parse_findings, AgentRole, CiResultMessage,
-    EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
+    decide_next_state, decide_next_state_after_ci, parse_findings, AgentDefinition, AgentRole,
+    CiResultMessage, EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
 };
 
+use crate::agent_runner::AgentRunner;
 use crate::ci_channel::CiResultListener;
 use crate::db;
 use crate::error::{Result, WardenError, WorktreeError};
@@ -43,10 +44,12 @@ const GATE_CHILD_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 /// Static configuration for a single run of the convergence loop.
 ///
-/// `coder_command`/`reviewer_command`/`tester_command` are the CLI agents to
-/// invoke for each role (ADR-0005: Warden spawns whatever CLI the caller
-/// configures; it never calls an LLM API directly, and Phase 1 does not
-/// hardcode which agent binary is used).
+/// `coder_agent`/`reviewer_agent`/`tester_agent` are the markdown
+/// definitions of each role (ADR-0013, issue #22): what the role *is* (its
+/// system prompt) plus how to invoke it (its runner). An [`AgentRunner`]
+/// maps each onto the concrete CLI to spawn -- ADR-0005: Warden spawns
+/// whatever CLI the caller configures, never calls an LLM API directly, and
+/// hardcodes no agent binary.
 pub struct RunConfig {
     /// The user's pre-existing repository. Never written to directly — only
     /// read to resolve the starting commit and to run `git worktree`.
@@ -56,9 +59,9 @@ pub struct RunConfig {
     pub branch: String,
     pub intent: String,
     pub max_cycles: u32,
-    pub coder_command: AgentCommand,
-    pub reviewer_command: AgentCommand,
-    pub tester_command: AgentCommand,
+    pub coder_agent: AgentDefinition,
+    pub reviewer_agent: AgentDefinition,
+    pub tester_agent: AgentDefinition,
     /// Overrides automatic project-type detection for the Evidence Capture
     /// Adapter (`evidence.tool`, ADR-0009). `None` means "detect from the
     /// repo" (`warden_core::detect_project_type`).
@@ -98,6 +101,47 @@ pub struct GateConfig {
     pub inactivity_timeout_secs: u64,
 }
 
+/// One role's markdown definition (ADR-0013), already mapped onto the
+/// command to spawn for it: what to run, and what to tell it it is.
+///
+/// Resolved once per run rather than per invocation — a definition is static
+/// for a run's whole lifetime and an [`AgentRunner`] is a pure mapping, so
+/// re-running it per cycle would produce the identical command.
+struct ResolvedAgent {
+    command: AgentCommand,
+    /// `AgentDefinition::system_prompt`, cloned once per run. Owned rather
+    /// than borrowed from `RunConfig` purely to keep a lifetime out of every
+    /// signature it's threaded through.
+    system_prompt: String,
+}
+
+/// The three roles' definitions, resolved through this run's
+/// [`AgentRunner`].
+struct ResolvedAgents {
+    coder: ResolvedAgent,
+    reviewer: ResolvedAgent,
+    tester: ResolvedAgent,
+}
+
+impl ResolvedAgents {
+    /// Maps all three definitions up-front, before the loop spawns anything:
+    /// a definition the runner cannot honour must fail the run at its start,
+    /// not two cycles in when that role first happens to be invoked.
+    fn resolve<R: AgentRunner>(runner: &R, config: &RunConfig) -> Result<Self> {
+        let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
+            Ok(ResolvedAgent {
+                command: runner.build_command(definition)?,
+                system_prompt: definition.system_prompt.clone(),
+            })
+        };
+        Ok(Self {
+            coder: resolve_one(&config.coder_agent)?,
+            reviewer: resolve_one(&config.reviewer_agent)?,
+            tester: resolve_one(&config.tester_agent)?,
+        })
+    }
+}
+
 /// Parameters for a single coder invocation. Grouped into a struct (rather
 /// than passed positionally) purely to keep `run_coder`'s signature
 /// readable — it has no behaviour of its own.
@@ -106,8 +150,37 @@ struct CoderInvocation<'a> {
     cycle_id: &'a str,
     cycle_number: u32,
     config: &'a RunConfig,
+    /// This run's coder command + system prompt (ADR-0013).
+    agent: &'a ResolvedAgent,
     worktree_manager: &'a WorktreeManager,
     base_commit: &'a str,
+    /// A2 (ADR-0013, issue #22): the findings that triggered this cycle —
+    /// what the coder is being asked to fix, fed to it as
+    /// `AgentInputMessage::findings`. The very same list the reviewer/tester
+    /// of this cycle are told triggered it (`select_prior_findings`),
+    /// including CI findings on a post-convergence reboucle (ADR-0011).
+    /// Empty on a run's first cycle.
+    prior_findings: &'a [Finding],
+    cancel: CancellationToken,
+}
+
+/// Parameters for one cycle's evidence capture (ADR-0009). Grouped into a
+/// struct (rather than passed positionally) purely to keep
+/// `capture_evidence_for_cycle`/`try_capture_evidence_for_cycle`'s
+/// signatures readable — the same convention as [`CoderInvocation`] /
+/// [`FindingAgentInvocation`]; it has no behaviour of its own.
+struct EvidenceCapture<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    config: &'a RunConfig,
+    /// The command the tester was invoked with, mapped from its definition
+    /// by this run's `AgentRunner` (ADR-0013) — what `asciinema rec` records
+    /// as the session. Passed explicitly because `RunConfig` holds
+    /// definitions rather than commands: only the runner can map one to the
+    /// other.
+    tester_command: &'a AgentCommand,
+    tester_worktree_path: &'a Path,
     cancel: CancellationToken,
 }
 
@@ -120,7 +193,8 @@ struct FindingAgentInvocation<'a> {
     cycle_id: &'a str,
     cycle_number: u32,
     role: AgentRole,
-    command: &'a AgentCommand,
+    /// This role's command + system prompt (ADR-0013).
+    agent: &'a ResolvedAgent,
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
     /// The diff this cycle's coder introduced against the cycle's starting
@@ -240,12 +314,22 @@ impl Orchestrator {
     /// alternates coder / review+test cycles until convergence, the cycle
     /// budget is exhausted, or `cancel` fires. Returns the run id and its
     /// final [`RunState`].
-    pub async fn run_convergence_loop(
+    ///
+    /// `runner` maps each role's markdown definition onto the command to
+    /// spawn for it (ADR-0013 / Q1). Injected as a generic parameter, the
+    /// same compile-time seam [`crate::gate_trigger::GateTrigger`] uses, so
+    /// tests can substitute a fake without spawning anything real.
+    pub async fn run_convergence_loop<R: AgentRunner>(
         &self,
         config: RunConfig,
+        runner: R,
         cancel: CancellationToken,
     ) -> Result<(String, RunState)> {
         let run_id = Uuid::new_v4().to_string();
+        // Before the `runs` row exists: a definition this runner cannot
+        // honour is a configuration error, and must not leave a half-started
+        // run behind.
+        let agents = ResolvedAgents::resolve(&runner, &config)?;
         let worktree_manager =
             WorktreeManager::new(&config.repo_path, config.warden_home.join("worktrees"))?;
 
@@ -324,7 +408,8 @@ impl Orchestrator {
             }
 
             // ADR-0012: what the reviewer/tester are told triggered this
-            // cycle.
+            // cycle -- and, since A2 (ADR-0013), what the coder is told to
+            // fix. One selection, one list, all three roles.
             let prior_findings =
                 select_prior_findings(&self.pool, ci_seeded_findings, previous_cycle_id.as_deref())
                     .await?;
@@ -335,8 +420,10 @@ impl Orchestrator {
                     cycle_id: &cycle_id,
                     cycle_number,
                     config: &config,
+                    agent: &agents.coder,
                     worktree_manager: &worktree_manager,
                     base_commit: &base_commit,
+                    prior_findings: &prior_findings,
                     cancel: cancel.clone(),
                 })
                 .await?;
@@ -352,6 +439,7 @@ impl Orchestrator {
                     &cycle_id,
                     cycle_number,
                     &config,
+                    &agents,
                     &worktree_manager,
                     &base_commit,
                     &coder_result.diff,
@@ -666,8 +754,10 @@ impl Orchestrator {
             cycle_id,
             cycle_number,
             config,
+            agent,
             worktree_manager,
             base_commit,
+            prior_findings,
             cancel,
         } = invocation;
 
@@ -689,13 +779,22 @@ impl Orchestrator {
         // cycle's coder introduces, once it has run.
         let base_commit_sha = read_head_commit(worktree.path()).await?;
 
-        let stdin_payload =
-            warden_core::AgentInputMessage::for_coder(config.intent.clone())?.to_json()?;
+        // ADR-0013: the coder's own definition (system prompt), the run
+        // intent, and -- A2 -- the findings it is being asked to fix. No
+        // `target_commit`/`diff`: this very worktree is already checked out
+        // at that commit, so the coder can `git diff` for itself rather than
+        // be handed a copy of what's on its own disk.
+        let stdin_payload = warden_core::AgentInputMessage::for_coder(
+            &agent.system_prompt,
+            config.intent.clone(),
+            prior_findings.to_vec(),
+        )?
+        .to_json()?;
         let outcome = self
             .run_agent(
                 cycle_id,
                 AgentRole::Coder,
-                &config.coder_command,
+                &agent.command,
                 worktree.path(),
                 stdin_payload,
                 cancel,
@@ -781,6 +880,7 @@ impl Orchestrator {
         cycle_id: &str,
         cycle_number: u32,
         config: &RunConfig,
+        agents: &ResolvedAgents,
         worktree_manager: &WorktreeManager,
         commit: &str,
         diff: &str,
@@ -802,7 +902,7 @@ impl Orchestrator {
                 cycle_id,
                 cycle_number,
                 role: AgentRole::Reviewer,
-                command: &config.reviewer_command,
+                agent: &agents.reviewer,
                 worktree_manager,
                 commit,
                 diff,
@@ -815,7 +915,7 @@ impl Orchestrator {
                 cycle_id,
                 cycle_number,
                 role: AgentRole::Tester,
-                command: &config.tester_command,
+                agent: &agents.tester,
                 worktree_manager,
                 commit,
                 diff,
@@ -839,7 +939,7 @@ impl Orchestrator {
             cycle_id,
             cycle_number,
             role,
-            command,
+            agent,
             worktree_manager,
             commit,
             diff,
@@ -860,12 +960,14 @@ impl Orchestrator {
         .await?;
 
         // ADR-0012: the reviewer/tester's own role, target commit, this
-        // cycle's diff, and the findings that triggered the cycle --
+        // cycle's diff, and the findings that triggered the cycle -- plus,
+        // since ADR-0013, its own definition's system prompt.
         // `for_finding_agent` refuses `AgentRole::Coder`, which can never
         // happen here since `role` is always `Reviewer`/`Tester` at this
         // call site.
         let stdin_payload = warden_core::AgentInputMessage::for_finding_agent(
             role,
+            &agent.system_prompt,
             commit,
             diff,
             prior_findings.to_vec(),
@@ -876,7 +978,7 @@ impl Orchestrator {
             .run_agent(
                 cycle_id,
                 role,
-                command,
+                &agent.command,
                 worktree.path(),
                 stdin_payload,
                 cancel.clone(),
@@ -905,14 +1007,17 @@ impl Orchestrator {
         // tester run, still inside its worktree -- which is about to be
         // removed below, so this must happen before that, not after.
         if role == AgentRole::Tester && tester_succeeded(&findings) {
-            self.capture_evidence_for_cycle(
+            // `agent.command` *is* the tester command here: this branch only
+            // runs for `AgentRole::Tester`.
+            self.capture_evidence_for_cycle(EvidenceCapture {
                 run_id,
                 cycle_id,
                 cycle_number,
                 config,
-                worktree.path(),
+                tester_command: &agent.command,
+                tester_worktree_path: worktree.path(),
                 cancel,
-            )
+            })
             .await;
         }
 
@@ -969,26 +1074,11 @@ impl Orchestrator {
     /// "nice to have" proof. Still logged loudly (`tracing::warn!` with the
     /// full error), never swallowed silently (code-standards.md:
     /// "catch-and-ignore ... qui jette l'erreur sans la logger").
-    async fn capture_evidence_for_cycle(
-        &self,
-        run_id: &str,
-        cycle_id: &str,
-        cycle_number: u32,
-        config: &RunConfig,
-        tester_worktree_path: &Path,
-        cancel: CancellationToken,
-    ) {
-        if let Err(error) = self
-            .try_capture_evidence_for_cycle(
-                run_id,
-                cycle_id,
-                cycle_number,
-                config,
-                tester_worktree_path,
-                cancel,
-            )
-            .await
-        {
+    async fn capture_evidence_for_cycle(&self, capture: EvidenceCapture<'_>) {
+        // Copied out before `capture` is consumed below -- both are `&str`,
+        // and the log line needs them on the failure path.
+        let (run_id, cycle_id) = (capture.run_id, capture.cycle_id);
+        if let Err(error) = self.try_capture_evidence_for_cycle(capture).await {
             tracing::warn!(
                 %error,
                 run_id,
@@ -998,15 +1088,17 @@ impl Orchestrator {
         }
     }
 
-    async fn try_capture_evidence_for_cycle(
-        &self,
-        run_id: &str,
-        cycle_id: &str,
-        cycle_number: u32,
-        config: &RunConfig,
-        tester_worktree_path: &Path,
-        cancel: CancellationToken,
-    ) -> Result<()> {
+    async fn try_capture_evidence_for_cycle(&self, capture: EvidenceCapture<'_>) -> Result<()> {
+        let EvidenceCapture {
+            run_id,
+            cycle_id,
+            cycle_number,
+            config,
+            tester_command,
+            tester_worktree_path,
+            cancel,
+        } = capture;
+
         let scratch_dir = config
             .warden_home
             .join("evidence")
@@ -1019,7 +1111,7 @@ impl Orchestrator {
             worktree_path: tester_worktree_path,
             scratch_dir: &scratch_dir,
             cycle_number,
-            record_command: &config.tester_command,
+            record_command: tester_command,
             cancel,
         };
         let captured = evidence::capture_evidence(&markers, config.evidence_tool, &ctx).await?;
@@ -1816,6 +1908,7 @@ async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_runner::CommandRunner;
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
@@ -1883,6 +1976,324 @@ mod tests {
         AgentCommand::new("sh", ["-c", "true"])
     }
 
+    /// Wraps an `AgentCommand` fixture in the markdown definition
+    /// `RunConfig` now takes (ADR-0013) -- the `command` runner is exactly
+    /// the escape hatch that keeps these plain-`sh` fixtures (and any real
+    /// user script) valid targets after `--*-cmd`'s removal.
+    fn definition(command: AgentCommand) -> AgentDefinition {
+        AgentDefinition::new(
+            warden_core::RunnerKind::Command {
+                program: command.program,
+                args: command.args,
+            },
+            "test agent system prompt",
+        )
+        .unwrap()
+    }
+
+    /// The runner seam (ADR-0013 / Q1): the orchestrator spawns what the
+    /// *runner* returns for a definition, not something read straight out of
+    /// `RunConfig` -- so a fake runner can serve every role from abstract
+    /// definitions that name no real binary at all. Records what it was
+    /// handed, to prove all three roles are resolved through it.
+    struct FakeRunner {
+        resolved_programs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self {
+                resolved_programs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AgentRunner for FakeRunner {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            let program = match &definition.runner {
+                warden_core::RunnerKind::Command { program, .. } => program.clone(),
+            };
+            self.resolved_programs.lock().unwrap().push(program.clone());
+            // The mapping a real runner does: an abstract definition onto
+            // whatever CLI actually implements that role.
+            Ok(match program.as_str() {
+                "the-coder" => AgentCommand::new(
+                    "sh",
+                    [
+                        "-c",
+                        r#"
+                        echo done > work.txt
+                        git add work.txt
+                        git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "fake coder"
+                        "#,
+                    ],
+                ),
+                _ => AgentCommand::new("sh", ["-c", "true"]),
+            })
+        }
+    }
+
+    /// A runner that refuses every definition -- models a definition naming
+    /// a runner this build cannot honour.
+    struct FailingRunner;
+
+    impl AgentRunner for FailingRunner {
+        fn build_command(&self, _definition: &AgentDefinition) -> Result<AgentCommand> {
+            Err(WardenError::Core(warden_core::CoreError::UnknownRunner(
+                "telepathy".to_string(),
+            )))
+        }
+    }
+
+    async fn count_runs(pool: &SqlitePool) -> i64 {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        count
+    }
+
+    /// ADR-0013 / Q1: the seam is real -- the loop drives whatever the
+    /// injected runner produces. The definitions here name programs that
+    /// don't exist as binaries (`the-coder`); only the runner's mapping
+    /// makes the run possible, so a converged run proves the orchestrator
+    /// went through it for all three roles.
+    #[tokio::test]
+    async fn the_convergence_loop_spawns_what_the_injected_runner_builds() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "drive the run through a fake runner".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let runner = FakeRunner::new();
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, runner, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+    }
+
+    /// A definition the runner cannot honour must fail the run *before* any
+    /// `runs` row exists: it's a configuration error, and a half-started run
+    /// left in the database would be indistinguishable from a crashed one to
+    /// recovery.
+    #[tokio::test]
+    async fn a_runner_that_refuses_a_definition_fails_before_any_run_row_is_written() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never gets to run".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(always_passing_tester()),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let result = orchestrator
+            .run_convergence_loop(config, FailingRunner, CancellationToken::new())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::Core(warden_core::CoreError::UnknownRunner(_)))
+        ));
+        assert_eq!(count_runs(&pool).await, 0);
+    }
+
+    /// A2 (ADR-0013, issue #22) driven through the real loop: on a reboucle
+    /// the coder must actually *receive* the findings it is being asked to
+    /// fix. Cycle 1's coder gets none (nothing has been reviewed yet);
+    /// cycle 2's gets the reviewer's blocking finding from cycle 1 -- and
+    /// still no `target_commit`/`diff`, which it can read from its own
+    /// worktree. Asserted by parsing the payloads the coder captured with
+    /// warden's own boundary parser, not by string-matching JSON.
+    #[tokio::test]
+    async fn the_coder_receives_the_prior_cycle_findings_it_must_fix() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // Records each cycle's stdin payload to `payload-<n>.json` (outside
+        // the worktree, which is removed at the end of every cycle), then
+        // behaves exactly like `flip_status_coder`.
+        let capturing_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    cat > "$dir/payload-$n.json"
+                    if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+                        echo fixed > status.txt
+                    else
+                        echo broken > status.txt
+                    fi
+                    git add status.txt
+                    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                    "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "flip status to fixed".to_string(),
+            max_cycles: 5,
+            coder_agent: definition(capturing_coder),
+            reviewer_agent: definition(status_gated_reviewer()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let read_payload = |n: u32| {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("coder payload {n} must have been captured: {error}")
+                });
+            warden_core::parse_agent_input_message(&raw)
+                .expect("a payload warden's own parser accepts")
+        };
+
+        // Cycle 1: nothing has been reviewed yet.
+        let first = read_payload(1);
+        assert_eq!(first.role, AgentRole::Coder);
+        assert_eq!(first.intent.as_deref(), Some("flip status to fixed"));
+        assert!(first.findings.is_empty());
+
+        // Cycle 2 (the reboucle): the reviewer's blocking finding from
+        // cycle 1 -- the whole point of A2.
+        let second = read_payload(2);
+        assert_eq!(second.role, AgentRole::Coder);
+        assert_eq!(second.intent.as_deref(), Some("flip status to fixed"));
+        assert_eq!(second.findings.len(), 1);
+        assert_eq!(
+            second.findings[0].source,
+            warden_core::FindingSource::Reviewer
+        );
+        assert_eq!(second.findings[0].severity, warden_core::Severity::Blocking);
+        assert_eq!(second.findings[0].description, "status is broken");
+        // A2: intent + findings only, never a commit/diff it can read off
+        // its own disk.
+        assert!(second.target_commit.is_none());
+        assert!(second.diff.is_none());
+    }
+
+    /// ADR-0013 / Q2: the system prompt reaches the agent over stdin -- and
+    /// nowhere else. Captured from the payload the agent actually received.
+    #[tokio::test]
+    async fn every_role_receives_its_own_definitions_system_prompt_over_stdin() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let capture = |role: &str, extra: &str| {
+            AgentCommand::new(
+                "sh",
+                [
+                    "-c",
+                    &format!("cat > '{}/{role}.json'\n{extra}", payloads.path().display()),
+                ],
+            )
+        };
+        let coder = capture(
+            "coder",
+            r#"
+            echo done > work.txt
+            git add work.txt
+            git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+            "#,
+        );
+
+        let prompted = |command: AgentCommand, prompt: &str| {
+            AgentDefinition::new(
+                warden_core::RunnerKind::Command {
+                    program: command.program,
+                    args: command.args,
+                },
+                prompt,
+            )
+            .unwrap()
+        };
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "check the prompts land".to_string(),
+            max_cycles: 3,
+            coder_agent: prompted(coder, "you are the coder"),
+            reviewer_agent: prompted(capture("reviewer", "true"), "you are the reviewer"),
+            tester_agent: prompted(capture("tester", "true"), "you are the tester"),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        for (role, expected_prompt) in [
+            ("coder", "you are the coder"),
+            ("reviewer", "you are the reviewer"),
+            ("tester", "you are the tester"),
+        ] {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("{role}.json")))
+                .unwrap_or_else(|error| panic!("{role} payload must have been captured: {error}"));
+            let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+            assert_eq!(payload.system_prompt, expected_prompt, "role {role}");
+        }
+    }
+
     #[tokio::test]
     async fn full_cycle_reboucles_once_then_converges() {
         let repo = init_test_repo();
@@ -1897,16 +2308,16 @@ mod tests {
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
             max_cycles: 5,
-            coder_command: flip_status_coder(),
-            reviewer_command: status_gated_reviewer(),
-            tester_command: always_passing_tester(),
+            coder_agent: definition(flip_status_coder()),
+            reviewer_agent: definition(status_gated_reviewer()),
+            tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
         };
 
         let (run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CancellationToken::new())
+            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
             .await
             .unwrap();
 
@@ -1964,16 +2375,16 @@ mod tests {
             branch: "main".to_string(),
             intent: "never converges".to_string(),
             max_cycles: 2,
-            coder_command: noop_coder,
-            reviewer_command: always_blocking_reviewer,
-            tester_command: always_passing_tester(),
+            coder_agent: definition(noop_coder),
+            reviewer_agent: definition(always_blocking_reviewer),
+            tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
         };
 
         let (_run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CancellationToken::new())
+            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
             .await
             .unwrap();
 
@@ -2311,13 +2722,14 @@ mod tests {
             branch: "main".to_string(),
             intent: "crossed findings, no collision".to_string(),
             max_cycles: 3,
-            coder_command: AgentCommand::new("sh", ["-c", "true"]),
-            reviewer_command,
-            tester_command,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(reviewer_command),
+            tester_agent: definition(tester_command),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
         };
+        let agents = ResolvedAgents::resolve(&CommandRunner, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
         let findings = orchestrator
@@ -2326,6 +2738,7 @@ mod tests {
                 "collision-cycle",
                 1,
                 &config,
+                &agents,
                 &worktree_manager,
                 "HEAD",
                 "",
@@ -2399,13 +2812,15 @@ mod tests {
             branch: "main".to_string(),
             intent: "timing check".to_string(),
             max_cycles: 3,
-            coder_command: AgentCommand::new("sh", ["-c", "true"]),
-            reviewer_command: sleepy_agent.clone(),
-            tester_command: sleepy_agent,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(sleepy_agent.clone()),
+            tester_agent: definition(sleepy_agent),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
         };
+
+        let agents = ResolvedAgents::resolve(&CommandRunner, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
 
@@ -2434,7 +2849,7 @@ mod tests {
                 cycle_id: "sequential-cycle",
                 cycle_number: 1,
                 role: AgentRole::Reviewer,
-                command: &config.reviewer_command,
+                agent: &agents.reviewer,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
                 diff: "",
@@ -2450,7 +2865,7 @@ mod tests {
                 cycle_id: "sequential-cycle",
                 cycle_number: 1,
                 role: AgentRole::Tester,
-                command: &config.tester_command,
+                agent: &agents.tester,
                 worktree_manager: &worktree_manager,
                 commit: "HEAD",
                 diff: "",
@@ -2485,6 +2900,7 @@ mod tests {
                 "timing-cycle",
                 1,
                 &config,
+                &agents,
                 &worktree_manager,
                 "HEAD",
                 "",
@@ -2839,22 +3255,22 @@ mod tests {
             branch: "main".to_string(),
             intent: "converge even though no evidence tool is installed".to_string(),
             max_cycles: 3,
-            coder_command: AgentCommand::new(
+            coder_agent: definition(AgentCommand::new(
                 "sh",
                 [
                     "-c",
                     "echo hi >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle",
                 ],
-            ),
-            reviewer_command: AgentCommand::new("sh", ["-c", "true"]),
-            tester_command: always_passing_tester(),
+            )),
+            reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
         };
 
         let (run_id, final_state) = orchestrator
-            .run_convergence_loop(config, CancellationToken::new())
+            .run_convergence_loop(config, CommandRunner, CancellationToken::new())
             .await
             .unwrap();
 
@@ -2986,9 +3402,9 @@ mod tests {
             branch: "main".to_string(),
             intent: "intent".to_string(),
             max_cycles: 5,
-            coder_command: AgentCommand::new("sh", ["-c", "true"]),
-            reviewer_command: AgentCommand::new("sh", ["-c", "true"]),
-            tester_command: AgentCommand::new("sh", ["-c", "true"]),
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            tester_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: Some(GateConfig {

@@ -60,6 +60,16 @@ pub struct AgentOutcome {
 /// environment (Architecture.md §10, "Isolation environnement des
 /// sous-processus").
 ///
+/// **A relative `command.program` resolves against `cwd`**, i.e. against the
+/// worktree — the child chdirs before exec, so `./reviewer.sh` means *the
+/// repo's own copy of that script at the commit under review*, which the
+/// coder can rewrite and commit. Long-standing behaviour (it predates
+/// markdown agent definitions: `--reviewer-cmd "sh ./reviewer.sh"` resolved
+/// exactly the same way), documented here rather than changed — refusing
+/// relative paths is a product decision, and it would break the plain-script
+/// case `RunnerKind::Command` exists to serve. See `warden_core::RunnerKind`
+/// and ADR-0013's Conséquences.
+///
 /// stdin is piped (ADR-0012, issue #20 Scope B) rather than inherited, so
 /// the intent/target-commit/diff/findings payload [`wait`] writes never
 /// leaks the orchestrator's own stdin into the agent. An agent that never

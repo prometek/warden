@@ -1,6 +1,8 @@
 //! Warden orchestrator library: I/O layer (worktrees, subprocesses, SQLite)
 //! plus the coordination that drives `warden-core`'s pure state machine.
 
+pub mod agent_def;
+pub mod agent_runner;
 pub mod ci_channel;
 pub mod db;
 pub mod error;
