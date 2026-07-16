@@ -393,6 +393,34 @@ mod tests {
         ));
     }
 
+    /// Issue #24 point 4 regression guard: ADR-0013's old warden-native
+    /// schema fenced its frontmatter with `+++` (TOML), not `---` (YAML).
+    /// That schema is fully gone -- a file still written in it must be
+    /// rejected exactly like any other fence-less file, never partially
+    /// understood or silently accepted as "no frontmatter, prompt-only".
+    #[test]
+    fn a_legacy_toml_plus_fence_definition_is_rejected_not_the_new_dash_schema() {
+        let raw =
+            "+++\nrunner = \"command\"\nprogram = \"echo\"\nargs = [\"hi\"]\n+++\nbe an agent\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
+        // The error must name what it actually expected (the `---` fence),
+        // not silently treat the `+++` line as if it were one.
+        assert!(error.to_string().contains("---"), "{error}");
+    }
+
+    /// Issue #24 point 4, the other half: even under the *new* `---` fence,
+    /// the old schema's own field names (`runner`/`program`/`args`) are not
+    /// grandfathered in -- they trip `deny_unknown_fields` exactly like any
+    /// other unrecognised key, naming the offending one.
+    #[test]
+    fn old_warden_native_field_names_are_rejected_as_unknown_keys_under_the_new_fence() {
+        let raw = "---\nrunner: command\nprogram: echo\n---\nbe an agent\n";
+        let error = parse_agent_definition(raw).unwrap_err();
+        assert!(matches!(error, CoreError::MalformedAgentDefinition(_)));
+        assert!(error.to_string().contains("runner"), "{error}");
+    }
+
     #[test]
     fn rejects_malformed_yaml_frontmatter() {
         let raw = "---\nname: [unterminated\n---\nprompt\n";

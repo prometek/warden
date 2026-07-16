@@ -905,6 +905,169 @@ async fn e2e_definition_model_and_tools_reach_the_claude_invocation_argv() {
     );
 }
 
+/// Issue #24 point 3, the other half of
+/// `e2e_definition_model_and_tools_reach_the_claude_invocation_argv` (which
+/// only covers the coder): the convention directory holds up to *three*
+/// independent files, `.warden/agents/{coder,reviewer,tester}.md`, and each
+/// role's own frontmatter/prompt must reach *that role's own* invocation --
+/// never the coder's definition leaking into the reviewer's argv or
+/// vice versa.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_reviewer_and_tester_definitions_each_reach_their_own_invocation_not_each_others() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    write_agent_definition(repo.path(), "coder", "", "be the coder");
+    write_agent_definition(
+        repo.path(),
+        "reviewer",
+        "model: haiku\ntools: Read, Grep\n",
+        "be the reviewer",
+    );
+    write_agent_definition(
+        repo.path(),
+        "tester",
+        "model: opus\ntools: Read, Bash\n",
+        "be the tester",
+    );
+
+    write_fake_claude(
+        bin_dir.path(),
+        &format!(
+            "printf '%s' \"$*\" > \"{captures}/coder_argv.txt\"\n{APPEND_NOTES_CODER_BODY}",
+            captures = captures.path().display()
+        ),
+        &format!(
+            "printf '%s' \"$*\" > \"{captures}/reviewer_argv.txt\"",
+            captures = captures.path().display()
+        ),
+        &format!(
+            "printf '%s' \"$*\" > \"{captures}/tester_argv.txt\"",
+            captures = captures.path().display()
+        ),
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "add a note",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let coder_argv = std::fs::read_to_string(captures.path().join("coder_argv.txt")).unwrap();
+    let reviewer_argv = std::fs::read_to_string(captures.path().join("reviewer_argv.txt")).unwrap();
+    let tester_argv = std::fs::read_to_string(captures.path().join("tester_argv.txt")).unwrap();
+
+    assert!(
+        coder_argv.contains("--append-system-prompt be the coder"),
+        "{coder_argv:?}"
+    );
+    assert!(!coder_argv.contains("--model"), "{coder_argv:?}");
+
+    assert!(
+        reviewer_argv.contains("--append-system-prompt be the reviewer"),
+        "{reviewer_argv:?}"
+    );
+    assert!(reviewer_argv.contains("--model haiku"), "{reviewer_argv:?}");
+    assert!(
+        reviewer_argv.contains("--allowedTools Read, Grep"),
+        "{reviewer_argv:?}"
+    );
+    assert!(
+        !reviewer_argv.contains("be the tester"),
+        "the reviewer's argv must never carry the tester's own prompt: {reviewer_argv:?}"
+    );
+
+    assert!(
+        tester_argv.contains("--append-system-prompt be the tester"),
+        "{tester_argv:?}"
+    );
+    assert!(tester_argv.contains("--model opus"), "{tester_argv:?}");
+    assert!(
+        tester_argv.contains("--allowedTools Read, Bash"),
+        "{tester_argv:?}"
+    );
+    assert!(
+        !tester_argv.contains("be the reviewer"),
+        "the tester's argv must never carry the reviewer's own prompt: {tester_argv:?}"
+    );
+}
+
+/// Architecture.md §10 (`ClaudeAdapter::env_allowlist`, issue #24 point 6):
+/// the allowlist is `["HOME", "USER"]`, not just `HOME` -- the coder's own
+/// live-verification note in `tool_adapter.rs` documents `USER` as required
+/// for `claude`'s OAuth credential resolution on this platform. This nails
+/// that second variable down explicitly, since
+/// `e2e_home_reaches_claude_but_other_env_vars_do_not` only asserts `HOME`.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_user_reaches_claude_alongside_home() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    write_fake_claude(
+        bin_dir.path(),
+        &format!(
+            "env | sort > \"{captures}/coder_env.txt\"\n{APPEND_NOTES_CODER_BODY}",
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    // The test harness's own `USER`, if any, is what should reach the
+    // child -- captured here so the assertion isn't hostage to whatever
+    // value happens to be set in this particular CI/dev environment.
+    let expected_user = std::env::var("USER").unwrap_or_default();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "add a note",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let env_dump = std::fs::read_to_string(captures.path().join("coder_env.txt")).unwrap();
+    if expected_user.is_empty() {
+        eprintln!(
+            "USER is unset in this test environment; skipping the positive assertion, \
+             spawn_with_extra_env only forwards variables actually set in warden's own env"
+        );
+    } else {
+        assert!(
+            env_dump.contains(&format!("USER={expected_user}")),
+            "USER must reach claude (ClaudeAdapter::env_allowlist): {env_dump:?}"
+        );
+    }
+}
+
 /// Crash recovery (Architecture.md §9), unaffected by issue #24: a run left
 /// in an intermediate state with no live process is marked `Failed` on the
 /// next invocation, not resurrected or left stuck.
