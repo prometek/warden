@@ -323,8 +323,9 @@ SQLite de `warden`, ne spawn aucun agent, ne touche jamais git.
 warden-tui attach --run-id <RUN_ID> --warden-home ~/.warden
 ```
 
-- `--run-id <ID>` — l'identifiant de run affiché par `warden run` à la fin de son
-  exécution (aussi consultable en base, table `runs`).
+- `--run-id <ID>` — l'identifiant de run. Affiché par `warden run` dès le démarrage
+  (`run <id> started`, suivi d'une commande `warden-tui attach` prête à copier), et de
+  nouveau à la fin de son exécution (aussi consultable en base, table `runs`).
 - `--db <PATH>` — base SQLite de `warden`, ouverte en lecture seule. Défaut :
   `<warden-home>/state.db`.
 - `--warden-home <PATH>` — sert à localiser la base et le socket de l'Event Bus du run.

@@ -471,3 +471,20 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   prompts par défaut contiennent des métacaractères shell (apostrophes, backticks) —
   un espace-join naïf y devenait un vecteur d'injection shell. Chaque partie de la commande
   est désormais quotée individuellement (`shlex::try_quote`) avant l'assemblage.
+
+### Added — Issue #31 : `warden run` imprime le `run_id` et la commande d'attache dès le démarrage
+
+- `warden run` imprime désormais sur stdout, **au démarrage du run** (visible à la
+  verbosité par défaut, sans `-v`), le `run_id` et une commande `warden-tui attach`
+  prête à copier :
+
+  ```
+  run 5f4d6e3a-... started
+  attach: warden-tui attach --run-id 5f4d6e3a-... --warden-home /Users/alice/.warden
+  ```
+
+  Auparavant le `run_id` n'apparaissait qu'à la toute fin du run (`run <id> finished:
+  ...`), obligeant à requêter la table `runs` en SQLite à la main pour attacher la TUI
+  à un run encore en cours. Le `--warden-home` imprimé est résolu en chemin absolu et
+  quoté (`shlex::try_quote`), pour rester copiable tel quel même si `--warden-home` a
+  été passé sous forme relative ou contient un espace.
