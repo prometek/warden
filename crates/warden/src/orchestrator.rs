@@ -293,6 +293,16 @@ pub struct Orchestrator {
     /// doesn't care to observe run start) -- a builder-style setter rather
     /// than a `run_convergence_loop` parameter for the same test-rippling
     /// reason as `run_context` above.
+    ///
+    /// Review L2: called inline, on the same task that is driving this
+    /// run's convergence loop, before the coder's first cycle -- so it
+    /// **must not panic** (an unwind here would abort the run mid-flight
+    /// with the `runs` row left in a non-terminal state, since nothing
+    /// downstream gets a chance to mark it `Failed`) and **must not block**
+    /// for any meaningful length of time (whatever it does delays the
+    /// coder from starting). `main.rs`'s callback keeps to a couple of
+    /// non-blocking, error-checked writes to stdout for exactly this
+    /// reason -- see `print_run_started_hint`'s own docs there.
     on_run_started: Option<RunStartedCallback>,
 }
 
@@ -310,9 +320,10 @@ impl Orchestrator {
     }
 
     /// Registers `callback` to run once, synchronously, when this
-    /// orchestrator's run starts (see the `on_run_started` field docs).
-    /// Consumes and returns `self` so the CLI can set it up in the same
-    /// expression that constructs the orchestrator (`main.rs`).
+    /// orchestrator's run starts (see the `on_run_started` field docs, in
+    /// particular the no-panic/non-blocking contract `callback` must
+    /// honour). Consumes and returns `self` so the CLI can set it up in the
+    /// same expression that constructs the orchestrator (`main.rs`).
     pub fn on_run_started(mut self, callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_run_started = Some(Box::new(callback));
         self
@@ -2604,6 +2615,127 @@ mod tests {
             ))
         ));
         assert_eq!(count_runs(&pool).await, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #31: `on_run_started` must fire before the run's actual work
+    // (the coder subprocess) starts, not merely before
+    // `run_convergence_loop` returns -- that ordering is the entire point of
+    // printing the run id at *start*, so `warden-tui attach` can catch a
+    // still-live run instead of only ever seeing a finished one.
+    // -----------------------------------------------------------------
+
+    /// Deterministic ordering proof (no reliance on timing/sleeps,
+    /// code-standards.md "tests déterministes"): the coder subprocess
+    /// itself refuses to proceed unless a marker file the callback writes
+    /// already exists by the time it starts. If `on_run_started` fired late
+    /// (e.g. only after the coder had already run, or not at all), the
+    /// coder would fail and the run could never reach `Converged`.
+    #[tokio::test]
+    async fn on_run_started_fires_before_the_coder_process_runs() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let marker_dir = TempDir::new().unwrap();
+        let marker_path = marker_dir.path().join("on_run_started_fired");
+
+        let coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    test -f "{marker}" || {{
+                        echo "on_run_started callback must fire before the coder process starts" >&2
+                        exit 1
+                    }}
+                    echo done > work.txt
+                    git add work.txt
+                    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                    "#,
+                    marker = marker_path.display()
+                ),
+            ],
+        );
+
+        let observed_run_id: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_run_id_for_callback = observed_run_id.clone();
+        let marker_path_for_callback = marker_path.clone();
+
+        let orchestrator = Orchestrator::new(pool.clone()).on_run_started(move |run_id| {
+            // Written synchronously, inside the callback, before it returns
+            // -- this is the exact "before the coder runs" guarantee under
+            // test.
+            std::fs::write(&marker_path_for_callback, "").unwrap();
+            *observed_run_id_for_callback.lock().unwrap() = Some(run_id.to_string());
+        });
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 31: on_run_started ordering".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(coder),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::Converged,
+            "the coder only converges if it found the marker on disk, proving the callback \
+             already ran by the time the coder process started"
+        );
+        assert_eq!(
+            observed_run_id.lock().unwrap().as_deref(),
+            Some(run_id.as_str()),
+            "the run id the callback observed must be the exact same run id the loop itself \
+             returns"
+        );
+    }
+
+    /// `on_run_started` is optional (`None` by default): a run must still
+    /// complete normally with no callback registered at all -- the common
+    /// case for every other test in this module.
+    #[tokio::test]
+    async fn a_run_with_no_on_run_started_callback_still_completes_normally() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "no callback registered".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(flip_status_coder()),
+            reviewer_agent: definition(status_gated_reviewer()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
     }
 
     // -----------------------------------------------------------------
