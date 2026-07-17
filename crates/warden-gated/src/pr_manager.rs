@@ -948,6 +948,62 @@ mod tests {
         assert!(comment.contains("consider adding an e2e test"));
     }
 
+    /// The bug the four-variant grouping fixed (issue #24 review, cycle 2):
+    /// a cycle whose only findings came from a source outside the original
+    /// `[Reviewer, Tester]` list rendered a **blank** comment -- header and
+    /// "informational only" footer, no findings section at all. A silently
+    /// empty report about a blocking tampering finding is worse than no
+    /// report, since it reads as "nothing to see here".
+    #[test]
+    fn a_warden_sourced_finding_is_rendered_rather_than_silently_dropped() {
+        let summary = CycleSummary {
+            cycle_number: 2,
+            findings: vec![Finding {
+                source: FindingSource::Warden,
+                severity: Severity::Blocking,
+                file: Some(".warden/agents/reviewer.md".to_string()),
+                description: "the coder's diff touches an agent definition".to_string(),
+                action: None,
+            }],
+        };
+
+        let comment = format_cycle_comment(&summary);
+
+        assert!(comment.contains("**Warden**"), "{comment}");
+        assert!(
+            comment.contains("the coder's diff touches an agent definition"),
+            "{comment}"
+        );
+        assert!(comment.contains(".warden/agents/reviewer.md"), "{comment}");
+        assert!(
+            !comment.contains("No findings raised this cycle."),
+            "a cycle that raised a finding must never claim it raised none: {comment}"
+        );
+    }
+
+    /// Same guarantee for the other non-agent source (ADR-0011).
+    #[test]
+    fn a_ci_sourced_finding_is_rendered_rather_than_silently_dropped() {
+        let summary = CycleSummary {
+            cycle_number: 4,
+            findings: vec![Finding {
+                source: FindingSource::Ci,
+                severity: Severity::Blocking,
+                file: None,
+                description: "build failed on the pushed commit".to_string(),
+                action: None,
+            }],
+        };
+
+        let comment = format_cycle_comment(&summary);
+
+        assert!(comment.contains("**Ci**"), "{comment}");
+        assert!(
+            comment.contains("build failed on the pushed commit"),
+            "{comment}"
+        );
+    }
+
     #[test]
     fn comment_says_so_explicitly_when_no_findings_were_raised() {
         let summary = CycleSummary {
