@@ -1696,6 +1696,47 @@ async fn agent_definition_tampering_finding(
 /// it already "sees" a differently-cased convention file exactly like a
 /// human editing that same path locally would. The gap was only ever in
 /// this module's own manual, non-filesystem string comparison.
+///
+/// # Known limitation: this check is partial, not a guarantee (issue #30)
+///
+/// **This detector catches the naive case and no more. Do not read it as a
+/// boundary.** It is defence in depth: a poisoned definition must still pass
+/// a human PR review to reach a future run, and that review -- not this
+/// function -- is what actually holds.
+///
+/// The section above closes the ASCII-case bypass, but not the class it
+/// belongs to. Two reproduced bypasses remain open (both verified on
+/// macOS/APFS during issue #24's review, cycle 3):
+///
+/// - **`to_lowercase` is not case *folding*.** It is Unicode *lowercasing*,
+///   and the two diverge exactly on the non-ASCII input the section above
+///   reasons about. `.warden/agentſ/coder.md` (U+017F) is *already*
+///   lowercase, so `to_lowercase` is a no-op here and the match fails --
+///   while APFS folds U+017F to `s` and `resolve_agent_definition` reads the
+///   poisoned file anyway.
+/// - **A symlinked parent component, on every platform.** `ln -s stash
+///   .warden` plus `stash/agents/reviewer.md` makes git report `.warden`
+///   (mode 120000) and `stash/agents/reviewer.md` -- neither matches this
+///   filter, while the OS resolves `.warden/agents/reviewer.md` to the
+///   poison. This bites precisely when a repo has no `.warden/agents/` yet,
+///   i.e. the zero-`.md` default issue #24 exists to enable.
+///
+/// The root cause is structural rather than a run of unlucky primitives:
+/// **this function models path resolution with string comparison, while
+/// `resolve_agent_definition` defers to the OS. Every gap between the model
+/// and the OS is a bypass** -- so patching one primitive relocates the gap
+/// instead of closing it, and there is no reason to believe the two above
+/// are the last of them.
+///
+/// Issue #30 tracks the structural fix: resolve the three literal
+/// `.warden/agents/{coder,reviewer,tester}.md` paths through the OS and
+/// compare *raw bytes* against the run-start snapshot, so both sides ask the
+/// same OS the same question and nothing is left to model. Note the trap an
+/// unfinished attempt already fell into (branch
+/// `issue-24-m4-resolve-compare-wip`): re-resolving via
+/// `resolve_agent_definition` *parses*, so a coder writing unparseable bytes
+/// makes the detector return `Err` rather than raise a finding. The guard
+/// must never depend on the poisoned file being well-formed.
 async fn touched_agent_definition_paths(
     worktree_path: &Path,
     base: &str,
