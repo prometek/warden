@@ -185,13 +185,31 @@ pub struct CycleSummary {
 /// status or content (that boundary is enforced by `post_cycle_update` only
 /// ever calling `PrProvider::post_comment`, never `mark_ready`/
 /// `update_body`).
+///
+/// Issue #24 review, cycle 2, MINOR: every [`FindingSource`] variant is
+/// listed explicitly here, not just `Reviewer`/`Tester` -- the original
+/// two-source grouping silently rendered a **blank** comment (just the
+/// header and the trailing "informational only" line, no findings section
+/// at all) for a cycle whose only findings came from a source outside that
+/// list, e.g. `FindingSource::Warden` (issue #24 review M4, the
+/// `.warden/agents/` tampering check) once `post_cycle_update` gains a
+/// production caller. Latent today (nothing calls `post_cycle_update` in
+/// production yet -- `warden`'s own `pr_summary::format_cycles_section`
+/// renders the Finalize-time PR body and never filtered by source at all),
+/// but there is no reason a *new* `FindingSource` variant should ever have
+/// to remember to add itself here to avoid silently vanishing.
 pub fn format_cycle_comment(summary: &CycleSummary) -> String {
     let mut body = format!("## Warden — cycle {} update\n\n", summary.cycle_number);
 
     if summary.findings.is_empty() {
         body.push_str("No findings raised this cycle.\n\n");
     } else {
-        for source in [FindingSource::Reviewer, FindingSource::Tester] {
+        for source in [
+            FindingSource::Reviewer,
+            FindingSource::Tester,
+            FindingSource::Warden,
+            FindingSource::Ci,
+        ] {
             let from_source: Vec<&Finding> = summary
                 .findings
                 .iter()
@@ -928,6 +946,62 @@ mod tests {
         assert!(comment.contains("(src/auth.rs)"));
         assert!(comment.contains("**Tester**"));
         assert!(comment.contains("consider adding an e2e test"));
+    }
+
+    /// The bug the four-variant grouping fixed (issue #24 review, cycle 2):
+    /// a cycle whose only findings came from a source outside the original
+    /// `[Reviewer, Tester]` list rendered a **blank** comment -- header and
+    /// "informational only" footer, no findings section at all. A silently
+    /// empty report about a blocking tampering finding is worse than no
+    /// report, since it reads as "nothing to see here".
+    #[test]
+    fn a_warden_sourced_finding_is_rendered_rather_than_silently_dropped() {
+        let summary = CycleSummary {
+            cycle_number: 2,
+            findings: vec![Finding {
+                source: FindingSource::Warden,
+                severity: Severity::Blocking,
+                file: Some(".warden/agents/reviewer.md".to_string()),
+                description: "the coder's diff touches an agent definition".to_string(),
+                action: None,
+            }],
+        };
+
+        let comment = format_cycle_comment(&summary);
+
+        assert!(comment.contains("**Warden**"), "{comment}");
+        assert!(
+            comment.contains("the coder's diff touches an agent definition"),
+            "{comment}"
+        );
+        assert!(comment.contains(".warden/agents/reviewer.md"), "{comment}");
+        assert!(
+            !comment.contains("No findings raised this cycle."),
+            "a cycle that raised a finding must never claim it raised none: {comment}"
+        );
+    }
+
+    /// Same guarantee for the other non-agent source (ADR-0011).
+    #[test]
+    fn a_ci_sourced_finding_is_rendered_rather_than_silently_dropped() {
+        let summary = CycleSummary {
+            cycle_number: 4,
+            findings: vec![Finding {
+                source: FindingSource::Ci,
+                severity: Severity::Blocking,
+                file: None,
+                description: "build failed on the pushed commit".to_string(),
+                action: None,
+            }],
+        };
+
+        let comment = format_cycle_comment(&summary);
+
+        assert!(comment.contains("**Ci**"), "{comment}");
+        assert!(
+            comment.contains("build failed on the pushed commit"),
+            "{comment}"
+        );
     }
 
     #[test]

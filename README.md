@@ -70,6 +70,14 @@ compromis au niveau code, sous cet UID, peut lire directement les credentials `o
 "Déploiement durci" ci-dessous et ADR-0006 dans `docs/Architecture.md` pour la configuration
 qui ferme cet écart.
 
+**Depuis l'issue #24, ce n'est plus seulement un `warden` compromis qui pose problème.**
+L'adaptateur `claude` (`--tool claude`) accorde `Bash` par défaut aux trois rôles et
+transmet `HOME`/`USER` à l'agent — un agent qui tourne **normalement** a donc les moyens
+d'atteindre la clé SSH réelle de l'utilisateur et `~/.config/gh`, et de pousser directement
+vers `origin` en contournant `warden-gated` entièrement, sous le même déploiement même-UID.
+Documenté sans l'euphémiser dans `docs/Architecture.md` (ADR-0006, amendement issue #24 ;
+§10). Isolation réelle côté agent — pas seulement côté gate — trackée par l'issue #28.
+
 ## Structure du dépôt
 
 - `crates/warden-core/` — logique pure (state machine des runs, interprétation des
@@ -109,10 +117,14 @@ de convergence complète sur un dépôt existant :
 warden run \
   --repo /chemin/vers/mon-projet \
   --intent "Ajouter la validation d'email au formulaire d'inscription" \
-  --coder-agent agents/coder.md \
-  --reviewer-agent agents/reviewer.md \
-  --tester-agent agents/tester.md
+  --tool claude
 ```
+
+Aucun fichier `.md` n'est requis : `--tool claude` sélectionne l'adaptateur intégré pour
+Claude Code (`warden::tool_adapter::ClaudeAdapter`), qui fournit un prompt et un jeu
+d'outils par défaut pour les trois rôles (coder, reviewer, tester). Voir "Définir un agent"
+ci-dessous pour reprendre la main sur un rôle en particulier via
+`.warden/agents/<role>.md`.
 
 Flags de `warden run` :
 
@@ -121,9 +133,15 @@ Flags de `warden run` :
 - `--intent <TEXT>` — description de la tâche transmise à l'agent coder sur son `stdin`
   (voir "Protocole d'entrée des agents (stdin)" ci-dessous, ADR-0012). Doit être non vide
   (espaces exclus) — validé dès la frontière CLI plutôt qu'en profondeur du premier cycle.
-- `--coder-agent <PATH>`, `--reviewer-agent <PATH>`, `--tester-agent <PATH>` — chemin de
-  la **définition markdown** de chaque rôle (voir "Définir un agent" ci-dessous,
-  ADR-0013). Remplacent `--coder-cmd`/`--reviewer-cmd`/`--tester-cmd`, supprimés.
+- `--tool <name>` (**requis**) — sélectionne l'adaptateur d'outil intégré qui pilote les
+  trois rôles de ce run (issue #24) : l'invocation CLI réelle, l'allowlist d'environnement,
+  la traduction de la sortie de l'outil en findings, et le prompt/`tools` par défaut de
+  chaque rôle en l'absence de définition (voir "Définir un agent" ci-dessous). Ensemble
+  fermé résolu à la compilation ; seul `claude` existe aujourd'hui. Global au run — pas de
+  sélection par rôle (`--coder-tool`…, hors périmètre). Remplace les flags
+  `--coder-agent`/`--reviewer-agent`/`--tester-agent` et le schéma de définition
+  warden-natif qu'ils sélectionnaient (ADR-0013, amendée par l'issue #24) — voir
+  `CHANGELOG.md` pour la note de migration.
 - `--branch <NAME>` — nom de branche enregistré pour ce run. `warden` lui-même ne pousse
   toujours rien vers un remote (aucun credential remote côté orchestrateur, ADR-0006) ;
   c'est `warden-gated` qui reçoit un push vers son dépôt bare local et décide seul de le
@@ -183,48 +201,57 @@ artefact produit, ...) est loggé (`tracing::warn!`) et n'interrompt jamais un r
 ailleurs convergent — l'absence de preuve pour un cycle donné n'est pas traitée comme un
 finding bloquant.
 
-### Définir un agent (fichier markdown)
+### Définir un agent (fichier markdown, optionnel)
 
-Un rôle est décrit par un fichier markdown (ADR-0013) : un frontmatter **TOML** fencé par
-`+++`, puis le corps markdown — le **system prompt** du rôle.
+Aucune définition n'est requise : `--tool claude` fournit déjà un prompt et un jeu
+d'outils par défaut pour les trois rôles (voir "Flags de `warden run`" ci-dessus). Pour
+reprendre la main sur un rôle en particulier, placez un fichier markdown à l'emplacement
+**conventionnel** `<repo>/.warden/agents/<role>.md` (`coder.md`, `reviewer.md` ou
+`tester.md`, à la racine du dépôt passé à `--repo`) — Warden le détecte et le lit
+automatiquement, sans flag à passer. Le format est celui de **Claude Code**
+(`.claude/agents/*.md`, issue #24) : un frontmatter **YAML** fencé par `---`, puis le
+corps markdown — le **system prompt** du rôle.
 
 ```markdown
-+++
-runner = "command"
-program = "claude"
-args = ["-p"]
-+++
+---
+name: coder
+description: Implémente la tâche demandée sur la branche courante.
+tools: Read, Write, Edit, Bash
+model: sonnet
+---
 
 Tu es le coder de Warden. Lis le payload JSON sur stdin (`intent`, `findings`),
 implémente la tâche demandée, puis commite dans le worktree courant.
 ```
 
-- `runner` — quel runner traduit cette définition en invocation concrète. Seul
-  `"command"` existe aujourd'hui : il lance `program` avec `args` verbatim, ce qui fait
-  qu'un simple script reste une cible de première classe.
-- `program` (requis par le runner `command`) et `args` (liste explicite, optionnelle —
-  plus de découpage sur les espaces : `args = ["-c", "echo une deux"]` passe bien **un**
-  argument).
+- `name`, `description` — acceptées pour compatibilité avec un fichier Claude Code
+  existant (un vrai fichier `.claude/agents/*.md` les porte toujours), sans usage
+  opérationnel côté Warden aujourd'hui.
+- `tools` — chaîne verbatim passée à `--allowedTools` (même format qu'un `tools:`
+  Claude Code, ex. `"Read, Write, Edit, Bash"`). **Omise**, la valeur par défaut de
+  l'adaptateur pour ce rôle est utilisée à la place (jamais "aucun outil" — un agent sans
+  aucun outil accordé en mode non-interactif ne peut rien faire et ferait converger le run
+  à tort).
+- `model` — alias ou nom de modèle verbatim passé à `--model` (ex. `"sonnet"`, `"opus"`).
+  Omis, laisse l'outil choisir son propre modèle par défaut.
 - Le corps markdown après le frontmatter est le system prompt. Il ne doit pas être vide.
+- Toute clé inconnue, ou une clé optionnelle présente mais vide, est une erreur typée à la
+  lecture — jamais silencieusement ignorée.
 
-> ⚠️ **Chemin relatif = code du dépôt sous revue.** Warden lance chaque agent avec son
-> `cwd` positionné sur le worktree du rôle (un checkout du dépôt sous revue). Un `program`
-> (ou un chemin dans `args`) **relatif** se résout donc contre ce worktree : `program =
-> "./reviewer.sh"` exécute la copie du script *telle que committée au commit sous revue* —
-> que le coder peut réécrire et committer. Pour le **reviewer** et le **tester**, préférez
-> un **chemin absolu** : sinon le reviewer exécuterait du code écrit par le coder, ce qui
-> ruine l'indépendance sur laquelle repose le pipeline. Comportement non contraint (il
-> préexiste aux définitions markdown) — voir ADR-0013.
+Le schéma est celui de **Claude Code**, adopté directement (issue #24, amende ADR-0013) :
+Warden reste agnostique de l'agent (ADR-0005) au niveau du seam `ToolAdapter` — un nouveau
+CLI supporté est un nouvel adaptateur, jamais un registre en configuration — pas au niveau
+du schéma de définition. Voir `docs/Architecture.md` (ADR-0013, amendement issue #24) pour
+la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML introduit par
+#22 a été abandonné (coût réel trop élevé pour lancer un vrai run).
 
-Le schéma est **warden-natif**, délibérément pas celui de `.claude/agents/*.md` : Warden
-reste agnostique de l'agent (ADR-0005), et c'est le runner qui fait le pont vers le CLI
-réellement utilisé. Toute entrée est validée à la frontière : **clé inconnue rejetée**
-(il n'y a par exemple pas de clé `timeout` — le timeout par invocation d'agent est un
-sujet à part entière, non livré ici, et une clé acceptée l'implémenterait à moitié ; ni de
-clé `tools` ou `model`, pour la même raison : aucun runner ne les consomme aujourd'hui),
-**clé d'un autre runner rejetée** (les clés sont scopées à leur runner), runner inconnu,
-`program` vide, fence manquante ou non fermée, system prompt blanc → erreur typée, jamais
-de valeur par défaut silencieuse.
+> ⚠️ **Le fichier n'engage que le prompt/`tools`/`model` — pas l'invocation elle-même.**
+> Contrairement au schéma warden-natif qu'il remplace, une définition ne déclare plus de
+> `program`/`args` : c'est l'adaptateur sélectionné par `--tool` qui construit
+> l'invocation réelle du CLI (`ClaudeAdapter` lance toujours `claude` via `PATH`, jamais un
+> chemin relatif au worktree du rôle). Le risque « le coder committe un script que le
+> reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
+> donc plus aux adaptateurs intégrés.
 
 ### Protocole d'entrée des agents (stdin)
 
@@ -239,8 +266,12 @@ non fatal au run :
 
 - `role` : `"coder"`, `"reviewer"` ou `"tester"` — toujours présent.
 - `system_prompt` : le corps markdown de la définition du rôle (ADR-0013) — toujours présent,
-  jamais vide. C'est le seul canal par lequel il transite : ni argv (fuite dans `ps`), ni
-  fichier de prompt temporaire.
+  jamais vide. Ce champ stdin reste le canal warden-géré pour ce texte (jamais un fichier de
+  prompt temporaire). **Exception ciblée (issue #24, `ClaudeAdapter`)** : `claude` n'a pas
+  d'autre canal qu'un argument pour recevoir un system prompt (son stdin, en mode texte,
+  *est* le tour utilisateur) — l'adaptateur passe donc la même chaîne une seconde fois en
+  argument (`--append-system-prompt`), un compromis assumé et documenté plutôt qu'une fuite
+  accidentelle (`warden::tool_adapter::ClaudeAdapter`, `docs/Architecture.md` ADR-0013).
 - Coder : `intent` (la tâche du run, cf. `--intent`) et `findings` (ceux qui ont déclenché ce
   cycle — ce qu'il doit corriger ; liste vide sur le premier cycle d'un run).
   `target_commit`/`diff` valent `null` : le worktree du coder est déjà checkouté sur le commit
@@ -252,10 +283,14 @@ non fatal au run :
   `null`. Le `diff` est tronqué à 8 Mio ; un diff tronqué porte le marqueur
   `\n\n[warden: diff truncated at the 8 MiB payload cap]\n` en fin de champ, détectable côté
   agent plutôt que silencieusement coupé.
-- L'environnement du sous-processus reste construit par `env_clear()` (seul `PATH` transmis,
-  voir "Sécurité" dans `docs/Architecture.md`) : ce payload stdin est le seul canal par
-  lequel l'intent/le contexte atteignent l'agent — jamais une variable d'environnement ni un
-  argument de ligne de commande.
+- L'environnement du sous-processus reste construit par `env_clear()` (jamais un héritage
+  brut) : par défaut seul `PATH` est transmis, plus l'allowlist explicite que l'adaptateur
+  `--tool` sélectionné déclare (`HOME`/`USER` pour `claude`, voir "Sécurité" dans
+  `docs/Architecture.md`, §10 et ADR-0006 amendée). Ce payload stdin reste le seul canal par
+  lequel l'intent/le contexte du run (findings, diff, ...) atteint l'agent — jamais une
+  variable d'environnement ni un argument de ligne de commande, contrairement au system
+  prompt lui-même qui, pour `claude`, voyage en argument (`--append-system-prompt`, voir
+  "Définir un agent" ci-dessus).
 
 ### Protocole de sortie des agents (findings)
 

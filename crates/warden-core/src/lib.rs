@@ -20,14 +20,14 @@ mod pr_body;
 mod socket;
 mod state;
 
-pub use agent_def::{parse_agent_definition, AgentDefinition, RunnerKind};
+pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
     parse_agent_input_message, AgentInputMessage, AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
 };
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{
-    decide_next_state, decide_next_state_after_ci, parse_findings, CiOutcome, Finding,
-    FindingSource, Severity,
+    decide_next_state, decide_next_state_after_ci, parse_findings,
+    validate_finding_sources_for_role, CiOutcome, Finding, FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
 pub use event::{EventKind, RunEvent, RunEventRecord};

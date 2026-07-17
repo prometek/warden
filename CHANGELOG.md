@@ -398,3 +398,76 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   markdown n'expose **pas** de clé `timeout` — une clé acceptée ici l'implémenterait à
   moitié ; ticket dédié) ; aucun auto-merge ni changement de la frontière credentials
   (ADR-0002/0006) ; Warden ne livre toujours aucune implémentation d'agent (ADR-0005).
+
+### Changed — Issue #24 : modèle d'adaptateur `--tool` + format d'agent Claude Code + lancement simplifié
+
+#### BREAKING (CLI) — `--coder-agent`/`--reviewer-agent`/`--tester-agent` supprimés, le schéma de définition warden-natif aussi
+
+- Le schéma de définition `+++`/TOML warden-natif introduit par #22 (ADR-0013) s'est révélé
+  trop coûteux à câbler en pratique pour un vrai run : il fallait écrire trois fichiers
+  `.md`, plus des scripts wrapper faits main pour restaurer `HOME` dans l'environnement de
+  l'agent (`env_clear()` ne laissait passer que `PATH`) et pour traduire la sortie du CLI en
+  NDJSON de findings. Les flags `--coder-agent`/`--reviewer-agent`/`--tester-agent` et le
+  seam de runner `warden::agent_runner::AgentRunner`/`CommandRunner` qu'ils sélectionnaient
+  sont **supprimés**, ainsi que le schéma `+++`/TOML lui-même (`RunnerKind`,
+  `CoreError::UnknownRunner`).
+- Remplacés par **`--tool <name>`** (obligatoire, ensemble fermé résolu à la compilation —
+  `claude` seul pour l'instant) qui sélectionne un **adaptateur d'outil intégré**
+  (`warden::tool_adapter::ToolAdapter`, `ClaudeAdapter`) pour les trois rôles du run.
+  L'adaptateur construit l'invocation réelle du CLI, déclare l'allowlist d'environnement
+  dont il a besoin, traduit lui-même la sortie de l'outil en NDJSON de findings, et fournit
+  un prompt et un `tools` par défaut par rôle — l'utilisateur n'écrit plus de wrapper.
+- Le format de définition d'un rôle adopte directement celui de **Claude Code**
+  (`.claude/agents/*.md` : frontmatter **YAML** `---`, clés `name`/`description`/`tools`/
+  `model`, corps markdown = system prompt), remplaçant le schéma warden-natif `+++`/TOML.
+- **Définitions par convention, plus par flag obligatoire** : `<repo>/.warden/agents/
+  {coder,reviewer,tester}.md`, si présent — sinon le prompt/`tools` par défaut de
+  l'adaptateur sélectionné. Résultat : un run tourne avec **zéro fichier `.md`**.
+
+  Avant (#22/#23) :
+
+  ```sh
+  warden run --repo . --intent "..." \
+    --coder-agent agents/coder.md \
+    --reviewer-agent agents/reviewer.md \
+    --tester-agent agents/tester.md
+  ```
+
+  Après :
+
+  ```sh
+  warden run --repo . --intent "..." --tool claude
+  ```
+
+  **Migration** — deux options pour un rôle dont vous voulez garder le contrôle plutôt que
+  le défaut de l'adaptateur : convertissez chaque définition `+++`/TOML existante en
+  frontmatter YAML `---` (`name`/`description`/`tools`/`model`, corps = system prompt
+  inchangé) sous `.warden/agents/<role>.md` du dépôt cible ; ou abandonnez-la et laissez
+  l'adaptateur fournir son prompt/`tools` par défaut pour ce rôle.
+
+#### Sécurité — à connaître avant de lancer un run
+
+- **`ClaudeAdapter` accorde `Bash` par défaut** aux trois rôles (coder :
+  `Read, Write, Edit, Bash` ; reviewer : `Read, Grep, Glob, Bash` ; tester :
+  `Read, Write, Edit, Grep, Glob, Bash`), et **`HOME`/`USER` sont désormais transmis** à
+  l'agent (allowlist d'environnement explicite par adaptateur, `USER` requis en pratique
+  pour l'auth `claude` via le trousseau macOS) là où seul `PATH` l'était auparavant. En
+  déploiement `warden`/`warden-gated` même-UID (le défaut documenté), un agent qui tourne
+  normalement — pas seulement un `warden` compromis — a donc les moyens d'atteindre la clé
+  SSH réelle de l'utilisateur et `~/.config/gh`, et de pousser directement vers `origin` en
+  contournant `warden-gated`. Documenté honnêtement dans `docs/Architecture.md` (ADR-0006,
+  amendement issue #24 ; §10) plutôt que présenté comme déjà couvert. Isolation réelle
+  trackée par l'issue #28.
+- Le détecteur de trafiquage de définition inter-run (`.warden/agents/` touché par un diff
+  coder → finding bloquant) est une défense en profondeur, **pas une garantie** : deux
+  contournements sont connus et documentés (`orchestrator.rs`, issue #30).
+
+#### Autres changements
+
+- Correctif de sécurité en cours de revue de cette même issue : `AsciinemaAdapter`
+  citait naïvement (espace-join) la commande enregistrée avant de la passer à
+  `asciinema rec --command`, qui l'exécute via un shell. `ClaudeAdapter::build_command`
+  met désormais le system prompt complet dans les args (`--append-system-prompt`), et les
+  prompts par défaut contiennent des métacaractères shell (apostrophes, backticks) —
+  un espace-join naïf y devenait un vecteur d'injection shell. Chaque partie de la commande
+  est désormais quotée individuellement (`shlex::try_quote`) avant l'assemblage.

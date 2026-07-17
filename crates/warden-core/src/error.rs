@@ -18,13 +18,6 @@ pub enum CoreError {
     #[error("unknown agent role: {0:?}")]
     UnknownRole(String),
 
-    /// A markdown agent definition's `runner` key names a runner Warden has
-    /// no implementation for (ADR-0013, issue #22) -- validated against a
-    /// closed set exactly like [`Self::UnknownRole`], never falling back to
-    /// whatever runner happens to exist.
-    #[error("unknown agent runner: {0:?}")]
-    UnknownRunner(String),
-
     #[error("unknown finding source: {0:?}")]
     UnknownFindingSource(String),
 
@@ -66,10 +59,11 @@ pub enum CoreError {
     #[error("malformed agent input: {0}")]
     MalformedAgentInput(String),
 
-    /// A markdown agent definition (ADR-0013, issue #22) whose frontmatter
-    /// fence is missing/unterminated, whose frontmatter isn't valid TOML,
-    /// carries an unknown key (`deny_unknown_fields`), misses a key its
-    /// runner requires, or whose system-prompt body is blank -- untrusted
+    /// A markdown agent definition (issue #24, Claude Code's own
+    /// `.claude/agents/*.md` schema) whose frontmatter fence is
+    /// missing/unterminated, whose frontmatter isn't valid YAML, carries an
+    /// unknown key (`deny_unknown_fields`), carries a blank-but-present
+    /// optional field, or whose system-prompt body is blank -- untrusted
     /// input read off disk at the CLI boundary, validated with the same
     /// rigor as [`Self::MalformedAgentInput`].
     #[error("malformed agent definition: {0}")]
