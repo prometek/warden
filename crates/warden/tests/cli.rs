@@ -471,6 +471,210 @@ async fn e2e_attach_command_shell_quotes_a_warden_home_containing_a_space() {
     );
 }
 
+/// Issue #31 review, M3: a RELATIVE `--warden-home` must be printed as an
+/// ABSOLUTE path in the attach command, so it stays paste-safe even from a
+/// different cwd than the one `warden run` itself was invoked from -- the
+/// "resolved, not raw flag value" requirement applies just as much to
+/// relativeness as it does to the default-vs-explicit case already covered
+/// above. Verified by invoking the binary with a relative `--warden-home`
+/// from a controlled `current_dir`, and asserting the printed path equals
+/// that cwd joined with the relative value -- not the relative value
+/// itself.
+///
+/// Deliberately does NOT assert the run itself reaches `Converged`: a
+/// relative `--warden-home` hits a separate, pre-existing bug unrelated to
+/// issue #31 -- `WorktreeManager::create` (`worktree.rs`) resolves it via
+/// `git -C <main_repo_path> worktree add <relative_worktrees_root>/...`
+/// (relative to the *repo*), while `read_head_commit` (`orchestrator.rs`)
+/// later does `git -C <relative_worktrees_root>/...` with no `-C` override
+/// at all (relative to the *process cwd*) -- two different git invocations
+/// resolving the exact same relative string against two different bases.
+/// The printed attach line (this test's actual subject) is written before
+/// either of those git calls ever runs, so it is unaffected; only the run's
+/// own eventual convergence is. Confirmed independently: `state.db` (opened
+/// by `db::connect`, resolved the same way SQLite resolves any relative
+/// path -- against the process cwd) does land exactly where the printed
+/// line says it does.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_attach_command_absolutizes_a_relative_warden_home() {
+    let repo = init_test_repo();
+    let cwd_root = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let relative_warden_home = "relative_warden_home";
+    // Not `.success()`: see this test's own docs for the unrelated,
+    // pre-existing relative-path git worktree bug this run is expected to
+    // hit downstream of the print statement under test here.
+    let output = Command::cargo_bin("warden")
+        .unwrap()
+        .current_dir(cwd_root.path())
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "absolutize a relative warden-home",
+            "--warden-home",
+            relative_warden_home,
+            "--tool",
+            "claude",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // The relative value itself must never appear as the `--warden-home`
+    // argument of the printed command -- only its absolutized form should.
+    assert!(
+        !stdout.contains(&format!("--warden-home {relative_warden_home}")),
+        "the attach command must not echo the raw relative --warden-home value verbatim: \
+         {stdout:?}"
+    );
+
+    // `cwd_root.path()` itself may still contain a symlinked component
+    // (e.g. macOS's `/var` -> `/private/var`); `std::path::absolute` is
+    // purely lexical and does not resolve those, but `getcwd(2)` -- what
+    // the child process's own `std::env::current_dir()` call reports, once
+    // it has actually `chdir`'d there -- always returns the fully resolved
+    // path. Canonicalizing here (the tempdir already exists, so this cannot
+    // fail) matches that, rather than comparing against the symlinked form.
+    let expected_absolute = cwd_root
+        .path()
+        .canonicalize()
+        .expect("cwd_root exists")
+        .join(relative_warden_home);
+    let expected_fragment = format!("--warden-home {}", expected_absolute.display());
+    assert!(
+        stdout.contains(&expected_fragment),
+        "expected the attach command to name the absolutized relative warden-home \
+         ({expected_fragment:?}), got stdout: {stdout:?}"
+    );
+
+    // Closes the loop: the resolved absolute path is really where this
+    // run's own state landed, not just a cosmetically-plausible string.
+    assert!(
+        expected_absolute.join("state.db").exists(),
+        "the absolutized relative warden-home ({}) must be where this run's state.db actually \
+         is",
+        expected_absolute.display()
+    );
+}
+
+/// Issue #31 review, L2: `warden run | head -1` must not panic on a closed
+/// stdout, and the run it started must still reach a terminal state
+/// (`Converged`) in SQLite rather than being aborted mid-flight with its
+/// `runs` row stuck non-terminal. Reproduced against the real compiled
+/// binary without a shell (so the test controls exactly when the read end
+/// closes, deterministically, rather than racing an external `head`
+/// process): the child's stdout is read one line, then the read end is
+/// dropped -- closing the pipe -- strictly before `Child::wait()` is called,
+/// so every later write (in particular the end-of-run `finished:` line,
+/// which is only ever written after the whole convergence loop -- and thus
+/// every write this test cares about -- has completed) is guaranteed to
+/// race against an already-closed pipe, not a possibly-still-open one.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_survives_a_closed_stdout_without_panicking() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let bin_path = env!("CARGO_BIN_EXE_warden");
+    let mut child = SyncCommand::new(bin_path)
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "survive a closed stdout",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn warden");
+
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    let child_stderr = child.stderr.take().expect("piped stderr");
+
+    // Drained concurrently on its own thread so a chatty stderr can't fill
+    // its pipe buffer and deadlock `child.wait()` below.
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut stderr = child_stderr;
+        stderr.read_to_string(&mut buf).ok();
+        buf
+    });
+
+    let first_line = {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(child_stdout);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("read the \"started\" line before closing stdout");
+        // Dropping `reader` (and the `ChildStdout` it owns) here closes our
+        // read end of the pipe -- this happens strictly before `child.wait()`
+        // below, in program order, so there is no race: every write the
+        // child performs afterwards (in particular the end-of-run line)
+        // necessarily targets an already-closed pipe.
+        line
+    };
+
+    let run_id = first_line
+        .trim_end()
+        .strip_prefix("run ")
+        .and_then(|rest| rest.strip_suffix(" started"))
+        .unwrap_or_else(|| panic!("unexpected first stdout line: {first_line:?}"))
+        .to_string();
+
+    let status = child.wait().expect("wait for warden to exit");
+    let stderr_output = stderr_thread.join().expect("stderr thread");
+
+    assert!(
+        status.success(),
+        "warden run must still exit successfully despite its stdout being closed mid-run \
+         (status: {status:?}, stderr: {stderr_output:?})"
+    );
+    assert!(
+        !stderr_output.contains("panicked"),
+        "warden run must not panic when stdout is closed mid-run; stderr: {stderr_output:?}"
+    );
+
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let run = warden::db::get_run(&pool, &run_id)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no `runs` row found for id {run_id}"));
+    assert_eq!(
+        run.state,
+        RunState::Converged,
+        "a closed stdout must not leave the run's own SQLite state stuck non-terminal"
+    );
+}
+
 /// Acceptance criterion 1 (issue #1): "Un cycle complet (coder -> review ->
 /// test -> reboucle si besoin) est reproductible sur un repo de test" --
 /// driven through the real `warden run --tool claude` CLI command, exactly
