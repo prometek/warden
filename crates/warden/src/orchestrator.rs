@@ -283,14 +283,39 @@ pub struct Orchestrator {
     /// list, so adding parameters there would be a breaking, test-rippling
     /// change for a purely additive observability feature.
     run_context: tokio::sync::OnceCell<RunContext>,
+    /// Issue #31: invoked synchronously with the freshly generated run id,
+    /// at the exact same point `RunEvent::RunStarted` is published --
+    /// before the first cycle, but after the `runs` row and the Event Bus
+    /// socket both exist. Lets `main.rs` print the run id and a
+    /// ready-to-copy `warden-tui attach` hint to stdout the moment the run
+    /// truly starts, instead of only after `run_convergence_loop` returns.
+    /// `None` by default (every test below, and any other caller that
+    /// doesn't care to observe run start) -- a builder-style setter rather
+    /// than a `run_convergence_loop` parameter for the same test-rippling
+    /// reason as `run_context` above.
+    on_run_started: Option<RunStartedCallback>,
 }
+
+/// See the `on_run_started` field docs on [`Orchestrator`]. Named alias
+/// only to satisfy clippy's `type_complexity` lint.
+type RunStartedCallback = Box<dyn Fn(&str) + Send + Sync>;
 
 impl Orchestrator {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
             run_context: tokio::sync::OnceCell::new(),
+            on_run_started: None,
         }
+    }
+
+    /// Registers `callback` to run once, synchronously, when this
+    /// orchestrator's run starts (see the `on_run_started` field docs).
+    /// Consumes and returns `self` so the CLI can set it up in the same
+    /// expression that constructs the orchestrator (`main.rs`).
+    pub fn on_run_started(mut self, callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_run_started = Some(Box::new(callback));
+        self
     }
 
     /// Persists `event` to `events` and broadcasts it on the active run's
@@ -388,6 +413,13 @@ impl Orchestrator {
             max_cycles: config.max_cycles,
         })
         .await?;
+        // Issue #31: the `runs` row and the Event Bus socket both exist by
+        // now, so `warden-tui attach --run-id <run_id>` is already a valid
+        // command -- this is the earliest point at which printing it is
+        // meaningful.
+        if let Some(callback) = &self.on_run_started {
+            callback(&run_id);
+        }
 
         // Write-ahead: the run is about to launch the coder, so record the
         // intent to do so before actually spawning anything (ADR-0004).

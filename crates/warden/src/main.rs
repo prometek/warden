@@ -289,6 +289,12 @@ async fn run<R: ToolAdapter>(
     let reviewer_agent = resolve_agent_definition(&repo, AgentRole::Reviewer, &adapter).await?;
     let tester_agent = resolve_agent_definition(&repo, AgentRole::Tester, &adapter).await?;
 
+    // Issue #31: cloned before `warden_home` moves into `config` below --
+    // this is the resolved `warden_home` (not the raw `--warden-home`
+    // flag, which may be unset), so the printed attach command is
+    // copy-pasteable as-is.
+    let attach_warden_home = warden_home.clone();
+
     let config = RunConfig {
         repo_path: repo,
         warden_home,
@@ -303,7 +309,17 @@ async fn run<R: ToolAdapter>(
         gate,
     };
 
-    let orchestrator = Orchestrator::new(pool);
+    // Printed at run start (not via `tracing`, so it shows at the default
+    // `warn` verbosity) rather than only once the run finishes, so
+    // `warden-tui attach` can follow a live run without the user having to
+    // query SQLite by hand for its run_id.
+    let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
+        println!("run {run_id} started");
+        println!(
+            "attach: warden-tui attach --run-id {run_id} --warden-home {}",
+            attach_warden_home.display()
+        );
+    });
     let (run_id, final_state) = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await
