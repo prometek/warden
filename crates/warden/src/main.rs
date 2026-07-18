@@ -416,6 +416,27 @@ async fn run<R: ToolAdapter>(
 
     let cancel_on_tui_exit = cancel.clone();
 
+    // Issue #32 review (HIGH): holds the `JoinHandle` for the task that
+    // awaits the spawned `warden-tui` child (see below), set from inside
+    // `on_run_started` -- that callback must stay synchronous/non-blocking
+    // (its own docs), so it cannot itself await the child. `run` awaits this
+    // same handle once the convergence loop below has settled (see the
+    // comment at that await site for why).
+    let tui_watcher: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let tui_watcher_setter = tui_watcher.clone();
+
+    // Issue #32 review (MEDIUM): a `--tui` spawn failure recorded here, then
+    // checked -- and, if present, surfaced as this run's own failure --
+    // right after the convergence loop below settles. `--tui` is an
+    // explicit user request for a spawned, attached `warden-tui` (including
+    // the cancel-on-exit safety net it provides); silently continuing the
+    // run headless when that spawn fails would both drop the feature the
+    // user asked for and violate code-standards.md's "no silent fallback".
+    let tui_spawn_error: std::sync::Arc<std::sync::Mutex<Option<warden::error::ProcessError>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let tui_spawn_error_setter = tui_spawn_error.clone();
+
     // Printed at run start (not via `tracing`, so it shows at the default
     // `warn` verbosity) rather than only once the run finishes, so
     // `warden-tui attach` can follow a live run without the user having to
@@ -444,28 +465,85 @@ async fn run<R: ToolAdapter>(
             ) {
                 Ok(child) => {
                     let cancel_on_tui_exit = cancel_on_tui_exit.clone();
-                    // Detached deliberately (its `JoinHandle` is dropped, not
-                    // awaited): `run` below does not wait for this task or
-                    // for the `warden-tui` child it watches -- see this
-                    // spawn's own docs (`cancel_run_when_tui_exits`) for why.
-                    tokio::spawn(async move {
+                    let handle = tokio::spawn(async move {
                         cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
                     });
+                    *tui_watcher_setter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
                 }
                 Err(error) => {
                     tracing::error!(
                         %error,
                         tui_bin = %tui_launch.tui_bin.display(),
-                        "failed to spawn warden-tui for --tui; continuing the run without it"
+                        "failed to spawn warden-tui for --tui; aborting the run"
                     );
+                    // Issue #32 review (MEDIUM): abort immediately, right
+                    // here, rather than only once the convergence loop below
+                    // eventually returns -- the coder's very first
+                    // invocation hasn't even started yet at this point
+                    // (`on_run_started` fires before any per-cycle work,
+                    // see its own docs), so cancelling now stops the run
+                    // from doing any real work at all instead of running an
+                    // entire (headless) cycle it will just fail after.
+                    *tui_spawn_error_setter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                    cancel_on_tui_exit.cancel();
                 }
             }
         }
     });
-    let (run_id, final_state) = orchestrator
+    let convergence_result = orchestrator
         .run_convergence_loop(config, adapter, cancel)
-        .await
-        .context("convergence loop failed")?;
+        .await;
+
+    // Issue #32 review (HIGH): waits for a still-attached `warden-tui` to
+    // exit *before* deciding this run's own outcome below -- regardless of
+    // how the convergence loop itself concluded. `warden_tui::app_loop`
+    // never self-exits once the run ends or its live channel closes (its
+    // `recv_live` branch on a closed channel just clears `attachment.live`
+    // and keeps looping on user input, see that module's own docs); it only
+    // ever returns via `is_quit` (`q`/`Esc`/Ctrl-C) or its input thread
+    // ending. So "launch and watch" only behaves the way a user expects --
+    // the terminal returns to the shell once *they* quit the TUI -- if this
+    // process waits here too. Skipping this would let `warden` exit while
+    // `warden-tui` still holds the tty in raw mode/the alternate screen
+    // (its own `restore_terminal` never having run), corrupting the
+    // terminal and leaving the shell and the orphaned TUI racing for it.
+    //
+    // If the TUI already exited on its own (having triggered
+    // `cancel_run_when_tui_exits`'s `cancel.cancel()`, which is what caused
+    // the convergence loop above to end early), this resolves immediately
+    // -- that task's own last action is exactly the `cancel()` call that
+    // unblocks the loop, so by the time this is reached it has already
+    // finished. If `--tui` was never set, `tui_watcher` stays `None` and
+    // this is a no-op.
+    let tui_watcher_handle = tui_watcher
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(handle) = tui_watcher_handle {
+        let _ = handle.await;
+    }
+
+    // Issue #32 review (MEDIUM): a recorded `--tui` spawn failure is this
+    // run's own root cause and takes precedence over whatever the
+    // convergence loop itself returned (typically just
+    // `ProcessError::Cancelled`, the downstream symptom of the
+    // `cancel.cancel()` the spawn failure triggered above) -- surfaced with
+    // its own actionable message (already naming the resolved `--tui-bin`
+    // path, see `ProcessError::Spawn`'s `Display`) rather than the more
+    // generic "cancelled" one.
+    if let Some(spawn_error) = tui_spawn_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(spawn_error).context("failed to spawn warden-tui for --tui; aborted the run");
+    }
+
+    let (run_id, final_state) = convergence_result.context("convergence loop failed")?;
 
     tracing::info!(run_id, ?final_state, "run finished");
     // Review L2: same closed-stdout hazard as `print_run_started_hint`,
@@ -473,21 +551,6 @@ async fn run<R: ToolAdapter>(
     // -- see `print_stdout_line_or_log`'s own docs.
     print_stdout_line_or_log(&format!("run {run_id} finished: {final_state:?}"));
 
-    // Issue #32: `run` deliberately does *not* wait here for a still-running
-    // `warden-tui` (spawned above) to exit on its own before returning --
-    // doing so deadlocks. The Event Bus (`event_bus::accept_loop`) never
-    // signals an already-connected subscriber that a run has ended; that
-    // subscriber only ever observes its live connection close because the
-    // *whole* `warden` process exits (which the OS then closes every open
-    // socket for). Waiting here for the TUI to exit first, while the TUI
-    // waits for its connection to close (which needs this very process to
-    // exit) is a genuine circular deadlock, not just a slow path -- caught by
-    // hand against the real `warden-tui` binary while validating this issue.
-    // A `warden-tui` still attached when this process exits keeps running
-    // standalone against the persisted `runs`/`events` rows exactly as any
-    // independently-launched `warden-tui attach` would (ADR-0008); this only
-    // changes when *this* process exits, never whether the TUI can still be
-    // watched.
     Ok(())
 }
 
@@ -499,10 +562,11 @@ async fn run<R: ToolAdapter>(
 /// going" from "cancel it" -- exit is the only signal this process ever
 /// gets, so it is treated uniformly. Cancelling after the run has already
 /// reached a terminal state is a harmless no-op (`CancellationToken::cancel`
-/// is idempotent, and nothing is left to kill) -- this task's own
-/// `JoinHandle` is deliberately never awaited by `run` (see its own docs),
-/// so it keeps running detached for exactly that case: a TUI the user keeps
-/// open to watch a run that has already converged.
+/// is idempotent, and nothing is left to kill) -- exactly the case where the
+/// user keeps a TUI open to watch a run that has already converged, then
+/// quits it themselves; `run` awaits this task's own `JoinHandle` afterwards
+/// (see the review (HIGH) comment at that await site) precisely so it stays
+/// alive until that happens.
 async fn cancel_run_when_tui_exits(mut child: tokio::process::Child, cancel: CancellationToken) {
     match child.wait().await {
         Ok(status) => {

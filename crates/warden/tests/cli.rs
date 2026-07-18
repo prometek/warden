@@ -2903,18 +2903,12 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
 /// `attach --run-id <id> --warden-home <warden_home>` -- the same argv a
 /// user would type by hand from the printed "attach:" hint (issue #31).
 ///
-/// The fake `warden-tui` here outlives `warden run` itself (it sleeps well
-/// past the point the convergence loop -- deliberately fast here -- has
-/// finished): `warden run` must not wait for it to exit before returning
-/// (unlike this issue's first cut, which did and deadlocked -- see
-/// `main.rs::run`'s own docs on why waiting here is unsound: the Event Bus
-/// only signals an attached subscriber that a run ended by `warden run`'s
-/// own process exiting, so waiting on the TUI while the TUI waits on that
-/// same process to exit is circular). Asserted by polling for the captured
-/// argv file rather than assuming it is already there the instant `warden
-/// run` exits -- deterministic either way, since the fake script writes it
-/// before its sleep, well before `warden run`'s own (slower, multi-worktree)
-/// convergence loop can finish.
+/// The fake `warden-tui` sleeps briefly before exiting -- if it exited
+/// (correctly) instantly instead, it would race the (fast, fake-claude)
+/// convergence loop and often cancel the run before it ever converges (the
+/// decided "TUI exit cancels the run" behaviour, exercised on its own by
+/// `e2e_tui_exit_cancels_a_still_running_run` below), which is not what
+/// this test is about.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home() {
@@ -2934,7 +2928,7 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
         tui_dir.path(),
         "fake-warden-tui",
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 5\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 1\n",
             captured_argv.display()
         ),
     );
@@ -2963,10 +2957,12 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let run_id = extract_run_id(&stdout);
 
-    // Polled rather than read once: `warden run` returning does not
-    // guarantee the independently-scheduled fake-tui process has already
-    // been scheduled to run its own first line, only that it was spawned.
-    let captured = poll_until_readable(&captured_argv, std::time::Duration::from_secs(3));
+    // `warden run` waits for the spawned `warden-tui` to exit before
+    // returning (see the dedicated lifecycle test below), so by the time
+    // `.assert()` above has returned, the fake script has already run to
+    // completion and its argv capture file is guaranteed to be there --
+    // no polling needed here, unlike that other test's longer-lived fake.
+    let captured = std::fs::read_to_string(&captured_argv).unwrap();
 
     // `printf '%s\n' "$@"` (rather than `"$*"`) prints one argv entry per
     // line -- unambiguous even if an argument itself contained a space,
@@ -2984,25 +2980,61 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
     );
 }
 
-/// Polls `path` until it is readable (non-empty) or `timeout` elapses,
-/// returning its contents. Used instead of a single blind read where a
-/// process independent of the one this test just awaited (`warden run`'s own
-/// child, `--tui`'s spawned `warden-tui`) is responsible for writing it, so
-/// there is no ordering guarantee against this test's own thread otherwise.
+/// Issue #32 review (HIGH): `warden run` must wait for a still-attached
+/// `warden-tui` to exit before returning, even once the run it's watching
+/// has already converged -- `warden_tui::app_loop` never self-exits on its
+/// own (it only returns via `is_quit`'s `q`/`Esc`/Ctrl-C, or its input
+/// thread ending), so skipping this would let `warden` exit while the real
+/// `warden-tui` is still holding the tty in raw mode/the alternate screen,
+/// corrupting the terminal. The fake `warden-tui` here sleeps well past the
+/// point the (deliberately fast) convergence loop has finished; asserting
+/// the whole command still takes at least that long is what proves `warden
+/// run` waited for it rather than returning the moment the run itself
+/// converged.
 #[cfg(unix)]
-fn poll_until_readable(path: &Path, timeout: std::time::Duration) -> String {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            if !contents.is_empty() {
-                return contents;
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("{path:?} was not written within {timeout:?}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+#[tokio::test]
+async fn e2e_tui_flag_waits_for_the_tui_to_exit_before_returning_on_a_converging_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let tui_dir = TempDir::new().unwrap();
+    let fake_tui = write_fake_tool(tui_dir.path(), "fake-warden-tui", "#!/bin/sh\nsleep 2\n");
+
+    let started = std::time::Instant::now();
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "issue 32: warden run waits for warden-tui",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--tui",
+            "--tui-bin",
+            fake_tui.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "warden run must wait for the warden-tui child it spawned to exit before returning \
+         (elapsed: {elapsed:?})"
+    );
 }
 
 /// Issue #32 decision ("la sortie de la TUI annule le run"): once the TUI
@@ -3054,4 +3086,48 @@ async fn e2e_tui_exit_cancels_a_still_running_run() {
         "the run must be cancelled promptly once the TUI exits, not run to completion \
          (elapsed: {elapsed:?}, coder sleeps 30s)"
     );
+}
+
+/// Issue #32 review (MEDIUM): a `--tui` spawn failure must abort the run
+/// with its own actionable error, not silently degrade to a plain headless
+/// run -- `--tui` is an explicit user request for the spawned TUI and the
+/// cancel-on-exit safety net it provides, and code-standards.md forbids
+/// exactly this kind of silent fallback. Driven with a `--tui-bin` that
+/// does not exist at all, so `spawn_tui_attach` fails immediately with a
+/// typed `ProcessError::Spawn`.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_tui_spawn_failure_aborts_the_run_instead_of_degrading_to_headless() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // The coder sleeps well past this test's own assertions below -- if the
+    // run were left running headless instead of aborting, this would show
+    // up as a slow/hanging test rather than a passing one.
+    write_fake_claude(bin_dir.path(), "sleep 30", NOOP_BODY, NOOP_BODY);
+
+    let tui_dir = TempDir::new().unwrap();
+    let missing_tui_bin = tui_dir.path().join("does-not-exist");
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "issue 32: --tui spawn failure must abort the run",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--tui",
+            "--tui-bin",
+            missing_tui_bin.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("failed to spawn"))
+        .stderr(contains(missing_tui_bin.to_str().unwrap().to_string()));
 }
