@@ -340,6 +340,18 @@ base, avant de fusionner les deux (déduplication par identifiant d'événement)
 attache tardive sur un run déjà en cours affiche donc l'historique complet puis bascule
 sur le direct, sans trou.
 
+**Progression d'agent en direct (issue #33, amende ADR-0008)** : entre `AgentStarted` et
+`AgentFinished`, `warden-tui` affiche désormais ce que l'agent rapporte faire — dernier
+message assistant complet ou bloc `tool_use` — au fur et à mesure (`RunEvent::AgentProgress`),
+au lieu de rester sans nouvelle jusqu'à la fin de l'agent. `ClaudeAdapter` (`--tool claude`)
+lance `claude` avec `--output-format stream-json --verbose` pour l'obtenir. Ce signal est
+**live-only** : il transite sur l'Event Bus mais n'est **jamais persisté** en base (contrairement
+aux autres événements de cette section) — une attache tardive ne rejoue donc jamais la
+progression d'un agent déjà en cours ou déjà terminé, elle attend le prochain événement en
+direct. C'est aussi une observation **déclarative** (ce que l'agent affirme faire), pas une
+preuve vérifiée d'exécution — voir "Preuve d'exécution (Evidence)" ci-dessus (ADR-0009) pour
+la seule source qui porte une valeur de preuve.
+
 Sur un terminal dont la sortie standard n'est pas un TTY (pipe, redirection), `warden-tui`
 bascule automatiquement sur un mode texte qui affiche un événement par ligne en NDJSON —
 pratique pour scripter/observer un run sans interface plein écran.

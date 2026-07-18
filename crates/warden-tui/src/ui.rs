@@ -132,10 +132,20 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
             let status = if let Some(final_state) = model.final_state() {
                 format!("finished: {final_state}")
             } else {
-                format!(
+                let cycle_status = format!(
                     "cycle {}/{max_cycles} in progress",
                     model.current_cycle_number()
-                )
+                );
+                // Issue #33: what actually makes the header alive during a
+                // long-running agent -- `None` before any progress has
+                // arrived, or once `RunModel::current_progress`'s own
+                // "stale after AgentFinished" rule clears it (see that
+                // method's docs), in which case the plain cycle status
+                // above is all there is to show.
+                match model.current_progress() {
+                    Some((role, detail)) => format!("{cycle_status} -- {role}: {detail}"),
+                    None => cycle_status,
+                }
             };
             format!("run {run_id} [{branch}] \"{intent}\" -- {status}")
         }
@@ -168,6 +178,14 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         RunEvent::AgentStarted { role } => {
             (Style::default().fg(Color::Gray), format!("{role} started"))
         }
+        // Issue #33: dim/dark styling deliberately distinguishes a
+        // declarative progress line (what the agent *reports* doing, per
+        // this variant's own docs -- never a verified execution trace) from
+        // every other, more consequential event kind in this list.
+        RunEvent::AgentProgress { role, detail } => (
+            Style::default().fg(Color::DarkGray),
+            format!("{role}: {detail}"),
+        ),
         RunEvent::AgentFinished { role, exit_code } => (
             if *exit_code == 0 {
                 Style::default().fg(Color::Gray)
@@ -280,6 +298,130 @@ mod tests {
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("run started"));
         assert!(content.contains("cycle 1 started"));
+    }
+
+    /// Issue #33: the whole point of this event -- while a cycle is still
+    /// in progress, the header must show what the running agent last
+    /// reported, not just the static "cycle N/M in progress" it showed
+    /// before this issue.
+    #[test]
+    fn draw_shows_the_current_agent_progress_in_the_header_while_a_cycle_is_in_progress() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "running cargo test".to_string(),
+            },
+        ));
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("coder: running cargo test"));
+    }
+
+    /// Once an agent has finished, the header must fall back to the plain
+    /// cycle status rather than keep showing its now-stale last progress
+    /// line (`RunModel::current_progress`'s own contract) -- the progress
+    /// detail legitimately still appears once, as a historical entry in the
+    /// scrollable event log below the header; what must disappear is the
+    /// header's own *second*, "this is happening right now" repetition of
+    /// it.
+    #[test]
+    fn draw_omits_stale_progress_from_the_header_after_the_agent_finishes() {
+        let events_only = |model: &RunModel| {
+            let backend = TestBackend::new(100, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, model, GraphicsCapability::None, None))
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+                .matches("running cargo test")
+                .count()
+        };
+
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "running cargo test".to_string(),
+            },
+        ));
+        assert_eq!(
+            events_only(&model),
+            2,
+            "before the agent finishes: once in the header, once in the event log"
+        );
+
+        model.apply(record(
+            "e4",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+            },
+        ));
+        let content_after_finish = {
+            let backend = TestBackend::new(100, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        };
+        assert_eq!(
+            content_after_finish.matches("running cargo test").count(),
+            1,
+            "after the agent finishes: only the historical event log entry remains, the \
+             header's own repetition must be gone"
+        );
+        assert!(content_after_finish.contains("cycle 1/3 in progress"));
+    }
+
+    /// The scrollable event log must also carry each progress line, not
+    /// only the header's "latest" summary.
+    #[test]
+    fn draw_lists_agent_progress_events_in_the_scrollable_log() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::AgentProgress {
+                role: "reviewer".to_string(),
+                detail: "reviewing the diff".to_string(),
+            },
+        ));
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("reviewer: reviewing the diff"));
     }
 
     /// Acceptance criterion 3 (issue #8): the evidence pane must actually be

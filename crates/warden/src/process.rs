@@ -150,8 +150,33 @@ pub fn spawn_with_extra_env(
     })
 }
 
-/// Awaits a previously [`spawn`]ed child, cancellable via `cancel`. If
-/// `cancel` fires first, the child is killed and
+/// Awaits a previously [`spawn`]ed child, cancellable via `cancel`. Thin
+/// wrapper over [`wait_with_progress`] for the (still overwhelmingly common)
+/// case where nothing needs to observe stdout as it arrives -- see that
+/// function's own docs for the full behaviour, including deadlock avoidance
+/// and stdin write-failure handling, both unchanged by this wrapper.
+pub async fn wait(
+    child: Child,
+    command_name: &str,
+    stdin_payload: Option<String>,
+    cancel: CancellationToken,
+) -> Result<AgentOutcome, ProcessError> {
+    wait_with_progress(child, command_name, stdin_payload, cancel, None).await
+}
+
+/// Like [`wait`], but additionally invokes `on_stdout_line` (if given) once
+/// per complete line of stdout, *as it arrives* rather than only once the
+/// child has exited (issue #33: what lets a caller turn a streaming agent's
+/// output into live progress instead of five minutes of silence between
+/// `AgentStarted` and `AgentFinished`). `on_stdout_line` is called with the
+/// line's text, trailing `\n`/`\r` stripped, blank lines skipped; it must
+/// not block (no I/O of its own) -- it runs inline on the same task draining
+/// stdout, so a slow callback would itself throttle the drain this function
+/// exists to keep unblocked. What a line *means* (e.g. a `claude
+/// --output-format stream-json` event) is entirely the caller's concern --
+/// this module has no opinion on any agent's own wire format.
+///
+/// If `cancel` fires first, the child is killed and
 /// [`ProcessError::Cancelled`] is returned.
 ///
 /// `stdin_payload`, if given, is written to the child's stdin and the write
@@ -170,7 +195,15 @@ pub fn spawn_with_extra_env(
 /// pipe; meanwhile we'd be blocked writing to a stdin the agent has stopped
 /// reading — neither side can make progress. Running all four concurrently
 /// means each blocked read/write just yields to the executor, and progress
-/// on any one of them unblocks the others.
+/// on any one of them unblocks the others. Reading stdout **line-by-line**
+/// (`AsyncBufReadExt::read_until`) rather than in one `read_to_end` shot
+/// changes nothing about this property: it is still a single continuous
+/// drain of the same pipe, byte-for-byte identical to what `read_to_end`
+/// would have accumulated (see
+/// `writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`, whose
+/// 200KiB payload has no newlines in it at all and still must not hang) --
+/// it is simply chunked at `\n` boundaries so a caller can be notified as
+/// each line completes instead of only once the stream ends.
 ///
 /// **Stdin write failures** (H1, issue #20 review): a broken pipe (the
 /// agent closed or never read stdin before exiting) is logged at `warn` and
@@ -184,13 +217,14 @@ pub fn spawn_with_extra_env(
 /// Uses `child.wait()` (borrows `&mut self`) rather than
 /// `wait_with_output()` (which consumes `self`) so `child` is still
 /// available to `kill()` in the cancellation branch of the `select!` below.
-pub async fn wait(
+pub async fn wait_with_progress(
     mut child: Child,
     command_name: &str,
     stdin_payload: Option<String>,
     cancel: CancellationToken,
+    on_stdout_line: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<AgentOutcome, ProcessError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let stdin_handle = child.stdin.take();
     let stdout_handle = child.stdout.take();
@@ -211,9 +245,35 @@ pub async fn wait(
     };
     let stdout_task = async move {
         let mut buf = Vec::new();
-        if let Some(mut stdout_handle) = stdout_handle {
-            if let Err(error) = stdout_handle.read_to_end(&mut buf).await {
-                tracing::warn!(command = command_name, %error, "failed to read agent stdout to completion");
+        if let Some(stdout_handle) = stdout_handle {
+            // Line-by-line rather than `read_to_end` (issue #33): still a
+            // single continuous drain of the pipe (same deadlock-avoidance
+            // property, see this function's own docs), just chunked at `\n`
+            // so `on_stdout_line` can be notified as each line completes.
+            // `buf` ends up byte-for-byte identical to what `read_to_end`
+            // would have produced -- each `line` (delimiter included) is
+            // appended to it exactly as read.
+            let mut reader = BufReader::new(stdout_handle);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        buf.extend_from_slice(&line);
+                        if let Some(callback) = on_stdout_line {
+                            let text = String::from_utf8_lossy(&line);
+                            let trimmed = text.trim_end_matches(['\n', '\r']);
+                            if !trimmed.is_empty() {
+                                callback(trimmed);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(command = command_name, %error, "failed to read agent stdout to completion");
+                        break;
+                    }
+                }
             }
         }
         buf
@@ -529,6 +589,130 @@ mod tests {
         .expect("wait must not hang when both stdin and stdout exceed the pipe buffer size");
 
         assert_eq!(result.unwrap().exit_code, 0);
+    }
+
+    /// Issue #33: `wait_with_progress`'s deadlock-avoidance property must
+    /// hold identically to `wait`'s (the same regression scenario as
+    /// [`writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`]),
+    /// even with an `on_stdout_line` callback attached and even though the
+    /// stdout in this scenario has no newline *until EOF* -- proves the
+    /// line-buffered reader still drains continuously rather than blocking
+    /// on a delimiter that never arrives mid-stream (`read_until` only
+    /// returns once it hits either `\n` or EOF, so the single oversized
+    /// "line" here is delivered whole, in one callback invocation, right at
+    /// EOF -- exercised precisely by asserting that below).
+    #[tokio::test]
+    async fn wait_with_progress_does_not_deadlock_on_large_newline_free_stdout() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new(
+            "sh",
+            ["-c", "head -c 200000 /dev/zero; cat > /dev/null; exit 0"],
+        );
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let large_payload = "x".repeat(200_000);
+        let callback_invocations = std::sync::atomic::AtomicUsize::new(0);
+        let on_line = |_line: &str| {
+            callback_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_with_progress(
+                child,
+                "sh",
+                Some(large_payload),
+                CancellationToken::new(),
+                Some(&on_line),
+            ),
+        )
+        .await
+        .expect("wait_with_progress must not hang when stdout has no newlines at all");
+
+        assert_eq!(result.unwrap().exit_code, 0);
+        assert_eq!(
+            callback_invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the whole newline-free chunk must be delivered as exactly one line, at EOF"
+        );
+    }
+
+    /// Issue #33: the whole point of `wait_with_progress` -- a caller must
+    /// be notified of each stdout line as it arrives, not only once the
+    /// child has exited and the buffer is fully collected.
+    #[tokio::test]
+    async fn wait_with_progress_invokes_the_callback_once_per_stdout_line() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new(
+            "sh",
+            ["-c", "echo line-one; echo line-two; echo line-three"],
+        );
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
+
+        let outcome =
+            wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            vec!["line-one", "line-two", "line-three"]
+        );
+    }
+
+    /// Issue #33: a line with no trailing newline (the child exits without
+    /// flushing one, e.g. the very last line of output) must still reach the
+    /// callback -- `read_until` returns it on EOF even without the
+    /// delimiter, and the loop's `Ok(_)` arm doesn't require one either.
+    #[tokio::test]
+    async fn wait_with_progress_invokes_the_callback_for_a_final_line_with_no_trailing_newline() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "printf 'no newline at the end'"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
+
+        wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.into_inner().unwrap(), vec!["no newline at the end"]);
+    }
+
+    /// Issue #33: blank lines carry nothing worth surfacing and must not
+    /// reach the callback at all.
+    #[tokio::test]
+    async fn wait_with_progress_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "printf 'a\\n\\nb\\n'"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
+
+        wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.into_inner().unwrap(), vec!["a", "b"]);
+    }
+
+    /// Issue #33: `wait_with_progress(..., None)` must behave exactly like
+    /// `wait` -- both the accumulated stdout and the exit code are
+    /// unaffected by the line-by-line reading change.
+    #[tokio::test]
+    async fn wait_with_progress_without_a_callback_matches_plain_wait() {
+        let dir = TempDir::new().unwrap();
+        let cmd = AgentCommand::new("sh", ["-c", "echo hello"]);
+        let child = spawn(&cmd, dir.path()).unwrap();
+
+        let outcome = wait_with_progress(child, "sh", None, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.stdout, "hello\n");
     }
 
     /// H1 (issue #20 review): an agent that exits immediately without ever
