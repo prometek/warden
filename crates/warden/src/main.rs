@@ -1,7 +1,7 @@
 //! `warden` binary: CLI parsing + dispatch only. All orchestration logic
 //! lives in the `warden` library crate (`src/lib.rs` and friends).
 
-use std::io::Write as _;
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -498,33 +498,29 @@ async fn run<R: ToolAdapter>(
         .run_convergence_loop(config, adapter, cancel)
         .await;
 
-    // Issue #32 review (HIGH): waits for a still-attached `warden-tui` to
-    // exit *before* deciding this run's own outcome below -- regardless of
-    // how the convergence loop itself concluded. `warden_tui::app_loop`
-    // never self-exits once the run ends or its live channel closes (its
-    // `recv_live` branch on a closed channel just clears `attachment.live`
-    // and keeps looping on user input, see that module's own docs); it only
-    // ever returns via `is_quit` (`q`/`Esc`/Ctrl-C) or its input thread
-    // ending. So "launch and watch" only behaves the way a user expects --
-    // the terminal returns to the shell once *they* quit the TUI -- if this
-    // process waits here too. Skipping this would let `warden` exit while
-    // `warden-tui` still holds the tty in raw mode/the alternate screen
-    // (its own `restore_terminal` never having run), corrupting the
-    // terminal and leaving the shell and the orphaned TUI racing for it.
+    // Issue #32 review (HIGH, then re-review): whether to wait here for a
+    // still-attached `warden-tui` to exit before deciding this run's own
+    // outcome below depends on whether *this process's own* stdout is a
+    // terminal -- see `should_wait_for_spawned_tui`'s own docs for exactly
+    // why that (rather than always/never waiting) is the correct gate.
+    // `spawn_tui_attach` inherits stdio, so the spawned `warden-tui`'s own
+    // `is_terminal(stdout)` check always agrees with this one.
     //
     // If the TUI already exited on its own (having triggered
     // `cancel_run_when_tui_exits`'s `cancel.cancel()`, which is what caused
-    // the convergence loop above to end early), this resolves immediately
-    // -- that task's own last action is exactly the `cancel()` call that
-    // unblocks the loop, so by the time this is reached it has already
-    // finished. If `--tui` was never set, `tui_watcher` stays `None` and
-    // this is a no-op.
-    let tui_watcher_handle = tui_watcher
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(handle) = tui_watcher_handle {
-        let _ = handle.await;
+    // the convergence loop above to end early), awaiting it here resolves
+    // immediately -- that task's own last action is exactly the `cancel()`
+    // call that unblocks the loop, so by the time this is reached it has
+    // already finished. If `--tui` was never set, `tui_watcher` stays
+    // `None` and this is a no-op either way.
+    if should_wait_for_spawned_tui(std::io::stdout().is_terminal()) {
+        let tui_watcher_handle = tui_watcher
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = tui_watcher_handle {
+            let _ = handle.await;
+        }
     }
 
     // Issue #32 review (MEDIUM): a recorded `--tui` spawn failure is this
@@ -580,6 +576,46 @@ async fn cancel_run_when_tui_exits(mut child: tokio::process::Child, cancel: Can
         }
     }
     cancel.cancel();
+}
+
+/// Issue #32 re-review: whether `run` should wait for a still-attached
+/// `warden-tui` (spawned for `--tui`) to exit before returning, given
+/// whether *this process's own* stdout is a terminal. `spawn_tui_attach`
+/// inherits stdio, so the spawned `warden-tui`'s own `is_terminal(stdout)`
+/// check always agrees with `stdout_is_terminal` here -- making it the exact
+/// discriminator between the two modes `warden-tui attach` runs in
+/// (`crates/warden-tui/src/main.rs`), which need opposite answers:
+///
+/// - **tty** (interactive `app_loop`): holds the tty in raw mode/the
+///   alternate screen and never self-exits on its own -- it only ever
+///   returns via `is_quit` (`q`/`Esc`/Ctrl-C) or its input thread ending
+///   (see that module's own docs). `run` must wait (`true`), or `warden`
+///   would exit while `warden-tui` still owns the terminal, corrupting it.
+/// - **non-tty** (headless `run_headless`, the scriptable NDJSON dump
+///   documented for e.g. `warden run --tui > events.ndjson`): self-exits
+///   only once its live channel closes, which only happens once the
+///   `EventBus`'s `broadcast::Sender` -- held by this very process -- is
+///   dropped, which only happens once `run` returns. Waiting here (`true`)
+///   would make `run` wait on `warden-tui` waiting on `run` to return: a
+///   real, previously-hit deadlock (`warden run --tui` with redirected
+///   stdout hangs forever). So this must be `false` in that case --
+///   `warden-tui` cleans up on its own once this process's exit closes its
+///   socket, exactly as it did before this issue existed.
+///
+/// Note for anyone piping/capturing this process's own stdout (e.g. `warden
+/// run --tui | tee log`, or a test harness reading it to EOF): because
+/// `spawn_tui_attach` inherits stdio, the headless `warden-tui` also holds
+/// its own copy of that same pipe's write end for as long as it stays
+/// alive -- a downstream reader waiting for EOF on it won't see one until
+/// *that* process closes its copy too, not merely once this one exits. That
+/// is bounded (not another indefinite hang): once this process's own exit
+/// closes its end of the Event Bus socket, the real `warden-tui` notices its
+/// live channel close and self-exits promptly on its own -- unlike a fake
+/// stand-in that just sleeps unconditionally, which is why a test double for
+/// "the TUI hasn't exited" shouldn't rely on reading this process's stdout
+/// to completion to prove `run` itself didn't wait for it.
+fn should_wait_for_spawned_tui(stdout_is_terminal: bool) -> bool {
+    stdout_is_terminal
 }
 
 /// clap `value_parser` for `--evidence-tool`: delegates to
@@ -661,4 +697,27 @@ fn init_tracing(verbosity: u8) {
         tracing_subscriber::EnvFilter::new(format!("warden={level},warden_core={level}"))
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #32 re-review: pins down `should_wait_for_spawned_tui`'s gate
+    /// in isolation, without needing a real pty (impractical in this test
+    /// harness -- `assert_cmd` never gives a spawned binary a real
+    /// terminal) -- see its own docs for why a tty must wait and a non-tty
+    /// must not.
+    #[test]
+    fn should_wait_for_spawned_tui_is_gated_on_stdout_being_a_terminal() {
+        assert!(
+            should_wait_for_spawned_tui(true),
+            "an interactive warden-tui (real tty) never self-exits -- warden must wait for it"
+        );
+        assert!(
+            !should_wait_for_spawned_tui(false),
+            "a headless warden-tui (non-tty) only self-exits once warden's own process drops \
+             the Event Bus -- waiting here would deadlock"
+        );
+    }
 }

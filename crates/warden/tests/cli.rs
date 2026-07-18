@@ -2980,20 +2980,38 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
     );
 }
 
-/// Issue #32 review (HIGH): `warden run` must wait for a still-attached
-/// `warden-tui` to exit before returning, even once the run it's watching
-/// has already converged -- `warden_tui::app_loop` never self-exits on its
-/// own (it only returns via `is_quit`'s `q`/`Esc`/Ctrl-C, or its input
-/// thread ending), so skipping this would let `warden` exit while the real
-/// `warden-tui` is still holding the tty in raw mode/the alternate screen,
-/// corrupting the terminal. The fake `warden-tui` here sleeps well past the
-/// point the (deliberately fast) convergence loop has finished; asserting
-/// the whole command still takes at least that long is what proves `warden
-/// run` waited for it rather than returning the moment the run itself
-/// converged.
+/// Issue #32 re-review: on a non-tty stdout -- exactly what a real `warden
+/// run --tui > file` / `| tee log` / CI invocation gets -- `warden run`'s
+/// own process must exit promptly once the run converges, without waiting
+/// for a still-alive `warden-tui` first. Waiting unconditionally (this
+/// issue's first re-review fix) deadlocked for real on this exact path: a
+/// non-tty `warden-tui attach` runs `run_headless`, which only self-exits
+/// once its live channel closes, which only happens once this very
+/// process's `EventBus` (and the `broadcast::Sender` it owns) is dropped --
+/// which only happens once `run` returns. `should_wait_for_spawned_tui`
+/// gates on stdout's tty-ness precisely to keep this scriptable/headless
+/// path (still documented for e.g. `warden run --tui > events.ndjson`)
+/// working exactly as it did before `--tui` existed.
+///
+/// Deliberately measures `Child::wait()` directly -- the moment `warden
+/// run`'s own process actually exits -- rather than reading its stdout to
+/// EOF (what `assert_cmd`/`Command::output` do internally): the fake
+/// `warden-tui` here sleeps well past this test's own bound to model "still
+/// alive", and since `spawn_tui_attach` inherits stdio, that still-sleeping
+/// process also holds its own copy of `warden run`'s stdout pipe open for
+/// as long as it stays alive. A reader waiting for that pipe to reach EOF
+/// (as `.output()` does) would then wait on *the fake TUI*, not on `warden
+/// run` -- which is a real, separate, and already-understood hazard of
+/// piping a `--tui` run's own output (see `should_wait_for_spawned_tui`'s
+/// own docs), but an artifact this test isn't about: a real `warden-tui`
+/// closes its own inherited copy promptly, once it notices its Event Bus
+/// connection close, unlike a fake stand-in that just sleeps
+/// unconditionally. `Child::wait()` sidesteps that artifact entirely and
+/// directly answers the one question this test asks: did `warden run`
+/// itself return without waiting for the TUI.
 #[cfg(unix)]
-#[tokio::test]
-async fn e2e_tui_flag_waits_for_the_tui_to_exit_before_returning_on_a_converging_run() {
+#[test]
+fn e2e_tui_flag_does_not_block_on_a_still_running_tui_when_stdout_is_not_a_terminal() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
@@ -3005,18 +3023,23 @@ async fn e2e_tui_flag_waits_for_the_tui_to_exit_before_returning_on_a_converging
     );
 
     let tui_dir = TempDir::new().unwrap();
-    let fake_tui = write_fake_tool(tui_dir.path(), "fake-warden-tui", "#!/bin/sh\nsleep 2\n");
+    // Sleeps far longer than this test's own bound below -- models "the TUI
+    // is still alive/has not exited on its own". Bare `sleep`, not
+    // reading stdin: a null stdin (below) already reads as EOF immediately,
+    // so a fake TUI that tried to block on reading it wouldn't actually
+    // stay alive at all -- see this test's own docs for why sleeping,
+    // rather than something tied to stdin, is what models "still running"
+    // here.
+    let fake_tui = write_fake_tool(tui_dir.path(), "fake-warden-tui", "#!/bin/sh\nsleep 30\n");
 
-    let started = std::time::Instant::now();
-    Command::cargo_bin("warden")
-        .unwrap()
+    let mut child = SyncCommand::new(env!("CARGO_BIN_EXE_warden"))
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
         .args([
             "run",
             "--repo",
             repo.path().to_str().unwrap(),
             "--intent",
-            "issue 32: warden run waits for warden-tui",
+            "issue 32: warden run must not block on a headless warden-tui",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
             "--tool",
@@ -3025,15 +3048,41 @@ async fn e2e_tui_flag_waits_for_the_tui_to_exit_before_returning_on_a_converging
             "--tui-bin",
             fake_tui.to_str().unwrap(),
         ])
-        .assert()
-        .success()
-        .stdout(contains("finished: Converged"));
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Drained on background threads (never joined here) purely so `warden
+    // run`'s own writes never block on a full OS pipe buffer -- not used
+    // for this test's assertions, see this test's own docs on why reading
+    // either pipe to EOF is exactly the artifact this test avoids.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = stdout.read_to_end(&mut sink);
+    });
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut sink = Vec::new();
+        let _ = stderr.read_to_end(&mut sink);
+    });
+
+    let started = std::time::Instant::now();
+    let status = child.wait().unwrap();
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed >= std::time::Duration::from_secs(2),
-        "warden run must wait for the warden-tui child it spawned to exit before returning \
-         (elapsed: {elapsed:?})"
+        status.success(),
+        "warden run itself must exit successfully regardless of the still-running TUI"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "warden run must not wait for a non-tty warden-tui to exit -- it never will on its own \
+         within this test's bound (elapsed: {elapsed:?}, fake tui sleeps 30s)"
     );
 }
 
