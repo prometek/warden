@@ -2997,6 +2997,176 @@ mod tests {
         );
     }
 
+    /// Test-only adapter pairing the real, shipped
+    /// `crate::tool_adapter::ClaudeAdapter::parse_progress_line` with a fake
+    /// `build_command`/`extract_findings` (decoding a smuggled `sh` script
+    /// the same way every other fixture adapter in this module does) -- lets
+    /// a test drive stdout that is genuinely parsed by the production
+    /// `stream-json` line parser, without needing the real `claude` binary.
+    struct RealClaudeParsingAdapter;
+
+    impl ToolAdapter for RealClaudeParsingAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+
+        fn parse_progress_line(&self, line: &str) -> Option<String> {
+            crate::tool_adapter::ClaudeAdapter.parse_progress_line(line)
+        }
+    }
+
+    /// Issue #33: malformed/partial JSON lines interleaved with a real
+    /// `claude --output-format stream-json` transcript must never crash the
+    /// run -- `ToolAdapter::parse_progress_line`'s parse-or-skip contract
+    /// (unit-tested in isolation in `tool_adapter.rs`) must hold when driven
+    /// through the *actual* `process::wait_with_progress` ->
+    /// `Orchestrator::run_agent` pipeline, on genuinely truncated/garbage
+    /// stdout lines a real subprocess could emit (a line split mid-write, a
+    /// stray non-JSON diagnostic, an empty line), not just a hand-picked
+    /// string handed directly to the pure function. Uses the real
+    /// `ClaudeAdapter::parse_progress_line` (via [`RealClaudeParsingAdapter`])
+    /// so this exercises production parsing logic, not a test-only stand-in.
+    #[tokio::test]
+    async fn malformed_progress_lines_interleaved_with_valid_ones_never_crash_the_run() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // A real `claude` process could plausibly emit any of these on
+        // stdout: a stray non-JSON diagnostic line, a truncated/partial JSON
+        // object (as if cut off mid-write), a JSON value that parses but
+        // isn't the expected shape (a bare array), and a blank line -- none
+        // of them must panic `parse_progress_line` or abort the run. Exactly
+        // one genuinely valid `assistant` stream-json line is interleaved
+        // among them, so the run must still surface exactly one progress
+        // event despite the noise around it.
+        let coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                echo "this is not json at all"
+                echo '{"type":"assistant","message":{"role":"assistant","content":[{'
+                echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"applying the fix now"}]}}'
+                echo '[]'
+                echo ""
+                echo done > work.txt
+                git add work.txt
+                git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                "#,
+            ],
+        );
+
+        let runs_dir = warden_home.path().join("runs");
+        let live_events: std::sync::Arc<
+            tokio::sync::Mutex<Option<tokio::task::JoinHandle<Vec<warden_core::RunEventRecord>>>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let live_events_for_callback = live_events.clone();
+        let runs_dir_for_callback = runs_dir.clone();
+
+        let orchestrator = Orchestrator::new(pool.clone()).on_run_started(move |run_id| {
+            use std::os::unix::net::UnixStream as StdUnixStream;
+            use tokio::io::{AsyncBufReadExt, BufReader};
+
+            let socket_path = warden_core::resolve_socket_path(run_id, &runs_dir_for_callback);
+            let std_stream = StdUnixStream::connect(&socket_path)
+                .expect("event bus socket must already be listening by on_run_started");
+            std_stream
+                .set_nonblocking(true)
+                .expect("set_nonblocking for tokio interop");
+            let tokio_stream = tokio::net::UnixStream::from_std(std_stream)
+                .expect("wrap the already-connected std socket for async reads");
+
+            let handle = tokio::spawn(async move {
+                let mut reader = BufReader::new(tokio_stream);
+                let mut line = String::new();
+                let mut received = Vec::new();
+                loop {
+                    line.clear();
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        reader.read_line(&mut line),
+                    )
+                    .await
+                    .expect("must not time out waiting for an event")
+                    .expect("socket read must not error");
+                    if read == 0 {
+                        break; // EOF
+                    }
+                    let record: warden_core::RunEventRecord =
+                        serde_json::from_str(line.trim()).expect("valid RunEventRecord JSON");
+                    let is_run_finished = matches!(record.event, RunEvent::RunFinished { .. });
+                    received.push(record);
+                    if is_run_finished {
+                        break;
+                    }
+                }
+                received
+            });
+
+            *live_events_for_callback.try_lock().unwrap() = Some(handle);
+        });
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 33: malformed progress lines must not crash the run".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(coder),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        // The whole point: this must resolve to `Converged`, not panic or
+        // hang, despite the malformed lines the coder emits.
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, RealClaudeParsingAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let handle = live_events.lock().await.take().expect("callback ran");
+        let received = handle.await.expect("subscriber task must not panic");
+
+        let progress_events: Vec<&RunEvent> = received
+            .iter()
+            .map(|record| &record.event)
+            .filter(|event| matches!(event, RunEvent::AgentProgress { .. }))
+            .collect();
+        assert_eq!(
+            progress_events.len(),
+            1,
+            "only the one genuinely valid assistant line must produce progress, every malformed \
+             line must be silently skipped: {received:?}"
+        );
+        assert!(matches!(
+            progress_events[0],
+            RunEvent::AgentProgress { role, detail }
+                if role == "coder" && detail == "message: applying the fix now"
+        ));
+    }
+
     // -----------------------------------------------------------------
     // Issue #24 review, M4: cross-run agent-definition poisoning. A coder
     // diff touching `.warden/agents/` must raise a blocking `Warden`-sourced
