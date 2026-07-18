@@ -720,4 +720,50 @@ mod tests {
              the Event Bus -- waiting here would deadlock"
         );
     }
+
+    /// Issue #32: `--tui-bin`, when given, must always win over any
+    /// sibling-binary/`PATH` auto-detection -- this is the branch every
+    /// `--tui`/`--tui-bin` CLI test in `cli.rs` actually exercises (they all
+    /// pass an explicit `--tui-bin`), but `resolve_tui_binary` itself had no
+    /// direct unit coverage of its own branching before this test.
+    #[test]
+    fn resolve_tui_binary_prefers_the_explicit_override_when_given() {
+        let explicit = PathBuf::from("/some/explicit/path/to/warden-tui");
+        assert_eq!(resolve_tui_binary(Some(explicit.clone())), explicit);
+    }
+
+    /// Issue #32: with no `--tui-bin`, `resolve_tui_binary` must fall back to
+    /// a bare `warden-tui` name (left for `spawn_tui_attach`'s own
+    /// `Command::new` to resolve against `PATH`) when no `warden-tui` binary
+    /// sits next to the *current* executable.
+    ///
+    /// Deterministic under `cargo test` without needing to fake
+    /// `std::env::current_exe()` (not injectable/mockable here without
+    /// refactoring production code purely for testability): a test binary's
+    /// own `current_exe()` always resolves under `target/.../deps/`, a
+    /// different directory than where compiled `[[bin]]` outputs like
+    /// `target/.../warden-tui` actually land -- so the sibling-lookup branch
+    /// reliably misses in this harness, and the fallback below is exercised
+    /// for real, not merely assumed.
+    #[test]
+    fn resolve_tui_binary_falls_back_to_a_bare_name_when_no_sibling_binary_exists() {
+        let current_exe = std::env::current_exe().expect("current_exe available under cargo test");
+        let sibling = current_exe
+            .parent()
+            .expect("current_exe has a parent dir")
+            .join(format!("warden-tui{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            !sibling.is_file(),
+            "test assumption violated: a real warden-tui binary exists at {} (this test's own \
+             directory, not the compiled [[bin]] output directory) -- resolve_tui_binary would \
+             then legitimately return that sibling instead of the bare-name fallback this test \
+             asserts on: {sibling:?}",
+            sibling.display()
+        );
+
+        assert_eq!(
+            resolve_tui_binary(None),
+            PathBuf::from(format!("warden-tui{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
 }
