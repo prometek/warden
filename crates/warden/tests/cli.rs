@@ -2898,3 +2898,160 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
     let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
     assert_eq!(run.state, RunState::Converged);
 }
+
+/// Issue #32: `--tui --tui-bin <path>` must spawn that exact binary with
+/// `attach --run-id <id> --warden-home <warden_home>` -- the same argv a
+/// user would type by hand from the printed "attach:" hint (issue #31).
+///
+/// The fake `warden-tui` here outlives `warden run` itself (it sleeps well
+/// past the point the convergence loop -- deliberately fast here -- has
+/// finished): `warden run` must not wait for it to exit before returning
+/// (unlike this issue's first cut, which did and deadlocked -- see
+/// `main.rs::run`'s own docs on why waiting here is unsound: the Event Bus
+/// only signals an attached subscriber that a run ended by `warden run`'s
+/// own process exiting, so waiting on the TUI while the TUI waits on that
+/// same process to exit is circular). Asserted by polling for the captured
+/// argv file rather than assuming it is already there the instant `warden
+/// run` exits -- deterministic either way, since the fake script writes it
+/// before its sleep, well before `warden run`'s own (slower, multi-worktree)
+/// convergence loop can finish.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let tui_dir = TempDir::new().unwrap();
+    let captured_argv = tui_dir.path().join("captured-argv.txt");
+    let fake_tui = write_fake_tool(
+        tui_dir.path(),
+        "fake-warden-tui",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 5\n",
+            captured_argv.display()
+        ),
+    );
+
+    let assert = Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "issue 32: --tui spawn wiring",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--tui",
+            "--tui-bin",
+            fake_tui.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    // Polled rather than read once: `warden run` returning does not
+    // guarantee the independently-scheduled fake-tui process has already
+    // been scheduled to run its own first line, only that it was spawned.
+    let captured = poll_until_readable(&captured_argv, std::time::Duration::from_secs(3));
+
+    // `printf '%s\n' "$@"` (rather than `"$*"`) prints one argv entry per
+    // line -- unambiguous even if an argument itself contained a space,
+    // unlike joining on `$*`'s `IFS`.
+    assert_eq!(
+        captured.lines().collect::<Vec<_>>(),
+        vec![
+            "attach",
+            "--run-id",
+            &run_id,
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+        ],
+        "the spawned warden-tui must receive exactly the attach subcommand for this run"
+    );
+}
+
+/// Polls `path` until it is readable (non-empty) or `timeout` elapses,
+/// returning its contents. Used instead of a single blind read where a
+/// process independent of the one this test just awaited (`warden run`'s own
+/// child, `--tui`'s spawned `warden-tui`) is responsible for writing it, so
+/// there is no ordering guarantee against this test's own thread otherwise.
+#[cfg(unix)]
+fn poll_until_readable(path: &Path, timeout: std::time::Duration) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if !contents.is_empty() {
+                return contents;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("{path:?} was not written within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Issue #32 decision ("la sortie de la TUI annule le run"): once the TUI
+/// exits -- for any reason, here simply by returning immediately -- the
+/// still-running run must be cancelled rather than left to run to
+/// completion. Driven with a coder that sleeps far longer than this test's
+/// own bound, so a passing assertion on wall-clock time only holds if the
+/// run was genuinely cancelled early, not if it happened to finish quickly
+/// on its own.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_tui_exit_cancels_a_still_running_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // The coder sleeps far longer than the bound asserted below -- if
+    // cancellation didn't fire, this test would time out rather than fail
+    // fast, making a regression here impossible to miss.
+    write_fake_claude(bin_dir.path(), "sleep 30", NOOP_BODY, NOOP_BODY);
+
+    let tui_dir = TempDir::new().unwrap();
+    let fake_tui = write_fake_tool(tui_dir.path(), "fake-warden-tui", "#!/bin/sh\nexit 0\n");
+
+    let started = std::time::Instant::now();
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "issue 32: TUI exit cancels the run",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--tui",
+            "--tui-bin",
+            fake_tui.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("was cancelled"));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "the run must be cancelled promptly once the TUI exits, not run to completion \
+         (elapsed: {elapsed:?}, coder sleeps 30s)"
+    );
+}

@@ -109,6 +109,23 @@ enum Commands {
 
         #[arg(long, default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
         gate_inactivity_timeout_secs: u64,
+
+        /// Issue #32: spawns `warden-tui attach` as a separate process
+        /// (ADR-0008), in the foreground on this same launch terminal, once
+        /// the run starts -- the "launch and watch" flow without manually
+        /// copying the `warden-tui attach` hint into a second terminal.
+        /// Exiting the TUI for any reason (`q`/`Esc`/Ctrl-C, or a crash)
+        /// cancels this run: there is no other channel back from the
+        /// read-only TUI to tell `warden run` "just detach, keep going".
+        #[arg(long)]
+        tui: bool,
+
+        /// Overrides the `warden-tui` binary `--tui` spawns. Defaults to
+        /// looking for `warden-tui` next to this running `warden` binary
+        /// (the usual co-installed-workspace-binaries layout), then falling
+        /// back to a `PATH` lookup. Ignored unless `--tui` is also set.
+        #[arg(long, value_parser = clap::value_parser!(PathBuf))]
+        tui_bin: Option<PathBuf>,
     },
 }
 
@@ -153,6 +170,8 @@ async fn main() -> anyhow::Result<()> {
             gate_repo_slug,
             gate_poll_interval_secs,
             gate_inactivity_timeout_secs,
+            tui,
+            tui_bin,
         } => {
             // Issue #15/ADR-0011: the post-Converged tail only runs when
             // both paths it needs are configured; omitting either preserves
@@ -167,6 +186,13 @@ async fn main() -> anyhow::Result<()> {
                 }),
                 _ => None,
             };
+
+            // Issue #32: `--tui-bin` is only meaningful alongside `--tui`;
+            // resolved once here (not inside `run`), same shape as `gate`
+            // above.
+            let tui_launch = tui.then(|| TuiLaunchConfig {
+                tui_bin: resolve_tui_binary(tui_bin),
+            });
 
             // One arm today (`ToolName::Claude`); a future adapter gets its
             // own arm here rather than a runtime lookup, so the concrete
@@ -184,12 +210,48 @@ async fn main() -> anyhow::Result<()> {
                         evidence_tool,
                         evidence_store_in_repo,
                         gate,
+                        tui_launch,
                     )
                     .await
                 }
             }
         }
     }
+}
+
+/// Issue #32: resolved once in `main`, before `run` is called -- same shape
+/// as `orchestrator::GateConfig`.
+struct TuiLaunchConfig {
+    tui_bin: PathBuf,
+}
+
+/// Resolves the `warden-tui` binary `--tui` spawns (issue #32).
+///
+/// `--tui-bin`, if given, always wins. Otherwise, looks for `warden-tui` next
+/// to this running `warden` binary -- the layout `cargo build --release`
+/// (or any install that keeps the workspace's `[[bin]]`s together) produces
+/// -- falling back to a bare `warden-tui` name, which `spawn_tui_attach`'s
+/// `Command::new` resolves against `PATH` the normal way. That last fallback
+/// is not validated here: a binary genuinely missing from both places
+/// surfaces as `spawn_tui_attach`'s own typed `ProcessError::Spawn` once
+/// actually invoked, naming this exact path, rather than being pre-empted by
+/// a duplicate check here that could itself race a `PATH` that changes
+/// between resolution and spawn.
+fn resolve_tui_binary(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            let sibling = dir.join(format!("warden-tui{}", std::env::consts::EXE_SUFFIX));
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+
+    PathBuf::from(format!("warden-tui{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -203,6 +265,7 @@ async fn run<R: ToolAdapter>(
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
+    tui_launch: Option<TuiLaunchConfig>,
 ) -> anyhow::Result<()> {
     let warden_home = warden_home.unwrap_or(default_warden_home()?);
     let db_path = warden_home.join("state.db");
@@ -351,6 +414,8 @@ async fn run<R: ToolAdapter>(
         gate,
     };
 
+    let cancel_on_tui_exit = cancel.clone();
+
     // Printed at run start (not via `tracing`, so it shows at the default
     // `warn` verbosity) rather than only once the run finishes, so
     // `warden-tui attach` can follow a live run without the user having to
@@ -363,6 +428,39 @@ async fn run<R: ToolAdapter>(
     // does not need its own `shlex::try_quote` pass.
     let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
         print_run_started_hint(run_id, &attach_warden_home_quoted);
+
+        // Issue #32: `--tui` spawns `warden-tui attach` as a separate
+        // process (ADR-0008), in the foreground on this launch terminal,
+        // once the run_id it needs actually exists. `Command::spawn` (used
+        // by `spawn_tui_attach`) is itself synchronous/non-blocking -- it
+        // only issues the `fork`/`exec` syscalls and returns -- so calling
+        // it directly here does not violate `on_run_started`'s "must not
+        // block" contract.
+        if let Some(tui_launch) = &tui_launch {
+            match warden::process::spawn_tui_attach(
+                &tui_launch.tui_bin,
+                run_id,
+                &attach_warden_home,
+            ) {
+                Ok(child) => {
+                    let cancel_on_tui_exit = cancel_on_tui_exit.clone();
+                    // Detached deliberately (its `JoinHandle` is dropped, not
+                    // awaited): `run` below does not wait for this task or
+                    // for the `warden-tui` child it watches -- see this
+                    // spawn's own docs (`cancel_run_when_tui_exits`) for why.
+                    tokio::spawn(async move {
+                        cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        tui_bin = %tui_launch.tui_bin.display(),
+                        "failed to spawn warden-tui for --tui; continuing the run without it"
+                    );
+                }
+            }
+        }
     });
     let (run_id, final_state) = orchestrator
         .run_convergence_loop(config, adapter, cancel)
@@ -375,7 +473,49 @@ async fn run<R: ToolAdapter>(
     // -- see `print_stdout_line_or_log`'s own docs.
     print_stdout_line_or_log(&format!("run {run_id} finished: {final_state:?}"));
 
+    // Issue #32: `run` deliberately does *not* wait here for a still-running
+    // `warden-tui` (spawned above) to exit on its own before returning --
+    // doing so deadlocks. The Event Bus (`event_bus::accept_loop`) never
+    // signals an already-connected subscriber that a run has ended; that
+    // subscriber only ever observes its live connection close because the
+    // *whole* `warden` process exits (which the OS then closes every open
+    // socket for). Waiting here for the TUI to exit first, while the TUI
+    // waits for its connection to close (which needs this very process to
+    // exit) is a genuine circular deadlock, not just a slow path -- caught by
+    // hand against the real `warden-tui` binary while validating this issue.
+    // A `warden-tui` still attached when this process exits keeps running
+    // standalone against the persisted `runs`/`events` rows exactly as any
+    // independently-launched `warden-tui attach` would (ADR-0008); this only
+    // changes when *this* process exits, never whether the TUI can still be
+    // watched.
     Ok(())
+}
+
+/// Issue #32 decision ("la sortie de la TUI annule le run"): awaits the
+/// `warden-tui` child spawned for `--tui`, then cancels the run regardless of
+/// *why* it exited -- clean quit (`q`/`Esc`/Ctrl-C, see `warden_tui`'s own
+/// `is_quit`), a crash, or being killed directly. There is no channel back
+/// from the read-only TUI (ADR-0008) to distinguish "detach, keep the run
+/// going" from "cancel it" -- exit is the only signal this process ever
+/// gets, so it is treated uniformly. Cancelling after the run has already
+/// reached a terminal state is a harmless no-op (`CancellationToken::cancel`
+/// is idempotent, and nothing is left to kill) -- this task's own
+/// `JoinHandle` is deliberately never awaited by `run` (see its own docs),
+/// so it keeps running detached for exactly that case: a TUI the user keeps
+/// open to watch a run that has already converged.
+async fn cancel_run_when_tui_exits(mut child: tokio::process::Child, cancel: CancellationToken) {
+    match child.wait().await {
+        Ok(status) => {
+            tracing::info!(?status, "warden-tui exited; cancelling the run (issue #32)");
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to wait for the warden-tui child; cancelling the run anyway (issue #32)"
+            );
+        }
+    }
+    cancel.cancel();
 }
 
 /// clap `value_parser` for `--evidence-tool`: delegates to
