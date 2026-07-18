@@ -1,6 +1,7 @@
 //! `warden` binary: CLI parsing + dispatch only. All orchestration logic
 //! lives in the `warden` library crate (`src/lib.rs` and friends).
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -289,6 +290,53 @@ async fn run<R: ToolAdapter>(
     let reviewer_agent = resolve_agent_definition(&repo, AgentRole::Reviewer, &adapter).await?;
     let tester_agent = resolve_agent_definition(&repo, AgentRole::Tester, &adapter).await?;
 
+    // Issue #31: resolved before `warden_home` moves into `config` below --
+    // this is the resolved `warden_home` (not the raw `--warden-home` flag,
+    // which may be unset), so the printed attach command is copy-pasteable
+    // as-is.
+    //
+    // Review M3: also made absolute, distinct from `warden_home` itself
+    // (every other consumer below keeps resolving a relative
+    // `--warden-home` against this process's cwd exactly as before -- only
+    // the *printed* copy changes). A relative path would otherwise echo
+    // verbatim and break as soon as the command is pasted from a different
+    // cwd, defeating the whole point of printing it. `std::path::absolute`
+    // is purely lexical (prepends the cwd, normalizes `.`/`..`) rather than
+    // `canonicalize`, which would also resolve symlinks and require the
+    // path to already exist -- `warden_home` (e.g. the default
+    // `~/.warden`) routinely doesn't exist yet at this point. A failure
+    // here (cwd unreadable) reflects an already-degraded environment this
+    // print can't fix either way, so it falls back to the unresolved path
+    // rather than failing the whole run over a cosmetic concern.
+    let attach_warden_home =
+        std::path::absolute(&warden_home).unwrap_or_else(|_| warden_home.clone());
+
+    // Review M1: `--warden-home`'s value is interpolated into the printed
+    // `warden-tui attach` command, so it must be shell-quoted the same way
+    // `evidence.rs::shell_join` quotes `asciinema`'s record command (same
+    // `shlex::try_quote` convention) -- otherwise a warden_home containing
+    // a space or other shell metacharacter produces a line that breaks on
+    // paste, which is precisely the "copiable telle quelle" requirement
+    // this feature exists for. Resolved once, eagerly, here (not inside the
+    // `on_run_started` callback below) so a genuine failure -- the resolved
+    // path is not valid UTF-8, and thus cannot be made copy-pasteable at
+    // all -- fails this command clearly before any run starts, rather than
+    // being silently swallowed mid-run where nothing could surface it.
+    let attach_warden_home_quoted =
+        shlex::try_quote(attach_warden_home.to_str().with_context(|| {
+            format!(
+                "--warden-home ({}) is not valid UTF-8; cannot render a copy-pasteable \
+                 `warden-tui attach` command",
+                attach_warden_home.display()
+            )
+        })?)
+        .map(|quoted| quoted.into_owned())
+        // `shlex::try_quote` only ever fails on an embedded NUL byte, which
+        // `to_str()` above already would have rejected as invalid UTF-8 first --
+        // this arm is unreachable in practice, kept only so a future change to
+        // either check still fails loudly instead of silently.
+        .context("--warden-home cannot be shell-quoted (embedded NUL byte)")?;
+
     let config = RunConfig {
         repo_path: repo,
         warden_home,
@@ -303,14 +351,29 @@ async fn run<R: ToolAdapter>(
         gate,
     };
 
-    let orchestrator = Orchestrator::new(pool);
+    // Printed at run start (not via `tracing`, so it shows at the default
+    // `warn` verbosity) rather than only once the run finishes, so
+    // `warden-tui attach` can follow a live run without the user having to
+    // query SQLite by hand for its run_id.
+    //
+    // Review L2: `--run-id`'s value below is `run_id` itself, always
+    // `Uuid::new_v4().to_string()` (see `Orchestrator::on_run_started`'s
+    // docs) -- lowercase hex and hyphens only, never containing shell
+    // metacharacters -- so, unlike `attach_warden_home_quoted` above, it
+    // does not need its own `shlex::try_quote` pass.
+    let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
+        print_run_started_hint(run_id, &attach_warden_home_quoted);
+    });
     let (run_id, final_state) = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await
         .context("convergence loop failed")?;
 
     tracing::info!(run_id, ?final_state, "run finished");
-    println!("run {run_id} finished: {final_state:?}");
+    // Review L2: same closed-stdout hazard as `print_run_started_hint`,
+    // reproduced against the real binary with plain `warden run | head -1`
+    // -- see `print_stdout_line_or_log`'s own docs.
+    print_stdout_line_or_log(&format!("run {run_id} finished: {final_state:?}"));
 
     Ok(())
 }
@@ -333,6 +396,46 @@ fn parse_intent(raw: &str) -> Result<String, String> {
         return Err("run intent must not be blank".to_string());
     }
     Ok(raw.to_string())
+}
+
+/// Prints the two `warden run`-start lines (issue #31) through a locked
+/// stdout handle instead of `println!`.
+///
+/// Review L2: `on_run_started` (see its doc comment on [`Orchestrator`])
+/// runs synchronously, *mid-run* -- a panic here would unwind through the
+/// convergence loop and abort the whole process with the `runs` row stuck
+/// in a non-terminal state, a strictly worse outcome than the end-of-run
+/// print this callback runs alongside ever risked. See
+/// `print_stdout_line_or_log`'s own docs for why a closed pipe (e.g.
+/// `warden run | head -1`) can't panic either print.
+fn print_run_started_hint(run_id: &str, quoted_warden_home: &str) {
+    print_stdout_line_or_log(&format!("run {run_id} started"));
+    print_stdout_line_or_log(&format!(
+        "attach: warden-tui attach --run-id {run_id} --warden-home {quoted_warden_home}"
+    ));
+}
+
+/// Writes `line` + a newline to stdout through a locked handle, in place of
+/// `println!`, which panics outright if stdout is closed (e.g. `warden run
+/// | head -1` -- reproduced against the real binary in the issue #31
+/// review, both for the mid-run `on_run_started` hint and for the
+/// pre-existing end-of-run line below).
+///
+/// A `BrokenPipe` write error is the one swallowed deliberately here: every
+/// caller of this function prints an advisory status line the run's own
+/// correctness never depends on reaching a terminal, so losing one to a
+/// reader that already hung up is not a reason to crash an otherwise
+/// successful (or, worse, still-live) run. Any other write error is logged
+/// instead of silently dropped, since that would signal something less
+/// routine than a closed pipe.
+fn print_stdout_line_or_log(line: &str) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    if let Err(error) = writeln!(handle, "{line}") {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            tracing::warn!(%error, "failed to print to stdout");
+        }
+    }
 }
 
 fn default_warden_home() -> anyhow::Result<PathBuf> {
