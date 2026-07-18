@@ -7,6 +7,40 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #33 / ADR-0008 (amendement) : progression d'agent en direct dans la TUI
+
+- Entre `AgentStarted` et `AgentFinished`, la TUI restait aveugle pendant toute la durée
+  d'un agent. `ClaudeAdapter` lance désormais `claude` avec
+  `--output-format stream-json --verbose` (au lieu de `--output-format json`) : Claude Code
+  émet ainsi lui-même ses événements au fil de l'eau (messages assistant complets, blocs
+  `tool_use`), avant de terminer par la même enveloppe `{"type":"result", ...}` qu'avant —
+  `ClaudeAdapter::extract_findings` continue de fonctionner à l'identique, en cherchant
+  cette enveloppe sur la **dernière ligne non vide** de stdout plutôt que sur la totalité
+  du buffer.
+- Nouveau variant `RunEvent::AgentProgress { role, detail }` (`EventKind::AgentProgress`),
+  traduit ligne par ligne depuis la sortie streamée de l'agent par le nouveau seam
+  `ToolAdapter::parse_progress_line` (`warden::tool_adapter`) — la spécificité du format
+  d'un CLI donné (`stream-json` pour `claude`) n'est jamais exposée à `warden_core` ni à
+  `warden-tui`, qui ne voient qu'une `String` déjà traduite. `process::wait_with_progress`
+  remplace la lecture bloc-à-bloc de stdout par une lecture ligne par ligne, en conservant
+  la même garantie anti-deadlock (drainage stdin/stdout/stderr/wait concurrent).
+- **Live-only, jamais persisté** : `Orchestrator::publish_progress_event` diffuse
+  `AgentProgress` sur l'Event Bus mais ne l'écrit jamais dans la table `events` —
+  contrairement à tout autre `RunEvent`, dont la persistance reste intégrale et inchangée.
+  C'est un signal d'observation temps réel, pas un élément d'audit : l'evidence (ADR-0009)
+  reste la seule source qui porte une valeur de preuve. Conséquence assumée : une attache
+  tardive de la TUI ne rejoue jamais la progression détaillée d'un agent déjà en cours ou
+  déjà terminé, seul un abonné connecté au moment de la publication la voit.
+- `warden-tui` affiche cette progression en direct (rôle + dernier detail rapporté) tant
+  qu'un agent est actif, et l'efface dès `AgentFinished` ; le flux NDJSON (mode non-TTY)
+  et l'historique d'événements affichent aussi `AgentProgress` au même titre que les autres
+  événements, en le distinguant visuellement des événements de cycle de vie.
+- Granularité retenue : messages assistant complets et blocs `tool_use`, délibérément
+  **sans** `--include-partial-messages` (chunks de tokens), jugé trop fin pour l'usage visé.
+- À ne pas confondre avec l'evidence (ADR-0009) : la progression d'agent est **déclarative**
+  (ce que l'agent *rapporte* faire, via son propre CLI), jamais une preuve vérifiée
+  d'exécution — cette dernière reste le rôle exclusif de l'Evidence Capture Adapter.
+
 ### Added — Phase 1 : fondations
 
 - Workspace Cargo avec deux crates : `warden-core` (state machine des runs et
