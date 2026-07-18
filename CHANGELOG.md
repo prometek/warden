@@ -7,6 +7,29 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #32 / ADR-0008 (amendement) : `warden run --tui`, lancement automatique de la TUI
+
+- Nouveau flag `--tui` sur `warden run` : dès que le run démarre, `warden` lance
+  `warden-tui attach --run-id <id> --warden-home <path>` comme **process séparé**, au
+  premier plan sur le terminal de lancement — le flux "je lance et je regarde" sans avoir
+  à copier la commande `warden-tui attach` affichée au démarrage dans un second terminal.
+- Nouveau flag `--tui-bin <PATH>` (ignoré sans `--tui`) pour surcharger le binaire
+  `warden-tui` lancé ; par défaut, recherché à côté du binaire `warden` en cours
+  d'exécution, avec repli sur une résolution via `PATH`.
+- **Quitter la TUI, pour quelque raison que ce soit (`q`, `Esc`, Ctrl-C, ou un crash),
+  annule le run** : la TUI reste strictement en lecture seule (ADR-0008), il n'existe
+  aucun canal retour pour distinguer "détache-toi, laisse le run continuer" de "annule" —
+  sa sortie est le seul signal disponible, traité uniformément. `warden-tui` traite
+  désormais Ctrl-C comme une touche de sortie au même titre que `q`/`Esc`, puisque le
+  mode raw de son terminal empêche Ctrl-C de générer un `SIGINT`.
+- Sur un terminal de lancement interactif (TTY), `warden run` attend que la TUI se
+  termine avant de rendre la main, pour qu'elle restaure proprement le terminal. Sur une
+  sortie standard non-TTY (`warden run --tui > events.ndjson`, pipe, `tee`), `warden-tui`
+  bascule sur son mode texte NDJSON existant et `warden run` n'attend pas.
+- Un échec de spawn de `warden-tui` (binaire introuvable, erreur d'exécution) annule
+  immédiatement le run avec une erreur explicite nommant le chemin résolu, plutôt que de
+  dégrader silencieusement vers un run headless.
+
 ### Added — Issue #33 / ADR-0008 (amendement) : progression d'agent en direct dans la TUI
 
 - Entre `AgentStarted` et `AgentFinished`, la TUI restait aveugle pendant toute la durée
