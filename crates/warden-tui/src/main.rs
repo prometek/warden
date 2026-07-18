@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -217,12 +217,23 @@ async fn recv_live(
     }
 }
 
+/// Issue #32: also treats Ctrl-C as a quit key. Raw mode (`setup_terminal`,
+/// via crossterm's `enable_raw_mode`) clears the terminal's `ISIG` flag along
+/// with canonical processing, so a Ctrl-C keypress no longer generates a
+/// `SIGINT` at all while this TUI holds the tty -- it only ever arrives here
+/// as an ordinary key event. Without this, `warden run --tui` (which cancels
+/// the run when this process exits, see `warden::process::spawn_tui_attach`'s
+/// docs) would leave Ctrl-C doing nothing: neither quitting the TUI nor
+/// cancelling the run.
 fn is_quit(event: &Event) -> bool {
     matches!(
         event,
         Event::Key(key)
             if key.kind == KeyEventKind::Press
-                && (key.code == KeyCode::Char('q') || key.code == KeyCode::Esc)
+                && (key.code == KeyCode::Char('q')
+                    || key.code == KeyCode::Esc
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)))
     )
 }
 
@@ -249,4 +260,59 @@ fn init_tracing(verbosity: u8) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    fn key_press(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new_with_kind(
+            code,
+            modifiers,
+            KeyEventKind::Press,
+        ))
+    }
+
+    #[test]
+    fn is_quit_matches_q_and_esc_with_no_modifiers() {
+        assert!(is_quit(&key_press(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(is_quit(&key_press(KeyCode::Esc, KeyModifiers::NONE)));
+    }
+
+    /// Issue #32: Ctrl-C must also quit -- see `is_quit`'s own docs for why
+    /// this is the only lever `warden run --tui` has to cancel a run once
+    /// its terminal is in raw mode (which disables `SIGINT` generation on
+    /// Ctrl-C entirely).
+    #[test]
+    fn is_quit_matches_ctrl_c() {
+        assert!(is_quit(&key_press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn is_quit_does_not_match_plain_c_without_control() {
+        assert!(!is_quit(&key_press(KeyCode::Char('c'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn is_quit_does_not_match_an_unrelated_key() {
+        assert!(!is_quit(&key_press(KeyCode::Char('a'), KeyModifiers::NONE)));
+    }
+
+    /// A key *release* (as opposed to a press) must never trigger a quit --
+    /// unchanged by this issue, but worth pinning down alongside the new
+    /// Ctrl-C branch since both live in the same `matches!` guard.
+    #[test]
+    fn is_quit_ignores_a_key_release_event() {
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(!is_quit(&release));
+    }
 }

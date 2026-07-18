@@ -346,6 +346,41 @@ fn classify_stdin_write_error(
     }
 }
 
+/// Spawns `<tui_binary> attach --run-id <run_id> --warden-home <warden_home>`
+/// in the foreground (issue #32, `warden run --tui`), attaching it to the run
+/// that just started. Unlike [`spawn`], stdio is **inherited** rather than
+/// piped -- the whole point is for this child to take over the launch
+/// terminal exactly as if the user had typed the `warden-tui attach` command
+/// themselves -- and the environment is inherited rather than cleared:
+/// `warden-tui` is a trusted first-party binary from this same install, not
+/// an agent under the Agent Subprocess Protocol (code-standards.md), so none
+/// of that isolation applies to it.
+///
+/// `warden run --tui` treats this child's exit -- for *any* reason (the user
+/// quit with `q`/`Esc`/Ctrl-C, or it was killed/crashed) -- as cancelling the
+/// run (issue #32 decision: "la sortie de la TUI annule le run"). Ctrl-C
+/// specifically needs `warden_tui`'s own `is_quit` to treat it as a quit key
+/// first: raw mode disables the terminal's `SIGINT`-on-Ctrl-C generation
+/// entirely (`cfmakeraw` clears `ISIG`), so relying on the signal reaching
+/// this process's own group would not work while `warden-tui` holds the tty.
+pub fn spawn_tui_attach(
+    tui_binary: &Path,
+    run_id: &str,
+    warden_home: &Path,
+) -> Result<Child, ProcessError> {
+    Command::new(tui_binary)
+        .arg("attach")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--warden-home")
+        .arg(warden_home)
+        .spawn()
+        .map_err(|source| ProcessError::Spawn {
+            command: tui_binary.display().to_string(),
+            source,
+        })
+}
+
 /// Convenience wrapper over [`spawn`] + [`wait`] for callers that don't
 /// need the PID before completion (e.g. tests) or a stdin payload (e.g. the
 /// Evidence Capture Adapter's `playwright`/`asciinema` invocations, which
@@ -921,5 +956,93 @@ mod tests {
     #[test]
     fn kill_pid_on_an_already_dead_pid_is_a_noop() {
         assert!(kill_pid(999_999_999, UNKNOWN_START_TIME).is_ok());
+    }
+
+    /// Issue #32: `spawn_tui_attach` must invoke `<binary> attach --run-id
+    /// <id> --warden-home <path>` verbatim. Captures argv to a file instead
+    /// of stdout, since [`spawn_tui_attach`]'s whole point is inheriting
+    /// stdio (the real `warden-tui` must take over the launch terminal), not
+    /// piping it for a test to capture.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_tui_attach_passes_the_expected_attach_subcommand_and_flags() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let out_file = dir.path().join("captured-args.txt");
+        let script_path = dir.path().join("fake-warden-tui");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let warden_home = dir.path().join("home");
+        let mut child = spawn_tui_attach(&script_path, "run-123", &warden_home).unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
+
+        let captured = std::fs::read_to_string(&out_file).unwrap();
+        assert_eq!(
+            captured.lines().collect::<Vec<_>>(),
+            vec![
+                "attach",
+                "--run-id",
+                "run-123",
+                "--warden-home",
+                warden_home.to_str().unwrap(),
+            ]
+        );
+    }
+
+    /// Unlike [`spawn`] (which `env_clear()`s for agent isolation),
+    /// `spawn_tui_attach` must inherit the full parent environment --
+    /// `warden-tui` is a trusted first-party binary, not an agent under the
+    /// Agent Subprocess Protocol. Checked against `PATH`, whatever it
+    /// already is in the test process, rather than mutating global process
+    /// environment state (which `std::env::set_var` would, unsafely and with
+    /// cross-test interference risk under a parallel test runner).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_tui_attach_inherits_the_full_parent_environment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let expected_path = std::env::var("PATH").expect("PATH is set in the test process");
+
+        let dir = TempDir::new().unwrap();
+        let out_file = dir.path().join("captured-env.txt");
+        let script_path = dir.path().join("fake-warden-tui");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$PATH\" > \"{}\"\n",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let mut child =
+            spawn_tui_attach(&script_path, "run-123", &dir.path().join("home")).unwrap();
+        let status = child.wait().await.unwrap();
+        assert!(status.success());
+
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap(), expected_path);
+    }
+
+    #[tokio::test]
+    async fn spawn_tui_attach_reports_a_typed_error_when_the_binary_does_not_exist() {
+        let dir = TempDir::new().unwrap();
+        let missing_binary = dir.path().join("does-not-exist");
+        let result = spawn_tui_attach(&missing_binary, "run-123", &dir.path().join("home"));
+        assert!(matches!(result, Err(ProcessError::Spawn { .. })));
     }
 }

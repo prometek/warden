@@ -167,6 +167,22 @@ Flags de `warden run` :
   (défaut `1800`) — mêmes réglages que `warden-gated watch-pr` (voir "CI Watcher"
   ci-dessous), transmis tels quels au `run-tail`/`resume-watch` déclenché.
 - `-v`, `-vv`, `-vvv` — verbosité des logs (`warn` par défaut, jusqu'à `trace`).
+- `--tui` (issue #32, amende ADR-0008) — dès que le run démarre, lance `warden-tui attach
+  --run-id <id> --warden-home <path>` comme **process séparé**, au premier plan sur ce même
+  terminal : le flux "je lance et je regarde" sans avoir à copier la commande
+  `warden-tui attach` affichée au démarrage dans un second terminal. **Quitter la TUI, pour
+  quelque raison que ce soit (`q`, `Esc`, Ctrl-C, ou un crash), annule le run** : la TUI
+  reste strictement en lecture seule (ADR-0008), il n'existe aucun canal retour pour lui
+  faire dire « détache-toi, laisse le run continuer » — sa sortie est le seul signal
+  disponible, traité uniformément. Sur un terminal de lancement interactif (TTY), `warden
+  run` attend que la TUI se termine avant de rendre la main, pour qu'elle restaure
+  proprement le terminal. Sur une sortie standard non-TTY (`warden run --tui >
+  events.ndjson`, pipe, `tee`), `warden-tui` bascule sur son mode texte NDJSON et `warden
+  run` n'attend pas : il rend la main normalement, et le dump NDJSON se termine de
+  lui-même.
+- `--tui-bin <PATH>` — surcharge le binaire `warden-tui` lancé par `--tui` (ignoré sans
+  `--tui`). Par défaut, cherche `warden-tui` à côté du binaire `warden` en cours
+  d'exécution, avec repli sur une résolution via `PATH`.
 
 ### Preuve d'exécution (Evidence)
 
@@ -322,6 +338,11 @@ SQLite de `warden`, ne spawn aucun agent, ne touche jamais git.
 ```sh
 warden-tui attach --run-id <RUN_ID> --warden-home ~/.warden
 ```
+
+`warden run --tui` (issue #32, amende ADR-0008) automatise ce lancement : `warden` lui-même
+démarre `warden-tui attach` comme process séparé une fois le run créé, au lieu de laisser
+l'utilisateur copier cette commande dans un second terminal. Voir "Flags de `warden run`"
+ci-dessus pour le détail (notamment : quitter cette TUI annule le run qu'elle observe).
 
 - `--run-id <ID>` — l'identifiant de run. Affiché par `warden run` dès le démarrage
   (`run <id> started`, suivi d'une commande `warden-tui attach` prête à copier), et de
