@@ -115,6 +115,33 @@ impl RunModel {
             .rev()
             .find(|record| matches!(record.event, RunEvent::EvidenceCaptured { .. }))
     }
+
+    /// "What is the currently running agent reporting right now" (issue
+    /// #33): the `(role, detail)` of the most recent `AgentProgress` event,
+    /// but only if no `AgentFinished` has arrived since -- once an agent
+    /// finishes, its last progress line is stale and must stop being shown
+    /// as current. Scans back from the most recent event and stops at the
+    /// first of either variant, so an `AgentFinished` with no intervening
+    /// `AgentProgress` correctly reports `None` too (an agent that finished
+    /// without ever reporting progress has nothing "current" to show).
+    ///
+    /// **Live-only** (ADR-0008 amendment, this issue): this can only ever be
+    /// non-`None` while attached live -- a late attach's `events` history
+    /// replay never contains an `AgentProgress` at all (never persisted),
+    /// so this always starts `None` after a pure-history replay and only
+    /// becomes populated once a live one actually arrives.
+    pub fn current_progress(&self) -> Option<(&str, &str)> {
+        for record in self.events.iter().rev() {
+            match &record.event {
+                RunEvent::AgentProgress { role, detail } => {
+                    return Some((role.as_str(), detail.as_str()))
+                }
+                RunEvent::AgentFinished { .. } => return None,
+                _ => continue,
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +294,100 @@ mod tests {
             &latest.event,
             RunEvent::EvidenceCaptured { file_path, .. } if file_path == "second.png"
         ));
+    }
+
+    #[test]
+    fn current_progress_is_none_before_any_progress_event_has_arrived() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::AgentStarted {
+                role: "coder".to_string(),
+            },
+        ));
+        assert_eq!(model.current_progress(), None);
+    }
+
+    #[test]
+    fn current_progress_tracks_the_most_recently_applied_progress_event() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "reading the codebase".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e2",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "running cargo test".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            model.current_progress(),
+            Some(("coder", "running cargo test"))
+        );
+    }
+
+    /// Issue #33: once an agent has finished, its last progress line is
+    /// stale and must stop being shown as "current" -- a header still
+    /// reading "running cargo test" after the agent already exited would be
+    /// actively misleading, worse than showing nothing.
+    #[test]
+    fn current_progress_is_cleared_once_the_agent_finishes() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "running cargo test".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e2",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+            },
+        ));
+
+        assert_eq!(model.current_progress(), None);
+    }
+
+    /// A fresh agent's own progress, arriving after a previous agent's
+    /// `AgentFinished`, must be shown again -- `current_progress` isn't
+    /// permanently latched off by the first finish it ever sees.
+    #[test]
+    fn current_progress_resumes_once_a_new_agent_reports_progress_after_a_prior_one_finished() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "coder work".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e2",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+            },
+        ));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentProgress {
+                role: "reviewer".to_string(),
+                detail: "reviewing the diff".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            model.current_progress(),
+            Some(("reviewer", "reviewing the diff"))
+        );
     }
 }

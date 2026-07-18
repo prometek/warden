@@ -66,7 +66,16 @@ use crate::process::AgentCommand;
 /// and default prompts are compiled-in constants); only
 /// [`extract_findings`](ToolAdapter::extract_findings) can fail, since it
 /// parses untrusted subprocess output.
-pub trait ToolAdapter {
+///
+/// `Sync` supertrait (issue #33): `Orchestrator::run_agent` closes over a
+/// `&R` inside the `on_stdout_line` callback it hands to
+/// `process::wait_with_progress`, which itself must be `Send + Sync` so
+/// `wait`/`wait_with_progress`'s future stays spawnable from any caller
+/// (including one that runs it inside `tokio::spawn`, as some tests do).
+/// Every real and test implementor here is a stateless unit/plain struct, so
+/// this is free in practice, not a constraint that costs an adapter author
+/// anything.
+pub trait ToolAdapter: Sync {
     /// Builds the concrete CLI invocation for `definition`: program, args,
     /// this tool's own system-prompt flag (fed `definition.system_prompt`),
     /// and this tool's own model flag when `definition.model` is set.
@@ -102,6 +111,31 @@ pub trait ToolAdapter {
     /// `ClaudeAdapter`'s own docs on this). `None` is a legitimate answer
     /// for a tool that needs no such grant.
     fn default_tools(&self, role: AgentRole) -> Option<&'static str>;
+
+    /// Translates one line of an agent's streamed stdout into a short,
+    /// human-readable progress description to publish on the Event Bus as a
+    /// `warden_core::RunEvent::AgentProgress`, or `None` if the line carries
+    /// nothing worth surfacing to a live observer (issue #33).
+    ///
+    /// **Declarative, not verified**: the returned text is whatever the
+    /// agent's own tool CLI *reports* itself doing (a streamed assistant
+    /// message, a `tool_use` block, ...), not a checked execution trace --
+    /// ADR-0009's evidence keeps that role, and a caller must never present
+    /// this as one. This method is exactly the seam that absorbs a tool's
+    /// own wire format (e.g. `claude --output-format stream-json`'s NDJSON
+    /// event shape): the returned `String` is plain text, so nothing about
+    /// that format ever needs to leak past this adapter into
+    /// `warden_core`/`warden-tui`.
+    ///
+    /// Defaults to `None` for every line -- an adapter is not required to
+    /// implement streaming progress at all (the same "a legitimate answer"
+    /// convention as [`default_tools`](ToolAdapter::default_tools) returning
+    /// `None`); a tool that never overrides this simply produces no
+    /// progress signal, degrading gracefully to the pre-issue-#33 silence
+    /// between `AgentStarted`/`AgentFinished` rather than failing anything.
+    fn parse_progress_line(&self, _line: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The `claude` adapter (issue #24): Warden's first built-in
@@ -110,14 +144,19 @@ pub trait ToolAdapter {
 ///
 /// # Invocation shape
 ///
-/// `claude -p --output-format json --append-system-prompt <prompt> [--model
-/// <model>] [--allowedTools <tools>]`, with the role's own context (run
-/// intent, or target commit/diff/prior findings, `AgentInputMessage` --
-/// unchanged from ADR-0012) still fed on stdin as the user turn: `claude -p`
-/// with no positional prompt argument reads its user prompt from stdin in
-/// plain-text input mode (verified directly against the real CLI), so this
-/// adapter needs no involvement in *that* channel at all -- it only owns the
-/// invocation's argv.
+/// `claude -p --output-format stream-json --verbose --append-system-prompt
+/// <prompt> [--model <model>] [--allowedTools <tools>]`, with the role's own
+/// context (run intent, or target commit/diff/prior findings,
+/// `AgentInputMessage` -- unchanged from ADR-0012) still fed on stdin as the
+/// user turn: `claude -p` with no positional prompt argument reads its user
+/// prompt from stdin in plain-text input mode (verified directly against the
+/// real CLI), so this adapter needs no involvement in *that* channel at all
+/// -- it only owns the invocation's argv.
+///
+/// `--verbose` is not optional decoration: verified directly against the
+/// real CLI, `claude -p --output-format stream-json` without it refuses to
+/// run at all (`Error: When using --print, --output-format=stream-json
+/// requires --verbose`).
 ///
 /// # `--append-system-prompt` reverses ADR-0013 / Q2's "no argv" stance
 ///
@@ -134,16 +173,35 @@ pub trait ToolAdapter {
 /// concrete adapter rather than reopening the general warden-native stdin
 /// contract (`warden_core::agent_wire`, unchanged by this issue).
 ///
-/// # `--output-format json`
+/// # `--output-format stream-json` (issue #33, was `json`)
 ///
-/// Lets [`ClaudeAdapter::extract_findings`] parse a single well-formed JSON
-/// envelope (`{"type":"result", ..., "result": "<final answer text>"}`,
-/// verified directly against the real CLI) instead of scraping
-/// human-oriented `text`/`stream-json` output. The default per-role prompts
-/// ([`ClaudeAdapter::default_prompt`]) instruct the reviewer/tester to make
-/// that final answer *be* NDJSON findings, so `extract_findings` only has to
-/// unwrap the envelope before handing the inner text to
-/// `warden_core::parse_findings` -- it does not itself understand findings.
+/// Originally `--output-format json`, chosen specifically because it emits a
+/// single well-formed JSON envelope and nothing else on stdout -- see this
+/// module's git history for that reasoning. Issue #33 (the TUI is blind for
+/// an agent's whole running time -- no signal at all between `AgentStarted`
+/// and `AgentFinished`) needed a second consumer of this same output: not
+/// just "one parsable final answer" (`extract_findings`) but also "an
+/// observable stream of what the agent is doing right now"
+/// (`parse_progress_line`). `stream-json` (with `--verbose`, see above)
+/// satisfies both without arbitration between them, because it emits its own
+/// NDJSON events *as the agent works* (`assistant` messages, `tool_use`
+/// blocks) and, verified directly against the real CLI, still ends with the
+/// **exact same** `{"type":"result", ..., "result": "<final answer
+/// text>"}` envelope as `json` mode did, as its last line. `extract_findings`
+/// below therefore doesn't need to change what it looks for, only *where*
+/// in stdout it looks (the last non-blank line, not the whole buffer as a
+/// single JSON value) -- see that method's own docs.
+///
+/// Every other line in the stream is `parse_progress_line`'s to interpret;
+/// this is a strictly additive change to what this adapter observes, not a
+/// new capability for Warden to *act* on anything (ADR-0005 is unaffected --
+/// see this issue's own analysis: Warden reads what `claude` already emits,
+/// it does not become a tool provider or intercept any command). The default
+/// per-role prompts ([`ClaudeAdapter::default_prompt`]) instruct the
+/// reviewer/tester to make the final answer *be* NDJSON findings, so
+/// `extract_findings` only has to unwrap the envelope before handing the
+/// inner text to `warden_core::parse_findings` -- it does not itself
+/// understand findings.
 ///
 /// # `--allowedTools` is required for a non-interactive invocation to act at
 /// all
@@ -165,14 +223,17 @@ pub trait ToolAdapter {
 /// [`ClaudeAdapter::build_command`] exactly as written.
 pub struct ClaudeAdapter;
 
-/// `claude`'s own JSON envelope for `--output-format json` (verified
-/// directly against a real `claude -p --output-format json` invocation --
-/// not documented CLI output, so only the two fields this adapter actually
-/// needs are modelled; every other field the real CLI emits is ignored by
-/// `serde`'s default "extra fields are fine" behaviour, not
-/// `deny_unknown_fields` -- this is *not* a Warden-owned wire contract like
-/// `agent_wire`/`agent_def`, it's a third party's output format Warden has
-/// no say over and must tolerate changing underneath it).
+/// `claude`'s own `result` envelope -- the same shape under both
+/// `--output-format json` (the entirety of stdout) and, since issue #33,
+/// `--output-format stream-json` (the last NDJSON line of stdout; every
+/// earlier line is some other `"type"`, left to [`ClaudeAdapter::parse_progress_line`]).
+/// Verified directly against the real CLI in both modes -- not documented
+/// CLI output, so only the two fields this adapter actually needs are
+/// modelled; every other field the real CLI emits is ignored by `serde`'s
+/// default "extra fields are fine" behaviour, not `deny_unknown_fields` --
+/// this is *not* a Warden-owned wire contract like `agent_wire`/`agent_def`,
+/// it's a third party's output format Warden has no say over and must
+/// tolerate changing underneath it).
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeResultEnvelope {
     /// The agent's final answer text. Absent on some non-success `subtype`s
@@ -214,7 +275,11 @@ impl ToolAdapter for ClaudeAdapter {
         let mut args = vec![
             "-p".to_string(),
             "--output-format".to_string(),
-            "json".to_string(),
+            "stream-json".to_string(),
+            // Required alongside `stream-json` in print mode (see this
+            // struct's own docs) -- without it the CLI refuses to start at
+            // all, before ever reaching `--append-system-prompt`.
+            "--verbose".to_string(),
             "--append-system-prompt".to_string(),
             definition.system_prompt.clone(),
         ];
@@ -234,9 +299,28 @@ impl ToolAdapter for ClaudeAdapter {
     }
 
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
-        let envelope: ClaudeResultEnvelope = serde_json::from_str(stdout).map_err(|error| {
+        // Issue #33: `--output-format stream-json` emits one NDJSON event
+        // per line while the agent works, then the exact same `result`
+        // envelope `json` mode used to emit as the *entirety* of stdout --
+        // now as its last line (verified directly against the real CLI, see
+        // `ClaudeAdapter`'s own docs). Every earlier line is
+        // `parse_progress_line`'s to interpret, not this method's --
+        // finding the last non-blank line first keeps this unchanged for
+        // plain `json`-mode stdout too (a single line, trivially "the last
+        // one"), so no separate code path is needed for the two modes.
+        let last_line = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| {
+                warden_core::CoreError::MalformedAgentOutput(
+                    "claude produced no output at all (expected at least a final `result` line)"
+                        .to_string(),
+                )
+            })?;
+        let envelope: ClaudeResultEnvelope = serde_json::from_str(last_line).map_err(|error| {
             warden_core::CoreError::MalformedAgentOutput(format!(
-                "claude output is not the expected --output-format json envelope: {error}"
+                "claude's final output line is not the expected `result` envelope: {error}"
             ))
         })?;
         let result_text = envelope.result.ok_or_else(|| {
@@ -271,6 +355,117 @@ impl ToolAdapter for ClaudeAdapter {
             // test suite (Bash) and add tests the diff lacks (Write/Edit).
             AgentRole::Tester => "Read, Write, Edit, Grep, Glob, Bash",
         })
+    }
+
+    fn parse_progress_line(&self, line: &str) -> Option<String> {
+        // Every other event `type` this stream can emit (`system`, `user`,
+        // `result`, `rate_limit_event`, ...) is either plumbing/noise for a
+        // live observer or already `extract_findings`'s own concern -- only
+        // `assistant` messages carry what the ticket asks for: complete
+        // messages and `tool_use` blocks, deliberately *not*
+        // `--include-partial-messages` chunks (issue #33: "probably too
+        // granular ... to validate by implementing", and this adapter never
+        // passes that flag in the first place, see `build_command`).
+        let parsed: ClaudeStreamLine = serde_json::from_str(line).ok()?;
+        if parsed.kind != "assistant" {
+            return None;
+        }
+        let blocks = parsed.message?.content?;
+        let parts: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ClaudeContentBlock::Text { text } => {
+                    Some(format!("message: {}", summarize_progress_text(text)))
+                }
+                ClaudeContentBlock::ToolUse { name, input } => {
+                    Some(format_tool_use_progress(name, input))
+                }
+                ClaudeContentBlock::Other => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" | "))
+        }
+    }
+}
+
+/// One line of `claude --output-format stream-json` output, kept
+/// deliberately minimal (see `ClaudeResultEnvelope`'s own docs on why this
+/// isn't a `deny_unknown_fields` wire contract): only enough structure to
+/// recognize an `assistant` message and read its content blocks.
+#[derive(Debug, serde::Deserialize)]
+struct ClaudeStreamLine {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    message: Option<ClaudeStreamMessage>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClaudeStreamMessage {
+    #[serde(default)]
+    content: Option<Vec<ClaudeContentBlock>>,
+}
+
+/// One content block of an `assistant` message. `#[serde(other)]` on
+/// `Other` means every block type this adapter doesn't specifically
+/// translate into progress (`thinking`, `image`, a future addition to the
+/// CLI's own format, ...) parses without error and is simply skipped by
+/// [`ClaudeAdapter::parse_progress_line`], rather than failing the whole
+/// line -- consistent with `code-standards.md`'s "never trust agent output"
+/// while still tolerating a third party's format evolving underneath this
+/// adapter (see `ClaudeResultEnvelope`'s own docs on the same point).
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClaudeContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// How much of a progress line's text is worth showing a live observer --
+/// long enough to be useful, short enough that one busy assistant message
+/// doesn't dominate the TUI's scrollable event log. Collapses internal
+/// whitespace (including newlines) to single spaces first: this is a
+/// one-line log entry, not a rendered markdown block.
+const MAX_PROGRESS_DETAIL_CHARS: usize = 200;
+
+fn summarize_progress_text(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_PROGRESS_DETAIL_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_PROGRESS_DETAIL_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Field names checked, in order, for a short human-readable summary of a
+/// `tool_use` block's `input` (issue #33: "tool_use blocks are likely enough
+/// ... start without partial messages"). Not exhaustive over every tool
+/// `claude` might call -- a tool whose input uses none of these field names
+/// still gets *a* progress line (just the tool name alone, see
+/// `format_tool_use_progress`), never a missing/failed one; this is
+/// observability, not a schema Warden owns or validates against.
+const TOOL_USE_SUMMARY_FIELDS: [&str; 5] =
+    ["command", "description", "file_path", "path", "pattern"];
+
+fn format_tool_use_progress(name: &str, input: &serde_json::Value) -> String {
+    let summary = TOOL_USE_SUMMARY_FIELDS
+        .iter()
+        .find_map(|field| input.get(field).and_then(|value| value.as_str()));
+    match summary {
+        Some(summary) => format!("tool_use: {name} ({})", summarize_progress_text(summary)),
+        None => format!("tool_use: {name}"),
     }
 }
 
@@ -337,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn build_command_always_runs_claude_in_print_json_mode_with_the_system_prompt() {
+    fn build_command_always_runs_claude_in_print_stream_json_mode_with_the_system_prompt() {
         let command = ClaudeAdapter
             .build_command(&definition(None, None))
             .unwrap();
@@ -347,7 +542,8 @@ mod tests {
             vec![
                 "-p",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
                 "--append-system-prompt",
                 "be an agent"
             ]
@@ -445,6 +641,161 @@ mod tests {
         let stdout =
             r#"{"type":"result","subtype":"success","is_error":false,"result":"not ndjson"}"#;
         assert!(ClaudeAdapter.extract_findings(stdout).is_err());
+    }
+
+    /// Issue #33: `--output-format stream-json` prints many NDJSON lines
+    /// before the final `result` envelope -- `extract_findings` must find
+    /// that envelope as the *last* non-blank line, ignoring everything
+    /// preceding it, rather than trying to parse the whole buffer as one
+    /// JSON value the way `--output-format json` mode's single-line output
+    /// allowed.
+    #[test]
+    fn extract_findings_finds_the_result_envelope_as_the_last_line_of_a_stream_json_transcript() {
+        let stdout = concat!(
+            r#"{"type":"system","subtype":"init","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"file.txt"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"source\":\"reviewer\",\"severity\":\"blocking\",\"description\":\"bug\"}"}"#,
+            "\n",
+        );
+        let findings = ClaudeAdapter.extract_findings(stdout).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].description, "bug");
+    }
+
+    /// A trailing blank line (a stray final `\n`) must not be mistaken for
+    /// "no output at all", nor parsed as the result line itself.
+    #[test]
+    fn extract_findings_ignores_a_trailing_blank_line_after_the_result_envelope() {
+        let stdout =
+            "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"\"}\n\n";
+        assert_eq!(ClaudeAdapter.extract_findings(stdout).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn extract_findings_rejects_completely_empty_output() {
+        let error = ClaudeAdapter.extract_findings("").unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn parse_progress_line_extracts_a_complete_assistant_text_message() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Looking at the failing test now."}]}}"#;
+        let progress = ClaudeAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(progress, "message: Looking at the failing test now.");
+    }
+
+    #[test]
+    fn parse_progress_line_extracts_a_tool_use_block_with_its_command() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test","description":"run the suite"}}]}}"#;
+        let progress = ClaudeAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(progress, "tool_use: Bash (cargo test)");
+    }
+
+    #[test]
+    fn parse_progress_line_falls_back_to_the_bare_tool_name_when_input_has_no_known_field() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"CustomTool","input":{"weird_field":"value"}}]}}"#;
+        let progress = ClaudeAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(progress, "tool_use: CustomTool");
+    }
+
+    #[test]
+    fn parse_progress_line_joins_multiple_content_blocks_in_one_assistant_message() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll list the files."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let progress = ClaudeAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(
+            progress,
+            "message: I'll list the files. | tool_use: Bash (ls)"
+        );
+    }
+
+    #[test]
+    fn parse_progress_line_ignores_non_assistant_event_types() {
+        for line in [
+            r#"{"type":"system","subtype":"init","cwd":"/tmp"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{}}"#,
+        ] {
+            assert_eq!(ClaudeAdapter.parse_progress_line(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn parse_progress_line_returns_none_for_unparsable_or_unrelated_lines() {
+        assert_eq!(ClaudeAdapter.parse_progress_line("not json at all"), None);
+        assert_eq!(ClaudeAdapter.parse_progress_line(""), None);
+    }
+
+    /// Long text is truncated for the live log rather than dumped verbatim
+    /// -- one huge assistant message must not dominate the TUI's scrollable
+    /// event list.
+    #[test]
+    fn parse_progress_line_truncates_a_very_long_assistant_message() {
+        let long_text = "word ".repeat(100); // well past MAX_PROGRESS_DETAIL_CHARS
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{long_text}"}}]}}}}"#
+        );
+        let progress = ClaudeAdapter.parse_progress_line(&line).unwrap();
+        assert!(progress.chars().count() < long_text.chars().count());
+        assert!(progress.ends_with('…'));
+    }
+
+    /// A content block type this adapter doesn't specifically translate
+    /// (e.g. `thinking`) must not fail the whole line -- it is simply
+    /// skipped, per `ClaudeContentBlock::Other`'s own docs.
+    #[test]
+    fn parse_progress_line_skips_unrecognized_content_block_types_without_failing() {
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"pondering..."}]}}"#;
+        assert_eq!(ClaudeAdapter.parse_progress_line(line), None);
+    }
+
+    /// Regression fixture captured verbatim from a real
+    /// `claude -p --output-format stream-json --verbose` invocation (issue
+    /// #33 implementation) -- not a hand-written approximation, so it also
+    /// exercises fields this adapter doesn't model (`caller`, `usage`,
+    /// `parent_tool_use_id`, ...) tolerated by serde's default "extra
+    /// fields are fine" behaviour (see `ClaudeStreamLine`'s own docs).
+    #[test]
+    fn parse_progress_line_handles_a_real_captured_tool_use_line() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_011Cd9HiRpTrNZbpg6SsxFb7","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01GLvBUCpwy33TmUv2zhwwWc","name":"Bash","input":{"command":"ls -la /private/tmp/stream-json-probe","description":"List files in working dir"},"caller":{"type":"direct"}}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","uuid":"dd65275f-4dc6-402b-bc2b-d7c5bf62f8af","timestamp":"2026-07-18T09:30:28.145Z","request_id":"req_011Cd9HiKv1bhZVTuY3FD96a"}"#;
+        let progress = ClaudeAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(
+            progress,
+            "tool_use: Bash (ls -la /private/tmp/stream-json-probe)"
+        );
+    }
+
+    /// Same real-capture provenance as the test above, for the terminal
+    /// `result` line -- an em-dash and embedded newlines in `result` (real
+    /// model output, not a test fixture's simplification) must round-trip
+    /// through `extract_findings` without corruption.
+    #[test]
+    fn extract_findings_handles_a_real_captured_result_line() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":8120,"result":"Files:\n- `err.log` — empty\n- `out.ndjson` — 11.7 KB\n\nHello.","stop_reason":"end_turn","session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","total_cost_usd":0.1483495,"permission_denials":[],"terminal_reason":"completed","uuid":"1d4ae256-0ea2-4dc3-addd-526a68c08806"}"#;
+        // This transcript's final answer is free text (an em-dash and
+        // embedded newlines, real model output, not a test simplification),
+        // not a reviewer/tester's NDJSON findings -- `extract_findings`
+        // must still correctly unwrap the real envelope (proving the
+        // `result` field round-trips through serde intact) before failing
+        // for the unrelated reason of `parse_findings` rejecting non-NDJSON
+        // text.
+        let error = match ClaudeAdapter.extract_findings(stdout).unwrap_err() {
+            warden_core::CoreError::MalformedAgentOutput(message) => message,
+            other => panic!("expected MalformedAgentOutput, got {other:?}"),
+        };
+        assert!(
+            !error.contains("envelope"),
+            "must fail on the inner NDJSON, not on unwrapping the envelope: {error}"
+        );
     }
 
     #[test]

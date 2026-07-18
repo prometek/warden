@@ -20,6 +20,16 @@ pub enum EventKind {
     RunStarted,
     CycleStarted,
     AgentStarted,
+    /// Issue #33 / ADR-0008 amendment: a live-only, declarative progress
+    /// signal, translated by the run's `warden::tool_adapter::ToolAdapter`
+    /// from one line of an agent's streamed output. Unlike every other
+    /// variant here, a [`RunEvent::AgentProgress`] is **never** persisted as
+    /// an `events` row (`warden::orchestrator::Orchestrator` broadcasts it
+    /// straight on the Event Bus, bypassing `db::insert_event` entirely) --
+    /// this discriminant still exists so [`RunEvent::kind`] stays a total
+    /// function, not because anything ever writes `"agent_progress"` to a
+    /// `event_type` column.
+    AgentProgress,
     AgentFinished,
     FindingRaised,
     /// Modeled now for forward compatibility with Phase 7 (Evidence Capture
@@ -38,6 +48,7 @@ impl EventKind {
             EventKind::RunStarted => "run_started",
             EventKind::CycleStarted => "cycle_started",
             EventKind::AgentStarted => "agent_started",
+            EventKind::AgentProgress => "agent_progress",
             EventKind::AgentFinished => "agent_finished",
             EventKind::FindingRaised => "finding_raised",
             EventKind::EvidenceCaptured => "evidence_captured",
@@ -50,6 +61,7 @@ impl EventKind {
             "run_started" => Ok(EventKind::RunStarted),
             "cycle_started" => Ok(EventKind::CycleStarted),
             "agent_started" => Ok(EventKind::AgentStarted),
+            "agent_progress" => Ok(EventKind::AgentProgress),
             "agent_finished" => Ok(EventKind::AgentFinished),
             "finding_raised" => Ok(EventKind::FindingRaised),
             "evidence_captured" => Ok(EventKind::EvidenceCaptured),
@@ -83,6 +95,29 @@ pub enum RunEvent {
     },
     AgentStarted {
         role: String,
+    },
+    /// A single declarative progress signal reported by an agent while it is
+    /// still running (issue #33): what the agent's own tool CLI says it is
+    /// doing right now (a streamed assistant message, or a `tool_use`
+    /// block), translated by that tool's own
+    /// `warden::tool_adapter::ToolAdapter` impl -- this type carries no
+    /// knowledge of any one CLI's wire format (e.g. `stream-json` never
+    /// leaks past the adapter that produces `detail`).
+    ///
+    /// **Declarative, not verified**: this is what the agent *reports*
+    /// itself doing, not a checked execution trace -- ADR-0009's evidence
+    /// keeps that role, and this event must never be presented as one.
+    ///
+    /// **Live-only** (ADR-0008 amendment, issue #33): unlike every other
+    /// variant in this enum, a value of this variant is *never* persisted to
+    /// the `events` table -- see [`EventKind::AgentProgress`]'s own docs. A
+    /// `warden-tui` that attaches after the fact never replays it; it is
+    /// only ever seen by a subscriber watching the run live at the moment it
+    /// was published, exactly like the bus already tolerates losing events
+    /// for a slow subscriber (`warden::event_bus`).
+    AgentProgress {
+        role: String,
+        detail: String,
     },
     AgentFinished {
         role: String,
@@ -120,6 +155,7 @@ impl RunEvent {
             RunEvent::RunStarted { .. } => EventKind::RunStarted,
             RunEvent::CycleStarted { .. } => EventKind::CycleStarted,
             RunEvent::AgentStarted { .. } => EventKind::AgentStarted,
+            RunEvent::AgentProgress { .. } => EventKind::AgentProgress,
             RunEvent::AgentFinished { .. } => EventKind::AgentFinished,
             RunEvent::FindingRaised { .. } => EventKind::FindingRaised,
             RunEvent::EvidenceCaptured { .. } => EventKind::EvidenceCaptured,
@@ -154,6 +190,7 @@ mod tests {
             EventKind::RunStarted,
             EventKind::CycleStarted,
             EventKind::AgentStarted,
+            EventKind::AgentProgress,
             EventKind::AgentFinished,
             EventKind::FindingRaised,
             EventKind::EvidenceCaptured,
@@ -186,6 +223,10 @@ mod tests {
             EventKind::CycleStarted => RunEvent::CycleStarted { cycle_number: 1 },
             EventKind::AgentStarted => RunEvent::AgentStarted {
                 role: "coder".to_string(),
+            },
+            EventKind::AgentProgress => RunEvent::AgentProgress {
+                role: "coder".to_string(),
+                detail: "running `cargo test`".to_string(),
             },
             EventKind::AgentFinished => RunEvent::AgentFinished {
                 role: "coder".to_string(),

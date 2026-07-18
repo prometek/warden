@@ -9,6 +9,14 @@
 //! published as a [`RunEvent`] -- persisted to `events` and broadcast live on
 //! the run's [`EventBus`] -- so a `warden-tui` can observe the run without
 //! polling SQLite itself. See [`Orchestrator::publish_event`].
+//!
+//! **ADR-0008 amendment (issue #33)**: a running agent's own declarative
+//! progress (`RunEvent::AgentProgress` -- what its tool CLI reports itself
+//! doing, translated per line by this run's `ToolAdapter`) is broadcast on
+//! the same [`EventBus`] but is deliberately **not** persisted to `events`
+//! at all -- a run can produce thousands of these, and unlike every other
+//! `RunEvent` variant, a late `warden-tui` attach is not expected to replay
+//! them. See [`Orchestrator::publish_progress_event`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -355,6 +363,40 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Publishes a [`RunEvent::AgentProgress`] straight to this run's
+    /// [`EventBus`], deliberately bypassing `db::insert_event` -- see this
+    /// module's own docs on the ADR-0008 amendment this implements (issue
+    /// #33): progress is live-only, never persisted to `events`, so a late
+    /// attach never replays it.
+    ///
+    /// **Synchronous and best-effort by design.** Called from inside
+    /// [`process::wait_with_progress`]'s per-line callback, on the hot path
+    /// draining an agent's stdout ([`run_agent`](Orchestrator::run_agent)):
+    /// it must never `.await` (that would insert backpressure into the very
+    /// drain loop `process.rs`'s deadlock-avoidance contract depends on --
+    /// [`EventBus::publish`] is itself synchronous and non-blocking for
+    /// exactly this reason, see its own docs) and it must never fail the
+    /// run. A missing `run_context` (e.g. a test that calls
+    /// [`run_agent`](Orchestrator::run_agent) directly without going through
+    /// [`run_convergence_loop`](Orchestrator::run_convergence_loop) first) is
+    /// silently a no-op, the same contract [`publish_event`](Orchestrator::publish_event)
+    /// already has for the same case.
+    fn publish_progress_event(&self, role: AgentRole, detail: String) {
+        let Some(context) = self.run_context.get() else {
+            return;
+        };
+
+        context.event_bus.publish(&warden_core::RunEventRecord {
+            id: Uuid::new_v4().to_string(),
+            run_id: context.run_id.clone(),
+            event: RunEvent::AgentProgress {
+                role: role.as_str().to_string(),
+                detail,
+            },
+            created_at: Utc::now().to_rfc3339(),
+        });
+    }
+
     /// Validates and persists a state transition by re-reading the run's
     /// *currently persisted* state first, rather than trusting an
     /// in-memory value the caller already believes is correct (L5: a
@@ -506,19 +548,22 @@ impl Orchestrator {
                     .await?;
 
             let coder_result = self
-                .run_coder(CoderInvocation {
-                    run_id: &run_id,
-                    cycle_id: &cycle_id,
-                    cycle_number,
-                    config: &config,
-                    agent: &agents.coder,
-                    env_allowlist: agents.env_allowlist,
-                    worktree_manager: &worktree_manager,
-                    base_commit: &base_commit,
-                    run_base_commit_sha: &run_base_commit_sha,
-                    prior_findings: &prior_findings,
-                    cancel: cancel.clone(),
-                })
+                .run_coder(
+                    &runner,
+                    CoderInvocation {
+                        run_id: &run_id,
+                        cycle_id: &cycle_id,
+                        cycle_number,
+                        config: &config,
+                        agent: &agents.coder,
+                        env_allowlist: agents.env_allowlist,
+                        worktree_manager: &worktree_manager,
+                        base_commit: &base_commit,
+                        run_base_commit_sha: &run_base_commit_sha,
+                        prior_findings: &prior_findings,
+                        cancel: cancel.clone(),
+                    },
+                )
                 .await?;
             base_commit = coder_result.commit;
 
@@ -850,7 +895,11 @@ impl Orchestrator {
         }
     }
 
-    async fn run_coder(&self, invocation: CoderInvocation<'_>) -> Result<CoderCycleResult> {
+    async fn run_coder<R: ToolAdapter>(
+        &self,
+        runner: &R,
+        invocation: CoderInvocation<'_>,
+    ) -> Result<CoderCycleResult> {
         let CoderInvocation {
             run_id,
             cycle_id,
@@ -898,6 +947,7 @@ impl Orchestrator {
             .run_agent(
                 cycle_id,
                 AgentRole::Coder,
+                runner,
                 &agent.command,
                 env_allowlist,
                 worktree.path(),
@@ -1107,6 +1157,7 @@ impl Orchestrator {
             .run_agent(
                 cycle_id,
                 role,
+                runner,
                 &agent.command,
                 env_allowlist,
                 worktree.path(),
@@ -1301,18 +1352,28 @@ impl Orchestrator {
     ///
     /// `stdin_payload` is the serialized `warden_core::AgentInputMessage`
     /// (ADR-0012, issue #20 Scope B) fed to the agent's stdin and then
-    /// closed by [`process::wait`] -- the coder's run intent, or the
-    /// reviewer/tester's target commit/diff/prior findings.
+    /// closed by [`process::wait_with_progress`] -- the coder's run intent,
+    /// or the reviewer/tester's target commit/diff/prior findings.
     ///
     /// `env_allowlist` is this run's `--tool` adapter's own
     /// `ToolAdapter::env_allowlist` (issue #24) -- forwarded to
     /// [`process::spawn_with_extra_env`] on top of the always-forwarded
     /// `PATH`.
+    ///
+    /// `runner` (issue #33) is this same run's `ToolAdapter` -- generic here
+    /// (rather than a `&dyn ToolAdapter`) for the same compile-time-seam
+    /// reason the rest of this module uses it (see [`ToolAdapter`]'s own
+    /// docs). Used to translate each stdout line into a progress detail via
+    /// [`ToolAdapter::parse_progress_line`] as it arrives, published through
+    /// [`publish_progress_event`](Orchestrator::publish_progress_event) --
+    /// never through [`publish_event`](Orchestrator::publish_event), which
+    /// would persist it (see this module's own ADR-0008 amendment docs).
     #[allow(clippy::too_many_arguments)]
-    async fn run_agent(
+    async fn run_agent<R: ToolAdapter>(
         &self,
         cycle_id: &str,
         role: AgentRole,
+        runner: &R,
         command: &AgentCommand,
         env_allowlist: &[&str],
         cwd: &Path,
@@ -1346,8 +1407,24 @@ impl Orchestrator {
         })
         .await?;
 
-        let outcome_result =
-            process::wait(child, &command.program, Some(stdin_payload), cancel).await;
+        // Issue #33: translates each streamed stdout line into a progress
+        // detail (this run's `ToolAdapter`'s own concern -- e.g. `claude
+        // --output-format stream-json`'s NDJSON events, never a format this
+        // module itself understands) and broadcasts it live-only. Must stay
+        // synchronous (see `publish_progress_event`'s own docs).
+        let on_stdout_line = |line: &str| {
+            if let Some(detail) = runner.parse_progress_line(line) {
+                self.publish_progress_event(role, detail);
+            }
+        };
+        let outcome_result = process::wait_with_progress(
+            child,
+            &command.program,
+            Some(stdin_payload),
+            cancel,
+            Some(&on_stdout_line),
+        )
+        .await;
         let exit_code_for_db = match &outcome_result {
             Ok(outcome) => outcome.exit_code,
             Err(_) => -1,
@@ -2447,6 +2524,42 @@ mod tests {
         }
     }
 
+    /// Issue #33: a `FakeCommandAdapter` that also translates stdout lines
+    /// into progress, so a test can exercise the full
+    /// `process::wait_with_progress` -> `ToolAdapter::parse_progress_line`
+    /// -> `Orchestrator::publish_progress_event` -> `EventBus` pipeline
+    /// without needing a real `claude` CLI. Recognizes any line prefixed
+    /// `PROGRESS: ` (a made-up convention for this fake only -- real
+    /// progress recognition is `ClaudeAdapter`'s own `stream-json`-specific
+    /// concern, unrelated to this marker).
+    struct ProgressReportingAdapter;
+
+    impl ToolAdapter for ProgressReportingAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+
+        fn parse_progress_line(&self, line: &str) -> Option<String> {
+            line.strip_prefix("PROGRESS: ").map(str::to_string)
+        }
+    }
+
     /// The tool-adapter seam (issue #24): the orchestrator spawns what the
     /// *adapter* returns for a definition, not something read straight out
     /// of `RunConfig` -- so a fake adapter can serve every role from
@@ -2736,6 +2849,152 @@ mod tests {
             .unwrap();
 
         assert_eq!(final_state, RunState::Converged);
+    }
+
+    /// Issue #33 end-to-end: a coder that prints an adapter-recognized
+    /// progress line while it runs must have it show up on the run's Event
+    /// Bus, live, as a `RunEvent::AgentProgress` -- *and* must never have it
+    /// show up in `events` (the ADR-0008 amendment this issue introduces:
+    /// progress is live-only, deliberately not persisted). Subscribes to
+    /// the socket synchronously from inside `on_run_started` (a blocking
+    /// local Unix connect, effectively instant against an already-listening
+    /// socket) so the subscription is guaranteed established before the
+    /// coder -- and therefore its progress line -- ever runs, avoiding a
+    /// connect-vs-publish race.
+    #[tokio::test]
+    async fn agent_progress_is_published_live_on_the_event_bus_but_never_persisted_to_events() {
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                echo "PROGRESS: implementing the fix"
+                echo done > work.txt
+                git add work.txt
+                git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                "#,
+            ],
+        );
+
+        let runs_dir = warden_home.path().join("runs");
+        let live_events: std::sync::Arc<
+            tokio::sync::Mutex<Option<tokio::task::JoinHandle<Vec<warden_core::RunEventRecord>>>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let live_events_for_callback = live_events.clone();
+        let runs_dir_for_callback = runs_dir.clone();
+
+        let orchestrator = Orchestrator::new(pool.clone()).on_run_started(move |run_id| {
+            let socket_path = warden_core::resolve_socket_path(run_id, &runs_dir_for_callback);
+            // Blocking connect (not the async `tokio::net::UnixStream`):
+            // establishing the subscription synchronously, before this
+            // callback returns and the coder is spawned, is what rules out
+            // the race against the coder's own (near-instant) progress
+            // line -- see this test's own docs.
+            let std_stream = StdUnixStream::connect(&socket_path)
+                .expect("event bus socket must already be listening by on_run_started");
+            std_stream
+                .set_nonblocking(true)
+                .expect("set_nonblocking for tokio interop");
+            let tokio_stream = tokio::net::UnixStream::from_std(std_stream)
+                .expect("wrap the already-connected std socket for async reads");
+
+            let handle = tokio::spawn(async move {
+                let mut reader = BufReader::new(tokio_stream);
+                let mut line = String::new();
+                let mut received = Vec::new();
+                loop {
+                    line.clear();
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        reader.read_line(&mut line),
+                    )
+                    .await
+                    .expect("must not time out waiting for an event")
+                    .expect("socket read must not error");
+                    if read == 0 {
+                        break; // EOF
+                    }
+                    let record: warden_core::RunEventRecord =
+                        serde_json::from_str(line.trim()).expect("valid RunEventRecord JSON");
+                    let is_run_finished = matches!(record.event, RunEvent::RunFinished { .. });
+                    received.push(record);
+                    if is_run_finished {
+                        break;
+                    }
+                }
+                received
+            });
+
+            // `try_lock` rather than `.lock().await`: this callback must stay
+            // synchronous/non-blocking (see `on_run_started`'s own docs) --
+            // uncontended here since nothing else touches this mutex before
+            // the callback returns.
+            *live_events_for_callback.try_lock().unwrap() = Some(handle);
+        });
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 33: live agent progress".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(coder),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, ProgressReportingAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let handle = live_events.lock().await.take().expect("callback ran");
+        let received = handle.await.expect("subscriber task must not panic");
+
+        let progress_events: Vec<&RunEvent> = received
+            .iter()
+            .map(|record| &record.event)
+            .filter(|event| matches!(event, RunEvent::AgentProgress { .. }))
+            .collect();
+        assert_eq!(
+            progress_events.len(),
+            1,
+            "expected exactly one AgentProgress event on the live bus: {received:?}"
+        );
+        assert!(matches!(
+            progress_events[0],
+            RunEvent::AgentProgress { role, detail }
+                if role == "coder" && detail == "implementing the fix"
+        ));
+
+        // The ADR-0008 amendment under test: `events` must have every
+        // lifecycle event this run produced, but *never* an `AgentProgress`
+        // -- proving `publish_progress_event` really does bypass
+        // `db::insert_event` end-to-end, not just by code inspection.
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        assert!(
+            !persisted.is_empty(),
+            "sanity: lifecycle events must still be persisted"
+        );
+        assert!(
+            persisted
+                .iter()
+                .all(|record| !matches!(record.event, RunEvent::AgentProgress { .. })),
+            "AgentProgress must never be persisted to `events` (ADR-0008 amendment, issue #33): \
+             {persisted:?}"
+        );
     }
 
     // -----------------------------------------------------------------
