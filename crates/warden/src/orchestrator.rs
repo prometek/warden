@@ -60,8 +60,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiResultMessage,
-    EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
+    decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiOutcome,
+    CiResultMessage, EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
 };
 
 use crate::ci_channel::CiResultListener;
@@ -890,6 +890,20 @@ impl Orchestrator {
                                 PostConvergenceOutcome::Terminal(state) => break state,
                                 PostConvergenceOutcome::Reboucle { findings } => {
                                     cycle_number += 1;
+                                    // Issue #43: `apply_ci_result_message`
+                                    // charged this CI reboucle to the review
+                                    // budget and persisted the advanced
+                                    // counter. Re-sync the in-loop counter so
+                                    // the next iteration's clean-review write
+                                    // (which persists `review_cycle_number`)
+                                    // can't clobber the CI charge and let a
+                                    // persistently-red CI loop forever.
+                                    review_cycle_number = db::get_run(&self.pool, &run_id)
+                                        .await?
+                                        .ok_or_else(|| WardenError::RunNotFound {
+                                            run_id: run_id.clone(),
+                                        })?
+                                        .current_review_cycle;
                                     pending_ci_findings = findings;
                                     continue;
                                 }
@@ -1089,9 +1103,23 @@ impl Orchestrator {
         }
 
         let next_state = match message.outcome.as_ci_outcome() {
-            // Issue #43: a CI reboucle re-enters the loop at `CoderRunning`
-            // -> `Reviewing` exactly like any other reboucle to the coder, so
-            // it's checked against the review budget.
+            // Issue #43: a CI `ChecksFailed` reboucle re-enters the loop at
+            // `CoderRunning` -> `Reviewing` exactly like any review-charged
+            // reboucle, so charge it to the review budget. The in-loop review
+            // counter never moves on a CI reboucle (the code passed review
+            // locally), so advance the persisted `current_review_cycle`
+            // *before* gating -- otherwise a persistently-red CI would gate on
+            // a counter that never grows and loop unboundedly instead of
+            // terminating at the budget. The main loop re-reads this value
+            // after the reboucle so its own clean-review write can't clobber
+            // it.
+            Some(CiOutcome::ChecksFailed) => {
+                let charged = run.current_review_cycle + 1;
+                db::set_run_current_review_cycle(&self.pool, run_id, charged).await?;
+                decide_next_state_after_ci(CiOutcome::ChecksFailed, charged, run.max_review_cycles)
+            }
+            // Merged/ChecksPassed/Closed/TimedOut: terminal outcomes with no
+            // reboucle and no budget to charge.
             Some(ci_outcome) => decide_next_state_after_ci(
                 ci_outcome,
                 run.current_review_cycle,
@@ -7138,9 +7166,11 @@ mod tests {
         let (run_id, config, converged_commit) =
             converged_run_fixture(&pool, &repo, &bare_repo).await;
         // `converged_run_fixture` inserts with max_review_cycles = 5 and
-        // leaves current_review_cycle at its 0 default; set it to the budget
-        // so this `ChecksFailed` lands exactly at the limit.
-        db::set_run_current_review_cycle(&pool, &run_id, 5)
+        // leaves current_review_cycle at its 0 default. Seed it to 4: this
+        // `ChecksFailed` charges the review budget by one (issue #43),
+        // advancing the counter to exactly 5 -- the budget -- so the gate
+        // lands precisely at the limit.
+        db::set_run_current_review_cycle(&pool, &run_id, 4)
             .await
             .unwrap();
 
@@ -7168,6 +7198,95 @@ mod tests {
         );
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// Issue #43 (review HIGH): a persistently-red CI must terminate at the
+    /// review budget rather than loop unboundedly. Each `ChecksFailed`
+    /// reboucle is charged to the review budget (it re-enters at
+    /// `CoderRunning` -> `Reviewing` like any review-charged reboucle), and
+    /// the counter must advance on the CI path *itself* -- driven here through
+    /// the real `drive_post_convergence_tail`/`apply_ci_result_message` flow
+    /// with no manual seeding. Between passes the run is returned to
+    /// `Converged` exactly as the main loop does after a reboucle, so this
+    /// exercises the genuine counter progression, not the pure mapping
+    /// function. It never touches the test budget.
+    #[tokio::test]
+    async fn repeated_checks_failed_charges_the_review_budget_until_it_terminates_at_failed() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+        // Fixture inserts max_review_cycles = 5, current_review_cycle = 0.
+        let max = config.max_review_cycles;
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let ci_finding = Finding {
+            source: warden_core::FindingSource::Ci,
+            severity: warden_core::Severity::Blocking,
+            file: None,
+            description: "flaky CI".to_string(),
+            action: None,
+        };
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_failed(&[ci_finding]),
+            pr_number: Some(99),
+        };
+
+        // The first `max - 1` CI failures each reboucle and charge one review
+        // cycle; the test budget's counter must never move.
+        for expected_cycle in 1..max {
+            let outcome = orchestrator
+                .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, PostConvergenceOutcome::Reboucle { .. }),
+                "CI failure {expected_cycle} below budget must reboucle, got {outcome:?}"
+            );
+            let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+            assert_eq!(
+                run.current_review_cycle, expected_cycle,
+                "each CI reboucle must advance the review budget counter by exactly one"
+            );
+            assert_eq!(
+                run.current_test_cycle, 0,
+                "a CI reboucle is charged to the review budget, never the test budget"
+            );
+            // The main loop returns the run to `Converged` before re-driving
+            // the tail (CoderRunning -> Reviewing -> Testing -> Converged).
+            db::update_run_state(&pool, &run_id, RunState::Reviewing)
+                .await
+                .unwrap();
+            db::update_run_state(&pool, &run_id, RunState::Testing)
+                .await
+                .unwrap();
+            db::update_run_state(&pool, &run_id, RunState::Converged)
+                .await
+                .unwrap();
+        }
+
+        // The `max`-th CI failure lands exactly at the budget: it must
+        // terminate at `Failed`, never reboucle again.
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, PostConvergenceOutcome::Terminal(RunState::Failed)),
+            "CI failure at the review budget must terminate at Failed, got {outcome:?}"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+        assert_eq!(
+            run.current_review_cycle, max,
+            "the review budget is what ran out"
+        );
+        assert_eq!(
+            run.current_test_cycle, 0,
+            "CI reboucles never charge the test budget"
+        );
     }
 
     /// `Closed` (PR closed without merging) reaches `Failed` -- verified at

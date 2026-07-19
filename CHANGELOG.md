@@ -34,12 +34,23 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   tournant à chaque cycle, y compris ceux reboucleés par le tester) : un run dont tous les
   reboucles étaient d'origine tester pouvait épuiser à tort son budget review dès le premier
   reboucle review-bloquant venu, même après des dizaines de cycles clean côté review. Persisté
-  dans `runs.current_review_cycle` (et donc lu tel quel par `decide_next_state_after_ci` pour
-  un reboucle déclenché par la CI). Verrouillé par
+  dans `runs.current_review_cycle`. Verrouillé par
   `max_test_cycles_exceeded_when_tester_findings_never_clear` (budget review minimal `1`,
   jamais épuisé malgré plusieurs reboucles tester) et son symétrique
   `max_review_cycles_exceeded_when_reviewer_findings_never_clear` (budget test minimal `1`,
   jamais épuisé — le tester ne tourne même jamais).
+- **Reboucle déclenché par la CI imputé au budget review (relecture, HIGH)** : un reboucle
+  `ChecksFailed` (issue #15/ADR-0011) ré-entre dans la boucle en `CoderRunning -> Reviewing`
+  comme n'importe quel reboucle review — il débite donc le budget review. Le compteur review
+  in-loop n'avance jamais sur un reboucle CI (le code a passé la review localement), donc
+  `apply_ci_result_message` incrémente `runs.current_review_cycle` *avant* de statuer, sinon
+  une CI durablement rouge boucle indéfiniment sur un compteur qui ne bouge pas au lieu de
+  s'arrêter au budget. La boucle relit ce compteur après le reboucle (`review_cycle_number`)
+  pour que son écriture review-clean ne l'écrase pas. Sans ce correctif, la première version
+  du fix ci-dessus avait désactivé le budget CI (l'ancien compteur global le portait
+  auparavant). Verrouillé par
+  `repeated_checks_failed_charges_the_review_budget_until_it_terminates_at_failed` (CI rouge
+  répétée → `Failed` au budget, `current_test_cycle` jamais touché).
 - **États d'épuisement dédiés, jamais un faux `Converged`** : `RunState::MaxCyclesExceeded`
   devient `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` — deux états terminaux
   distincts (`-> Failed` uniquement), jamais confondus avec `Converged`.
