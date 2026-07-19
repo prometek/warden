@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT DISTINCT runs.id as \"id!\", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_cycles, runs.current_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number\n        FROM runs\n        WHERE runs.state = 'failed'\n          AND (\n            EXISTS (\n                SELECT 1 FROM agent_processes\n                JOIN cycles ON cycles.id = agent_processes.cycle_id\n                WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL\n            )\n            OR EXISTS (\n                SELECT 1 FROM cycles\n                WHERE cycles.run_id = runs.id\n                  AND (cycles.coder_worktree_path IS NOT NULL\n                       OR cycles.reviewer_worktree_path IS NOT NULL\n                       OR cycles.tester_worktree_path IS NOT NULL)\n            )\n          )\n        ",
+  "query": "SELECT id as \"id!\", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?",
   "describe": {
     "columns": [
       {
@@ -59,30 +59,52 @@
         }
       },
       {
-        "name": "max_cycles",
+        "name": "max_review_cycles",
         "ordinal": 5,
         "type_info": "Integer",
         "origin": {
           "Table": {
             "table": "runs",
-            "name": "max_cycles"
+            "name": "max_review_cycles"
           }
         }
       },
       {
-        "name": "current_cycle",
+        "name": "max_test_cycles",
         "ordinal": 6,
         "type_info": "Integer",
         "origin": {
           "Table": {
             "table": "runs",
-            "name": "current_cycle"
+            "name": "max_test_cycles"
+          }
+        }
+      },
+      {
+        "name": "current_review_cycle",
+        "ordinal": 7,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "current_review_cycle"
+          }
+        }
+      },
+      {
+        "name": "current_test_cycle",
+        "ordinal": 8,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "current_test_cycle"
           }
         }
       },
       {
         "name": "created_at",
-        "ordinal": 7,
+        "ordinal": 9,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -93,7 +115,7 @@
       },
       {
         "name": "updated_at",
-        "ordinal": 8,
+        "ordinal": 10,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -104,7 +126,7 @@
       },
       {
         "name": "converged_commit_sha",
-        "ordinal": 9,
+        "ordinal": 11,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -115,7 +137,7 @@
       },
       {
         "name": "pr_number",
-        "ordinal": 10,
+        "ordinal": 12,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -126,10 +148,12 @@
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       true,
+      false,
+      false,
       false,
       false,
       false,
@@ -142,5 +166,5 @@
       true
     ]
   },
-  "hash": "13a1fec6ff71aa8396d08c7b5734ca966e99c1df0432c1a6f5ac7f4b62aafb06"
+  "hash": "e1b129ebb7559d3d66bb28b0242b4240804006e6d70611d7f049f1ac769802c3"
 }

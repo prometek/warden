@@ -29,9 +29,13 @@ de re-review scopée (portant sur le correctif et les findings du tester qui l'o
 décision #37 Q2) avant que le tester ne soit jamais rappelé — si cette re-review relève à son
 tour un finding, le cycle reboucle vers le coder sans jamais rappeler le tester, jusqu'à ce que
 la review soit clean ; la convergence n'est atteinte que quand le tester lui-même est clean.
-Les budgets et états dédiés par phase (compter les reboucles de re-review sur un budget review
-distinct du budget test) restent **pas encore livrés** — voir #43 ; ce run partage encore un
-unique `max_cycles` et un unique `RunState::AwaitingReviewTest` entre les deux gates. Un second binaire,
+Depuis l'issue #43, budgets et états sont dédiés par phase : `--max-review-cycles`/
+`--max-test-cycles` remplacent l'unique `--max-cycles`, et `RunState::Reviewing`/
+`RunState::Testing` remplacent l'unique `AwaitingReviewTest` — une re-review scopée
+déclenchée par un finding du tester est imputée au budget review, jamais au budget test
+(décision #37 Q1, `warden_core::decide_next_state`), et l'épuisement de chaque budget mène
+à un état terminal dédié (`MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded`), jamais à un
+faux `Converged`. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
 run et le hash validé en SQLite (connexion strictement lecture seule) avant tout push vers
@@ -161,8 +165,13 @@ Flags de `warden run` :
   toujours rien vers un remote (aucun credential remote côté orchestrateur, ADR-0006) ;
   c'est `warden-gated` qui reçoit un push vers son dépôt bare local et décide seul de le
   relayer vers `origin`. Défaut : `main`.
-- `--max-cycles <N>` — nombre maximum de cycles coder/review/test avant abandon
-  (`RunState::MaxCyclesExceeded`). Doit être ≥ 1. Défaut : `5`.
+- `--max-review-cycles <N>` — nombre maximum d'allers-retours coder↔reviewer avant
+  abandon (`RunState::MaxReviewCyclesExceeded`, issue #43). Une re-review scopée
+  déclenchée par un finding du tester compte sur ce budget, jamais sur celui du tester
+  (décision #37 Q1). Doit être ≥ 1. Défaut : `5`.
+- `--max-test-cycles <N>` — nombre maximum de passages du tester se soldant par un finding
+  bloquant avant abandon (`RunState::MaxTestCyclesExceeded`, issue #43). Doit être ≥ 1.
+  Défaut : `5`.
 - `--warden-home <PATH>` — répertoire d'état de Warden (base SQLite + worktrees).
   Défaut : `~/.warden`.
 - `--evidence-tool <playwright|asciinema>` — force l'outil de capture de preuve
@@ -347,8 +356,9 @@ finding :
 
 - `source` : `"reviewer"` ou `"tester"`.
 - `severity` : `"blocking"`, `"warning"` ou `"info"`. Un finding `blocking` déclenche un
-  nouveau cycle (ou `MaxCyclesExceeded` si le budget est épuisé) ; sans finding
-  `blocking`, le run passe à `Converged`.
+  nouveau cycle, ou l'épuisement du budget de sa propre phase (`MaxReviewCyclesExceeded`
+  pour un finding `reviewer`, `MaxTestCyclesExceeded` pour un finding `tester` — issue
+  #43, décision #37 Q1) ; sans finding `blocking`, le run passe à `Converged`.
 - `file` et `action` sont optionnels ; `description` est requis.
 
 Toute ligne non vide qui n'est pas un JSON valide, ou dont `severity`/`source` sort de

@@ -714,7 +714,7 @@ async fn e2e_full_convergence_cycle_reboucles_then_converges_via_cli() {
             "flip status to fixed",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "5",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -1314,7 +1314,8 @@ async fn e2e_run_intent_never_leaks_into_argv() {
 /// not silently dropped).
 #[cfg(unix)]
 #[tokio::test]
-async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_max_cycles() {
+async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_max_review_cycles()
+{
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
@@ -1334,7 +1335,7 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
             repo.path().to_str().unwrap(),
             "--intent",
             "never converges",
-            "--max-cycles",
+            "--max-review-cycles",
             "2",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -1343,14 +1344,14 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
         ])
         .assert()
         .success()
-        .stdout(contains("finished: MaxCyclesExceeded"));
+        .stdout(contains("finished: MaxReviewCyclesExceeded"));
 
     let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
     let pool = warden::db::connect(&warden_home.path().join("state.db"))
         .await
         .unwrap();
     let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
-    assert_eq!(run.state, RunState::MaxCyclesExceeded);
+    assert_eq!(run.state, RunState::MaxReviewCyclesExceeded);
 }
 
 /// A convention file naming a role Claude Code files also use (`tools`) must
@@ -1589,9 +1590,17 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
     // guessed unused number).
     {
         let pool = warden::db::connect(&db_path).await.unwrap();
-        warden::db::insert_run(&pool, "crashed-run", "/tmp/some-repo", "main", "intent", 3)
-            .await
-            .unwrap();
+        warden::db::insert_run(
+            &pool,
+            "crashed-run",
+            "/tmp/some-repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
         warden::db::update_run_state(&pool, "crashed-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -1719,7 +1728,7 @@ async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_b
             "single converging cycle",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -1870,7 +1879,7 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
             "crossed findings, no collision",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -1996,6 +2005,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -2087,7 +2097,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             "unrelated new run",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2181,7 +2191,7 @@ async fn e2e_restart_backs_up_db_before_applying_pending_migrations_via_cli() {
             "trigger startup migration",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2269,7 +2279,7 @@ exit 0
             &large_intent,
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2348,7 +2358,7 @@ cp "$stdin_file" "{captures}/tester_stdin_$next.json"
             "flip status to fixed via a reboucle",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "5",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2556,7 +2566,7 @@ async fn e2e_cli_project_selects_asciinema_and_evidence_is_stored_and_committed_
             "cli project captures evidence via asciinema",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2662,7 +2672,7 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
             "web project captures evidence via playwright",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2738,7 +2748,7 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
             "override forces asciinema on a web-looking project",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2795,7 +2805,7 @@ async fn e2e_evidence_store_in_repo_false_keeps_evidence_local_and_never_commits
             "evidence stays local when store-in-repo is disabled",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),
@@ -2889,7 +2899,7 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
             "converges even though no evidence tool is installed",
             "--branch",
             "main",
-            "--max-cycles",
+            "--max-review-cycles",
             "3",
             "--warden-home",
             warden_home.path().to_str().unwrap(),

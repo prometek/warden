@@ -41,14 +41,20 @@ pub async fn connect_read_only(db_path: &Path) -> Result<SqlitePool> {
 /// The subset of a `runs` row the TUI header needs to render. Re-read from
 /// SQLite on demand, never trusted from a cached value that might have
 /// drifted (same discipline `warden_gated::db::GateRunView` follows).
+///
+/// Issue #43/ADR-0014: `max_cycles`/`current_cycle` are gone, replaced by two
+/// independent per-phase budgets/counters -- see
+/// `crates/warden/migrations/0007_phase_budgets.sql`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunView {
     pub id: String,
     pub intent: String,
     pub branch: String,
     pub state: RunState,
-    pub max_cycles: u32,
-    pub current_cycle: u32,
+    pub max_review_cycles: u32,
+    pub max_test_cycles: u32,
+    pub current_review_cycle: u32,
+    pub current_test_cycle: u32,
 }
 
 struct RunRow {
@@ -56,8 +62,10 @@ struct RunRow {
     intent: String,
     branch: String,
     state: String,
-    max_cycles: i64,
-    current_cycle: i64,
+    max_review_cycles: i64,
+    max_test_cycles: i64,
+    current_review_cycle: i64,
+    current_test_cycle: i64,
 }
 
 fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
@@ -67,7 +75,7 @@ fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<RunView>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", intent, branch, state, max_cycles, current_cycle FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", intent, branch, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -79,8 +87,10 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<RunView>>
             intent: r.intent,
             branch: r.branch,
             state: RunState::parse(&r.state)?,
-            max_cycles: checked_u32(r.max_cycles, "runs.max_cycles")?,
-            current_cycle: checked_u32(r.current_cycle, "runs.current_cycle")?,
+            max_review_cycles: checked_u32(r.max_review_cycles, "runs.max_review_cycles")?,
+            max_test_cycles: checked_u32(r.max_test_cycles, "runs.max_test_cycles")?,
+            current_review_cycle: checked_u32(r.current_review_cycle, "runs.current_review_cycle")?,
+            current_test_cycle: checked_u32(r.current_test_cycle, "runs.current_test_cycle")?,
         })
     })
     .transpose()
@@ -167,8 +177,10 @@ mod tests {
                 intent TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 state TEXT NOT NULL,
-                max_cycles INTEGER NOT NULL,
-                current_cycle INTEGER NOT NULL
+                max_review_cycles INTEGER NOT NULL,
+                max_test_cycles INTEGER NOT NULL,
+                current_review_cycle INTEGER NOT NULL,
+                current_test_cycle INTEGER NOT NULL
             )",
         )
         .execute(&write_pool)
@@ -195,14 +207,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (db_path, write_pool) = seed_db(dir.path()).await;
         sqlx::query(
-            "INSERT INTO runs (id, intent, branch, state, max_cycles, current_cycle) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs (id, intent, branch, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("run-1")
         .bind("do the thing")
         .bind("main")
         .bind("coder_running")
         .bind(5)
+        .bind(4)
         .bind(1)
+        .bind(0)
         .execute(&write_pool)
         .await
         .unwrap();
@@ -215,8 +229,10 @@ mod tests {
             .expect("run-1 exists");
         assert_eq!(run.intent, "do the thing");
         assert_eq!(run.state, RunState::CoderRunning);
-        assert_eq!(run.max_cycles, 5);
-        assert_eq!(run.current_cycle, 1);
+        assert_eq!(run.max_review_cycles, 5);
+        assert_eq!(run.max_test_cycles, 4);
+        assert_eq!(run.current_review_cycle, 1);
+        assert_eq!(run.current_test_cycle, 0);
     }
 
     #[tokio::test]

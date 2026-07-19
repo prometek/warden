@@ -173,8 +173,19 @@ pub enum WardenError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("run {run_id} exceeded its cycle budget ({max_cycles} cycles) without converging")]
-    MaxCyclesExceeded { run_id: String, max_cycles: u32 },
+    #[error("run {run_id} exceeded its review cycle budget ({max_review_cycles} cycles) without converging")]
+    MaxReviewCyclesExceeded {
+        run_id: String,
+        max_review_cycles: u32,
+    },
+
+    #[error(
+        "run {run_id} exceeded its test cycle budget ({max_test_cycles} cycles) without converging"
+    )]
+    MaxTestCyclesExceeded {
+        run_id: String,
+        max_test_cycles: u32,
+    },
 
     #[error("row column `{column}` = {value} does not fit in the expected numeric type")]
     InvalidStoredValue { column: &'static str, value: i64 },

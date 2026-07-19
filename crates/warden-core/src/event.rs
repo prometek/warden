@@ -88,7 +88,10 @@ pub enum RunEvent {
     RunStarted {
         intent: String,
         branch: String,
-        max_cycles: u32,
+        /// Issue #43: the run's two independent per-phase budgets (ADR-0014)
+        /// -- replaces the single `max_cycles` this event used to carry.
+        max_review_cycles: u32,
+        max_test_cycles: u32,
     },
     CycleStarted {
         cycle_number: u32,
@@ -218,7 +221,8 @@ mod tests {
             EventKind::RunStarted => RunEvent::RunStarted {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 5,
+                max_review_cycles: 5,
+                max_test_cycles: 5,
             },
             EventKind::CycleStarted => RunEvent::CycleStarted { cycle_number: 1 },
             EventKind::AgentStarted => RunEvent::AgentStarted {

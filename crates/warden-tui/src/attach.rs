@@ -158,7 +158,9 @@ mod tests {
         sqlx::query(
             "CREATE TABLE runs (
                 id TEXT PRIMARY KEY, intent TEXT NOT NULL, branch TEXT NOT NULL,
-                state TEXT NOT NULL, max_cycles INTEGER NOT NULL, current_cycle INTEGER NOT NULL
+                state TEXT NOT NULL, max_review_cycles INTEGER NOT NULL,
+                max_test_cycles INTEGER NOT NULL, current_review_cycle INTEGER NOT NULL,
+                current_test_cycle INTEGER NOT NULL
             )",
         )
         .execute(&pool)
@@ -174,7 +176,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO runs (id, intent, branch, state, max_cycles, current_cycle) VALUES ('run-1', 'intent', 'main', 'coder_running', 5, 1)",
+            "INSERT INTO runs (id, intent, branch, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle) VALUES ('run-1', 'intent', 'main', 'coder_running', 5, 5, 1, 0)",
         )
         .execute(&pool)
         .await
@@ -243,7 +245,8 @@ mod tests {
             &RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 5,
+                max_review_cycles: 5,
+                max_test_cycles: 5,
             },
             "2026-07-12T00:00:00+00:00",
         )

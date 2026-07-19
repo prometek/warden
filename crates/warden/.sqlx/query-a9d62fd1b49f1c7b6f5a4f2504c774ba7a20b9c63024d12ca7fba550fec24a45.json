@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE runs SET current_review_cycle = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "a9d62fd1b49f1c7b6f5a4f2504c774ba7a20b9c63024d12ca7fba550fec24a45"
+}
