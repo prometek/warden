@@ -17,7 +17,14 @@ récupérées — y compris si un second crash interrompt la récupération elle
 sauvegarde de la base SQLite est également prise avant toute migration de schéma.
 Reviewer et tester tournent **séquentiellement** (`run_review` puis `run_test`, deux
 fonctions indépendantes depuis l'issue #40 — plus de `tokio::join!` reviewer+tester),
-chacun dans son propre worktree synchronisé sur le commit du coder. Un second binaire,
+chacun dans son propre worktree synchronisé sur le commit du coder. Depuis l'issue #41
+(Phase A, ADR-0014) la review est une **gate** : dans un cycle donné, le tester n'est lancé
+que si la review de ce cycle est *clean* (aucun finding bloquant du reviewer, ni de la
+vérification de définition d'agent) ; sinon le cycle reboucle directement vers le coder sans
+lancer le tester. Le premier passage reviewer d'un run porte sur le diff complet (`scope:
+full`), chaque re-review suivant une correction est **scopée** au correctif (`scope:
+correctif`, issue #40). Les budgets par phase, les états par phase et la boucle de re-review
+scopée côté tester (Phase B) ne sont **pas encore livrés** — voir #42/#43. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
 run et le hash validé en SQLite (connexion strictement lecture seule) avant tout push vers

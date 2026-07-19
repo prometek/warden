@@ -2287,6 +2287,11 @@ exit 0
 /// orchestrator unit test's `flip_status_coder`/`status_gated_reviewer`
 /// fixtures deterministically: cycle 1 leaves `status.txt` "broken"
 /// (reviewer blocks), cycle 2 leaves it "fixed" (reviewer passes).
+///
+/// Issue #41, ADR-0014 (Phase A -- gate review): the tester never runs
+/// during cycle 1, since the reviewer blocks it -- its one and only
+/// invocation lands in cycle 2, once the review gate opens, so it is the
+/// tester's *first* capture (`tester_stdin_1.json`), not its second.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_prior_cycle_findings_from_a_reboucle_reach_the_next_cycles_agents_stdin() {
@@ -2385,13 +2390,26 @@ cp "$stdin_file" "{captures}/tester_stdin_$next.json"
     // The tester gets the exact same prior-findings context as the reviewer
     // (code-standards.md / ADR-0012: both roles are fed identically) --
     // proven independently rather than assumed from the reviewer's payload.
-    let tester_cycle2: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(captures.path().join("tester_stdin_2.json")).unwrap(),
+    // Issue #41 (Phase A gate review): the tester never runs in cycle 1 (the
+    // reviewer is still blocking), so its one capture is its *first*
+    // invocation overall, named `tester_stdin_1.json` by the fixture's own
+    // invocation counter -- not `tester_stdin_2.json`.
+    assert!(
+        !captures.path().join("tester_stdin_2.json").exists(),
+        "the tester must never have run a second time -- it only ever ran once, in cycle 2"
+    );
+    let tester_first_invocation: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(captures.path().join("tester_stdin_1.json")).unwrap(),
     )
     .unwrap();
-    let tester_cycle2_findings = tester_cycle2["findings"].as_array().unwrap();
-    assert_eq!(tester_cycle2_findings.len(), 1);
-    assert_eq!(tester_cycle2_findings[0]["description"], "status is broken");
+    let tester_findings = tester_first_invocation["findings"].as_array().unwrap();
+    assert_eq!(tester_findings.len(), 1);
+    assert_eq!(tester_findings[0]["description"], "status is broken");
+    assert_eq!(
+        tester_first_invocation["target_commit"], cycle2["target_commit"],
+        "the tester's one invocation must review the same (cycle 2) commit as the reviewer's \
+         second pass, since it only ever runs once the review gate opens"
+    );
 
     // A2 (ADR-0013, issue #22): the role that must actually *fix* the
     // findings finally receives them. Cycle 1's coder has nothing to fix;
