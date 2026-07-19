@@ -1,5 +1,7 @@
 # Warden
 
+[![CI](https://github.com/prometek/warden/actions/workflows/ci.yml/badge.svg)](https://github.com/prometek/warden/actions/workflows/ci.yml)
+
 Orchestrateur local, écrit en Rust, qui pilote un cycle de développement assisté par
 plusieurs agents IA spécialisés (coder, reviewer, tester, rédacteur de doc) jusqu'à
 convergence, puis livre le résultat via un point de passage git indépendant du jugement
@@ -146,6 +148,13 @@ L'archive contient les trois binaires (`warden`, `warden-gated`, `warden-tui`), 
 de service `contrib/systemd/` et `contrib/launchd/` (voir "Service managé" ci-dessous), ce
 `README.md` et `LICENSE`. Placez les trois binaires dans un répertoire présent dans votre
 `PATH` (ex. `~/.local/bin`) pour les invoquer directement.
+**Intégration continue (issue #38)** : chaque pull request et chaque push sur `main`
+déclenchent un workflow GitHub Actions (`.github/workflows/ci.yml`), sur une matrice
+`ubuntu-latest`/`macos-latest`, qui exécute quatre passes obligatoires — `cargo fmt --all
+--check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build
+--release --workspace`, `cargo test --workspace`, toutes en `SQLX_OFFLINE=true` (mêmes
+caches `.sqlx/` committés qu'en local, aucune base requise). Une PR dont l'une de ces
+passes échoue sur l'une des deux plateformes n'est pas mergeable.
 
 ## Utiliser la CLI `warden`
 
