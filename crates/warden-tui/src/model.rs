@@ -64,16 +64,22 @@ impl RunModel {
             .unwrap_or(0)
     }
 
-    /// The run's intent/branch/max_cycles, from its `RunStarted` event --
-    /// `None` until that event has been applied (e.g. a late attach whose
-    /// history query hasn't returned yet).
-    pub fn run_started(&self) -> Option<(&str, &str, u32)> {
+    /// The run's intent/branch/per-phase budgets (issue #43), from its
+    /// `RunStarted` event -- `None` until that event has been applied (e.g. a
+    /// late attach whose history query hasn't returned yet).
+    pub fn run_started(&self) -> Option<(&str, &str, u32, u32)> {
         self.events.iter().find_map(|record| match &record.event {
             RunEvent::RunStarted {
                 intent,
                 branch,
-                max_cycles,
-            } => Some((intent.as_str(), branch.as_str(), *max_cycles)),
+                max_review_cycles,
+                max_test_cycles,
+            } => Some((
+                intent.as_str(),
+                branch.as_str(),
+                *max_review_cycles,
+                *max_test_cycles,
+            )),
             _ => None,
         })
     }
@@ -174,13 +180,14 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 5,
+                max_review_cycles: 5,
+                max_test_cycles: 4,
             },
         ));
 
         assert_eq!(model.run_id(), Some("run-1"));
         assert_eq!(model.events().len(), 1);
-        assert_eq!(model.run_started(), Some(("do the thing", "main", 5)));
+        assert_eq!(model.run_started(), Some(("do the thing", "main", 5, 4)));
     }
 
     #[test]

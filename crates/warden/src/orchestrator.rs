@@ -24,11 +24,16 @@
 //! until a re-review comes back clean; only then does the tester rerun. No
 //! extra state machinery was needed to land this: #41's gate was already
 //! generic over *why* a cycle reboucles, not specifically "the reviewer
-//! found something". Per-phase budgets and states (separately counting
-//! review-only reboucles against a review budget, never a test budget)
-//! remain #43's job -- this run still shares one `max_cycles` budget and one
-//! `RunState::AwaitingReviewTest` across both gates. Each role still gets its own
-//! worktree synced onto the coder's commit (see [`WorktreeManager::create`],
+//! found something". **Per-phase budgets and states, issue #43**: separate
+//! `max_review_cycles`/`max_test_cycles` budgets (replacing the single
+//! `max_cycles`) and separate [`RunState::Reviewing`]/[`RunState::Testing`]
+//! states (replacing `RunState::AwaitingReviewTest`) now back this gate --
+//! [`warden_core::decide_next_state`] charges a blocking finding to whichever
+//! budget its own [`warden_core::FindingSource`] belongs to, so a scoped
+//! re-review's finding is charged to the review budget even when a *tester*
+//! finding was what triggered the coder's correctif (decision #37 Q1). Each
+//! role still gets its own worktree synced onto the coder's commit (see
+//! [`WorktreeManager::create`],
 //! keyed by role, so no two ever share a directory) -- that isolation was
 //! never *only* about concurrency safety, and stays valuable now purely as a
 //! boundary between roles. Every [`RunState`] transition is written to
@@ -99,7 +104,15 @@ pub struct RunConfig {
     pub warden_home: PathBuf,
     pub branch: String,
     pub intent: String,
-    pub max_cycles: u32,
+    /// Issue #43/ADR-0014: the coder<->reviewer round-trip budget
+    /// (`RunState::Reviewing`) -- a scoped re-review's own finding is charged
+    /// here even when a tester finding was what triggered the coder's
+    /// correctif (decision #37 Q1).
+    pub max_review_cycles: u32,
+    /// Issue #43/ADR-0014: how many times the tester may actually run and
+    /// come back with a blocking finding (`RunState::Testing`) before the run
+    /// gives up as `MaxTestCyclesExceeded`.
+    pub max_test_cycles: u32,
     pub coder_agent: AgentDefinition,
     pub reviewer_agent: AgentDefinition,
     pub tester_agent: AgentDefinition,
@@ -536,13 +549,15 @@ impl Orchestrator {
             &config.repo_path.display().to_string(),
             &config.branch,
             &config.intent,
-            config.max_cycles,
+            config.max_review_cycles,
+            config.max_test_cycles,
         )
         .await?;
         self.publish_event(RunEvent::RunStarted {
             intent: config.intent.clone(),
             branch: config.branch.clone(),
-            max_cycles: config.max_cycles,
+            max_review_cycles: config.max_review_cycles,
+            max_test_cycles: config.max_test_cycles,
         })
         .await?;
         // Issue #31: the `runs` row and the Event Bus socket both exist by
@@ -577,7 +592,15 @@ impl Orchestrator {
         let run_base_commit_sha = read_head_commit(&config.repo_path).await?;
 
         let mut base_commit = "HEAD".to_string();
+        // Issue #43: also this run's review-cycle counter -- the reviewer
+        // runs every single cycle (Phase A gate, issue #41), so `cycle_number`
+        // *is* `review_cycle` for [`decide_next_state`]'s purposes; no
+        // separate counter is needed for it.
         let mut cycle_number: u32 = 1;
+        // Issue #43: the tester, unlike the reviewer, only actually runs on a
+        // cycle whose review came back clean (issue #41's gate) -- so this
+        // only advances then, independently of `cycle_number`.
+        let mut test_cycle_number: u32 = 0;
         // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
         // coder exactly like a reviewer/tester blocking finding does, just
         // one step later in the pipeline -- these are seeded into the next
@@ -601,7 +624,7 @@ impl Orchestrator {
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
             db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
-            db::set_run_current_cycle(&self.pool, &run_id, cycle_number).await?;
+            db::set_run_current_review_cycle(&self.pool, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
                 .await?;
 
@@ -653,13 +676,11 @@ impl Orchestrator {
                 .await?;
             base_commit = coder_result.commit;
 
-            // Write-ahead: about to launch the reviewer. `AwaitingReviewTest`
-            // still names this wait even though, from here until the
-            // review-gate opens, only the reviewer runs -- splitting it
-            // into a state per phase is #43's job (state machine/budget
-            // rework, issue #37), out of scope for this gate itself.
-            self.transition(&run_id, RunState::AwaitingReviewTest)
-                .await?;
+            // Write-ahead: about to launch the reviewer -- issue #43 splits
+            // what was one `AwaitingReviewTest` state into `Reviewing` (this
+            // wait) and `Testing` (below, only entered once this cycle's
+            // review is clean).
+            self.transition(&run_id, RunState::Reviewing).await?;
 
             // Phase A -- gate review (issue #37/#41, ADR-0014): the tester
             // must never run before the reviewer is clean. The first
@@ -720,6 +741,15 @@ impl Orchestrator {
                 .iter()
                 .any(|finding| finding.severity == warden_core::Severity::Blocking);
             if review_is_clean {
+                // Write-ahead: about to launch the tester -- issue #43's
+                // other half of the old `AwaitingReviewTest` split. Only
+                // entered from `Reviewing` on a review-clean cycle, so this
+                // is also where the test-cycle counter actually advances
+                // (unlike `cycle_number`/the review counter, which advances
+                // every cycle regardless).
+                self.transition(&run_id, RunState::Testing).await?;
+                test_cycle_number += 1;
+                db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number).await?;
                 findings.extend(
                     self.run_test(
                         &runner,
@@ -759,7 +789,13 @@ impl Orchestrator {
             // iteration's reviewer/tester (if there is one) reports on.
             previous_cycle_id = Some(cycle_id.clone());
 
-            let next_state = decide_next_state(&findings, cycle_number, config.max_cycles);
+            let next_state = decide_next_state(
+                &findings,
+                cycle_number,
+                config.max_review_cycles,
+                test_cycle_number,
+                config.max_test_cycles,
+            );
             let mut converged_commit_for_tail: Option<String> = None;
             if next_state == RunState::Converged {
                 // Issue #7 / ADR-0009: fold any evidence captured across
@@ -1023,9 +1059,14 @@ impl Orchestrator {
         }
 
         let next_state = match message.outcome.as_ci_outcome() {
-            Some(ci_outcome) => {
-                decide_next_state_after_ci(ci_outcome, run.current_cycle, run.max_cycles)
-            }
+            // Issue #43: a CI reboucle re-enters the loop at `CoderRunning`
+            // -> `Reviewing` exactly like any other reboucle to the coder, so
+            // it's checked against the review budget.
+            Some(ci_outcome) => decide_next_state_after_ci(
+                ci_outcome,
+                run.current_review_cycle,
+                run.max_review_cycles,
+            ),
             // GateFailed: no CI signal to interpret, and no cycle-budget
             // reboucle either -- an infrastructure failure (push/PR/finalize)
             // is not something re-running the coder can fix.
@@ -2860,7 +2901,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "drive the run through a fake runner".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
@@ -2895,7 +2937,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "never gets to run".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(always_passing_tester()),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -2977,7 +3020,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "issue 31: on_run_started ordering".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3021,7 +3065,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "no callback registered".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
@@ -3132,7 +3177,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "issue 33: live agent progress".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3316,7 +3362,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "issue 33: malformed progress lines must not crash the run".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3376,9 +3423,10 @@ mod tests {
     }
 
     /// A coder commit that adds a file under `.warden/agents/` must block
-    /// convergence: `max_cycles: 1` makes a blocking finding at cycle 1 land
-    /// straight on `MaxCyclesExceeded` (never `Converged`), deterministically
-    /// in one cycle. The reviewer/tester themselves raise nothing at all --
+    /// convergence: `max_review_cycles: 1` makes a blocking (`Warden`-sourced,
+    /// so review-phase per decision #37 Q1) finding at cycle 1 land straight
+    /// on `MaxReviewCyclesExceeded` (never `Converged`), deterministically in
+    /// one cycle. The reviewer/tester themselves raise nothing at all --
     /// proving the block comes from the tampering check, not from either of
     /// them independently objecting to the change.
     #[tokio::test]
@@ -3407,7 +3455,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "sneak in a reviewer.md change".to_string(),
-            max_cycles: 1,
+            max_review_cycles: 1,
+            max_test_cycles: 1,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3423,7 +3472,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
             "a coder diff touching .warden/agents/ must never reach Converged silently"
         );
 
@@ -3473,7 +3522,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "an ordinary, unrelated change".to_string(),
-            max_cycles: 1,
+            max_review_cycles: 1,
+            max_test_cycles: 1,
             coder_agent: definition(ordinary_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3550,7 +3600,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "delete the reviewer definition to loosen the next run".to_string(),
-            max_cycles: 1,
+            max_review_cycles: 1,
+            max_test_cycles: 1,
             coder_agent: definition(deleting_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3566,7 +3617,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
             "deleting a definition file under .warden/agents/ must block exactly like adding one"
         );
         let findings = findings_for_the_only_cycle(&pool, &run_id).await;
@@ -3635,7 +3686,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "sneak in a capitalized Agents dir".to_string(),
-            max_cycles: 1,
+            max_review_cycles: 1,
+            max_test_cycles: 1,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3651,7 +3703,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
             "a capitalized .warden/Agents/ must block exactly like the canonical lowercase path"
         );
         let findings = findings_for_the_only_cycle(&pool, &run_id).await;
@@ -3699,7 +3751,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "sneak in a fully uppercase WARDEN dir".to_string(),
-            max_cycles: 1,
+            max_review_cycles: 1,
+            max_test_cycles: 1,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -3715,7 +3768,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
             "a fully uppercase .WARDEN/agents/ must block exactly like the canonical lowercase path"
         );
         let findings = findings_for_the_only_cycle(&pool, &run_id).await;
@@ -3804,7 +3857,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "sneak in a reviewer.md change and let it ride through a reboucle".to_string(),
-            max_cycles: 2,
+            max_review_cycles: 2,
+            max_test_cycles: 2,
             coder_agent: definition(poison_once_then_fix_coder),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
@@ -3867,7 +3921,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
             "a definition-tampering finding that keeps firing every cycle must never let the \
              run reach Converged, however many cycles it takes to notice the ordinary \
              (unrelated) finding is otherwise resolved"
@@ -3922,7 +3976,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(capturing_coder),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
@@ -4007,7 +4062,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "check the prompts land".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: prompted(coder, "you are the coder"),
             reviewer_agent: prompted(capture("reviewer", "true"), "you are the reviewer"),
             tester_agent: prompted(capture("tester", "true"), "you are the tester"),
@@ -4047,7 +4103,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
@@ -4065,9 +4122,12 @@ mod tests {
 
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Converged);
-        // Cycle 1: coder writes "broken", reviewer blocks -> reboucle.
-        // Cycle 2: coder writes "fixed", reviewer passes -> converged.
-        assert_eq!(run.current_cycle, 2);
+        // Cycle 1: coder writes "broken", reviewer blocks -> reboucle (no
+        // tester run at all, issue #41's gate).
+        // Cycle 2: coder writes "fixed", reviewer passes -> tester runs once
+        // -> converged.
+        assert_eq!(run.current_review_cycle, 2);
+        assert_eq!(run.current_test_cycle, 1);
 
         // Never written into the user's main repo working tree: only
         // Warden's own worktrees under warden_home should contain the
@@ -4087,7 +4147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_cycles_exceeded_when_findings_never_clear() {
+    async fn max_review_cycles_exceeded_when_reviewer_findings_never_clear() {
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
@@ -4114,7 +4174,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "never converges".to_string(),
-            max_cycles: 2,
+            max_review_cycles: 2,
+            max_test_cycles: 2,
             coder_agent: definition(noop_coder),
             reviewer_agent: definition(always_blocking_reviewer),
             tester_agent: definition(always_passing_tester()),
@@ -4128,7 +4189,68 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxCyclesExceeded);
+        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
+    }
+
+    /// Decision #37 Q1's other half: a tester finding that never clears
+    /// exhausts the *test* budget, not the review budget -- even though the
+    /// reviewer itself passes clean every single cycle (so the review budget
+    /// never comes close to exhausting).
+    #[tokio::test]
+    async fn max_test_cycles_exceeded_when_tester_findings_never_clear() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let always_blocking_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"tester","severity":"blocking","description":"never happy"}'"#,
+            ],
+        );
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            // A generous review budget (never exhausted -- the reviewer
+            // always passes) alongside a tight test budget proves the
+            // exhaustion is charged to the right phase, not just "whichever
+            // budget happens to run out first".
+            max_review_cycles: 10,
+            max_test_cycles: 2,
+            coder_agent: definition(noop_coder),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_blocking_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::MaxTestCyclesExceeded);
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_review_cycle, 2,
+            "the reviewer ran every cycle (it always passes) but never came close to its own \
+             much larger budget"
+        );
+        assert_eq!(run.current_test_cycle, 2, "the test budget is what ran out");
     }
 
     // -----------------------------------------------------------------
@@ -4176,7 +4298,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(counting_tester),
@@ -4193,7 +4316,7 @@ mod tests {
         assert_eq!(final_state, RunState::Converged);
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_cycle, 2,
+            run.current_review_cycle, 2,
             "cycle 1 must block on the reviewer, cycle 2 must converge, exactly like \
              full_cycle_reboucles_once_then_converges"
         );
@@ -4293,7 +4416,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "sneak in a reviewer.md change, then revert it".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(poison_once_then_revert_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(counting_tester),
@@ -4313,7 +4437,7 @@ mod tests {
             "cycle 1's tampering finding must reboucle, cycle 2's revert must converge"
         );
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
-        assert_eq!(run.current_cycle, 2);
+        assert_eq!(run.current_review_cycle, 2);
 
         // Cycle 1: the tampering finding alone -- no reviewer finding at
         // all, since the reviewer here never raises anything -- must still
@@ -4399,7 +4523,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(always_passing_tester()),
@@ -4523,7 +4648,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "flip status to fixed".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(counting_status_gated_tester),
@@ -4544,7 +4670,7 @@ mod tests {
         );
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_cycle, 2,
+            run.current_review_cycle, 2,
             "cycle 1 must reboucle on the tester's finding, cycle 2 must converge"
         );
 
@@ -4678,7 +4804,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "fix the app without regressing".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(three_state_coder),
             reviewer_agent: definition(capturing_regression_gated_reviewer),
             tester_agent: definition(counting_fixed_gated_tester),
@@ -4695,7 +4822,7 @@ mod tests {
         assert_eq!(final_state, RunState::Converged);
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_cycle, 3,
+            run.current_review_cycle, 3,
             "cycle 1: tester blocks on buggy. cycle 2: reviewer blocks on the coder's own \
              half-fixed regression, tester must not run. cycle 3: both clean, converges"
         );
@@ -4752,7 +4879,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "crashed-run", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "crashed-run", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::update_run_state(&pool, "crashed-run", RunState::CoderRunning)
@@ -4797,7 +4924,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::update_run_state(&pool, "live-run", RunState::CoderRunning)
@@ -4865,6 +4992,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -4928,22 +5056,23 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
-        db::update_run_state(&pool, "orphan-process-run", RunState::AwaitingReviewTest)
+        db::update_run_state(&pool, "orphan-process-run", RunState::Testing)
             .await
             .unwrap();
         db::insert_cycle(&pool, "orphan-process-cycle", "orphan-process-run", 1)
             .await
             .unwrap();
 
-        // An *earlier* concurrent process (reviewer/tester run via
-        // `tokio::join!`, ADR-0003) is still alive, but the run's *latest*
-        // recorded process (inserted after it, so it sorts last by
-        // `started_at` and is what drives the Failed decision, see
+        // An *earlier* process (the reviewer, which already ran and passed
+        // this cycle -- Phase A's gate, issue #41) is still alive, but the
+        // run's *latest* recorded process (inserted after it, so it sorts
+        // last by `started_at` and is what drives the Failed decision, see
         // `latest_open_agent_process_for_run`) is dead -- exactly the shape
-        // a crash mid-`AwaitingReviewTest` leaves behind.
+        // a crash mid-`Testing` leaves behind.
         let mut live_child = tokio::process::Command::new("sh")
             .args(["-c", "sleep 30"])
             .spawn()
@@ -5044,6 +5173,7 @@ mod tests {
             "main",
             "crossed findings, no collision",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5078,7 +5208,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "crossed findings, no collision".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(reviewer_command),
             tester_agent: definition(tester_command),
@@ -5178,6 +5309,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5197,7 +5329,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(always_passing_tester()),
@@ -5268,6 +5401,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5280,7 +5414,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
@@ -5359,7 +5494,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "timing check".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(sleepy_agent.clone()),
             tester_agent: definition(sleepy_agent),
@@ -5378,6 +5514,7 @@ mod tests {
             &repo.path().display().to_string(),
             "main",
             "timing check",
+            3,
             3,
         )
         .await
@@ -5482,6 +5619,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5501,7 +5639,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(forging_reviewer),
             tester_agent: definition(always_passing_tester()),
@@ -5572,6 +5711,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5591,7 +5731,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(self_mislabelling_tester),
@@ -5654,6 +5795,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5673,7 +5815,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(honest_reviewer),
             tester_agent: definition(always_passing_tester()),
@@ -5731,7 +5874,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "pid-reuse-run", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "pid-reuse-run", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::update_run_state(&pool, "pid-reuse-run", RunState::CoderRunning)
@@ -5842,6 +5985,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -5951,6 +6095,7 @@ mod tests {
             "main",
             "intent",
             3,
+            3,
         )
         .await
         .unwrap();
@@ -6052,7 +6197,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "converge even though no evidence tool is installed".to_string(),
-            max_cycles: 3,
+            max_review_cycles: 3,
+            max_test_cycles: 3,
             coder_agent: definition(AgentCommand::new(
                 "sh",
                 [
@@ -6168,13 +6314,16 @@ mod tests {
         bare_repo: &TempDir,
     ) -> (String, RunConfig, String) {
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(pool, &run_id, "/tmp/repo", "main", "intent", 5)
+        db::insert_run(pool, &run_id, "/tmp/repo", "main", "intent", 5, 5)
             .await
             .unwrap();
         db::update_run_state(pool, &run_id, RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(pool, &run_id, RunState::AwaitingReviewTest)
+        db::update_run_state(pool, &run_id, RunState::Reviewing)
+            .await
+            .unwrap();
+        db::update_run_state(pool, &run_id, RunState::Testing)
             .await
             .unwrap();
         db::update_run_state(pool, &run_id, RunState::Converged)
@@ -6199,7 +6348,8 @@ mod tests {
             warden_home: warden_home.path().to_path_buf(),
             branch: "main".to_string(),
             intent: "intent".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             tester_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
@@ -6505,12 +6655,13 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-silent", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-silent", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::AwaitingReviewTest,
+            RunState::Reviewing,
+            RunState::Testing,
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -6553,13 +6704,16 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 5)
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 5, 5)
             .await
             .unwrap();
         db::update_run_state(&pool, &run_id, RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(&pool, &run_id, RunState::AwaitingReviewTest)
+        db::update_run_state(&pool, &run_id, RunState::Reviewing)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, &run_id, RunState::Testing)
             .await
             .unwrap();
         db::update_run_state(&pool, &run_id, RunState::Converged)
@@ -6609,12 +6763,13 @@ mod tests {
     async fn apply_ci_result_message_rejects_a_run_id_mismatch() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-a", "/tmp/repo", "main", "intent", 5)
+        db::insert_run(&pool, "run-a", "/tmp/repo", "main", "intent", 5, 5)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::AwaitingReviewTest,
+            RunState::Reviewing,
+            RunState::Testing,
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -6657,13 +6812,16 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::update_run_state(&pool, "run-ci", RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(&pool, "run-ci", RunState::AwaitingReviewTest)
+        db::update_run_state(&pool, "run-ci", RunState::Reviewing)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, "run-ci", RunState::Testing)
             .await
             .unwrap();
         db::update_run_state(&pool, "run-ci", RunState::Converged)
@@ -6692,12 +6850,13 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::AwaitingReviewTest,
+            RunState::Reviewing,
+            RunState::Testing,
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -6734,12 +6893,13 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-no-pr", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-no-pr", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::AwaitingReviewTest,
+            RunState::Reviewing,
+            RunState::Testing,
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -6885,11 +7045,11 @@ mod tests {
     }
 
     /// `ChecksFailed` at the cycle budget must reach `Failed`, never
-    /// `MaxCyclesExceeded` -- that transition is illegal from `AwaitingCi`
-    /// ([`RunState::validate_transition`]); if `decide_next_state_after_ci`
-    /// or its caller ever regressed to returning it here, `self.transition`
-    /// would reject it and this test would fail loudly rather than silently
-    /// accept a corrupted state.
+    /// `MaxReviewCyclesExceeded` -- that transition is illegal from
+    /// `AwaitingCi` ([`RunState::validate_transition`]); if
+    /// `decide_next_state_after_ci` or its caller ever regressed to
+    /// returning it here, `self.transition` would reject it and this test
+    /// would fail loudly rather than silently accept a corrupted state.
     #[tokio::test]
     async fn drive_post_convergence_tail_maps_checks_failed_at_cycle_budget_to_failed_not_max_cycles_exceeded(
     ) {
@@ -6899,10 +7059,12 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let (run_id, config, converged_commit) =
             converged_run_fixture(&pool, &repo, &bare_repo).await;
-        // `converged_run_fixture` inserts with max_cycles = 5 and leaves
-        // current_cycle at its 0 default; set it to the budget so this
-        // `ChecksFailed` lands exactly at the limit.
-        db::set_run_current_cycle(&pool, &run_id, 5).await.unwrap();
+        // `converged_run_fixture` inserts with max_review_cycles = 5 and
+        // leaves current_review_cycle at its 0 default; set it to the budget
+        // so this `ChecksFailed` lands exactly at the limit.
+        db::set_run_current_review_cycle(&pool, &run_id, 5)
+            .await
+            .unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
         let ci_finding = Finding {
@@ -7141,7 +7303,7 @@ mod tests {
     async fn select_prior_findings_prefers_ci_seeded_findings_over_the_previous_cycle() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-1", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-select-1", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::insert_cycle(&pool, "cycle-select-1", "run-select-1", 1)
@@ -7188,7 +7350,7 @@ mod tests {
     ) {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-2", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-select-2", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::insert_cycle(&pool, "cycle-select-2", "run-select-2", 1)
@@ -7722,7 +7884,7 @@ mod tests {
     async fn select_prior_findings_returns_findings_in_ascending_id_order_not_insertion_order() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-order-1", "/tmp/repo", "main", "intent", 3)
+        db::insert_run(&pool, "run-order-1", "/tmp/repo", "main", "intent", 3, 3)
             .await
             .unwrap();
         db::insert_cycle(&pool, "cycle-order-1", "run-order-1", 1)

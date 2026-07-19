@@ -53,11 +53,17 @@ enum Commands {
         #[arg(long, default_value = "main")]
         branch: String,
 
-        /// Maximum number of coder/review/test cycles before giving up
-        /// (`RunState::MaxCyclesExceeded`). Must be at least 1 — a budget
-        /// of 0 could never let the coder run at all.
+        /// Maximum number of coder<->reviewer round trips before giving up
+        /// (`RunState::MaxReviewCyclesExceeded`, issue #43/ADR-0014). Must be
+        /// at least 1 — a budget of 0 could never let the coder run at all.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
-        max_cycles: u32,
+        max_review_cycles: u32,
+
+        /// Maximum number of times the tester may run and come back with a
+        /// blocking finding before giving up (`RunState::MaxTestCyclesExceeded`,
+        /// issue #43/ADR-0014). Must be at least 1.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+        max_test_cycles: u32,
 
         /// Warden's own state directory (SQLite db + worktrees). Defaults
         /// to `~/.warden`.
@@ -160,7 +166,8 @@ async fn main() -> anyhow::Result<()> {
             repo,
             intent,
             branch,
-            max_cycles,
+            max_review_cycles,
+            max_test_cycles,
             warden_home,
             tool,
             evidence_tool,
@@ -204,7 +211,8 @@ async fn main() -> anyhow::Result<()> {
                         repo,
                         intent,
                         branch,
-                        max_cycles,
+                        max_review_cycles,
+                        max_test_cycles,
                         warden_home,
                         ClaudeAdapter,
                         evidence_tool,
@@ -259,7 +267,8 @@ async fn run<R: ToolAdapter>(
     repo: PathBuf,
     intent: String,
     branch: String,
-    max_cycles: u32,
+    max_review_cycles: u32,
+    max_test_cycles: u32,
     warden_home: Option<PathBuf>,
     adapter: R,
     evidence_tool: Option<warden_core::EvidenceTool>,
@@ -405,7 +414,8 @@ async fn run<R: ToolAdapter>(
         warden_home,
         branch,
         intent,
-        max_cycles,
+        max_review_cycles,
+        max_test_cycles,
         coder_agent,
         reviewer_agent,
         tester_agent,

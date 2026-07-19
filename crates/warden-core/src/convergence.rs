@@ -194,23 +194,71 @@ pub fn validate_finding_sources_for_role(findings: &[Finding], role: AgentRole) 
     Ok(())
 }
 
-/// Decides the next [`RunState`] once reviewer + tester findings for a cycle
-/// are known. Only meaningful from [`RunState::AwaitingReviewTest`]; callers
-/// elsewhere in the state machine (crash recovery, `MaxCyclesExceeded` ->
-/// `Failed`, ...) do not go through this function.
+/// Decides the next [`RunState`] once a cycle's findings are known -- called
+/// from either [`RunState::Reviewing`] or [`RunState::Testing`], never
+/// meaningful elsewhere (crash recovery, `MaxReviewCyclesExceeded`/
+/// `MaxTestCyclesExceeded` -> `Failed`, ... do not go through this function).
 ///
-/// - Any blocking finding, with cycles remaining: `CoderRunning` (reboucle).
-/// - Any blocking finding, at the cycle budget: `MaxCyclesExceeded`.
-/// - No blocking finding: `Converged`.
-pub fn decide_next_state(findings: &[Finding], current_cycle: u32, max_cycles: u32) -> RunState {
-    let has_blocking = findings.iter().any(|f| f.severity == Severity::Blocking);
+/// **Issue #43 / ADR-0014, decision #37 Q1**: review and test now carry
+/// *separate* cycle budgets, and a blocking finding is charged to whichever
+/// budget its own phase belongs to -- never inferred from which `RunState`
+/// the caller happened to be in, but from the finding's own
+/// [`FindingSource`]:
+///
+/// - A blocking [`FindingSource::Reviewer`] or [`FindingSource::Warden`]
+///   (the agent-definition-tampering check,
+///   `warden::orchestrator::agent_definition_tampering_finding`) finding is a
+///   **review-phase** failure -- checked against `max_review_cycles`. This is
+///   what makes a *scoped* re-review (issue #41/#42: every re-review after a
+///   tester finding's correctif is scoped, `ReviewScope::Correctif`) count
+///   against the review budget rather than the test budget, exactly as
+///   decision #37 Q1 requires -- it's still a `Reviewer`-sourced finding, so
+///   it takes this branch regardless of what triggered the coder's correctif
+///   in the first place.
+/// - A blocking [`FindingSource::Tester`] finding is a **test-phase**
+///   failure -- checked against `max_test_cycles`. By the caller's own
+///   invariant (`warden::orchestrator::run_convergence_loop`: the tester
+///   never runs on a cycle whose review wasn't clean, issue #41), `findings`
+///   never carries both a blocking reviewer/tampering finding *and* a
+///   blocking tester finding for the same call -- review-phase failures take
+///   priority in the (unreachable in practice) case they did.
+/// - No blocking finding at all: `Converged`.
+///
+/// `review_cycle`/`test_cycle` are the 1-based counts of review/test
+/// invocations made so far *including this one* (the reviewer runs every
+/// cycle, so `review_cycle` tracks the run's overall cycle number; the tester
+/// only runs on review-clean cycles, so `test_cycle` only advances then) --
+/// at or past the matching budget, the run exhausts that phase's budget
+/// instead of reboucling.
+pub fn decide_next_state(
+    findings: &[Finding],
+    review_cycle: u32,
+    max_review_cycles: u32,
+    test_cycle: u32,
+    max_test_cycles: u32,
+) -> RunState {
+    let review_blocking = findings.iter().any(|f| {
+        f.severity == Severity::Blocking
+            && matches!(f.source, FindingSource::Reviewer | FindingSource::Warden)
+    });
+    let test_blocking = findings
+        .iter()
+        .any(|f| f.severity == Severity::Blocking && f.source == FindingSource::Tester);
 
-    if !has_blocking {
+    if !review_blocking && !test_blocking {
         return RunState::Converged;
     }
 
-    if current_cycle >= max_cycles {
-        RunState::MaxCyclesExceeded
+    if review_blocking {
+        return if review_cycle >= max_review_cycles {
+            RunState::MaxReviewCyclesExceeded
+        } else {
+            RunState::CoderRunning
+        };
+    }
+
+    if test_cycle >= max_test_cycles {
+        RunState::MaxTestCyclesExceeded
     } else {
         RunState::CoderRunning
     }
@@ -237,9 +285,13 @@ pub enum CiOutcome {
 /// Decides the next [`RunState`] once a run's CI watch (issue #5) reaches a
 /// terminal outcome. Only meaningful from [`RunState::AwaitingCi`], whose
 /// legal next states are exactly `Done` / `CoderRunning` / `Failed`
-/// ([`RunState::validate_transition`]) -- notably *not* `MaxCyclesExceeded`,
-/// unlike [`decide_next_state`]'s cycle-budget case: a CI failure that
-/// exhausts the cycle budget lands on `Failed` here instead.
+/// ([`RunState::validate_transition`]) -- notably neither
+/// `MaxReviewCyclesExceeded` nor `MaxTestCyclesExceeded`, unlike
+/// [`decide_next_state`]'s per-phase budget cases: a CI failure that exhausts
+/// the cycle budget lands on `Failed` here instead. The caller
+/// (`warden::orchestrator`) checks this against the review budget -- a CI
+/// reboucle re-enters the loop at `CoderRunning` -> `Reviewing`, exactly like
+/// any other reboucle to the coder.
 ///
 /// - `Merged` / `ChecksPassed`: `Done`. Warden's own responsibility ends
 ///   once CI is green -- actually merging the PR is deliberately never
@@ -282,6 +334,32 @@ mod tests {
         }
     }
 
+    /// Issue #24 review M4: the tampering finding
+    /// (`warden::orchestrator::agent_definition_tampering_finding`) is
+    /// `FindingSource::Warden`, folded in alongside the reviewer's own
+    /// findings -- must be charged to the review budget exactly like a real
+    /// reviewer finding (decision #37 Q1's imputation rule applies to it
+    /// too, not only to `Reviewer`-sourced findings).
+    fn tampering_finding() -> Finding {
+        Finding {
+            source: FindingSource::Warden,
+            severity: Severity::Blocking,
+            file: Some(".warden/agents/coder.md".to_string()),
+            description: "agent definition tampering".to_string(),
+            action: None,
+        }
+    }
+
+    fn tester_blocking_finding() -> Finding {
+        Finding {
+            source: FindingSource::Tester,
+            severity: Severity::Blocking,
+            file: Some("src/lib.rs".to_string()),
+            description: "test fails".to_string(),
+            action: Some("fix the panic".to_string()),
+        }
+    }
+
     fn info_finding() -> Finding {
         Finding {
             source: FindingSource::Tester,
@@ -294,38 +372,94 @@ mod tests {
 
     #[test]
     fn no_findings_converges() {
-        assert_eq!(decide_next_state(&[], 1, 5), RunState::Converged);
+        assert_eq!(decide_next_state(&[], 1, 5, 0, 5), RunState::Converged);
     }
 
     #[test]
     fn only_non_blocking_findings_converges() {
         assert_eq!(
-            decide_next_state(&[info_finding()], 1, 5),
+            decide_next_state(&[info_finding()], 1, 5, 1, 5),
             RunState::Converged
         );
     }
 
     #[test]
-    fn blocking_finding_within_budget_reboucles_to_coder() {
+    fn blocking_reviewer_finding_within_review_budget_reboucles_to_coder() {
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 1, 5),
+            decide_next_state(&[blocking_finding()], 1, 5, 0, 5),
             RunState::CoderRunning
         );
     }
 
     #[test]
-    fn blocking_finding_at_budget_exceeds_max_cycles() {
+    fn blocking_reviewer_finding_at_review_budget_exceeds_max_review_cycles() {
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 5, 5),
-            RunState::MaxCyclesExceeded
+            decide_next_state(&[blocking_finding()], 5, 5, 0, 5),
+            RunState::MaxReviewCyclesExceeded
         );
     }
 
     #[test]
-    fn blocking_finding_past_budget_exceeds_max_cycles() {
+    fn blocking_reviewer_finding_past_review_budget_exceeds_max_review_cycles() {
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 6, 5),
-            RunState::MaxCyclesExceeded
+            decide_next_state(&[blocking_finding()], 6, 5, 0, 5),
+            RunState::MaxReviewCyclesExceeded
+        );
+    }
+
+    /// The tampering finding (`FindingSource::Warden`) is charged to the
+    /// review budget exactly like a `Reviewer`-sourced one.
+    #[test]
+    fn blocking_tampering_finding_is_charged_to_the_review_budget() {
+        assert_eq!(
+            decide_next_state(&[tampering_finding()], 5, 5, 0, 5),
+            RunState::MaxReviewCyclesExceeded
+        );
+    }
+
+    /// Decision #37 Q1, the core acceptance criterion of issue #43: a
+    /// blocking tester finding reboucles/exhausts against the *test* budget,
+    /// never the review budget -- even when the review budget is itself
+    /// already exhausted, since a tester finding only ever appears in
+    /// `findings` on a cycle whose review already came back clean this same
+    /// cycle (`warden::orchestrator::run_convergence_loop`'s gate, issue
+    /// #41).
+    #[test]
+    fn blocking_tester_finding_within_test_budget_reboucles_to_coder() {
+        assert_eq!(
+            decide_next_state(&[tester_blocking_finding()], 5, 5, 1, 5),
+            RunState::CoderRunning
+        );
+    }
+
+    #[test]
+    fn blocking_tester_finding_at_test_budget_exceeds_max_test_cycles_not_review() {
+        assert_eq!(
+            decide_next_state(&[tester_blocking_finding()], 1, 5, 3, 3),
+            RunState::MaxTestCyclesExceeded
+        );
+    }
+
+    #[test]
+    fn blocking_tester_finding_past_test_budget_exceeds_max_test_cycles() {
+        assert_eq!(
+            decide_next_state(&[tester_blocking_finding()], 1, 5, 4, 3),
+            RunState::MaxTestCyclesExceeded
+        );
+    }
+
+    /// A scoped re-review (issue #41/#42) triggered by a *tester* finding's
+    /// correctif is still a `Reviewer`-sourced finding when it itself finds
+    /// something -- decision #37 Q1's whole point: that reboucle is charged
+    /// to the review budget, not the test budget, regardless of what
+    /// motivated the coder's correctif in the first place.
+    #[test]
+    fn a_scoped_re_review_finding_after_a_tester_reboucle_is_charged_to_the_review_budget_not_test()
+    {
+        assert_eq!(
+            decide_next_state(&[blocking_finding()], 2, 5, 1, 1),
+            RunState::CoderRunning,
+            "review budget still has room even though the test budget is already exhausted"
         );
     }
 
@@ -509,7 +643,10 @@ mod tests {
     #[test]
     fn decide_next_state_mixed_severities_still_reboucles_on_any_blocking() {
         let findings = vec![info_finding(), blocking_finding()];
-        assert_eq!(decide_next_state(&findings, 1, 5), RunState::CoderRunning);
+        assert_eq!(
+            decide_next_state(&findings, 1, 5, 0, 5),
+            RunState::CoderRunning
+        );
     }
 
     // ---- FindingSource::Ci -------------------------------------------------
@@ -566,10 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn checks_failed_at_cycle_budget_fails_the_run_not_max_cycles_exceeded() {
+    fn checks_failed_at_cycle_budget_fails_the_run_not_a_max_cycles_exceeded_state() {
         // AwaitingCi's only legal next states are Done/CoderRunning/Failed
-        // (state.rs) -- MaxCyclesExceeded is not reachable from here, unlike
-        // decide_next_state's reviewer/tester equivalent.
+        // (state.rs) -- neither MaxReviewCyclesExceeded nor
+        // MaxTestCyclesExceeded is reachable from here, unlike
+        // decide_next_state's reviewer/tester equivalents.
         assert_eq!(
             decide_next_state_after_ci(CiOutcome::ChecksFailed, 5, 5),
             RunState::Failed

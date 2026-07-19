@@ -7,6 +7,42 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #43 (sous-tâche #37.4) / ADR-0014 : budgets par phase, états par phase, migration DB, `decide_next_state` conscient de la phase
+
+- **Deux budgets indépendants remplacent `max_cycles`** : `RunConfig`/`--max-cycles`
+  (CLI) deviennent `max_review_cycles`/`--max-review-cycles` et
+  `max_test_cycles`/`--max-test-cycles`, chacun avec sa propre valeur par défaut (5,
+  au moins 1). La table `runs` gagne les colonnes `max_review_cycles`,
+  `max_test_cycles`, `current_review_cycle`, `current_test_cycle` (migration
+  `0007_phase_budgets.sql`, `ALTER TABLE ... ADD COLUMN` + report des valeurs
+  existantes + `DROP COLUMN` de `max_cycles`/`current_cycle`) ; `warden-tui`
+  (lecture seule, schéma dupliqué par conception) suit le même schéma.
+- **Décision #37 Q1, imputation explicite et testée** : `warden_core::decide_next_state`
+  ne prend plus un unique `(current_cycle, max_cycles)` mais
+  `(review_cycle, max_review_cycles, test_cycle, max_test_cycles)`, et impute chaque
+  finding bloquant à son budget selon sa *source* : `Reviewer`/`Warden` (y compris la
+  re-review scopée déclenchée par un finding du tester, issue #41/#42) débite le budget
+  review ; `Tester` débite le budget test. Une re-review scopée motivée par un finding
+  du tester est ainsi imputée au budget review, jamais au budget test — le critère
+  d'acceptation central de #43 — verrouillé par
+  `a_scoped_re_review_finding_after_a_tester_reboucle_is_charged_to_the_review_budget_not_test`
+  et les tests d'intégration `max_review_cycles_exceeded_when_reviewer_findings_never_clear`
+  / `max_test_cycles_exceeded_when_tester_findings_never_clear` (ce dernier avec un budget
+  review large et un budget test étroit, pour prouver que c'est bien la bonne phase qui
+  s'épuise).
+- **États d'épuisement dédiés, jamais un faux `Converged`** : `RunState::MaxCyclesExceeded`
+  devient `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` — deux états terminaux
+  distincts (`-> Failed` uniquement), jamais confondus avec `Converged`.
+- **`AwaitingReviewTest` scindé en deux états par phase** : `RunState::Reviewing`
+  (coder→reviewer, ouvre la porte Phase A) et `RunState::Testing` (tester, atteint
+  uniquement depuis `Reviewing` quand la review du cycle est clean) remplacent l'unique
+  `AwaitingReviewTest` qu'utilisaient encore #41/#42. `run_convergence_loop` écrit
+  `Reviewing` avant chaque review et `Testing` juste avant chaque passage du tester
+  (write-ahead, ADR-0004) ; `RunState::is_intermediate`/crash recovery et
+  `db::list_intermediate_runs` suivent les deux nouveaux états.
+- Aucun changement de comportement pour la boucle Phase A/B elle-même (héritée de
+  #41/#42) : seuls les budgets/états qui l'entourent deviennent conscients de la phase.
+
 ### Changed — Issue #42 (sous-tâche #37.3) / ADR-0014 : Phase B — gate test avec re-review scopée avant tout retour au tester
 
 - **Un finding du tester reboucle vers le coder exactement comme un finding du reviewer** :

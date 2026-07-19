@@ -10,20 +10,34 @@ use crate::error::{CoreError, Result};
 
 /// Lifecycle state of a run, mirroring the state diagram in Architecture.md §6.
 ///
-/// Phase 1 only exercises `Pending` through `Converged` / `MaxCyclesExceeded`
-/// / `Failed`. `Pushed`, `AwaitingCi`, and `Done` are reserved for the git
-/// gate (Phase 3) and CI watcher (Phase 5) but are modeled now so the state
-/// machine doesn't need a breaking change later.
+/// **ADR-0014, issue #37/#43**: the single `AwaitingReviewTest` state (and its
+/// one shared `max_cycles` budget) that Phase A/B (#41/#42) still ran on is
+/// split into two per-phase states -- `Reviewing` (coder->reviewer, gating
+/// the tester) and `Testing` (tester only ever runs once a cycle's review is
+/// clean) -- each with its own exhaustion state
+/// (`MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded`) and budget, tracked by
+/// `warden::db`'s `runs.max_review_cycles`/`max_test_cycles` columns and
+/// decided by [`crate::decide_next_state`]. A scoped re-review triggered by a
+/// tester finding is charged to the review budget, never the test budget
+/// (decision #37 Q1) -- see [`crate::decide_next_state`]'s own docs for how.
+///
+/// Phase 1 only exercises `Pending` through `Converged` /
+/// `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` / `Failed`. `Pushed`,
+/// `AwaitingCi`, and `Done` are reserved for the git gate (Phase 3) and CI
+/// watcher (Phase 5) but are modeled now so the state machine doesn't need a
+/// breaking change later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RunState {
     Pending,
     CoderRunning,
-    AwaitingReviewTest,
+    Reviewing,
+    Testing,
     Converged,
     Pushed,
     AwaitingCi,
     Done,
-    MaxCyclesExceeded,
+    MaxReviewCyclesExceeded,
+    MaxTestCyclesExceeded,
     Failed,
 }
 
@@ -34,12 +48,14 @@ impl RunState {
         match self {
             RunState::Pending => "pending",
             RunState::CoderRunning => "coder_running",
-            RunState::AwaitingReviewTest => "awaiting_review_test",
+            RunState::Reviewing => "reviewing",
+            RunState::Testing => "testing",
             RunState::Converged => "converged",
             RunState::Pushed => "pushed",
             RunState::AwaitingCi => "awaiting_ci",
             RunState::Done => "done",
-            RunState::MaxCyclesExceeded => "max_cycles_exceeded",
+            RunState::MaxReviewCyclesExceeded => "max_review_cycles_exceeded",
+            RunState::MaxTestCyclesExceeded => "max_test_cycles_exceeded",
             RunState::Failed => "failed",
         }
     }
@@ -51,12 +67,14 @@ impl RunState {
         match raw {
             "pending" => Ok(RunState::Pending),
             "coder_running" => Ok(RunState::CoderRunning),
-            "awaiting_review_test" => Ok(RunState::AwaitingReviewTest),
+            "reviewing" => Ok(RunState::Reviewing),
+            "testing" => Ok(RunState::Testing),
             "converged" => Ok(RunState::Converged),
             "pushed" => Ok(RunState::Pushed),
             "awaiting_ci" => Ok(RunState::AwaitingCi),
             "done" => Ok(RunState::Done),
-            "max_cycles_exceeded" => Ok(RunState::MaxCyclesExceeded),
+            "max_review_cycles_exceeded" => Ok(RunState::MaxReviewCyclesExceeded),
+            "max_test_cycles_exceeded" => Ok(RunState::MaxTestCyclesExceeded),
             "failed" => Ok(RunState::Failed),
             other => Err(CoreError::UnknownState(other.to_string())),
         }
@@ -69,7 +87,7 @@ impl RunState {
     pub fn is_intermediate(self) -> bool {
         matches!(
             self,
-            RunState::CoderRunning | RunState::AwaitingReviewTest | RunState::AwaitingCi
+            RunState::CoderRunning | RunState::Reviewing | RunState::Testing | RunState::AwaitingCi
         )
     }
 
@@ -81,17 +99,30 @@ impl RunState {
     fn allowed_next_states(self) -> &'static [RunState] {
         match self {
             RunState::Pending => &[RunState::CoderRunning],
-            RunState::CoderRunning => &[RunState::AwaitingReviewTest, RunState::Failed],
-            RunState::AwaitingReviewTest => &[
+            RunState::CoderRunning => &[RunState::Reviewing, RunState::Failed],
+            // Issue #43: `Testing` is reached only once this cycle's review
+            // is clean (Phase A gate, issue #41) -- `Converged` is therefore
+            // never a legal direct successor of `Reviewing` itself, only of
+            // `Testing` (a review-clean cycle whose tester also came back
+            // clean). A blocking reviewer/tampering finding reboucles to
+            // `CoderRunning` (within budget) or exhausts the review budget.
+            RunState::Reviewing => &[
+                RunState::Testing,
+                RunState::CoderRunning,
+                RunState::MaxReviewCyclesExceeded,
+                RunState::Failed,
+            ],
+            RunState::Testing => &[
                 RunState::Converged,
                 RunState::CoderRunning,
-                RunState::MaxCyclesExceeded,
+                RunState::MaxTestCyclesExceeded,
                 RunState::Failed,
             ],
             RunState::Converged => &[RunState::Pushed],
             RunState::Pushed => &[RunState::AwaitingCi],
             RunState::AwaitingCi => &[RunState::Done, RunState::CoderRunning, RunState::Failed],
-            RunState::MaxCyclesExceeded => &[RunState::Failed],
+            RunState::MaxReviewCyclesExceeded => &[RunState::Failed],
+            RunState::MaxTestCyclesExceeded => &[RunState::Failed],
             RunState::Done => &[],
             RunState::Failed => &[],
         }
@@ -155,20 +186,41 @@ mod tests {
             .validate_transition(RunState::Failed)
             .is_ok());
         assert!(RunState::CoderRunning
-            .validate_transition(RunState::AwaitingReviewTest)
+            .validate_transition(RunState::Reviewing)
             .is_ok());
     }
 
+    /// Issue #43: `Reviewing` gates `Testing` -- it never jumps straight to
+    /// `Converged` itself (only a review-clean cycle whose tester also came
+    /// back clean, from `Testing`, does).
     #[test]
-    fn awaiting_review_test_covers_all_convergence_outcomes() {
-        let from = RunState::AwaitingReviewTest;
+    fn reviewing_gates_testing_and_never_converges_directly() {
+        let from = RunState::Reviewing;
+        assert!(from.validate_transition(RunState::Testing).is_ok());
+        assert!(from.validate_transition(RunState::CoderRunning).is_ok());
+        assert!(from
+            .validate_transition(RunState::MaxReviewCyclesExceeded)
+            .is_ok());
+        assert!(from.validate_transition(RunState::Failed).is_ok());
+        assert!(from.validate_transition(RunState::Converged).is_err());
+        assert!(from
+            .validate_transition(RunState::MaxTestCyclesExceeded)
+            .is_err());
+    }
+
+    #[test]
+    fn testing_covers_all_convergence_outcomes() {
+        let from = RunState::Testing;
         assert!(from.validate_transition(RunState::Converged).is_ok());
         assert!(from.validate_transition(RunState::CoderRunning).is_ok());
         assert!(from
-            .validate_transition(RunState::MaxCyclesExceeded)
+            .validate_transition(RunState::MaxTestCyclesExceeded)
             .is_ok());
         assert!(from.validate_transition(RunState::Failed).is_ok());
         assert!(from.validate_transition(RunState::Done).is_err());
+        assert!(from
+            .validate_transition(RunState::MaxReviewCyclesExceeded)
+            .is_err());
     }
 
     #[test]
@@ -214,11 +266,21 @@ mod tests {
     }
 
     #[test]
-    fn max_cycles_exceeded_can_only_move_to_failed() {
-        assert!(RunState::MaxCyclesExceeded
+    fn max_review_cycles_exceeded_can_only_move_to_failed() {
+        assert!(RunState::MaxReviewCyclesExceeded
             .validate_transition(RunState::Failed)
             .is_ok());
-        assert!(RunState::MaxCyclesExceeded
+        assert!(RunState::MaxReviewCyclesExceeded
+            .validate_transition(RunState::CoderRunning)
+            .is_err());
+    }
+
+    #[test]
+    fn max_test_cycles_exceeded_can_only_move_to_failed() {
+        assert!(RunState::MaxTestCyclesExceeded
+            .validate_transition(RunState::Failed)
+            .is_ok());
+        assert!(RunState::MaxTestCyclesExceeded
             .validate_transition(RunState::CoderRunning)
             .is_err());
     }
@@ -226,7 +288,8 @@ mod tests {
     #[test]
     fn intermediate_states_match_recovery_rule() {
         assert!(RunState::CoderRunning.is_intermediate());
-        assert!(RunState::AwaitingReviewTest.is_intermediate());
+        assert!(RunState::Reviewing.is_intermediate());
+        assert!(RunState::Testing.is_intermediate());
         assert!(RunState::AwaitingCi.is_intermediate());
         assert!(!RunState::Pending.is_intermediate());
         assert!(!RunState::Converged.is_intermediate());
@@ -238,12 +301,14 @@ mod tests {
         for state in [
             RunState::Pending,
             RunState::CoderRunning,
-            RunState::AwaitingReviewTest,
+            RunState::Reviewing,
+            RunState::Testing,
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
             RunState::Done,
-            RunState::MaxCyclesExceeded,
+            RunState::MaxReviewCyclesExceeded,
+            RunState::MaxTestCyclesExceeded,
             RunState::Failed,
         ] {
             assert_eq!(RunState::parse(state.as_str()).unwrap(), state);

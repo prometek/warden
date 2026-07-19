@@ -42,7 +42,9 @@ async fn seeded_db(dir: &Path) -> (std::path::PathBuf, SqlitePool) {
     sqlx::query(
         "CREATE TABLE runs (
             id TEXT PRIMARY KEY, intent TEXT NOT NULL, branch TEXT NOT NULL,
-            state TEXT NOT NULL, max_cycles INTEGER NOT NULL, current_cycle INTEGER NOT NULL
+            state TEXT NOT NULL, max_review_cycles INTEGER NOT NULL,
+            max_test_cycles INTEGER NOT NULL, current_review_cycle INTEGER NOT NULL,
+            current_test_cycle INTEGER NOT NULL
         )",
     )
     .execute(&pool)
@@ -58,7 +60,7 @@ async fn seeded_db(dir: &Path) -> (std::path::PathBuf, SqlitePool) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO runs (id, intent, branch, state, max_cycles, current_cycle) VALUES ('run-1', 'intent', 'main', 'coder_running', 5, 1)",
+        "INSERT INTO runs (id, intent, branch, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle) VALUES ('run-1', 'intent', 'main', 'coder_running', 5, 5, 1, 0)",
     )
     .execute(&pool)
     .await
@@ -137,7 +139,8 @@ async fn attach_cli_replays_full_history_then_streams_live_events_with_no_gap() 
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -205,7 +208,8 @@ async fn attach_cli_to_a_finished_run_prints_history_only_and_exits() {
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -254,7 +258,8 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -277,7 +282,8 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
         event: RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_cycles: 5,
+            max_review_cycles: 5,
+            max_test_cycles: 5,
         },
         created_at: "2026-07-12T00:00:00+00:00".to_string(),
     };

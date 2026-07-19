@@ -128,12 +128,17 @@ fn render_evidence_pane(
 
 fn header_widget(model: &RunModel) -> Paragraph<'static> {
     let text = match (model.run_id(), model.run_started()) {
-        (Some(run_id), Some((intent, branch, max_cycles))) => {
+        (Some(run_id), Some((intent, branch, max_review_cycles, max_test_cycles))) => {
             let status = if let Some(final_state) = model.final_state() {
                 format!("finished: {final_state}")
             } else {
+                // Issue #43: separate per-phase budgets replace the single
+                // "cycle N/max" the header used to show. Kept compact
+                // (`review N, test N` rather than spelling out "budget"
+                // twice) so it still leaves room for the live agent-progress
+                // suffix below within a narrow terminal.
                 let cycle_status = format!(
-                    "cycle {}/{max_cycles} in progress",
+                    "cycle {} in progress (review {max_review_cycles}, test {max_test_cycles})",
                     model.current_cycle_number()
                 );
                 // Issue #33: what actually makes the header alive during a
@@ -166,10 +171,14 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         RunEvent::RunStarted {
             intent,
             branch,
-            max_cycles,
+            max_review_cycles,
+            max_test_cycles,
         } => (
             Style::default().fg(Color::Cyan),
-            format!("run started: \"{intent}\" on {branch} (max {max_cycles} cycles)"),
+            format!(
+                "run started: \"{intent}\" on {branch} (max {max_review_cycles} review cycles, \
+                 max {max_test_cycles} test cycles)"
+            ),
         ),
         RunEvent::CycleStarted { cycle_number } => (
             Style::default().fg(Color::Blue),
@@ -261,7 +270,8 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "add email validation".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 5,
+                max_review_cycles: 5,
+                max_test_cycles: 5,
             },
         ));
 
@@ -284,7 +294,8 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 3,
+                max_review_cycles: 3,
+                max_test_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -312,7 +323,8 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 3,
+                max_review_cycles: 3,
+                max_test_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -360,7 +372,8 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_cycles: 3,
+                max_review_cycles: 3,
+                max_test_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -398,7 +411,7 @@ mod tests {
             "after the agent finishes: only the historical event log entry remains, the \
              header's own repetition must be gone"
         );
-        assert!(content_after_finish.contains("cycle 1/3 in progress"));
+        assert!(content_after_finish.contains("cycle 1 in progress (review 3, test 3)"));
     }
 
     /// The scrollable event log must also carry each progress line, not
