@@ -5,7 +5,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 env:
   # crates/*/.sqlx caches are committed -- no live database needed to build
@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # The tag is the single source of truth for the release version --
       # fail early rather than ship binaries whose --version disagrees with
@@ -52,15 +52,19 @@ jobs:
             os: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # dtolnay/rust-toolchain is versioned by branch, not tag; `stable`
+      # always resolves the actual Rust toolchain dynamically at run time --
+      # pinning below only freezes the *action's* code for supply-chain
+      # safety, not the Rust version installed.
       - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.target }}
 
@@ -89,9 +93,7 @@ jobs:
           cp -R crates/warden-gated/contrib/systemd "${stage_dir}/contrib/"
           cp -R crates/warden-gated/contrib/launchd "${stage_dir}/contrib/"
           cp README.md "${stage_dir}/"
-          if [ -f LICENSE ]; then
-            cp LICENSE "${stage_dir}/"
-          fi
+          cp LICENSE "${stage_dir}/"
 
           tar -C "${stage_root}" -czf "${pkg_name}.tar.gz" "${pkg_name}"
           shasum -a 256 "${pkg_name}.tar.gz" > "${pkg_name}.tar.gz.sha256"
@@ -99,7 +101,7 @@ jobs:
           echo "pkg_name=${pkg_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.package.outputs.pkg_name }}
           path: |
@@ -115,7 +117,7 @@ jobs:
       contents: write
     steps:
       - name: Download all target artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
 
@@ -133,6 +135,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" \
             release/*.tar.gz release/checksums.txt \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes
