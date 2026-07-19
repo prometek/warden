@@ -32,7 +32,18 @@ use crate::state::AgentRole;
 /// may carry `findings` (the ones it is being asked to fix on a reboucle).
 /// Both are breaking for an agent-side consumer: a v1 agent would drop the
 /// prompt on the floor.
-pub const AGENT_INPUT_VERSION: u32 = 2;
+///
+/// **3** (issue #40, ADR-0012/0013 amendment): every payload now also
+/// carries a `scope` ("full" or "correctif", see [`ReviewScope`]) --
+/// `"correctif"` is only ever set on a reviewer payload, and narrows `diff`/
+/// `findings` from this cycle's full context down to a single correctif
+/// under re-review plus the findings that prompted it (decision #37 Q2).
+/// Breaking for the same reason 2 was: a v2 agent has never seen this field
+/// and has no way to infer "full" from its own absence -- retro-compat is
+/// handled the same way every prior bump was, by rejecting the mismatched
+/// version outright rather than guessing (see `parse_agent_input_message`),
+/// not by accepting both shapes.
+pub const AGENT_INPUT_VERSION: u32 = 3;
 
 /// Appended to [`AgentInputMessage::diff`] when `warden` truncated it at its
 /// size cap (`warden::orchestrator::MAX_DIFF_BYTES`) before handing it to a
@@ -81,6 +92,48 @@ impl AgentFindingWire {
     }
 }
 
+/// Whether a reviewer/tester `diff`/`findings` pair describes this cycle's
+/// full context, or is narrowed to a single correctif under re-review (issue
+/// #40, ADR-0012/0013 amendment, decision #37 Q2: "re-review scopée").
+///
+/// `Full` is the only mode that existed before issue #40, and the only one
+/// ever set for `AgentRole::Coder`/`AgentRole::Tester` -- `Correctif` is
+/// reviewer-only, enforced by [`AgentInputMessage::for_scoped_review`] at
+/// construction and by [`parse_agent_input_message`] on the read side (the
+/// same "constructor invariant == parse invariant" convention as
+/// `coder_only_violation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewScope {
+    /// This cycle's full diff/findings context -- the only mode before
+    /// issue #40.
+    Full,
+    /// `diff`/`findings` are narrowed to a single correctif -- the fix a
+    /// coder produced in response to specific findings -- plus the findings
+    /// that prompted it, rather than this cycle's whole context. Tells the
+    /// reviewer to "look only at this correctif" instead of re-reviewing
+    /// everything.
+    Correctif,
+}
+
+impl ReviewScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewScope::Full => "full",
+            ReviewScope::Correctif => "correctif",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "full" => Ok(ReviewScope::Full),
+            "correctif" => Ok(ReviewScope::Correctif),
+            other => Err(CoreError::MalformedAgentInput(format!(
+                "unknown review scope {other:?} (expected \"full\" or \"correctif\")"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentInputWire {
     version: u32,
@@ -93,6 +146,9 @@ struct AgentInputWire {
     target_commit: Option<String>,
     diff: Option<String>,
     findings: Vec<AgentFindingWire>,
+    /// Issue #40: required (not defaulted) for the same reason
+    /// `system_prompt` became required at v2 -- see `AGENT_INPUT_VERSION`.
+    scope: String,
 }
 
 /// The payload `warden` feeds an agent subprocess over stdin (ADR-0012): the
@@ -127,6 +183,11 @@ pub struct AgentInputMessage {
     /// on a silently incomplete payload.
     pub diff: Option<String>,
     pub findings: Vec<Finding>,
+    /// `Full` for a coder payload and for a full reviewer/tester pass (the
+    /// only mode before issue #40); `Correctif` only for a scoped reviewer
+    /// re-review (decision #37 Q2), set by [`Self::for_scoped_review`] --
+    /// see [`ReviewScope`]'s own docs.
+    pub scope: ReviewScope,
 }
 
 impl AgentInputMessage {
@@ -165,6 +226,7 @@ impl AgentInputMessage {
             target_commit: None,
             diff: None,
             findings,
+            scope: ReviewScope::Full,
         })
     }
 
@@ -206,7 +268,35 @@ impl AgentInputMessage {
             target_commit: Some(target_commit),
             diff: Some(diff.into()),
             findings,
+            scope: ReviewScope::Full,
         })
+    }
+
+    /// Scoped reviewer re-review (issue #40, ADR-0012/0013 amendment,
+    /// decision #37 Q2: "re-review scopée"): same wire shape as
+    /// [`Self::for_finding_agent`], but `diff`/`findings` are deliberately
+    /// **not** this cycle's full context -- `diff` is the single correctif
+    /// under re-review, and `findings` is only the findings that prompted
+    /// it, telling the reviewer to look only at this correctif rather than
+    /// re-reviewing everything. Reviewer-only, exactly like the mode it
+    /// implements -- delegates to [`Self::for_finding_agent`] (which rejects
+    /// `AgentRole::Coder`) and hardcodes [`AgentRole::Reviewer`], so it can
+    /// never be constructed for any other role.
+    pub fn for_scoped_review(
+        system_prompt: impl Into<String>,
+        target_commit: impl Into<String>,
+        correctif_diff: impl Into<String>,
+        originating_findings: Vec<Finding>,
+    ) -> Result<Self> {
+        let mut message = Self::for_finding_agent(
+            AgentRole::Reviewer,
+            system_prompt,
+            target_commit,
+            correctif_diff,
+            originating_findings,
+        )?;
+        message.scope = ReviewScope::Correctif;
+        Ok(message)
     }
 
     /// Serializes to the exact wire form [`parse_agent_input_message`] parses
@@ -226,6 +316,7 @@ impl AgentInputMessage {
                 .iter()
                 .map(AgentFindingWire::from_finding)
                 .collect(),
+            scope: self.scope.as_str().to_string(),
         };
         serde_json::to_string(&wire)
             .map_err(|error| CoreError::MalformedAgentInput(error.to_string()))
@@ -260,6 +351,18 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
         .into_iter()
         .map(AgentFindingWire::into_finding)
         .collect::<Result<Vec<_>>>()?;
+    let scope = ReviewScope::parse(&wire.scope)?;
+    // Issue #40: `Correctif` is an invariant `for_scoped_review` enforces by
+    // construction (it hardcodes `AgentRole::Reviewer`), so the parse side
+    // must enforce it too -- the same "constructor invariant == parse
+    // invariant" rule `coder_only_violation` already applies to
+    // `target_commit`/`diff` on a coder payload.
+    if scope == ReviewScope::Correctif && role != AgentRole::Reviewer {
+        return Err(CoreError::MalformedAgentInput(format!(
+            "{} input must not carry a \"correctif\" scope (only the reviewer can be scoped)",
+            role.as_str()
+        )));
+    }
 
     match role {
         AgentRole::Coder => {
@@ -298,6 +401,7 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
                 target_commit: None,
                 diff: None,
                 findings,
+                scope,
             })
         }
         AgentRole::Reviewer | AgentRole::Tester => {
@@ -320,6 +424,7 @@ pub fn parse_agent_input_message(raw: &str) -> Result<AgentInputMessage> {
                 // changes has a legitimately empty diff to report.
                 diff: Some(wire.diff.unwrap_or_default()),
                 findings,
+                scope,
             })
         }
     }
@@ -433,6 +538,54 @@ mod tests {
         );
         assert_eq!(decoded.findings.len(), 1);
         assert_eq!(decoded.findings[0].source, FindingSource::Ci);
+        assert_eq!(decoded.scope, ReviewScope::Full);
+    }
+
+    /// Issue #40 / decision #37 Q2: a scoped reviewer re-review carries the
+    /// correctif's own diff and the findings that prompted it, not this
+    /// cycle's full context -- and round-trips with `scope: Correctif`, the
+    /// marker that tells the reviewer to look only at this correctif.
+    #[test]
+    fn scoped_review_input_round_trips_through_json_as_correctif_scope() {
+        let message = AgentInputMessage::for_scoped_review(
+            SYSTEM_PROMPT,
+            "def456",
+            "diff --git a/x b/x\n+fixed the bug\n",
+            vec![sample_finding()],
+        )
+        .unwrap();
+        let json = message.to_json().unwrap();
+        let decoded = parse_agent_input_message(&json).unwrap();
+
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.role, AgentRole::Reviewer);
+        assert_eq!(decoded.scope, ReviewScope::Correctif);
+        assert_eq!(decoded.target_commit.as_deref(), Some("def456"));
+        assert_eq!(
+            decoded.diff.as_deref(),
+            Some("diff --git a/x b/x\n+fixed the bug\n")
+        );
+        assert_eq!(decoded.findings.len(), 1);
+        assert!(json.contains(r#""scope":"correctif""#));
+    }
+
+    /// M2 counterpart for `for_scoped_review`: same construction-side rigor
+    /// as `for_finding_agent_rejects_a_blank_target_commit`, since
+    /// `for_scoped_review` delegates to `for_finding_agent` internally.
+    #[test]
+    fn for_scoped_review_rejects_a_blank_target_commit() {
+        assert!(matches!(
+            AgentInputMessage::for_scoped_review(SYSTEM_PROMPT, "   ", "diff", vec![]),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn review_scope_round_trips_through_its_string_form() {
+        for scope in [ReviewScope::Full, ReviewScope::Correctif] {
+            assert_eq!(ReviewScope::parse(scope.as_str()).unwrap(), scope);
+        }
+        assert!(ReviewScope::parse("ghost").is_err());
     }
 
     #[test]
@@ -530,7 +683,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unsupported_version() {
-        let json = r#"{"version":99,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":99,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -539,16 +692,33 @@ mod tests {
 
     /// The 1 -> 2 bump (ADR-0013) is a real break, not a formality: a
     /// payload announcing v1 is refused on its *version*, never read as a
-    /// best-effort v2.
+    /// best-effort current version.
     ///
-    /// The fixture deliberately carries a `system_prompt` even though no
-    /// real v1 payload ever did: without it, `serde_json` would reject the
-    /// missing field before the version gate is ever reached, and this test
-    /// would pass for a reason that has nothing to do with what it claims to
-    /// prove. Everything here is valid v2 except the `version` itself.
+    /// The fixture deliberately carries every field the *current* (v3)
+    /// wire shape requires, even though no real v1 payload ever did: without
+    /// them, `serde_json` would reject the payload on a missing field before
+    /// the version gate is ever reached, and this test would pass for a
+    /// reason that has nothing to do with what it claims to prove. Everything
+    /// here is valid v3 except the `version` itself.
     #[test]
     fn rejects_a_version_1_payload() {
-        let json = r#"{"version":1,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":1,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
+        assert!(matches!(
+            parse_agent_input_message(json),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    /// The 2 -> 3 bump (issue #40) is its own real break: a genuine v2
+    /// payload -- valid under the *old* shape, and missing `scope` entirely,
+    /// since that field did not exist yet -- must be refused outright, never
+    /// silently read as `scope: "full"`. This is what "retro-compat handled"
+    /// means throughout this module: reject the mismatched version with a
+    /// clear, typed error, not guess at forward/backward compatibility (same
+    /// convention the 1 -> 2 bump already established above).
+    #[test]
+    fn rejects_a_genuine_version_2_payload_with_no_scope_field() {
+        let json = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -557,7 +727,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_role() {
-        let json = r#"{"version":2,"role":"ghost","system_prompt":"x","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":3,"role":"ghost","system_prompt":"x","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::UnknownRole(_))
@@ -566,7 +736,7 @@ mod tests {
 
     #[test]
     fn rejects_a_payload_missing_system_prompt() {
-        let json = r#"{"version":2,"role":"coder","intent":"x","target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":3,"role":"coder","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -575,7 +745,7 @@ mod tests {
 
     #[test]
     fn rejects_a_payload_whose_system_prompt_is_blank() {
-        let json = r#"{"version":2,"role":"reviewer","system_prompt":"   ","target_commit":"abc","diff":"","findings":[]}"#;
+        let json = r#"{"version":3,"role":"reviewer","system_prompt":"   ","target_commit":"abc","diff":"","findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -586,7 +756,7 @@ mod tests {
     /// coder payload is still validated with the same rigor it always was.
     #[test]
     fn rejects_a_coder_payload_missing_intent() {
-        let json = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":null,"target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":null,"target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -595,7 +765,7 @@ mod tests {
 
     #[test]
     fn rejects_a_coder_payload_whose_intent_is_blank_even_when_it_carries_findings() {
-        let json = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"   ","target_commit":null,"diff":null,"findings":[{"source":"reviewer","severity":"blocking","file":null,"description":"x","action":null}]}"#;
+        let json = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":"   ","target_commit":null,"diff":null,"findings":[{"source":"reviewer","severity":"blocking","file":null,"description":"x","action":null}],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -612,7 +782,7 @@ mod tests {
     /// fallback -- dropping data the sender meant is exactly that).
     #[test]
     fn rejects_a_coder_payload_that_carries_a_target_commit_or_diff() {
-        let with_commit = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":"abc123","diff":null,"findings":[]}"#;
+        let with_commit = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":"abc123","diff":null,"findings":[],"scope":"full"}"#;
         assert!(
             matches!(
                 parse_agent_input_message(with_commit),
@@ -622,7 +792,7 @@ mod tests {
             parse_agent_input_message(with_commit)
         );
 
-        let with_diff = r#"{"version":2,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":"diff --git a/x b/x","findings":[]}"#;
+        let with_diff = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":"diff --git a/x b/x","findings":[],"scope":"full"}"#;
         assert!(
             matches!(
                 parse_agent_input_message(with_diff),
@@ -635,7 +805,7 @@ mod tests {
 
     #[test]
     fn rejects_a_reviewer_payload_missing_target_commit() {
-        let json = r#"{"version":2,"role":"reviewer","system_prompt":"be a reviewer","intent":null,"target_commit":null,"diff":null,"findings":[]}"#;
+        let json = r#"{"version":3,"role":"reviewer","system_prompt":"be a reviewer","intent":null,"target_commit":null,"diff":null,"findings":[],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::MalformedAgentInput(_))
@@ -644,10 +814,42 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_finding_source_inside_findings() {
-        let json = r#"{"version":2,"role":"tester","system_prompt":"be a tester","intent":null,"target_commit":"abc","diff":"","findings":[{"source":"ghost","severity":"blocking","file":null,"description":"x","action":null}]}"#;
+        let json = r#"{"version":3,"role":"tester","system_prompt":"be a tester","intent":null,"target_commit":"abc","diff":"","findings":[{"source":"ghost","severity":"blocking","file":null,"description":"x","action":null}],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::UnknownFindingSource(_))
+        ));
+    }
+
+    /// Issue #40: `Correctif` is reviewer-only, enforced on the read side the
+    /// same way `coder_only_violation` already enforces "no target_commit/
+    /// diff on a coder payload" -- a tester payload claiming a `"correctif"`
+    /// scope must be rejected, not silently coerced to `Full`.
+    #[test]
+    fn rejects_a_tester_payload_with_a_correctif_scope() {
+        let json = r#"{"version":3,"role":"tester","system_prompt":"be a tester","intent":null,"target_commit":"abc","diff":"","findings":[],"scope":"correctif"}"#;
+        assert!(matches!(
+            parse_agent_input_message(json),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    /// Same invariant, coder side.
+    #[test]
+    fn rejects_a_coder_payload_with_a_correctif_scope() {
+        let json = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"correctif"}"#;
+        assert!(matches!(
+            parse_agent_input_message(json),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unknown_scope_string() {
+        let json = r#"{"version":3,"role":"reviewer","system_prompt":"be a reviewer","intent":null,"target_commit":"abc","diff":"","findings":[],"scope":"ghost"}"#;
+        assert!(matches!(
+            parse_agent_input_message(json),
+            Err(CoreError::MalformedAgentInput(_))
         ));
     }
 }

@@ -1,9 +1,17 @@
 //! The convergence loop: coder -> review/test -> reboucle if findings
-//! (Architecture.md §5.1). Reviewer and tester run **in parallel**
-//! (`tokio::join!`, ADR-0003), each synced onto the coder's commit in its
-//! own worktree (see [`WorktreeManager::create`], keyed by role, so the two
-//! never share a directory). Every [`RunState`] transition is written to
-//! SQLite *before* the action it authorizes, per ADR-0004.
+//! (Architecture.md §5.1).
+//!
+//! **ADR-0003 amendment (issue #40)**: reviewer and tester no longer run in
+//! parallel via `tokio::join!` -- [`Orchestrator::run_review`] then
+//! [`Orchestrator::run_test`] run **sequentially**, an intermediate step
+//! toward the two-phase review-gate/test-gate loop (issue #37, #41/#42) that
+//! also closes the token-conflict/collision risk the old parallel path
+//! carried. Each still gets its own worktree synced onto the coder's commit
+//! (see [`WorktreeManager::create`], keyed by role, so the two never share a
+//! directory) -- that isolation was never *only* about concurrency safety,
+//! and stays valuable now purely as a boundary between roles. Every
+//! [`RunState`] transition is written to SQLite *before* the action it
+//! authorizes, per ADR-0004.
 //!
 //! Phase 8 (ADR-0008, issue #8): every significant transition is also
 //! published as a [`RunEvent`] -- persisted to `events` and broadcast live on
@@ -215,7 +223,9 @@ struct EvidenceCapture<'a> {
 /// Parameters for a single reviewer/tester invocation. Grouped into a
 /// struct (rather than passed positionally) purely to keep
 /// `run_finding_agent`'s signature readable — it has no behaviour of its
-/// own.
+/// own. Built internally by [`Orchestrator::run_review`]/
+/// [`Orchestrator::run_test`] (issue #40) -- not constructed by
+/// `run_convergence_loop` directly any more.
 struct FindingAgentInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
@@ -230,16 +240,64 @@ struct FindingAgentInvocation<'a> {
     commit: &'a str,
     /// The diff this cycle's coder introduced against the cycle's starting
     /// commit -- fed to the agent as `AgentInputMessage::diff` (ADR-0012,
-    /// issue #20 Scope B).
+    /// issue #20 Scope B), unless `scope` narrows it to a correctif (issue
+    /// #40): see `AgentInputMessage::for_scoped_review`.
     diff: &'a str,
     /// Findings that triggered this cycle (including CI findings on a
     /// post-convergence reboucle, ADR-0011) -- fed to the agent as
     /// `AgentInputMessage::findings` (ADR-0012). Empty on a run's first
-    /// cycle.
+    /// cycle. Read as "the findings that prompted this correctif" instead
+    /// when `scope` is `Correctif` (issue #40).
     prior_findings: &'a [Finding],
+    /// `ReviewScope::Full` for every tester invocation and a full reviewer
+    /// pass; `ReviewScope::Correctif` only for a scoped reviewer re-review
+    /// (issue #40, decision #37 Q2) -- see [`warden_core::ReviewScope`].
+    /// `run_finding_agent` refuses `Correctif` for any role but
+    /// `AgentRole::Reviewer` (defense in depth: only `Orchestrator::run_review`
+    /// can ever set it in the first place, since `TestInvocation` carries no
+    /// `scope` field at all).
+    scope: warden_core::ReviewScope,
     /// Only consulted for `AgentRole::Tester` (evidence capture,
     /// `evidence_tool`/`evidence_store_in_repo`/`warden_home`) -- carried
     /// through here rather than threading four separate fields.
+    config: &'a RunConfig,
+    cancel: CancellationToken,
+}
+
+/// Parameters for an independent reviewer invocation (issue #40): the same
+/// fields as [`FindingAgentInvocation`] minus `role` (always
+/// `AgentRole::Reviewer` -- [`Orchestrator::run_review`] sets it, callers
+/// never do), plus `scope`, the one axis a reviewer invocation can vary on
+/// that a tester's never does (decision #37 Q2).
+struct ReviewInvocation<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    agent: &'a ResolvedAgent,
+    env_allowlist: &'static [&'static str],
+    worktree_manager: &'a WorktreeManager,
+    commit: &'a str,
+    diff: &'a str,
+    prior_findings: &'a [Finding],
+    scope: warden_core::ReviewScope,
+    config: &'a RunConfig,
+    cancel: CancellationToken,
+}
+
+/// Parameters for an independent tester invocation (issue #40): the same
+/// fields as [`FindingAgentInvocation`] minus `role` (always
+/// `AgentRole::Tester`). No `scope` -- the tester is never invoked scoped
+/// (decision #37 Q2 only scopes the reviewer).
+struct TestInvocation<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    agent: &'a ResolvedAgent,
+    env_allowlist: &'static [&'static str],
+    worktree_manager: &'a WorktreeManager,
+    commit: &'a str,
+    diff: &'a str,
+    prior_findings: &'a [Finding],
     config: &'a RunConfig,
     cancel: CancellationToken,
 }
@@ -286,7 +344,7 @@ pub struct Orchestrator {
     /// Read by [`Orchestrator::publish_event`], called from deep inside the
     /// agent-invocation call chain (`run_agent`) without needing to thread
     /// an `&EventBus`/`run_id` pair through every intermediate signature --
-    /// several of those (`run_review_and_test`, `run_finding_agent`) are
+    /// several of those (`run_review`, `run_test`, `run_finding_agent`) are
     /// also exercised directly by unit tests below with a fixed argument
     /// list, so adding parameters there would be a breaking, test-rippling
     /// change for a purely additive observability feature.
@@ -571,21 +629,51 @@ impl Orchestrator {
             self.transition(&run_id, RunState::AwaitingReviewTest)
                 .await?;
 
+            // Issue #40 (ADR-0003 amendment): reviewer then tester,
+            // sequentially -- an intermediate step toward the two-phase
+            // review-gate/test-gate loop (issue #37, #41/#42), and an
+            // immediate token-conflict gain on its own (no more concurrent
+            // agents racing over the same coder commit). Both run a full
+            // (unscoped) pass here -- scoped re-review only starts once the
+            // two-phase loop lands.
             let mut findings = self
-                .run_review_and_test(
+                .run_review(
                     &runner,
-                    &run_id,
-                    &cycle_id,
-                    cycle_number,
-                    &config,
-                    &agents,
-                    &worktree_manager,
-                    &base_commit,
-                    &coder_result.diff,
-                    &prior_findings,
-                    cancel.clone(),
+                    ReviewInvocation {
+                        run_id: &run_id,
+                        cycle_id: &cycle_id,
+                        cycle_number,
+                        agent: &agents.reviewer,
+                        env_allowlist: agents.env_allowlist,
+                        worktree_manager: &worktree_manager,
+                        commit: &base_commit,
+                        diff: &coder_result.diff,
+                        prior_findings: &prior_findings,
+                        scope: warden_core::ReviewScope::Full,
+                        config: &config,
+                        cancel: cancel.clone(),
+                    },
                 )
                 .await?;
+            findings.extend(
+                self.run_test(
+                    &runner,
+                    TestInvocation {
+                        run_id: &run_id,
+                        cycle_id: &cycle_id,
+                        cycle_number,
+                        agent: &agents.tester,
+                        env_allowlist: agents.env_allowlist,
+                        worktree_manager: &worktree_manager,
+                        commit: &base_commit,
+                        diff: &coder_result.diff,
+                        prior_findings: &prior_findings,
+                        config: &config,
+                        cancel: cancel.clone(),
+                    },
+                )
+                .await?,
+            );
 
             // Issue #24 review, M4: folded in alongside the reviewer/
             // tester's own findings -- persisted, published, and factored
@@ -1029,82 +1117,96 @@ impl Orchestrator {
         })
     }
 
-    /// Runs reviewer and tester **concurrently** (ADR-0003) via
-    /// `tokio::join!`, each against its own worktree synced onto `commit`
-    /// (`WorktreeManager::create` paths worktrees by `<run_id>/<role>`, so
-    /// the two agents never touch the same directory — no shared mutable
-    /// state between the two concurrent branches, per code-standards.md
-    /// "Async & concurrence"). On an `Err` from either branch, `tokio::join!`
-    /// still awaits the other branch to completion before this returns, so a
-    /// failing reviewer never leaves the tester's worktree/process
-    /// bookkeeping half-done (the exception is a panic, which unwinds and
-    /// drops the sibling future without awaiting it — mitigated by
-    /// `kill_on_drop` on the spawned child process and `Worktree`'s `Drop`
-    /// impl, both of which clean up best-effort even on an ungraceful exit).
-    #[allow(clippy::too_many_arguments)]
-    async fn run_review_and_test<R: ToolAdapter>(
+    /// Independent reviewer invocation (issue #40): its own worktree, its
+    /// own agent spawn, its own findings extraction -- no longer entangled
+    /// with the tester's via `tokio::join!` (ADR-0003 amendment; the removed
+    /// `run_review_and_test` used to run both concurrently). Thin
+    /// role-fixing wrapper around `run_finding_agent`, which still does the
+    /// actual work; kept as its own named entry point so callers -- and the
+    /// two-phase review-gate loop landing in #41/#42 -- have a
+    /// `Reviewer`-only seam distinct from [`Self::run_test`], the one that
+    /// can be invoked scoped to a single correctif (`invocation.scope`,
+    /// decision #37 Q2).
+    async fn run_review<R: ToolAdapter>(
         &self,
         runner: &R,
-        run_id: &str,
-        cycle_id: &str,
-        cycle_number: u32,
-        config: &RunConfig,
-        agents: &ResolvedAgents,
-        worktree_manager: &WorktreeManager,
-        commit: &str,
-        diff: &str,
-        prior_findings: &[Finding],
-        cancel: CancellationToken,
+        invocation: ReviewInvocation<'_>,
     ) -> Result<Vec<Finding>> {
-        // ADR-0003 / issue #2 explicitly permit "tokio::join! ou
-        // équivalent"; code-standards.md's "sa propre task" phrasing is
-        // satisfied loosely here rather than via `tokio::spawn`. `join!`
-        // polls both futures concurrently on the current task, which is
-        // enough: the actual agent work happens in a child process started
-        // by `process::spawn` (with `kill_on_drop`), so a dedicated tokio
-        // task around `run_finding_agent` would add no real isolation --
-        // the child process is already the isolation boundary, and its
-        // worktree already gives it a private working directory.
-        let (reviewer_result, tester_result) = tokio::join!(
-            self.run_finding_agent(
-                runner,
-                FindingAgentInvocation {
-                    run_id,
-                    cycle_id,
-                    cycle_number,
-                    role: AgentRole::Reviewer,
-                    agent: &agents.reviewer,
-                    env_allowlist: agents.env_allowlist,
-                    worktree_manager,
-                    commit,
-                    diff,
-                    prior_findings,
-                    config,
-                    cancel: cancel.clone(),
-                }
-            ),
-            self.run_finding_agent(
-                runner,
-                FindingAgentInvocation {
-                    run_id,
-                    cycle_id,
-                    cycle_number,
-                    role: AgentRole::Tester,
-                    agent: &agents.tester,
-                    env_allowlist: agents.env_allowlist,
-                    worktree_manager,
-                    commit,
-                    diff,
-                    prior_findings,
-                    config,
-                    cancel,
-                }
-            )
-        );
+        let ReviewInvocation {
+            run_id,
+            cycle_id,
+            cycle_number,
+            agent,
+            env_allowlist,
+            worktree_manager,
+            commit,
+            diff,
+            prior_findings,
+            scope,
+            config,
+            cancel,
+        } = invocation;
+        self.run_finding_agent(
+            runner,
+            FindingAgentInvocation {
+                run_id,
+                cycle_id,
+                cycle_number,
+                role: AgentRole::Reviewer,
+                agent,
+                env_allowlist,
+                worktree_manager,
+                commit,
+                diff,
+                prior_findings,
+                scope,
+                config,
+                cancel,
+            },
+        )
+        .await
+    }
 
-        let mut findings = reviewer_result?;
-        findings.extend(tester_result?);
-        Ok(findings)
+    /// Independent tester invocation (issue #40): [`Self::run_review`]'s
+    /// mirror image, minus the `scope` axis a tester is never invoked with
+    /// (decision #37 Q2 only scopes the reviewer).
+    async fn run_test<R: ToolAdapter>(
+        &self,
+        runner: &R,
+        invocation: TestInvocation<'_>,
+    ) -> Result<Vec<Finding>> {
+        let TestInvocation {
+            run_id,
+            cycle_id,
+            cycle_number,
+            agent,
+            env_allowlist,
+            worktree_manager,
+            commit,
+            diff,
+            prior_findings,
+            config,
+            cancel,
+        } = invocation;
+        self.run_finding_agent(
+            runner,
+            FindingAgentInvocation {
+                run_id,
+                cycle_id,
+                cycle_number,
+                role: AgentRole::Tester,
+                agent,
+                env_allowlist,
+                worktree_manager,
+                commit,
+                diff,
+                prior_findings,
+                scope: warden_core::ReviewScope::Full,
+                config,
+                cancel,
+            },
+        )
+        .await
     }
 
     async fn run_finding_agent<R: ToolAdapter>(
@@ -1123,6 +1225,7 @@ impl Orchestrator {
             commit,
             diff,
             prior_findings,
+            scope,
             config,
             cancel,
         } = invocation;
@@ -1140,17 +1243,43 @@ impl Orchestrator {
 
         // ADR-0012: the reviewer/tester's own role, target commit, this
         // cycle's diff, and the findings that triggered the cycle -- plus,
-        // since ADR-0013, its own definition's system prompt.
-        // `for_finding_agent` refuses `AgentRole::Coder`, which can never
-        // happen here since `role` is always `Reviewer`/`Tester` at this
-        // call site.
-        let stdin_payload = warden_core::AgentInputMessage::for_finding_agent(
-            role,
-            &agent.system_prompt,
-            commit,
-            diff,
-            prior_findings.to_vec(),
-        )?
+        // since ADR-0013, its own definition's system prompt. `Correctif`
+        // (issue #40) is reviewer-only -- `TestInvocation` carries no
+        // `scope` field at all, so `run_test` can never reach that branch,
+        // but the match below still refuses it defensively for any other
+        // future caller of `run_finding_agent` rather than silently falling
+        // back to `Full` (code-standards.md: no silent fallback).
+        // `for_finding_agent`/`for_scoped_review` both refuse
+        // `AgentRole::Coder`, which can never happen here since `role` is
+        // always `Reviewer`/`Tester` at this call site.
+        let stdin_payload = match (role, scope) {
+            (AgentRole::Reviewer, warden_core::ReviewScope::Correctif) => {
+                warden_core::AgentInputMessage::for_scoped_review(
+                    &agent.system_prompt,
+                    commit,
+                    diff,
+                    prior_findings.to_vec(),
+                )?
+            }
+            (_, warden_core::ReviewScope::Correctif) => {
+                return Err(WardenError::Core(
+                    warden_core::CoreError::MalformedAgentInput(format!(
+                        "{} cannot be invoked with a scoped (\"correctif\") review -- only the \
+                         reviewer can be scoped",
+                        role.as_str()
+                    )),
+                ));
+            }
+            (_, warden_core::ReviewScope::Full) => {
+                warden_core::AgentInputMessage::for_finding_agent(
+                    role,
+                    &agent.system_prompt,
+                    commit,
+                    diff,
+                    prior_findings.to_vec(),
+                )?
+            }
+        }
         .to_json()?;
 
         let outcome = self
@@ -4199,18 +4328,21 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion 1 (issue #2), exercised directly against
-    /// `run_review_and_test` rather than through the full CLI: reviewer and
-    /// tester each write to a DIFFERENT file in their own worktree, then
-    /// (after a deliberate sleep long enough to overlap with the other
-    /// role's run) read back the *other* role's target file from their own
-    /// worktree. If the two roles ever shared a worktree/directory, the
-    /// other role's write -- which completes well before the sleep ends --
+    /// Acceptance criterion 1 (issue #2), updated for issue #40's
+    /// independent `run_review`/`run_test` (the removed `run_review_and_test`
+    /// used to exercise this concurrently via `tokio::join!`; reviewer and
+    /// tester now run sequentially, see `run_review_and_test_runs_...`
+    /// below): reviewer and tester each write to a DIFFERENT file in their
+    /// own worktree, then read back the *other* role's target file from
+    /// their own worktree. Each gets a fresh worktree checked out from the
+    /// same base `commit` (`WorktreeManager::create`, keyed by role), so if
+    /// the two ever shared a worktree/directory, the other role's write
     /// would already be visible here instead of the original, untouched
-    /// content. This distinguishes "isolated worktrees" from "shared
-    /// worktree" deterministically, regardless of exact interleaving.
+    /// content -- regardless of whether the two run concurrently or in
+    /// sequence, this is what distinguishes "isolated worktrees" from
+    /// "shared worktree".
     #[tokio::test]
-    async fn run_review_and_test_isolates_concurrent_writes_to_different_worktree_files() {
+    async fn run_review_and_test_isolates_writes_to_different_worktree_files() {
         let repo = init_test_repo();
         std::fs::write(repo.path().join("review_target.txt"), "original-review\n").unwrap();
         std::fs::write(repo.path().join("test_target.txt"), "original-test\n").unwrap();
@@ -4251,7 +4383,6 @@ mod tests {
                 "-c",
                 r#"
                 echo modified-by-reviewer > review_target.txt
-                sleep 0.3
                 seen=$(cat test_target.txt)
                 echo "{\"source\":\"reviewer\",\"severity\":\"info\",\"description\":\"review_target=modified-by-reviewer test_target_seen=$seen\"}"
                 "#,
@@ -4263,7 +4394,6 @@ mod tests {
                 "-c",
                 r#"
                 echo modified-by-tester > test_target.txt
-                sleep 0.3
                 seen=$(cat review_target.txt)
                 echo "{\"source\":\"tester\",\"severity\":\"info\",\"description\":\"test_target=modified-by-tester review_target_seen=$seen\"}"
                 "#,
@@ -4285,22 +4415,47 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
-        let findings = orchestrator
-            .run_review_and_test(
+        let mut findings = orchestrator
+            .run_review(
                 &FakeCommandAdapter,
-                "collision-run",
-                "collision-cycle",
-                1,
-                &config,
-                &agents,
-                &worktree_manager,
-                "HEAD",
-                "",
-                &[],
-                CancellationToken::new(),
+                ReviewInvocation {
+                    run_id: "collision-run",
+                    cycle_id: "collision-cycle",
+                    cycle_number: 1,
+                    agent: &agents.reviewer,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
             )
             .await
             .unwrap();
+        findings.extend(
+            orchestrator
+                .run_test(
+                    &FakeCommandAdapter,
+                    TestInvocation {
+                        run_id: "collision-run",
+                        cycle_id: "collision-cycle",
+                        cycle_number: 1,
+                        agent: &agents.tester,
+                        env_allowlist: agents.env_allowlist,
+                        worktree_manager: &worktree_manager,
+                        commit: "HEAD",
+                        diff: "",
+                        prior_findings: &[],
+                        config: &config,
+                        cancel: CancellationToken::new(),
+                    },
+                )
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(findings.len(), 2);
         let reviewer_finding = findings
@@ -4317,7 +4472,7 @@ mod tests {
                 .description
                 .contains("test_target_seen=original-test"),
             "reviewer's worktree must still see the untouched original \
-             test_target.txt, not the tester's concurrent write -- got: {}",
+             test_target.txt, not the tester's write -- got: {}",
             reviewer_finding.description
         );
         assert!(
@@ -4325,33 +4480,198 @@ mod tests {
                 .description
                 .contains("review_target_seen=original-review"),
             "tester's worktree must still see the untouched original \
-             review_target.txt, not the reviewer's concurrent write -- got: {}",
+             review_target.txt, not the reviewer's write -- got: {}",
             tester_finding.description
         );
     }
 
-    /// Acceptance criterion 2 (issue #2): "Temps de cycle mesurablement
-    /// réduit par rapport à la Phase 1" -- reviewer and tester must run
-    /// concurrently (`tokio::join!`), so total wall-clock time is dominated
-    /// by the slower of the two, not their sum.
+    /// Issue #40 / decision #37 Q2: a reviewer invoked through `run_review`
+    /// with `ReviewScope::Correctif` must receive a payload scoped to the
+    /// correctif's own diff plus the findings that prompted it -- captured
+    /// directly from what the reviewer agent actually reads off stdin, the
+    /// same way `every_role_receives_its_own_definitions_system_prompt_over_stdin`
+    /// captures a full-cycle payload.
+    #[tokio::test]
+    async fn run_review_with_a_correctif_scope_sends_the_reviewer_a_scoped_payload() {
+        let (repo, warden_home, _db_dir, pool, worktree_manager) =
+            finding_agent_test_fixture().await;
+        let payloads = TempDir::new().unwrap();
+
+        db::insert_run(
+            &pool,
+            "scoped-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "scoped-cycle", "scoped-run", 1)
+            .await
+            .unwrap();
+
+        let capturing_reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!("cat > '{}/reviewer.json'", payloads.path().display()),
+            ],
+        );
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "intent".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(capturing_reviewer),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
+        let orchestrator = Orchestrator::new(pool.clone());
+
+        let originating_finding = Finding {
+            source: warden_core::FindingSource::Reviewer,
+            severity: warden_core::Severity::Blocking,
+            file: Some("src/lib.rs".to_string()),
+            description: "unchecked unwrap".to_string(),
+            action: Some("handle the error".to_string()),
+        };
+
+        orchestrator
+            .run_review(
+                &FakeCommandAdapter,
+                ReviewInvocation {
+                    run_id: "scoped-run",
+                    cycle_id: "scoped-cycle",
+                    cycle_number: 1,
+                    agent: &agents.reviewer,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "diff --git a/x b/x\n+fixed the unwrap\n",
+                    prior_findings: std::slice::from_ref(&originating_finding),
+                    scope: warden_core::ReviewScope::Correctif,
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let raw = std::fs::read_to_string(payloads.path().join("reviewer.json"))
+            .expect("reviewer payload must have been captured");
+        let payload = warden_core::parse_agent_input_message(&raw)
+            .expect("a payload warden's own parser accepts");
+
+        assert_eq!(payload.scope, warden_core::ReviewScope::Correctif);
+        assert_eq!(
+            payload.diff.as_deref(),
+            Some("diff --git a/x b/x\n+fixed the unwrap\n")
+        );
+        assert_eq!(payload.findings, vec![originating_finding]);
+    }
+
+    /// Issue #40: `run_finding_agent` must refuse a `Correctif` scope for
+    /// any role but `AgentRole::Reviewer` -- defense in depth against a
+    /// future caller that (mis)constructs a `FindingAgentInvocation`
+    /// directly instead of going through `run_test` (whose `TestInvocation`
+    /// carries no `scope` field at all, so this path can't be reached via
+    /// the intended entry points).
+    #[tokio::test]
+    async fn run_finding_agent_rejects_a_correctif_scope_for_the_tester_role() {
+        let (repo, warden_home, _db_dir, pool, worktree_manager) =
+            finding_agent_test_fixture().await;
+
+        db::insert_run(
+            &pool,
+            "bad-scope-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "bad-scope-cycle", "bad-scope-run", 1)
+            .await
+            .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "intent".to_string(),
+            max_cycles: 3,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
+        let orchestrator = Orchestrator::new(pool.clone());
+
+        let result = orchestrator
+            .run_finding_agent(
+                &FakeCommandAdapter,
+                FindingAgentInvocation {
+                    run_id: "bad-scope-run",
+                    cycle_id: "bad-scope-cycle",
+                    cycle_number: 1,
+                    role: AgentRole::Tester,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    scope: warden_core::ReviewScope::Correctif,
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WardenError::Core(
+                    warden_core::CoreError::MalformedAgentInput(_)
+                ))
+            ),
+            "expected a typed rejection, got: {result:?}"
+        );
+    }
+
+    /// Issue #40 (ADR-0003 amendment): reviewer and tester must now run
+    /// **sequentially** -- the opposite of what this test asserted before
+    /// the removed `run_review_and_test`'s `tokio::join!` path. Regression
+    /// coverage for "no one quietly reintroduces `tokio::join!`/`try_join!`
+    /// here": `run_review` immediately followed by `run_test`, each backed
+    /// by a sleepy agent, must together take at least as long as both
+    /// sleeps combined, not just the slower one.
     ///
-    /// Deliberately not a fixed wall-clock threshold (e.g. `elapsed <
-    /// 1.5 * SLEEP`): under cargo's default parallel test harness, `git
+    /// Deliberately not a fixed wall-clock threshold (e.g. `elapsed >
+    /// 1.9 * SLEEP`): under cargo's default parallel test harness, `git
     /// worktree add` contention and process-spawn overhead from other
     /// worktree-creating tests running at the same time can push a single
     /// absolute bound past its margin without anything actually being wrong
-    /// -- non-deterministic per code-standards.md line 17. Instead, this
-    /// measures a **sequential baseline through the exact same code path**
-    /// (`run_finding_agent`, back-to-back: worktree create -> spawn -> wait
-    /// -> worktree remove -> DB writes, for reviewer then tester) and
-    /// compares it against the real `run_review_and_test` (`tokio::join!`)
-    /// path measured immediately after, on the same machine/run. Both
-    /// numbers absorb the same ambient overhead, so only their *ratio* is
-    /// asserted on: sequential is ~2x SLEEP + overhead, parallel is ~1x
-    /// SLEEP + overhead, so parallel must land under 75% of sequential
-    /// regardless of how loaded the machine is.
+    /// -- non-deterministic per code-standards.md line 17. Instead this
+    /// asserts on a *ratio* against `SLEEP` alone: a concurrent
+    /// (`tokio::join!`) path would land close to 1x `SLEEP` plus overhead; a
+    /// sequential one lands close to 2x. 1.5x is comfortably above the
+    /// concurrent case and comfortably below the sequential one regardless
+    /// of ambient load.
     #[tokio::test]
-    async fn run_review_and_test_runs_reviewer_and_tester_concurrently_not_sequentially() {
+    async fn run_review_and_test_runs_reviewer_and_tester_sequentially_not_concurrently() {
+        const SLEEP: Duration = Duration::from_millis(500);
+
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
@@ -4378,69 +4698,6 @@ mod tests {
 
         let orchestrator = Orchestrator::new(pool.clone());
 
-        // Sequential baseline: same real invocation (`run_finding_agent`)
-        // used for reviewer then tester, awaited back-to-back rather than
-        // concurrently. Uses its own run/cycle id so it doesn't share
-        // worktree paths or DB rows with the parallel measurement below.
-        db::insert_run(
-            &pool,
-            "sequential-run",
-            &repo.path().display().to_string(),
-            "main",
-            "timing check",
-            3,
-        )
-        .await
-        .unwrap();
-        db::insert_cycle(&pool, "sequential-cycle", "sequential-run", 1)
-            .await
-            .unwrap();
-
-        let sequential_start = std::time::Instant::now();
-        orchestrator
-            .run_finding_agent(
-                &FakeCommandAdapter,
-                FindingAgentInvocation {
-                    run_id: "sequential-run",
-                    cycle_id: "sequential-cycle",
-                    cycle_number: 1,
-                    role: AgentRole::Reviewer,
-                    agent: &agents.reviewer,
-                    env_allowlist: agents.env_allowlist,
-                    worktree_manager: &worktree_manager,
-                    commit: "HEAD",
-                    diff: "",
-                    prior_findings: &[],
-                    config: &config,
-                    cancel: CancellationToken::new(),
-                },
-            )
-            .await
-            .unwrap();
-        orchestrator
-            .run_finding_agent(
-                &FakeCommandAdapter,
-                FindingAgentInvocation {
-                    run_id: "sequential-run",
-                    cycle_id: "sequential-cycle",
-                    cycle_number: 1,
-                    role: AgentRole::Tester,
-                    agent: &agents.tester,
-                    env_allowlist: agents.env_allowlist,
-                    worktree_manager: &worktree_manager,
-                    commit: "HEAD",
-                    diff: "",
-                    prior_findings: &[],
-                    config: &config,
-                    cancel: CancellationToken::new(),
-                },
-            )
-            .await
-            .unwrap();
-        let sequential_elapsed = sequential_start.elapsed();
-
-        // Parallel path: the real `run_review_and_test`, measured right
-        // after, on the same machine/run as the baseline above.
         db::insert_run(
             &pool,
             "timing-run",
@@ -4455,31 +4712,53 @@ mod tests {
             .await
             .unwrap();
 
-        let parallel_start = std::time::Instant::now();
+        let start = std::time::Instant::now();
         orchestrator
-            .run_review_and_test(
+            .run_review(
                 &FakeCommandAdapter,
-                "timing-run",
-                "timing-cycle",
-                1,
-                &config,
-                &agents,
-                &worktree_manager,
-                "HEAD",
-                "",
-                &[],
-                CancellationToken::new(),
+                ReviewInvocation {
+                    run_id: "timing-run",
+                    cycle_id: "timing-cycle",
+                    cycle_number: 1,
+                    agent: &agents.reviewer,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
             )
             .await
             .unwrap();
-        let parallel_elapsed = parallel_start.elapsed();
+        orchestrator
+            .run_test(
+                &FakeCommandAdapter,
+                TestInvocation {
+                    run_id: "timing-run",
+                    cycle_id: "timing-cycle",
+                    cycle_number: 1,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
 
         assert!(
-            parallel_elapsed < sequential_elapsed.mul_f64(0.75),
-            "expected the tokio::join! path ({parallel_elapsed:?}) to be \
-             meaningfully faster than the sequential baseline \
-             ({sequential_elapsed:?}) -- this looks like reviewer/tester ran \
-             one after another instead of concurrently"
+            elapsed > SLEEP.mul_f64(1.5),
+            "expected run_review then run_test ({elapsed:?}) to together take \
+             meaningfully longer than a single {SLEEP:?} sleep -- this looks \
+             like reviewer/tester ran concurrently instead of sequentially"
         );
     }
 
@@ -4489,7 +4768,7 @@ mod tests {
     // nothing previously checked that a finding's own claimed `source`
     // actually belongs to the role that produced it. `run_finding_agent` is
     // exercised directly (the same seam
-    // `run_review_and_test_runs_reviewer_and_tester_concurrently_not_sequentially`
+    // `run_review_and_test_runs_reviewer_and_tester_sequentially_not_concurrently`
     // above already uses), so these observe the *replacement* finding
     // `run_finding_agent` actually returns, not just that some `Result`
     // fails somewhere.
@@ -4573,6 +4852,7 @@ mod tests {
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -4662,6 +4942,7 @@ mod tests {
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -4743,6 +5024,7 @@ mod tests {
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },

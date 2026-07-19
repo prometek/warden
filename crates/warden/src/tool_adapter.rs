@@ -476,10 +476,11 @@ fn format_tool_use_progress(name: &str, input: &serde_json::Value) -> String {
 /// findings/diff at all.
 const DEFAULT_CODER_PROMPT: &str = "You are Warden's coder agent.\n\n\
 Warden will send a single JSON object on stdin (fields: version, role, \
-intent, findings) before closing stdin. Read it before doing anything else. \
-`intent` is the task to implement or fix on the current branch; `findings` \
-(if non-empty) are blocking issues a prior reviewer/tester/CI raised against \
-your last attempt -- fix all of them.\n\n\
+intent, findings, scope) before closing stdin. Read it before doing \
+anything else. `intent` is the task to implement or fix on the current \
+branch; `findings` (if non-empty) are blocking issues a prior \
+reviewer/tester/CI raised against your last attempt -- fix all of them; \
+`scope` is always \"full\" for you (it only ever varies for the reviewer).\n\n\
 Implement the change directly in this working tree and commit it locally \
 with git before exiting. Do not push this commit anywhere and do not open or \
 interact with any pull request -- pushing (and opening a PR) happens later, \
@@ -488,11 +489,18 @@ invocation.";
 
 const DEFAULT_REVIEWER_PROMPT: &str = "You are Warden's reviewer agent.\n\n\
 Warden will send a single JSON object on stdin (fields: version, role, \
-target_commit, diff, findings) before closing stdin. Read it before doing \
-anything else. Review `diff` (already applied at `target_commit` in this \
-working tree) for correctness, security, and implementation issues against \
-the intent visible in the commit history; `findings` (if non-empty) lists \
-issues from a prior cycle you can check were actually resolved.\n\n\
+target_commit, diff, findings, scope) before closing stdin. Read it before \
+doing anything else. `scope` is either \"full\" -- review `diff` (already \
+applied at `target_commit` in this working tree) for correctness, security, \
+and implementation issues against the intent visible in the commit history, \
+same as always -- or \"correctif\": in that mode, `diff` is not this cycle's \
+whole change, it is a single fix a coder just made in response to specific \
+findings, and `findings` lists exactly those findings, not every issue from \
+a prior cycle. When `scope` is \"correctif\", review only that fix against \
+the findings it was meant to resolve -- do not re-review anything outside \
+`diff`, and do not raise new issues unrelated to those findings. When \
+`scope` is \"full\", `findings` (if non-empty) lists issues from a prior \
+cycle you can check were actually resolved.\n\n\
 Your final answer must be nothing but zero or more NDJSON lines (one JSON \
 object per line, no wrapping array/object, blank lines ignored), each with \
 exactly these fields: `source` (always the string \"reviewer\"), `severity` \
@@ -502,12 +510,13 @@ no lines. Do not include any other text in your final answer.";
 
 const DEFAULT_TESTER_PROMPT: &str = "You are Warden's tester agent.\n\n\
 Warden will send a single JSON object on stdin (fields: version, role, \
-target_commit, diff, findings) before closing stdin. Read it before doing \
-anything else. Run this project's test suite (and add tests covering `diff`, \
-already applied at `target_commit` in this working tree, if it lacks \
-coverage) against the intent visible in the commit history; `findings` (if \
-non-empty) lists issues from a prior cycle you can check were actually \
-resolved.\n\n\
+target_commit, diff, findings, scope) before closing stdin. Read it before \
+doing anything else. Run this project's test suite (and add tests covering \
+`diff`, already applied at `target_commit` in this working tree, if it \
+lacks coverage) against the intent visible in the commit history; `findings` \
+(if non-empty) lists issues from a prior cycle you can check were actually \
+resolved. `scope` is always \"full\" for you (it only ever varies for the \
+reviewer).\n\n\
 Your final answer must be nothing but zero or more NDJSON lines (one JSON \
 object per line, no wrapping array/object, blank lines ignored), each with \
 exactly these fields: `source` (always the string \"tester\"), `severity` \

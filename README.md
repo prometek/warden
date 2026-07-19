@@ -15,8 +15,9 @@ intermédiaire sans processus agent vivant est marqué `Failed`, et les ressourc
 laisser orphelines (worktrees git, processus agents encore en vie) sont automatiquement
 récupérées — y compris si un second crash interrompt la récupération elle-même. Une
 sauvegarde de la base SQLite est également prise avant toute migration de schéma.
-Reviewer et tester tournent **en parallèle** (`tokio::join!`), chacun
-dans son propre worktree synchronisé sur le commit du coder. Un second binaire,
+Reviewer et tester tournent **séquentiellement** (`run_review` puis `run_test`, deux
+fonctions indépendantes depuis l'issue #40 — plus de `tokio::join!` reviewer+tester),
+chacun dans son propre worktree synchronisé sur le commit du coder. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
 run et le hash validé en SQLite (connexion strictement lecture seule) avant tout push vers
@@ -277,7 +278,7 @@ est fermé (EOF) — un agent qui n'ouvre ou ne lit jamais stdin est un comporte
 non fatal au run :
 
 ```json
-{"version": 2, "role": "coder", "system_prompt": "Tu es le coder de Warden. ...", "intent": "Ajouter la validation d'email au formulaire d'inscription", "target_commit": null, "diff": null, "findings": []}
+{"version": 3, "role": "coder", "system_prompt": "Tu es le coder de Warden. ...", "intent": "Ajouter la validation d'email au formulaire d'inscription", "target_commit": null, "diff": null, "findings": [], "scope": "full"}
 ```
 
 - `role` : `"coder"`, `"reviewer"` ou `"tester"` — toujours présent.
@@ -299,6 +300,16 @@ non fatal au run :
   `null`. Le `diff` est tronqué à 8 Mio ; un diff tronqué porte le marqueur
   `\n\n[warden: diff truncated at the 8 MiB payload cap]\n` en fin de champ, détectable côté
   agent plutôt que silencieusement coupé.
+- `scope` (`"full"` ou `"correctif"`, issue #40) : toujours `"full"` pour coder/tester et pour
+  le reviewer sur un cycle normal. `"correctif"` est réservé au reviewer, posé uniquement par
+  `AgentInputMessage::for_scoped_review` (rejeté ailleurs, en écriture comme en lecture) — le
+  reviewer est alors invoqué en mode « regarde uniquement ce correctif » : `diff`/`findings`
+  portent le correctif du coder et les findings qui l'ont motivé (décision #37 Q2), au lieu du
+  contexte complet du cycle. `AGENT_INPUT_VERSION` est passé à **3** pour ce champ ; un payload
+  v2 (sans `scope`) est refusé explicitement, jamais lu en silence comme `scope: "full"` — même
+  convention de rétro-compatibilité que le passage 1 → 2. Ce mode scopé n'est pas encore câblé
+  dans la boucle de convergence (fondations seulement ; voir #41/#42/#43 pour la boucle à deux
+  phases qui l'utilisera).
 - L'environnement du sous-processus reste construit par `env_clear()` (jamais un héritage
   brut) : par défaut seul `PATH` est transmis, plus l'allowlist explicite que l'adaptateur
   `--tool` sélectionné déclare (`HOME`/`USER` pour `claude`, voir "Sécurité" dans
