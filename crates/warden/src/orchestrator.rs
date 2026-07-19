@@ -13,11 +13,21 @@
 //! diff); every re-review that follows a coder correction is scoped to just
 //! that correctif plus the findings that motivated it (decision #37 Q3,
 //! `has_reviewed_once`) -- issue #40's `ReviewScope`/`AgentInputMessage`
-//! payload. Phase B (issue #42: a scoped re-review loop for the tester's own
-//! findings, before ever returning to the tester) has not landed yet -- once
-//! the review gate opens, a clean cycle still only runs the tester once, and
-//! a tester finding reboucles to the coder like any other blocking finding,
-//! whose next review will be scoped as above. Each role still gets its own
+//! payload. **Phase B (issue #42)**: a tester finding reboucles to the coder
+//! exactly like a reviewer finding does (`decide_next_state` treats every
+//! blocking finding uniformly, whatever its source) -- so the coder's
+//! correctif for a tester finding goes through the very same scoped
+//! re-review gate above before the tester is ever handed that commit again.
+//! If that scoped re-review itself raises a finding (e.g. a regression the
+//! correctif introduced), the cycle reboucles to the coder once more without
+//! the tester running at all, and keeps doing so -- coder-reviewer only --
+//! until a re-review comes back clean; only then does the tester rerun. No
+//! extra state machinery was needed to land this: #41's gate was already
+//! generic over *why* a cycle reboucles, not specifically "the reviewer
+//! found something". Per-phase budgets and states (separately counting
+//! review-only reboucles against a review budget, never a test budget)
+//! remain #43's job -- this run still shares one `max_cycles` budget and one
+//! `RunState::AwaitingReviewTest` across both gates. Each role still gets its own
 //! worktree synced onto the coder's commit (see [`WorktreeManager::create`],
 //! keyed by role, so no two ever share a directory) -- that isolation was
 //! never *only* about concurrency safety, and stays valuable now purely as a
@@ -655,9 +665,12 @@ impl Orchestrator {
             // must never run before the reviewer is clean. The first
             // review of this run's body of work is full (the whole diff);
             // every re-review that follows a coder correction -- whether
-            // prompted by the reviewer itself here, or, once Phase B lands
-            // (#42), by the tester -- is scoped to just that correctif plus
-            // the findings that motivated it (decision #37 Q3).
+            // prompted by the reviewer itself here, or, per Phase B (#42),
+            // by the tester -- is scoped to just that correctif plus
+            // the findings that motivated it (decision #37 Q3). This branch
+            // does not need to know which role's finding triggered this
+            // cycle: `has_reviewed_once` only tracks whether the run has had
+            // its one full pass yet, not who asked for the reboucle.
             let review_scope = if has_reviewed_once {
                 warden_core::ReviewScope::Correctif
             } else {
@@ -695,11 +708,14 @@ impl Orchestrator {
             // Gate review clean == no blocking finding in `findings` so
             // far (reviewer + tampering). Only then may this cycle reach
             // Phase B (issue #41 acceptance criterion: "le tester ne
-            // tourne jamais avant que la review soit clean"). Phase B
-            // itself -- the tester's own scoped-re-review loop before
-            // returning to it -- is issue #42; for now a clean review
-            // simply lets the tester run once, mirroring the pre-#41
-            // behaviour once past this gate.
+            // tourne jamais avant que la review soit clean"). A clean
+            // review lets the tester run once this cycle; if it raises a
+            // blocking finding, `decide_next_state` below reboucles to the
+            // coder exactly like any other blocking finding would, and that
+            // reboucle's own re-review (above) is scoped to it -- issue #42,
+            // Phase B's "aucun retour au tester tant que le correctif n'est
+            // pas revu-clean" acceptance criterion, without this branch
+            // needing any special case for a tester-originated reboucle.
             let review_is_clean = !findings
                 .iter()
                 .any(|finding| finding.severity == warden_core::Severity::Blocking);
@@ -4430,6 +4446,305 @@ mod tests {
             warden_core::FindingSource::Reviewer
         );
         assert_eq!(second.findings[0].description, "status is broken");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #37/#42, ADR-0014: Phase B -- gate test. A tester finding
+    // reboucles to the coder exactly like a reviewer finding does (issue
+    // #41's gate is generic over the finding's source), so the very same
+    // "next review is scoped to the correctif" machinery (decision #37 Q3,
+    // `has_reviewed_once`) already re-reviews the coder's fix for a tester
+    // finding before the tester ever runs again -- these tests pin that down
+    // as an explicit acceptance criterion of #42, not just an incidental
+    // side effect of #41's generalization. Both reuse
+    // `flip_status_coder`-style deterministic fixtures rather than a real
+    // agent (ADR-0005).
+    // -----------------------------------------------------------------
+
+    /// Acceptance criteria (issue #42): "findings tester -> coder -> re-review
+    /// scopée -> retour tester" and "convergence = tester clean". The
+    /// reviewer here always passes (`always_passing_tester`), isolating the
+    /// reboucle to the tester's own finding: cycle 1's tester blocks on
+    /// `status.txt == "broken"`; cycle 2's coder fixes it, cycle 2's
+    /// re-review is scoped to exactly that tester finding, and -- once
+    /// clean -- the tester reruns and passes, converging.
+    #[tokio::test]
+    async fn a_tester_finding_reboucles_through_a_scoped_re_review_before_the_tester_reruns() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let tester_invocations = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // Captures its own stdin payload every invocation (same convention
+        // as `a_re_review_after_a_correction_is_scoped_while_the_first_review_is_full`),
+        // but never raises a finding of its own -- isolates this test to a
+        // tester-originated reboucle.
+        let capturing_reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    cat > "$dir/payload-$n.json"
+                    "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let counting_status_gated_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+                        echo '{{"source":"tester","severity":"blocking","description":"tester found status broken"}}'
+                    fi
+                    "#,
+                    tester_invocations.path().display()
+                ),
+            ],
+        );
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "flip status to fixed".to_string(),
+            max_cycles: 5,
+            coder_agent: definition(flip_status_coder()),
+            reviewer_agent: definition(capturing_reviewer),
+            tester_agent: definition(counting_status_gated_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::Converged,
+            "convergence must only happen once the tester itself is clean"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_cycle, 2,
+            "cycle 1 must reboucle on the tester's finding, cycle 2 must converge"
+        );
+
+        let invocation_count =
+            std::fs::read_to_string(tester_invocations.path().join("count")).unwrap();
+        assert_eq!(
+            invocation_count.trim(),
+            "2",
+            "the tester must run exactly twice: once to raise the finding, once to confirm the fix"
+        );
+
+        // Cycle 1's findings must be tester-sourced (the review was clean,
+        // so nothing from the reviewer is expected).
+        let cycle_1_findings = findings_for_cycle_number(&pool, &run_id, 1).await;
+        assert!(
+            cycle_1_findings
+                .iter()
+                .all(|f| f.source == warden_core::FindingSource::Tester),
+            "cycle 1's only finding must be the tester's: {cycle_1_findings:?}"
+        );
+        assert_eq!(cycle_1_findings.len(), 1);
+
+        let read_payload = |n: u32| {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("reviewer payload {n} must have been captured: {error}")
+                });
+            warden_core::parse_agent_input_message(&raw)
+                .expect("a payload warden's own parser accepts")
+        };
+
+        // Cycle 2's re-review must be scoped to exactly the tester finding
+        // that motivated the coder's correctif (decision #37 Q2: "le
+        // correctif + les findings tester qui l'ont motivé"), not a full
+        // pass over the whole diff again.
+        let second = read_payload(2);
+        assert_eq!(second.scope, warden_core::ReviewScope::Correctif);
+        assert_eq!(second.findings.len(), 1);
+        assert_eq!(
+            second.findings[0].source,
+            warden_core::FindingSource::Tester
+        );
+        assert_eq!(second.findings[0].description, "tester found status broken");
+    }
+
+    /// Acceptance criteria (issue #42): "aucun retour au tester tant que le
+    /// correctif n'est pas revu-clean" -- the invariant that no unreviewed
+    /// code ever reaches the tester. The coder here cycles through three
+    /// states (`buggy` -> `half-fixed` -> `fixed`): the tester blocks on
+    /// anything but `fixed`, and the reviewer blocks specifically on
+    /// `half-fixed` (simulating a regression introduced by the coder's own
+    /// attempt to address the tester's finding). This forces a second,
+    /// review-only reboucle between the tester's two runs -- the scoped
+    /// re-review loop must keep going back to the coder, without ever
+    /// letting the tester see `half-fixed`, until the reviewer itself is
+    /// clean again.
+    #[tokio::test]
+    async fn a_scoped_reviewer_finding_on_the_correctif_reboucles_again_before_the_tester_reruns() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let tester_invocations = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let three_state_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                if [ -f app.txt ]; then
+                    content=$(cat app.txt)
+                else
+                    content=""
+                fi
+                if [ "$content" = "half-fixed" ]; then
+                    echo fixed > app.txt
+                elif [ "$content" = "buggy" ]; then
+                    echo half-fixed > app.txt
+                else
+                    echo buggy > app.txt
+                fi
+                git add app.txt
+                git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                "#,
+            ],
+        );
+
+        let capturing_regression_gated_reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    cat > "$dir/payload-$n.json"
+                    if [ -f app.txt ] && [ "$(cat app.txt)" = "half-fixed" ]; then
+                        echo '{{"source":"reviewer","severity":"blocking","description":"half-fixed introduces a regression"}}'
+                    fi
+                    "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let counting_fixed_gated_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    if [ ! -f app.txt ] || [ "$(cat app.txt)" != "fixed" ]; then
+                        echo '{{"source":"tester","severity":"blocking","description":"app is not fixed yet"}}'
+                    fi
+                    "#,
+                    tester_invocations.path().display()
+                ),
+            ],
+        );
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "fix the app without regressing".to_string(),
+            max_cycles: 5,
+            coder_agent: definition(three_state_coder),
+            reviewer_agent: definition(capturing_regression_gated_reviewer),
+            tester_agent: definition(counting_fixed_gated_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_cycle, 3,
+            "cycle 1: tester blocks on buggy. cycle 2: reviewer blocks on the coder's own \
+             half-fixed regression, tester must not run. cycle 3: both clean, converges"
+        );
+
+        let invocation_count =
+            std::fs::read_to_string(tester_invocations.path().join("count")).unwrap();
+        assert_eq!(
+            invocation_count.trim(),
+            "2",
+            "the tester must run exactly twice -- cycle 1 and cycle 3 -- never cycle 2, while \
+             the correctif for cycle 1's finding was itself still under a blocking review"
+        );
+
+        // Cycle 2's findings must be reviewer-sourced only -- direct
+        // evidence the tester never saw the `half-fixed` commit, not just an
+        // inference from the invocation counter.
+        let cycle_2_findings = findings_for_cycle_number(&pool, &run_id, 2).await;
+        assert!(
+            cycle_2_findings
+                .iter()
+                .all(|f| f.source == warden_core::FindingSource::Reviewer),
+            "cycle 2's only finding must be the reviewer's own regression finding: \
+             {cycle_2_findings:?}"
+        );
+        assert_eq!(cycle_2_findings.len(), 1);
+
+        let read_payload = |n: u32| {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("reviewer payload {n} must have been captured: {error}")
+                });
+            warden_core::parse_agent_input_message(&raw)
+                .expect("a payload warden's own parser accepts")
+        };
+
+        // Cycle 3's re-review must be scoped to cycle 2's own regression
+        // finding -- the one that actually motivated this correctif -- not
+        // the original (already-superseded) tester finding from cycle 1.
+        let third = read_payload(3);
+        assert_eq!(third.scope, warden_core::ReviewScope::Correctif);
+        assert_eq!(third.findings.len(), 1);
+        assert_eq!(
+            third.findings[0].source,
+            warden_core::FindingSource::Reviewer
+        );
+        assert_eq!(
+            third.findings[0].description,
+            "half-fixed introduces a regression"
+        );
     }
 
     #[tokio::test]

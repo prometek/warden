@@ -7,6 +7,38 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #42 (sous-tâche #37.3) / ADR-0014 : Phase B — gate test avec re-review scopée avant tout retour au tester
+
+- **Un finding du tester reboucle vers le coder exactement comme un finding du reviewer** :
+  `decide_next_state` (`crates/warden-core/src/convergence.rs`) traite déjà tout finding
+  bloquant de façon uniforme, quelle que soit sa source — ce qui signifie que la gate de
+  re-review scopée livrée par #41 (`has_reviewed_once`/`ReviewScope::Correctif`) rejouait déjà,
+  sans code supplémentaire, exactement le comportement demandé par #42 : la correction du coder
+  pour un finding du tester repasse par la même re-review scopée (portant sur le correctif et
+  les findings du tester qui l'ont motivé, décision #37 Q2) avant que le tester ne soit jamais
+  rappelé sur ce commit. Si cette re-review relève à son tour un finding (p. ex. une régression
+  introduite par le correctif), le cycle reboucle vers le coder sans jamais rappeler le tester,
+  et continue ainsi coder↔reviewer jusqu'à ce que la review soit clean — la convergence n'est
+  atteinte que quand le tester lui-même est clean (invariant #42 : "aucun code non-revu
+  n'atteint le tester"). Aucun changement de `run_convergence_loop` n'a donc été nécessaire ;
+  seuls les commentaires de `crates/warden/src/orchestrator.rs` (module + gate review/gate test)
+  ont été mis à jour pour documenter explicitement ce comportement au lieu de le décrire comme
+  "pas encore livré".
+- Deux nouveaux tests verrouillent ce comportement comme critère d'acceptation explicite de #42
+  plutôt que comme simple effet de bord de la généralisation de #41 :
+  `a_tester_finding_reboucles_through_a_scoped_re_review_before_the_tester_reruns` (un finding du
+  tester déclenche une correction, une re-review scopée à ce finding, puis un nouveau passage du
+  tester qui converge) et
+  `a_scoped_reviewer_finding_on_the_correctif_reboucles_again_before_the_tester_reruns` (le
+  correctif du coder introduit lui-même une régression relevée par la re-review scopée : le
+  cycle reboucle vers le coder une deuxième fois — sans jamais rappeler le tester — avant que la
+  review ne soit clean et que le tester ne reprenne la main).
+- **Limite connue, héritée de #43 non livrée** : le budget des re-reviews scopées n'est pas
+  imputé à un budget review séparé d'un budget test — ce dépôt ne porte encore qu'un unique
+  `max_cycles` et un unique `RunState::AwaitingReviewTest`, partagés entre les deux gates (état
+  et budget par phase : #43). Aucune migration ni état supplémentaire n'a été ajouté ici pour
+  rester dans le périmètre de #42.
+
 ### Changed — Issue #41 (sous-tâche #37.2) / ADR-0014 (nouvelle) : Phase A — boucle de gate review (coder↔reviewer jusqu'à clean)
 
 - **Le tester est désormais gated derrière une review clean** : `run_convergence_loop`
