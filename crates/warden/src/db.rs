@@ -1532,6 +1532,103 @@ mod tests {
         );
     }
 
+    /// Issue #43 (#37.4): `0007_phase_budgets.sql` must not just add the new
+    /// per-phase columns -- it also has to carry forward rows already
+    /// sitting on the pre-#43 schema (single `max_cycles`/`current_cycle`,
+    /// and `RunState` string values only the removed
+    /// `AwaitingReviewTest`/`MaxCyclesExceeded` variants ever wrote:
+    /// `awaiting_review_test`/`max_cycles_exceeded`). Every other test in
+    /// this module goes through `connect`/`test_pool`, which always starts
+    /// from an empty file and so applies migration 0007 against zero rows --
+    /// it would pass even if the `UPDATE runs SET state = ...` remap
+    /// statements were deleted entirely. This test instead seeds a row on
+    /// the *pre-0007* schema (mirroring
+    /// `connect_backs_up_a_pre_existing_database_before_applying_pending_migrations`'s
+    /// `Migrator::run_to` technique to stop short of 0007), then lets
+    /// `MIGRATOR.run` apply 0007 for real and checks the row lands exactly
+    /// where the migration's own comments say it should.
+    #[tokio::test]
+    async fn phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strings() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let pre_phase_budgets_version = migrations[migrations.len() - 2].version;
+
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+
+            MIGRATOR
+                .run_to(pre_phase_budgets_version, &pool)
+                .await
+                .unwrap();
+
+            // Two rows, each pinned on a distinct legacy `state` string the
+            // migration must remap, both still on the single `max_cycles`/
+            // `current_cycle` pair 0007 replaces.
+            sqlx::query(
+                "INSERT INTO runs (id, repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at) \
+                 VALUES ('run-mid-cycle', '/tmp/repo', 'main', 'legacy mid-cycle run', 'awaiting_review_test', 5, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO runs (id, repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at) \
+                 VALUES ('run-exhausted', '/tmp/repo', 'main', 'legacy exhausted run', 'max_cycles_exceeded', 4, 4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            pool.close().await;
+        }
+
+        // Re-`connect` applies every remaining pending migration, including
+        // 0007, against the seeded rows above.
+        let pool = connect(&db_path).await.unwrap();
+
+        let mid_cycle = get_run(&pool, "run-mid-cycle").await.unwrap().unwrap();
+        assert_eq!(
+            mid_cycle.state,
+            RunState::Reviewing,
+            "a legacy 'awaiting_review_test' row must remap onto Reviewing, per the migration's \
+             own comment (the specific phase can't be recovered from the string alone, but both \
+             Reviewing/Testing are equally is_intermediate so crash recovery behaves the same)"
+        );
+        assert_eq!(
+            mid_cycle.max_review_cycles, 5,
+            "the old single max_cycles becomes both phases' starting budget"
+        );
+        assert_eq!(mid_cycle.max_test_cycles, 5);
+        assert_eq!(
+            mid_cycle.current_review_cycle, 3,
+            "the old single current_cycle becomes the review phase's starting progress"
+        );
+        assert_eq!(
+            mid_cycle.current_test_cycle, 0,
+            "current_test_cycle has no legacy equivalent to carry forward, so it starts at 0"
+        );
+
+        let exhausted = get_run(&pool, "run-exhausted").await.unwrap().unwrap();
+        assert_eq!(
+            exhausted.state,
+            RunState::MaxReviewCyclesExceeded,
+            "a legacy 'max_cycles_exceeded' row must remap onto MaxReviewCyclesExceeded"
+        );
+        assert_eq!(exhausted.max_review_cycles, 4);
+        assert_eq!(exhausted.max_test_cycles, 4);
+        assert_eq!(exhausted.current_review_cycle, 4);
+        assert_eq!(exhausted.current_test_cycle, 0);
+    }
+
     /// Issue #6: "a failed backup aborts migration (fails loud) rather than
     /// proceeding". Forces `VACUUM INTO` to fail by revoking write
     /// permission on the directory the backup file would be created in
