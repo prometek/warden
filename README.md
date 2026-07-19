@@ -23,8 +23,15 @@ que si la review de ce cycle est *clean* (aucun finding bloquant du reviewer, ni
 vérification de définition d'agent) ; sinon le cycle reboucle directement vers le coder sans
 lancer le tester. Le premier passage reviewer d'un run porte sur le diff complet (`scope:
 full`), chaque re-review suivant une correction est **scopée** au correctif (`scope:
-correctif`, issue #40). Les budgets par phase, les états par phase et la boucle de re-review
-scopée côté tester (Phase B) ne sont **pas encore livrés** — voir #42/#43. Un second binaire,
+correctif`, issue #40). Depuis l'issue #42 (Phase B, ADR-0014), un finding du tester reboucle
+vers le coder exactement comme un finding du reviewer : sa correction repasse par la même gate
+de re-review scopée (portant sur le correctif et les findings du tester qui l'ont motivé,
+décision #37 Q2) avant que le tester ne soit jamais rappelé — si cette re-review relève à son
+tour un finding, le cycle reboucle vers le coder sans jamais rappeler le tester, jusqu'à ce que
+la review soit clean ; la convergence n'est atteinte que quand le tester lui-même est clean.
+Les budgets et états dédiés par phase (compter les reboucles de re-review sur un budget review
+distinct du budget test) restent **pas encore livrés** — voir #43 ; ce run partage encore un
+unique `max_cycles` et un unique `RunState::AwaitingReviewTest` entre les deux gates. Un second binaire,
 `warden-gated`, forme désormais la frontière de sécurité vers le remote réel
 (ADR-0002/ADR-0006) : il ne partage aucun code I/O avec `warden`, relit lui-même l'état du
 run et le hash validé en SQLite (connexion strictement lecture seule) avant tout push vers
@@ -314,9 +321,11 @@ non fatal au run :
   portent le correctif du coder et les findings qui l'ont motivé (décision #37 Q2), au lieu du
   contexte complet du cycle. `AGENT_INPUT_VERSION` est passé à **3** pour ce champ ; un payload
   v2 (sans `scope`) est refusé explicitement, jamais lu en silence comme `scope: "full"` — même
-  convention de rétro-compatibilité que le passage 1 → 2. Ce mode scopé n'est pas encore câblé
-  dans la boucle de convergence (fondations seulement ; voir #41/#42/#43 pour la boucle à deux
-  phases qui l'utilisera).
+  convention de rétro-compatibilité que le passage 1 → 2. Ce mode scopé est câblé dans la boucle
+  de convergence depuis l'issue #41 (Phase A) : le premier passage du reviewer sur un run est
+  `"full"`, toute ré-invocation suivante est `"correctif"`, que la correction ait été motivée par
+  le reviewer lui-même ou par le tester (Phase B, issue #42) — voir "État du projet" ci-dessus
+  pour le détail de la gate à deux phases.
 - L'environnement du sous-processus reste construit par `env_clear()` (jamais un héritage
   brut) : par défaut seul `PATH` est transmis, plus l'allowlist explicite que l'adaptateur
   `--tool` sélectionné déclare (`HOME`/`USER` pour `claude`, voir "Sécurité" dans
