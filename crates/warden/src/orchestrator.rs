@@ -1,17 +1,28 @@
-//! The convergence loop: coder -> review/test -> reboucle if findings
-//! (Architecture.md §5.1).
+//! The convergence loop: coder -> [gate review] -> [gate test] -> reboucle
+//! if findings (Architecture.md §5.1, ADR-0014).
 //!
-//! **ADR-0003 amendment (issue #40)**: reviewer and tester no longer run in
-//! parallel via `tokio::join!` -- [`Orchestrator::run_review`] then
-//! [`Orchestrator::run_test`] run **sequentially**, an intermediate step
-//! toward the two-phase review-gate/test-gate loop (issue #37, #41/#42) that
-//! also closes the token-conflict/collision risk the old parallel path
-//! carried. Each still gets its own worktree synced onto the coder's commit
-//! (see [`WorktreeManager::create`], keyed by role, so the two never share a
-//! directory) -- that isolation was never *only* about concurrency safety,
-//! and stays valuable now purely as a boundary between roles. Every
-//! [`RunState`] transition is written to SQLite *before* the action it
-//! authorizes, per ADR-0004.
+//! **ADR-0014 (issue #37), Phase A landed by #41**: reviewer and tester no
+//! longer run in parallel (ADR-0003 amendment, issue #40's `tokio::join!`
+//! removal), and the tester is now **gated** on the reviewer being clean --
+//! [`Orchestrator::run_review`] runs first every cycle, and
+//! [`Orchestrator::run_test`] only runs at all once that cycle's review
+//! carries no blocking finding (see the `review_is_clean` check in
+//! [`Orchestrator::run_convergence_loop`]'s loop body). A cycle whose review
+//! is not clean reboucles straight back to the coder without the tester ever
+//! running. The very first review of a run's body of work is full (the whole
+//! diff); every re-review that follows a coder correction is scoped to just
+//! that correctif plus the findings that motivated it (decision #37 Q3,
+//! `has_reviewed_once`) -- issue #40's `ReviewScope`/`AgentInputMessage`
+//! payload. Phase B (issue #42: a scoped re-review loop for the tester's own
+//! findings, before ever returning to the tester) has not landed yet -- once
+//! the review gate opens, a clean cycle still only runs the tester once, and
+//! a tester finding reboucles to the coder like any other blocking finding,
+//! whose next review will be scoped as above. Each role still gets its own
+//! worktree synced onto the coder's commit (see [`WorktreeManager::create`],
+//! keyed by role, so no two ever share a directory) -- that isolation was
+//! never *only* about concurrency safety, and stays valuable now purely as a
+//! boundary between roles. Every [`RunState`] transition is written to
+//! SQLite *before* the action it authorizes, per ADR-0004.
 //!
 //! Phase 8 (ADR-0008, issue #8): every significant transition is also
 //! published as a [`RunEvent`] -- persisted to `events` and broadcast live on
@@ -569,6 +580,13 @@ impl Orchestrator {
         // "prior-cycle findings" context below (`None` on a run's first
         // cycle, which has no prior cycle to report on).
         let mut previous_cycle_id: Option<String> = None;
+        // Issue #37/#41, ADR-0014, decision #37 Q3: `false` until the
+        // reviewer has completed one full pass over this run's body of
+        // work; every reviewer invocation after that first one is scoped to
+        // just the coder's latest correctif, in Phase A as in Phase B --
+        // tracked across cycles (not reset per cycle) because "first
+        // review" means the run's very first one, not each cycle's.
+        let mut has_reviewed_once = false;
 
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
@@ -625,17 +643,26 @@ impl Orchestrator {
                 .await?;
             base_commit = coder_result.commit;
 
-            // Write-ahead: about to launch reviewer + tester.
+            // Write-ahead: about to launch the reviewer. `AwaitingReviewTest`
+            // still names this wait even though, from here until the
+            // review-gate opens, only the reviewer runs -- splitting it
+            // into a state per phase is #43's job (state machine/budget
+            // rework, issue #37), out of scope for this gate itself.
             self.transition(&run_id, RunState::AwaitingReviewTest)
                 .await?;
 
-            // Issue #40 (ADR-0003 amendment): reviewer then tester,
-            // sequentially -- an intermediate step toward the two-phase
-            // review-gate/test-gate loop (issue #37, #41/#42), and an
-            // immediate token-conflict gain on its own (no more concurrent
-            // agents racing over the same coder commit). Both run a full
-            // (unscoped) pass here -- scoped re-review only starts once the
-            // two-phase loop lands.
+            // Phase A -- gate review (issue #37/#41, ADR-0014): the tester
+            // must never run before the reviewer is clean. The first
+            // review of this run's body of work is full (the whole diff);
+            // every re-review that follows a coder correction -- whether
+            // prompted by the reviewer itself here, or, once Phase B lands
+            // (#42), by the tester -- is scoped to just that correctif plus
+            // the findings that motivated it (decision #37 Q3).
+            let review_scope = if has_reviewed_once {
+                warden_core::ReviewScope::Correctif
+            } else {
+                warden_core::ReviewScope::Full
+            };
             let mut findings = self
                 .run_review(
                     &runner,
@@ -649,38 +676,53 @@ impl Orchestrator {
                         commit: &base_commit,
                         diff: &coder_result.diff,
                         prior_findings: &prior_findings,
-                        scope: warden_core::ReviewScope::Full,
+                        scope: review_scope,
                         config: &config,
                         cancel: cancel.clone(),
                     },
                 )
                 .await?;
-            findings.extend(
-                self.run_test(
-                    &runner,
-                    TestInvocation {
-                        run_id: &run_id,
-                        cycle_id: &cycle_id,
-                        cycle_number,
-                        agent: &agents.tester,
-                        env_allowlist: agents.env_allowlist,
-                        worktree_manager: &worktree_manager,
-                        commit: &base_commit,
-                        diff: &coder_result.diff,
-                        prior_findings: &prior_findings,
-                        config: &config,
-                        cancel: cancel.clone(),
-                    },
-                )
-                .await?,
-            );
+            has_reviewed_once = true;
 
-            // Issue #24 review, M4: folded in alongside the reviewer/
-            // tester's own findings -- persisted, published, and factored
-            // into `decide_next_state` exactly like any of theirs (or a CI
-            // finding, ADR-0011), rather than a parallel gate of its own.
+            // Issue #24 review, M4: folded in alongside the reviewer's own
+            // findings -- an unresolved definition-tampering finding gates
+            // Phase A exactly like a reviewer finding does; the tester must
+            // never run over a coder commit that still carries one either.
             if let Some(finding) = coder_result.definition_tampering_finding {
                 findings.push(finding);
+            }
+
+            // Gate review clean == no blocking finding in `findings` so
+            // far (reviewer + tampering). Only then may this cycle reach
+            // Phase B (issue #41 acceptance criterion: "le tester ne
+            // tourne jamais avant que la review soit clean"). Phase B
+            // itself -- the tester's own scoped-re-review loop before
+            // returning to it -- is issue #42; for now a clean review
+            // simply lets the tester run once, mirroring the pre-#41
+            // behaviour once past this gate.
+            let review_is_clean = !findings
+                .iter()
+                .any(|finding| finding.severity == warden_core::Severity::Blocking);
+            if review_is_clean {
+                findings.extend(
+                    self.run_test(
+                        &runner,
+                        TestInvocation {
+                            run_id: &run_id,
+                            cycle_id: &cycle_id,
+                            cycle_number,
+                            agent: &agents.tester,
+                            env_allowlist: agents.env_allowlist,
+                            worktree_manager: &worktree_manager,
+                            commit: &base_commit,
+                            diff: &coder_result.diff,
+                            prior_findings: &prior_findings,
+                            config: &config,
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await?,
+                );
             }
 
             for finding in &findings {
@@ -1122,11 +1164,11 @@ impl Orchestrator {
     /// with the tester's via `tokio::join!` (ADR-0003 amendment; the removed
     /// `run_review_and_test` used to run both concurrently). Thin
     /// role-fixing wrapper around `run_finding_agent`, which still does the
-    /// actual work; kept as its own named entry point so callers -- and the
-    /// two-phase review-gate loop landing in #41/#42 -- have a
-    /// `Reviewer`-only seam distinct from [`Self::run_test`], the one that
-    /// can be invoked scoped to a single correctif (`invocation.scope`,
-    /// decision #37 Q2).
+    /// actual work; kept as its own named entry point so callers -- the
+    /// gate-review loop (issue #41) and its Phase B scoped-re-review
+    /// follow-up (#42) -- have a `Reviewer`-only seam distinct from
+    /// [`Self::run_test`], the one that can be invoked scoped to a single
+    /// correctif (`invocation.scope`, decision #37 Q2).
     async fn run_review<R: ToolAdapter>(
         &self,
         runner: &R,
@@ -4071,6 +4113,200 @@ mod tests {
             .unwrap();
 
         assert_eq!(final_state, RunState::MaxCyclesExceeded);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #37/#41, ADR-0014: Phase A -- gate review. The tester must
+    // never run while the reviewer still has a blocking finding, the first
+    // review of a run is full, and every re-review that follows a coder
+    // correction is scoped to that correctif (decision #37 Q3).
+    // -----------------------------------------------------------------
+
+    /// Acceptance criterion (issue #41): "le tester ne tourne jamais avant
+    /// que la review soit clean". `flip_status_coder`/`status_gated_reviewer`
+    /// deterministically block cycle 1 (status "broken") and pass cycle 2
+    /// (status "fixed") -- exactly like `full_cycle_reboucles_once_then_converges`
+    /// -- but here the tester itself counts its own invocations into a file
+    /// outside any worktree, so this asserts the tester ran **exactly once**
+    /// (in cycle 2, once the review gate opened), never during cycle 1's
+    /// blocking review.
+    #[tokio::test]
+    async fn tester_never_runs_while_the_reviewer_still_has_a_blocking_finding() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let tester_invocations = TempDir::new().unwrap();
+
+        let counting_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    "#,
+                    tester_invocations.path().display()
+                ),
+            ],
+        );
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "flip status to fixed".to_string(),
+            max_cycles: 5,
+            coder_agent: definition(flip_status_coder()),
+            reviewer_agent: definition(status_gated_reviewer()),
+            tester_agent: definition(counting_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_cycle, 2,
+            "cycle 1 must block on the reviewer, cycle 2 must converge, exactly like \
+             full_cycle_reboucles_once_then_converges"
+        );
+
+        let invocation_count = std::fs::read_to_string(tester_invocations.path().join("count"))
+            .unwrap_or_else(|error| {
+                panic!("expected the tester to have run at least once: {error}")
+            });
+        assert_eq!(
+            invocation_count.trim(),
+            "1",
+            "the tester must run exactly once -- never during cycle 1, while the reviewer's \
+             finding was still blocking"
+        );
+
+        // Cycle 1's persisted findings must carry the reviewer's own
+        // blocking finding and nothing sourced from the tester -- direct
+        // evidence the tester never ran that cycle, not just an inference
+        // from the invocation counter.
+        let cycle_1_findings = findings_for_cycle_number(&pool, &run_id, 1).await;
+        assert!(
+            cycle_1_findings
+                .iter()
+                .any(|f| f.source == warden_core::FindingSource::Reviewer),
+            "expected the status-gated reviewer's blocking finding in cycle 1: {cycle_1_findings:?}"
+        );
+        assert!(
+            !cycle_1_findings
+                .iter()
+                .any(|f| f.source == warden_core::FindingSource::Tester),
+            "no tester-sourced finding must exist for cycle 1 -- the tester never ran: \
+             {cycle_1_findings:?}"
+        );
+    }
+
+    /// Acceptance criteria (issue #41): "premier review complet, re-reviews
+    /// suivantes scopées (via payload #40)" and "boucle coder<->reviewer
+    /// jusqu'à 0 finding review". Captures the reviewer's own stdin payload
+    /// every cycle (the same convention `the_coder_receives_the_prior_cycle_findings_it_must_fix`
+    /// uses for the coder) across the same deterministic two-cycle
+    /// reboucle as `full_cycle_reboucles_once_then_converges`: cycle 1's
+    /// review must be `ReviewScope::Full` with no originating findings;
+    /// cycle 2's re-review -- following the coder's correction -- must be
+    /// `ReviewScope::Correctif`, carrying exactly the finding that
+    /// prompted it.
+    #[tokio::test]
+    async fn a_re_review_after_a_correction_is_scoped_while_the_first_review_is_full() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // Behaves exactly like `status_gated_reviewer`, but first records
+        // its own stdin payload to `payload-<n>.json` (outside the
+        // worktree, which is removed at the end of every cycle).
+        let capturing_reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                    dir='{}'
+                    n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                    n=$((n + 1))
+                    echo "$n" > "$dir/count"
+                    cat > "$dir/payload-$n.json"
+                    if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+                        echo '{{"source":"reviewer","severity":"blocking","description":"status is broken"}}'
+                    fi
+                    "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "flip status to fixed".to_string(),
+            max_cycles: 5,
+            coder_agent: definition(flip_status_coder()),
+            reviewer_agent: definition(capturing_reviewer),
+            tester_agent: definition(always_passing_tester()),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let read_payload = |n: u32| {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("reviewer payload {n} must have been captured: {error}")
+                });
+            warden_core::parse_agent_input_message(&raw)
+                .expect("a payload warden's own parser accepts")
+        };
+
+        // Cycle 1: the run's first ever review -- full, nothing has
+        // motivated it yet.
+        let first = read_payload(1);
+        assert_eq!(first.role, AgentRole::Reviewer);
+        assert_eq!(first.scope, warden_core::ReviewScope::Full);
+        assert!(
+            first.findings.is_empty(),
+            "the first review has no originating findings: {:?}",
+            first.findings
+        );
+
+        // Cycle 2: a re-review following the coder's correction for cycle
+        // 1's blocking finding -- scoped to that correctif, per decision
+        // #37 Q3.
+        let second = read_payload(2);
+        assert_eq!(second.role, AgentRole::Reviewer);
+        assert_eq!(second.scope, warden_core::ReviewScope::Correctif);
+        assert_eq!(second.findings.len(), 1);
+        assert_eq!(
+            second.findings[0].source,
+            warden_core::FindingSource::Reviewer
+        );
+        assert_eq!(second.findings[0].description, "status is broken");
     }
 
     #[tokio::test]
