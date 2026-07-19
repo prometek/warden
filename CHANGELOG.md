@@ -7,6 +7,37 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #41 (sous-tâche #37.2) / ADR-0014 (nouvelle) : Phase A — boucle de gate review (coder↔reviewer jusqu'à clean)
+
+- **Le tester est désormais gated derrière une review clean** : `run_convergence_loop`
+  lance `run_review` en premier à chaque cycle, et n'appelle `run_test` que si ce
+  cycle-là ne porte aucun finding bloquant (reviewer + le finding de trafiquage de
+  définition existant, issue #24 M4). Un cycle dont la review n'est pas clean reboucle
+  directement vers le coder — le tester ne tourne jamais sur du code pas encore validé
+  par le reviewer (issue #41, critère d'acceptation).
+- **Re-review scopée après la première** : le premier passage du reviewer sur le corps
+  de travail d'un run est complet (`ReviewScope::Full`, tout le diff) ; chaque
+  ré-invocation suivante — après une correction du coder — est scopée
+  (`ReviewScope::Correctif`, décision #37 Q3) au correctif plus les findings qui l'ont
+  motivé, via le payload `AgentInputMessage`/`ReviewScope` introduit par #40. Suivi sur
+  toute la durée du run (`has_reviewed_once`), jamais remis à zéro par cycle.
+- **ADR-0014 (nouvelle, issue #37)** : remplace le parallélisme réel review/test
+  d'ADR-0003 par une convergence en **deux phases à portes** — Phase A : boucle
+  coder↔reviewer jusqu'à review clean (livrée ici) ; Phase B (#42, pas encore livrée) :
+  boucle tester→coder→**re-review scopée**→tester jusqu'à tester clean, sans jamais
+  laisser de code non revu atteindre le tester. Budgets séparés par phase et états dédiés
+  (`decide_next_state` conscient de la phase) restent à câbler par #43 — cette livraison
+  garde volontairement un budget/état unique (`max_cycles`, `RunState::AwaitingReviewTest`)
+  pour rester dans le périmètre de #41. **Cette entrée de CHANGELOG est, pour l'instant,
+  le seul enregistrement écrit de la décision ADR-0014** (pas de fichier `ADR-0014.md`
+  séparé — ce dépôt n'a pas de dossier `ADR/` versionné, même convention que les
+  amendements ADR-0003/ADR-0012/ADR-0013 documentés uniquement ici par #40) ; le
+  write-up complet (détails Phase B, budgets/états par phase) suivra au fil de #42/#43.
+- Deux nouveaux tests couvrant le critère d'acceptation : le tester ne tourne jamais
+  tant que la review n'est pas clean (compteur d'invocations dédié), et la première
+  review est complète tandis que la ré-review qui suit une correction est scopée
+  (payload stdin capturé et reparsé).
+
 ### Changed — Issue #40 (sous-tâche #37.1) / ADR-0003, ADR-0012, ADR-0013 (amendements) : `run_review`/`run_test` indépendantes + reviewer scopé (fondations)
 
 - **Suppression de `run_review_and_test`** (le `tokio::join!` reviewer+tester,
