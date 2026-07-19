@@ -25,11 +25,21 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   review ; `Tester` débite le budget test. Une re-review scopée motivée par un finding
   du tester est ainsi imputée au budget review, jamais au budget test — le critère
   d'acceptation central de #43 — verrouillé par
-  `a_scoped_re_review_finding_after_a_tester_reboucle_is_charged_to_the_review_budget_not_test`
-  et les tests d'intégration `max_review_cycles_exceeded_when_reviewer_findings_never_clear`
-  / `max_test_cycles_exceeded_when_tester_findings_never_clear` (ce dernier avec un budget
-  review large et un budget test étroit, pour prouver que c'est bien la bonne phase qui
-  s'épuise).
+  `a_scoped_re_review_finding_after_a_tester_reboucle_is_charged_to_the_review_budget_not_test`.
+- **Budgets réellement indépendants (relecture, correction MEDIUM)** : `run_convergence_loop`
+  tient désormais un compteur `review_cycle_number` dédié, distinct du compteur global de
+  cycle de la boucle — il n'avance que sur un cycle dont le reboucle est effectivement imputé
+  à la review (finding bloquant `Reviewer`/`Warden`), jamais simplement parce que le reviewer
+  a tourné ce cycle-là. La première version confondait les deux compteurs (le reviewer
+  tournant à chaque cycle, y compris ceux reboucleés par le tester) : un run dont tous les
+  reboucles étaient d'origine tester pouvait épuiser à tort son budget review dès le premier
+  reboucle review-bloquant venu, même après des dizaines de cycles clean côté review. Persisté
+  dans `runs.current_review_cycle` (et donc lu tel quel par `decide_next_state_after_ci` pour
+  un reboucle déclenché par la CI). Verrouillé par
+  `max_test_cycles_exceeded_when_tester_findings_never_clear` (budget review minimal `1`,
+  jamais épuisé malgré plusieurs reboucles tester) et son symétrique
+  `max_review_cycles_exceeded_when_reviewer_findings_never_clear` (budget test minimal `1`,
+  jamais épuisé — le tester ne tourne même jamais).
 - **États d'épuisement dédiés, jamais un faux `Converged`** : `RunState::MaxCyclesExceeded`
   devient `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` — deux états terminaux
   distincts (`-> Failed` uniquement), jamais confondus avec `Converged`.
@@ -40,6 +50,14 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `Reviewing` avant chaque review et `Testing` juste avant chaque passage du tester
   (write-ahead, ADR-0004) ; `RunState::is_intermediate`/crash recovery et
   `db::list_intermediate_runs` suivent les deux nouveaux états.
+- **Migration, remap des valeurs `state` historiques (relecture, LOW)** : au-delà des colonnes
+  numériques, `0007_phase_budgets.sql` remappe aussi les valeurs `awaiting_review_test` →
+  `reviewing` et `max_cycles_exceeded` → `max_review_cycles_exceeded` sur les lignes
+  existantes — sans ce remap, un run persisté dans l'un de ces états au moment de la mise à
+  jour serait devenu `UnknownState` et n'aurait plus jamais été repris par la récupération
+  après crash. L'attribution exacte de phase n'est pas reconstructible depuis la seule chaîne
+  `state` ; le choix (conservateur pour `reviewing`, cosmétique pour
+  `max_review_cycles_exceeded`) est documenté dans la migration elle-même.
 - Aucun changement de comportement pour la boucle Phase A/B elle-même (héritée de
   #41/#42) : seuls les budgets/états qui l'entourent deviennent conscients de la phase.
 

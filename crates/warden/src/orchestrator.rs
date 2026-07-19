@@ -592,14 +592,28 @@ impl Orchestrator {
         let run_base_commit_sha = read_head_commit(&config.repo_path).await?;
 
         let mut base_commit = "HEAD".to_string();
-        // Issue #43: also this run's review-cycle counter -- the reviewer
-        // runs every single cycle (Phase A gate, issue #41), so `cycle_number`
-        // *is* `review_cycle` for [`decide_next_state`]'s purposes; no
-        // separate counter is needed for it.
+        // The run's overall loop-iteration counter -- every cycle advances
+        // it, whether it reboucled because of a review-blocking finding, a
+        // test-blocking finding, or neither (a fresh CI reboucle). Purely
+        // informational (`cycles.cycle_number`, `RunEvent::CycleStarted`) --
+        // *not* the review budget itself; see `review_cycle_number` below for
+        // that (code review of issue #43's first commit, MEDIUM: the reviewer
+        // runs every cycle, but not every cycle's reboucle is *caused* by a
+        // review-blocking finding, so this counter over-counts the review
+        // budget whenever a tester-driven reboucle's own re-review comes back
+        // clean).
         let mut cycle_number: u32 = 1;
+        // Issue #43: the review budget's own counter -- advances only on a
+        // cycle whose reboucle is actually charged to the review phase (a
+        // blocking `Reviewer`/`Warden`-sourced finding, decision #37 Q1),
+        // never merely because the reviewer ran. This is what keeps the two
+        // budgets genuinely independent: a run whose every reboucle is
+        // tester-driven (review clean every single cycle) never advances
+        // this counter at all, however many cycles it takes.
+        let mut review_cycle_number: u32 = 0;
         // Issue #43: the tester, unlike the reviewer, only actually runs on a
         // cycle whose review came back clean (issue #41's gate) -- so this
-        // only advances then, independently of `cycle_number`.
+        // only advances then, independently of `review_cycle_number`.
         let mut test_cycle_number: u32 = 0;
         // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
         // coder exactly like a reviewer/tester blocking finding does, just
@@ -624,7 +638,6 @@ impl Orchestrator {
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
             db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
-            db::set_run_current_review_cycle(&self.pool, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
                 .await?;
 
@@ -740,13 +753,30 @@ impl Orchestrator {
             let review_is_clean = !findings
                 .iter()
                 .any(|finding| finding.severity == warden_core::Severity::Blocking);
+            // Issue #43 code review (MEDIUM): the review budget's own
+            // counter only advances when this cycle's reboucle is actually
+            // charged to the review phase -- a blocking Reviewer/Warden-
+            // sourced finding, mirroring `decide_next_state`'s own
+            // imputation rule (decision #37 Q1) below. A cycle whose review
+            // is clean -- whether it's the run's very first review, or a
+            // scoped re-review that clears a *tester*-driven reboucle --
+            // never advances it, which is what keeps the two budgets
+            // genuinely independent: a run whose every reboucle is
+            // tester-driven (review clean every single cycle) can exhaust
+            // `max_test_cycles` without ever coming close to
+            // `max_review_cycles`, and vice versa.
+            if !review_is_clean {
+                review_cycle_number += 1;
+            }
+            db::set_run_current_review_cycle(&self.pool, &run_id, review_cycle_number).await?;
             if review_is_clean {
                 // Write-ahead: about to launch the tester -- issue #43's
                 // other half of the old `AwaitingReviewTest` split. Only
                 // entered from `Reviewing` on a review-clean cycle, so this
                 // is also where the test-cycle counter actually advances
-                // (unlike `cycle_number`/the review counter, which advances
-                // every cycle regardless).
+                // -- `review_cycle_number` deliberately did *not* advance a
+                // few lines above, precisely because this cycle's review was
+                // clean.
                 self.transition(&run_id, RunState::Testing).await?;
                 test_cycle_number += 1;
                 db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number).await?;
@@ -791,7 +821,7 @@ impl Orchestrator {
 
             let next_state = decide_next_state(
                 &findings,
-                cycle_number,
+                review_cycle_number,
                 config.max_review_cycles,
                 test_cycle_number,
                 config.max_test_cycles,
@@ -4123,10 +4153,11 @@ mod tests {
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Converged);
         // Cycle 1: coder writes "broken", reviewer blocks -> reboucle (no
-        // tester run at all, issue #41's gate).
-        // Cycle 2: coder writes "fixed", reviewer passes -> tester runs once
-        // -> converged.
-        assert_eq!(run.current_review_cycle, 2);
+        // tester run at all, issue #41's gate) -- charges the review budget
+        // once.
+        // Cycle 2: coder writes "fixed", reviewer passes (review budget
+        // untouched this cycle) -> tester runs once -> converged.
+        assert_eq!(run.current_review_cycle, 1);
         assert_eq!(run.current_test_cycle, 1);
 
         // Never written into the user's main repo working tree: only
@@ -4146,6 +4177,84 @@ mod tests {
         );
     }
 
+    /// Issue #43 code review (MEDIUM): the review budget's own counter must
+    /// only advance on cycles whose reboucle is actually charged to the
+    /// review phase -- never merely because the reviewer ran. A tester
+    /// finding that never clears (review comes back clean every single
+    /// cycle) must be able to exhaust the *test* budget without the review
+    /// budget's counter moving at all, however small `max_review_cycles` is
+    /// -- proven here with the smallest legal budget (`1`), which the
+    /// pre-fix bug (`review_cycle` fed the loop's global cycle counter,
+    /// incremented on every reboucle regardless of which phase caused it)
+    /// would have tripped as early as this run's very first cycle.
+    #[tokio::test]
+    async fn max_test_cycles_exceeded_when_tester_findings_never_clear() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let always_blocking_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"tester","severity":"blocking","description":"never happy"}'"#,
+            ],
+        );
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            // The smallest legal review budget alongside several tester
+            // reboucles: if a tester-driven (review-clean) reboucle ever
+            // charged the review budget, this run would hit
+            // `MaxReviewCyclesExceeded` at cycle 1 instead.
+            max_review_cycles: 1,
+            max_test_cycles: 3,
+            coder_agent: definition(noop_coder),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(always_blocking_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+            gate: None,
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::MaxTestCyclesExceeded,
+            "the test budget must be what exhausts, not a review budget of 1 falsely tripped \
+             by tester-driven reboucles"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_review_cycle, 0,
+            "the reviewer ran every cycle and always passed clean -- a cycle whose review is \
+             clean never charges the review budget at all, so the counter never leaves 0"
+        );
+        assert_eq!(run.current_test_cycle, 3, "the test budget is what ran out");
+    }
+
+    /// The converse of
+    /// [`max_test_cycles_exceeded_when_tester_findings_never_clear`]: a
+    /// reviewer finding that never clears must exhaust the *review* budget
+    /// without the test budget's own counter ever moving -- the tester never
+    /// even runs (issue #41's gate: it only runs on a review-clean cycle),
+    /// proven here with the smallest legal test budget (`1`).
     #[tokio::test]
     async fn max_review_cycles_exceeded_when_reviewer_findings_never_clear() {
         let repo = init_test_repo();
@@ -4175,64 +4284,10 @@ mod tests {
             branch: "main".to_string(),
             intent: "never converges".to_string(),
             max_review_cycles: 2,
-            max_test_cycles: 2,
+            max_test_cycles: 1,
             coder_agent: definition(noop_coder),
             reviewer_agent: definition(always_blocking_reviewer),
             tester_agent: definition(always_passing_tester()),
-            evidence_tool: None,
-            evidence_store_in_repo: true,
-            gate: None,
-        };
-
-        let (_run_id, final_state) = orchestrator
-            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
-    }
-
-    /// Decision #37 Q1's other half: a tester finding that never clears
-    /// exhausts the *test* budget, not the review budget -- even though the
-    /// reviewer itself passes clean every single cycle (so the review budget
-    /// never comes close to exhausting).
-    #[tokio::test]
-    async fn max_test_cycles_exceeded_when_tester_findings_never_clear() {
-        let repo = init_test_repo();
-        let warden_home = TempDir::new().unwrap();
-        let db_dir = TempDir::new().unwrap();
-        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-
-        let orchestrator = Orchestrator::new(pool.clone());
-        let always_blocking_tester = AgentCommand::new(
-            "sh",
-            [
-                "-c",
-                r#"echo '{"source":"tester","severity":"blocking","description":"never happy"}'"#,
-            ],
-        );
-        let noop_coder = AgentCommand::new(
-            "sh",
-            [
-                "-c",
-                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
-            ],
-        );
-
-        let config = RunConfig {
-            repo_path: repo.path().to_path_buf(),
-            warden_home: warden_home.path().to_path_buf(),
-            branch: "main".to_string(),
-            intent: "never converges".to_string(),
-            // A generous review budget (never exhausted -- the reviewer
-            // always passes) alongside a tight test budget proves the
-            // exhaustion is charged to the right phase, not just "whichever
-            // budget happens to run out first".
-            max_review_cycles: 10,
-            max_test_cycles: 2,
-            coder_agent: definition(noop_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_blocking_tester),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -4243,14 +4298,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxTestCyclesExceeded);
+        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
             run.current_review_cycle, 2,
-            "the reviewer ran every cycle (it always passes) but never came close to its own \
-             much larger budget"
+            "the review budget is what ran out"
         );
-        assert_eq!(run.current_test_cycle, 2, "the test budget is what ran out");
+        assert_eq!(
+            run.current_test_cycle, 0,
+            "the tester never ran at all -- the review never once came back clean -- so its \
+             own counter never leaves 0, regardless of how small max_test_cycles is"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -4316,8 +4374,9 @@ mod tests {
         assert_eq!(final_state, RunState::Converged);
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_review_cycle, 2,
-            "cycle 1 must block on the reviewer, cycle 2 must converge, exactly like \
+            run.current_review_cycle, 1,
+            "cycle 1 must block on the reviewer (charging the review budget once), cycle 2 \
+             must converge with a clean review (no further charge), exactly like \
              full_cycle_reboucles_once_then_converges"
         );
 
@@ -4437,7 +4496,11 @@ mod tests {
             "cycle 1's tampering finding must reboucle, cycle 2's revert must converge"
         );
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
-        assert_eq!(run.current_review_cycle, 2);
+        assert_eq!(
+            run.current_review_cycle, 1,
+            "cycle 1's tampering finding charges the review budget once; cycle 2's clean \
+             revert charges nothing further"
+        );
 
         // Cycle 1: the tampering finding alone -- no reviewer finding at
         // all, since the reviewer here never raises anything -- must still
@@ -4670,8 +4733,15 @@ mod tests {
         );
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_review_cycle, 2,
-            "cycle 1 must reboucle on the tester's finding, cycle 2 must converge"
+            run.current_review_cycle, 0,
+            "both cycles' review came back clean (the reviewer never raises a finding here) -- \
+             the reboucle is entirely tester-driven, so the review budget is never charged \
+             (issue #43 code review MEDIUM)"
+        );
+        assert_eq!(
+            run.current_test_cycle, 2,
+            "cycle 1's tester run raises the finding, cycle 2's confirms the fix -- both count \
+             against the test budget"
         );
 
         let invocation_count =
@@ -4822,9 +4892,17 @@ mod tests {
         assert_eq!(final_state, RunState::Converged);
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
-            run.current_review_cycle, 3,
-            "cycle 1: tester blocks on buggy. cycle 2: reviewer blocks on the coder's own \
-             half-fixed regression, tester must not run. cycle 3: both clean, converges"
+            run.current_review_cycle, 1,
+            "cycle 1: review clean, tester blocks on buggy (test-driven, no review charge). \
+             cycle 2: reviewer blocks on the coder's own half-fixed regression -- the only \
+             review-charged cycle, tester must not run. cycle 3: both clean, converges (no \
+             further review charge)"
+        );
+        assert_eq!(
+            run.current_test_cycle, 2,
+            "cycle 1's tester run raises the finding, cycle 3's confirms the fix -- cycle 2's \
+             tester never runs at all (gated behind the regression review), so only two cycles \
+             count against the test budget"
         );
 
         let invocation_count =
@@ -5944,7 +6022,7 @@ mod tests {
     /// itself dies in that window -- a crash *during* recovery, e.g. the
     /// very next `SIGKILL` -- the run is already `Failed` by the time the
     /// process comes back up. `list_intermediate_runs` only looks at
-    /// `coder_running`/`awaiting_review_test`/`awaiting_ci`, so a `Failed`
+    /// `coder_running`/`reviewing`/`testing`/`awaiting_ci`, so a `Failed`
     /// run is never revisited by a later recovery pass, and its worktree
     /// and/or live process are never cleaned up again: a permanent leak,
     /// not merely a delayed cleanup.
