@@ -127,6 +127,26 @@ requête ou migration doit régénérer le cache du crate concerné (`cargo sqlx
 exécuté depuis ce crate) et le committer avec le code — voir `code-standards.md` ("SQLite &
 sqlx").
 
+### Installer depuis une release prébuilt (issue #39)
+
+Alternative à la compilation depuis les sources : chaque tag `vX.Y.Z` poussé déclenche
+`.github/workflows/release.yml`, qui publie une [GitHub Release](../../releases) avec une
+archive par plateforme (`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-gnu`) et un `checksums.txt` agrégé.
+
+```sh
+# Télécharger l'archive correspondant à sa plateforme et checksums.txt depuis la Release,
+# puis vérifier l'intégrité avant d'extraire quoi que ce soit :
+shasum -a 256 -c checksums.txt --ignore-missing
+
+tar xzf warden-<version>-<target>.tar.gz
+```
+
+L'archive contient les trois binaires (`warden`, `warden-gated`, `warden-tui`), les unités
+de service `contrib/systemd/` et `contrib/launchd/` (voir "Service managé" ci-dessous), ce
+`README.md` et `LICENSE`. Placez les trois binaires dans un répertoire présent dans votre
+`PATH` (ex. `~/.local/bin`) pour les invoquer directement.
+
 ## Utiliser la CLI `warden`
 
 Le binaire expose pour l'instant une seule sous-commande, `run`, qui exécute une boucle
@@ -620,6 +640,22 @@ Pour une isolation qui tient même si `warden` est compromis **au niveau code** 
 Ce mode n'est pas automatisé par les fichiers `contrib/` fournis (qui visent la simplicité
 d'installation mono-utilisateur) ; il nécessite une configuration système manuelle
 correspondant à l'infrastructure de déploiement réelle.
+
+## Faire une release (mainteneurs)
+
+Le tag est la seule source de vérité de la version publiée : `check-version` (dans
+`.github/workflows/release.yml`) échoue si le tag ne correspond pas exactement à la
+version des trois crates binaires — aucune version n'est déduite ou bumpée
+automatiquement.
+
+1. Aligner `version` dans `crates/warden/Cargo.toml`, `crates/warden-gated/Cargo.toml` et
+   `crates/warden-tui/Cargo.toml` sur la version cible (ex. `0.2.0`).
+2. Committer ce bump (`git commit`).
+3. Tagger ce commit `vX.Y.Z` (ex. `git tag v0.2.0`), en accord avec la version des trois
+   `Cargo.toml`.
+4. `git push origin vX.Y.Z` — le push du tag déclenche le workflow : build des trois
+   binaires pour les trois cibles, packaging en `.tar.gz` + `.sha256` par cible, puis
+   publication d'une GitHub Release avec `checksums.txt` agrégé.
 
 ## Documentation
 
