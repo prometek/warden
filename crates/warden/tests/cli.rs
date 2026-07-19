@@ -1821,20 +1821,22 @@ async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_b
 
 /// Acceptance criterion 1 (issue #2): "Aucune collision d'écriture constatée
 /// sur un repo de test avec des findings croisés (reviewer et tester
-/// modifiant des fichiers différents en simultané)" -- driven through the
-/// real `warden run --tool claude` CLI entry point.
+/// modifiant des fichiers différents)" -- driven through the real
+/// `warden run --tool claude` CLI entry point.
 ///
-/// The reviewer writes `review_target.txt`, then (after a deliberate sleep
-/// that overlaps with the tester's run) reads back `test_target.txt` from
-/// its own worktree; the tester does the mirror image. If reviewer and
-/// tester ever shared a worktree/directory (a write collision), the other
-/// role's write -- which completes well before the sleep ends -- would
-/// already be visible, instead of the untouched original content. This is
-/// what distinguishes "isolated worktrees" from "shared worktree"
-/// deterministically, without relying on interleaving order.
+/// Reviewer and tester no longer run concurrently (issue #40, ADR-0003
+/// amendment: `run_review` then `run_test`, sequentially), so this no longer
+/// needs the deliberate overlapping sleep the original (issue #2, parallel
+/// `tokio::join!`) version of this test relied on -- worktree isolation is
+/// exercised the same way regardless of timing. The reviewer writes
+/// `review_target.txt`, then reads back `test_target.txt` from its own
+/// worktree; the tester does the mirror image. If reviewer and tester ever
+/// shared a worktree/directory (a write collision), the other role's write
+/// would already be visible, instead of the untouched original content --
+/// this is what distinguishes "isolated worktrees" from "shared worktree".
 #[cfg(unix)]
 #[tokio::test]
-async fn e2e_reviewer_and_tester_modify_different_files_concurrently_without_collision() {
+async fn e2e_reviewer_and_tester_modify_different_files_without_collision() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
@@ -1847,13 +1849,11 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
 "#;
     let reviewer_body = r#"
 echo modified-by-reviewer > review_target.txt
-sleep 0.3
 seen=$(cat test_target.txt)
 printf '{"source":"reviewer","severity":"info","description":"review_target=modified-by-reviewer test_target_seen=%s"}\n' "$seen" > "$WARDEN_RESULT_FILE"
 "#;
     let tester_body = r#"
 echo modified-by-tester > test_target.txt
-sleep 0.3
 seen=$(cat review_target.txt)
 printf '{"source":"tester","severity":"info","description":"test_target=modified-by-tester review_target_seen=%s"}\n' "$seen" > "$WARDEN_RESULT_FILE"
 "#;
@@ -1919,7 +1919,7 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
             .description
             .contains("test_target_seen=original-test"),
         "reviewer's worktree must still see the untouched original \
-         test_target.txt, not the tester's concurrent write -- got: {}",
+         test_target.txt, not the tester's write -- got: {}",
         reviewer_finding.description
     );
     assert!(
@@ -1927,7 +1927,7 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
             .description
             .contains("review_target_seen=original-review"),
         "tester's worktree must still see the untouched original \
-         review_target.txt, not the reviewer's concurrent write -- got: {}",
+         review_target.txt, not the reviewer's write -- got: {}",
         tester_finding.description
     );
 
@@ -2014,14 +2014,17 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
         .await
         .unwrap();
 
-        // Two concurrent agent processes recorded for the same cycle, the
-        // way reviewer and tester run in parallel (ADR-0003): an earlier one
-        // that is genuinely still alive (a real orphan agent process the
-        // crashed orchestrator never reaped or killed), and a later, dead
-        // one -- recovery decides whether the *run* crashed based on the
-        // latest recorded process (`latest_open_agent_process_for_run`), so
-        // the dead one must sort after the live one for this run to be
-        // recovered as Failed at all.
+        // Two agent processes recorded for the same cycle -- the
+        // `agent_processes` schema has always allowed more than one row per
+        // cycle (originally because reviewer and tester ran in parallel,
+        // ADR-0003; unaffected by issue #40 moving them to sequential, since
+        // this is purely about what recovery does with whatever rows it
+        // finds): an earlier one that is genuinely still alive (a real
+        // orphan agent process the crashed orchestrator never reaped or
+        // killed), and a later, dead one -- recovery decides whether the
+        // *run* crashed based on the latest recorded process
+        // (`latest_open_agent_process_for_run`), so the dead one must sort
+        // after the live one for this run to be recovered as Failed at all.
         let orphan_child = tokio::process::Command::new("sh")
             .args(["-c", "sleep 30"])
             .spawn()

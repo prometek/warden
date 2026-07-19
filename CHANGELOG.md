@@ -7,6 +7,32 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #40 (sous-tâche #37.1) / ADR-0003, ADR-0012, ADR-0013 (amendements) : `run_review`/`run_test` indépendantes + reviewer scopé (fondations)
+
+- **Suppression de `run_review_and_test`** (le `tokio::join!` reviewer+tester,
+  ADR-0003) : `run_review` et `run_test` sont désormais deux fonctions
+  indépendantes, chacune avec son propre worktree, son propre spawn d'agent
+  et sa propre gestion des findings — testées isolément. `run_convergence_loop`
+  les appelle **séquentiellement** (reviewer puis tester), une étape
+  intermédiaire vers la boucle à deux phases (issue #37) qui supprime au
+  passage le risque de collision de tokens entre les deux agents tournant en
+  concurrence sur le même commit.
+- **Reviewer scopé** : `AgentInputMessage` porte un nouveau champ `scope`
+  (`"full"` ou `"correctif"`) permettant d'invoquer le reviewer en mode
+  « regarde uniquement ce correctif » — `diff`/`findings` portent alors le
+  correctif du coder et les findings qui l'ont motivé (décision #37 Q2), au
+  lieu du contexte complet du cycle. Nouveau constructeur
+  `AgentInputMessage::for_scoped_review`, réservé au rôle reviewer (rejeté en
+  écriture comme en lecture pour tout autre rôle).
+- `AGENT_INPUT_VERSION` passe à **3** : un payload v2 (sans champ `scope`) est
+  refusé explicitement, jamais lu en silence comme `scope: "full"` — même
+  convention de rétro-compatibilité que le passage 1 → 2 (ADR-0013).
+- Prompts par défaut du reviewer (`ClaudeAdapter`) mis à jour pour documenter
+  `scope` et le comportement attendu en mode `"correctif"`.
+- Ne construit pas encore la nouvelle boucle à deux phases (états par phase,
+  budgets séparés, re-review scopée automatique) : voir les sous-tâches
+  suivantes de #37 (#41, #42, #43).
+
 ### Added — Issue #32 / ADR-0008 (amendement) : `warden run --tui`, lancement automatique de la TUI
 
 - Nouveau flag `--tui` sur `warden run` : dès que le run démarre, `warden` lance
