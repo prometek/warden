@@ -8832,6 +8832,73 @@ mod tests {
         );
     }
 
+    /// Genuine coverage gap, independently derived from issue #50's own
+    /// acceptance criteria (sandbox lifecycle "on cancellation"), distinct
+    /// from both neighbours: here the `CancellationToken` passed to
+    /// `run_agent` fires while its future keeps running to completion --
+    /// never dropped or aborted from outside, unlike
+    /// [`sandbox_is_destroyed_when_the_run_agent_future_itself_is_dropped_mid_flight`].
+    /// `execution.wait()` resolves on its own with
+    /// `SandboxError::Cancelled`, `run_agent`'s `result` plumbing turns that
+    /// into `Err(WardenError::Process(ProcessError::Cancelled { .. }))`
+    /// (`map_sandbox_error`, strict parity with pre-#50 error text), and the
+    /// explicit, awaited `guard.destroy()` right after the inner async block
+    /// -- not `SandboxGuard::drop`'s detached backstop -- is what must run.
+    #[tokio::test]
+    async fn sandbox_is_destroyed_when_cancellation_resolves_the_future_normally() {
+        let dir = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let sandbox = Arc::new(RecordingSandbox::new(false));
+
+        let orchestrator = orchestrator_with_sandbox_and_cycle(
+            &pool,
+            sandbox.clone() as Arc<dyn Sandbox>,
+            "sandbox-seam-cancel-run",
+            "sandbox-seam-cancel-cycle",
+        )
+        .await;
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = orchestrator
+            .run_agent(
+                "sandbox-seam-cancel-cycle",
+                AgentRole::Coder,
+                &FakeCommandAdapter,
+                &AgentCommand::new("sh", ["-c", "sleep 30"]),
+                &[],
+                dir.path(),
+                repo.path(),
+                repo.path(),
+                "{}".to_string(),
+                cancel,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WardenError::Process(ProcessError::Cancelled { .. }))
+            ),
+            "a cancelled agent must surface as ProcessError::Cancelled (strict parity with \
+             pre-#50 behaviour), got {result:?}"
+        );
+        assert_eq!(
+            sandbox.calls(),
+            vec!["create", "execute", "destroy"],
+            "destroy must run via the explicit, awaited call in `run_agent` -- not just \
+             `SandboxGuard::drop`'s backstop -- when cancellation resolves the future \
+             normally rather than the future being dropped/aborted from outside"
+        );
+    }
+
     /// Issue #50 review, MEDIUM 1's other named skip point: the whole
     /// `run_agent` future being dropped mid-`.await` (run cancellation,
     /// `warden run --tui` exit), not just an early `?` return. Aborts the

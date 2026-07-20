@@ -367,6 +367,70 @@ mod tests {
         assert!(matches!(result, Err(SandboxError::Cancelled { .. })));
     }
 
+    /// Distinct from [`cancellation_kills_the_child_and_returns_cancelled_error`]:
+    /// that test exercises the explicit `cancel.cancel()` path inside
+    /// `drain_and_wait`, whose `select!` branch calls `child.kill()` by
+    /// hand. This test instead drops the `Execution` (and the `Child` it
+    /// owns) mid-flight *without* ever cancelling -- via
+    /// `tokio::time::timeout`, whose combinator drops the inner future once
+    /// the deadline elapses, the same "future torn down mid-poll rather than
+    /// explicitly cancelled" shape `warden::orchestrator`'s `SandboxGuard::drop`
+    /// backstop relies on -- isolating `kill_on_drop` itself (set on the
+    /// underlying `tokio::process::Command` in [`LocalSandbox::execute`]) as
+    /// the thing actually terminating the process, independent of the
+    /// cancellation machinery.
+    #[tokio::test]
+    async fn dropping_the_execution_mid_flight_kills_the_child_via_kill_on_drop_not_the_cancel_path(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let sandbox = LocalSandbox::new();
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: dir.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+        let marker = dir.path().join("still-alive-after-sleep");
+
+        let execution = sandbox
+            .execute(
+                &id,
+                command(
+                    "sh",
+                    &["-c", &format!("sleep 1; touch {}", marker.display())],
+                ),
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Times out mid the child's own `sleep 1`, well before it would
+        // otherwise touch `marker` -- `tokio::time::timeout` drops the inner
+        // `execution.wait()` future (and therefore the `Child` it owns) the
+        // moment the deadline elapses, without this test ever calling
+        // `cancel()` on anything.
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(200), execution.wait())
+                .await
+                .is_err();
+        assert!(
+            timed_out,
+            "the timeout must fire while the child is still sleeping, for this test to mean \
+             anything"
+        );
+
+        // Wait well past the child's own `sleep 1` -- if `kill_on_drop` had
+        // not fired, the child would keep running on its own and create
+        // `marker` regardless of anything on this side having stopped
+        // waiting for it.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "kill_on_drop must terminate the child when the Execution future is dropped \
+             mid-flight, independent of the explicit cancel-token path"
+        );
+    }
+
     #[tokio::test]
     async fn stdin_payload_is_written_and_closed_so_the_child_sees_it_and_exits() {
         let dir = TempDir::new().unwrap();
