@@ -39,6 +39,15 @@ pub enum EventKind {
     /// rather than added later so the wire/row protocol doesn't need a
     /// breaking change once Phase 7 lands.
     EvidenceCaptured,
+    /// Issue #26: a reviewer/tester definition for this run was resolved
+    /// from the repo under review (`.warden/agents/<role>.md`) rather than
+    /// the trusted user config directory -- only ever reachable with
+    /// `--trust-repo-agents` and no user-config file for that role (see
+    /// `warden::agent_def`'s own "Security: role-asymmetric resolution"
+    /// docs). Published once per affected role, right after `RunStarted`,
+    /// so the run's own permanent event log carries a record of which
+    /// role(s) ran under a definition the coder can write to.
+    UntrustedAgentDefinitionUsed,
     RunFinished,
 }
 
@@ -52,6 +61,7 @@ impl EventKind {
             EventKind::AgentFinished => "agent_finished",
             EventKind::FindingRaised => "finding_raised",
             EventKind::EvidenceCaptured => "evidence_captured",
+            EventKind::UntrustedAgentDefinitionUsed => "untrusted_agent_definition_used",
             EventKind::RunFinished => "run_finished",
         }
     }
@@ -65,6 +75,7 @@ impl EventKind {
             "agent_finished" => Ok(EventKind::AgentFinished),
             "finding_raised" => Ok(EventKind::FindingRaised),
             "evidence_captured" => Ok(EventKind::EvidenceCaptured),
+            "untrusted_agent_definition_used" => Ok(EventKind::UntrustedAgentDefinitionUsed),
             "run_finished" => Ok(EventKind::RunFinished),
             other => Err(CoreError::UnknownEventKind(other.to_string())),
         }
@@ -142,6 +153,28 @@ pub enum RunEvent {
         file_path: String,
         description: Option<String>,
     },
+    /// See [`EventKind::UntrustedAgentDefinitionUsed`]'s own docs. `role` is
+    /// always `"reviewer"` or `"tester"` (`AgentRole::as_str`) -- the coder
+    /// is never subject to this (`warden::agent_def`'s own docs). `path` is
+    /// the literal, pre-canonicalization path that was actually read (what
+    /// an operator recognizes -- `.warden/agents/reviewer.md`, or the
+    /// would-be user-config path), exactly as `Path::display` renders it.
+    ///
+    /// `canonical_path` (issue #26 review, LOW) is what `path` actually
+    /// canonicalizes to (symlinks resolved) -- carried *alongside* `path`,
+    /// never instead of it. For the plain repo-convention case the two
+    /// usually agree; for the degraded-user-config case (a coder-controlled
+    /// `XDG_CONFIG_HOME`, or a symlinked `<role>.md`) `path` may not
+    /// literally look like it is inside the repo/a worktree at all -- e.g.
+    /// `~/.config/warden/agents/reviewer.md` -- while `canonical_path` names
+    /// exactly where it actually resolved to. Without this, an operator
+    /// replaying the event for exactly the adversarial case this record
+    /// exists for sees a path that is technically true but unactionable.
+    UntrustedAgentDefinitionUsed {
+        role: String,
+        path: String,
+        canonical_path: String,
+    },
     RunFinished {
         final_state: String,
     },
@@ -162,6 +195,9 @@ impl RunEvent {
             RunEvent::AgentFinished { .. } => EventKind::AgentFinished,
             RunEvent::FindingRaised { .. } => EventKind::FindingRaised,
             RunEvent::EvidenceCaptured { .. } => EventKind::EvidenceCaptured,
+            RunEvent::UntrustedAgentDefinitionUsed { .. } => {
+                EventKind::UntrustedAgentDefinitionUsed
+            }
             RunEvent::RunFinished { .. } => EventKind::RunFinished,
         }
     }
@@ -197,6 +233,7 @@ mod tests {
             EventKind::AgentFinished,
             EventKind::FindingRaised,
             EventKind::EvidenceCaptured,
+            EventKind::UntrustedAgentDefinitionUsed,
             EventKind::RunFinished,
         ]
     }
@@ -249,6 +286,11 @@ mod tests {
                 evidence_type: "image".to_string(),
                 file_path: ".warden/evidence/1/screenshot.png".to_string(),
                 description: Some("login screen".to_string()),
+            },
+            EventKind::UntrustedAgentDefinitionUsed => RunEvent::UntrustedAgentDefinitionUsed {
+                role: "reviewer".to_string(),
+                path: "/repo/.warden/agents/reviewer.md".to_string(),
+                canonical_path: "/repo/.warden/agents/reviewer.md".to_string(),
             },
             EventKind::RunFinished => RunEvent::RunFinished {
                 final_state: "converged".to_string(),

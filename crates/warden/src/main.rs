@@ -81,6 +81,21 @@ enum Commands {
         #[arg(long, value_parser = parse_tool)]
         tool: ToolName,
 
+        /// Issue #26: opts into honouring a repo-supplied reviewer/tester
+        /// definition (`<repo>/.warden/agents/{reviewer,tester}.md`) when no
+        /// user-config definition exists for that role. Off by default -- a
+        /// repo's own reviewer/tester convention file is otherwise ignored
+        /// entirely, since it is committable by the very coder that role
+        /// exists to judge independently (see `warden::agent_def`'s own
+        /// "Security: role-asymmetric resolution" docs). When this actually
+        /// causes a repo file to be used, it is surfaced as untrusted: a
+        /// `tracing::warn!` naming the path, and a
+        /// `RunEvent::UntrustedAgentDefinitionUsed` on the run's own event
+        /// log. Never affects the coder's own convention file, which was
+        /// already read from the repo regardless of this flag.
+        #[arg(long)]
+        trust_repo_agents: bool,
+
         /// Overrides automatic project-type detection for the Evidence
         /// Capture Adapter (ADR-0009): `playwright` for web/UI projects,
         /// `asciinema` for CLI projects. Detected from the repo when
@@ -156,6 +171,17 @@ fn parse_tool(raw: &str) -> Result<ToolName, String> {
     }
 }
 
+/// A newtype around `--trust-repo-agents`'s `bool` (issue #26 review, LOW):
+/// `run`'s own parameter list carries this alongside `evidence_store_in_repo`
+/// (also a bare `bool`), separated only by a generic `adapter` and an
+/// `Option<EvidenceTool>` -- a future insertion there could silently
+/// transpose the two positionally, and this one is a security-relevant
+/// switch (it gates whether a reviewer/tester definition the coder can write
+/// to is ever used at all). Wrapping it in its own type makes that
+/// transposition a compile error instead of a silent bug.
+#[derive(Debug, Clone, Copy)]
+struct TrustRepoAgents(bool);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -170,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
             max_test_cycles,
             warden_home,
             tool,
+            trust_repo_agents,
             evidence_tool,
             evidence_store_in_repo,
             gate_bare_repo,
@@ -215,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
                         max_test_cycles,
                         warden_home,
                         ClaudeAdapter,
+                        TrustRepoAgents(trust_repo_agents),
                         evidence_tool,
                         evidence_store_in_repo,
                         gate,
@@ -271,12 +299,24 @@ async fn run<R: ToolAdapter>(
     max_test_cycles: u32,
     warden_home: Option<PathBuf>,
     adapter: R,
+    trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
     tui_launch: Option<TuiLaunchConfig>,
 ) -> anyhow::Result<()> {
-    let warden_home = warden_home.unwrap_or(default_warden_home()?);
+    // Issue #26 review: `Option::unwrap_or` (the previous form here)
+    // evaluates its argument eagerly, so `default_warden_home()?` used to
+    // run -- and could fail on a missing `HOME` -- even when `--warden-home`
+    // was passed explicitly and its result would just be discarded. This
+    // `match` only calls `default_warden_home()` when `warden_home` is
+    // actually `None`, matching the flag's own documented "defaults to
+    // `~/.warden`" behaviour instead of silently requiring `HOME`
+    // unconditionally.
+    let warden_home = match warden_home {
+        Some(warden_home) => warden_home,
+        None => default_warden_home()?,
+    };
     let db_path = warden_home.join("state.db");
     let pool = db::connect(&db_path)
         .await
@@ -358,9 +398,68 @@ async fn run<R: ToolAdapter>(
     // worktree), before this run's `runs` row is even written -- see
     // `warden::agent_def::resolve_agent_definition`'s own docs for why that
     // timing is the security-relevant part of this call.
-    let coder_agent = resolve_agent_definition(&repo, AgentRole::Coder, &adapter).await?;
-    let reviewer_agent = resolve_agent_definition(&repo, AgentRole::Reviewer, &adapter).await?;
-    let tester_agent = resolve_agent_definition(&repo, AgentRole::Tester, &adapter).await?;
+    //
+    // Issue #26: the reviewer/tester's own trusted source
+    // (`user_config_agents_dir`) is resolved once here, from this process's
+    // real environment (`XDG_CONFIG_HOME`/`HOME`) -- see
+    // `agent_def::default_user_config_agents_dir`'s own docs for why that
+    // env read lives here rather than inside `resolve_agent_definition`
+    // itself. `warden_home` is passed alongside it (owner's ruling,
+    // "escalated asymmetry"): a user-config source resolving under
+    // `<warden_home>/worktrees/` -- a stale worktree from a crashed run --
+    // must be degraded exactly like one resolving inside the repo itself.
+    let user_config_agents_dir = warden::agent_def::default_user_config_agents_dir()?;
+    let (coder_agent, _coder_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Coder,
+        &adapter,
+        &user_config_agents_dir,
+        &warden_home,
+        trust_repo_agents.0,
+    )
+    .await?;
+    let (reviewer_agent, reviewer_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Reviewer,
+        &adapter,
+        &user_config_agents_dir,
+        &warden_home,
+        trust_repo_agents.0,
+    )
+    .await?;
+    let (tester_agent, tester_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Tester,
+        &adapter,
+        &user_config_agents_dir,
+        &warden_home,
+        trust_repo_agents.0,
+    )
+    .await?;
+
+    // Issue #26: `resolve_agent_definition` already `tracing::warn!`ed the
+    // moment it actually read a repo-sourced reviewer/tester definition
+    // (before this run, or its Event Bus, even exist) -- this just collects
+    // which role(s) that happened for, so `run_convergence_loop` can also
+    // publish a persisted `RunEvent::UntrustedAgentDefinitionUsed` for each,
+    // once the run's own event log exists to carry it.
+    let untrusted_repo_agent_definitions = [
+        (AgentRole::Reviewer, reviewer_source),
+        (AgentRole::Tester, tester_source),
+    ]
+    .into_iter()
+    .filter_map(|(role, source)| match source {
+        warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
+            path,
+            canonical_path,
+        } => Some(orchestrator::UntrustedRepoAgentDefinition {
+            role,
+            path,
+            canonical_path,
+        }),
+        _ => None,
+    })
+    .collect();
 
     // Issue #31: resolved before `warden_home` moves into `config` below --
     // this is the resolved `warden_home` (not the raw `--warden-home` flag,
@@ -422,6 +521,7 @@ async fn run<R: ToolAdapter>(
         evidence_tool,
         evidence_store_in_repo,
         gate,
+        untrusted_repo_agent_definitions,
     };
 
     let cancel_on_tui_exit = cancel.clone();

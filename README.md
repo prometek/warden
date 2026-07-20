@@ -171,8 +171,11 @@ warden run \
 Aucun fichier `.md` n'est requis : `--tool claude` sélectionne l'adaptateur intégré pour
 Claude Code (`warden::tool_adapter::ClaudeAdapter`), qui fournit un prompt et un jeu
 d'outils par défaut pour les trois rôles (coder, reviewer, tester). Voir "Définir un agent"
-ci-dessous pour reprendre la main sur un rôle en particulier via
-`.warden/agents/<role>.md`.
+ci-dessous pour reprendre la main sur un rôle en particulier — **attention, la résolution
+n'est plus la même pour les trois rôles depuis l'issue #26** : le coder lit toujours
+`<repo>/.warden/agents/coder.md`, mais reviewer/tester lisent désormais
+`$XDG_CONFIG_HOME/warden/agents/<role>.md` (ou `~/.config/warden/agents/<role>.md`), jamais
+le dépôt sous revue, sauf `--trust-repo-agents` explicite.
 
 Flags de `warden run` :
 
@@ -190,6 +193,15 @@ Flags de `warden run` :
   `--coder-agent`/`--reviewer-agent`/`--tester-agent` et le schéma de définition
   warden-natif qu'ils sélectionnaient (ADR-0013, amendée par l'issue #24) — voir
   `CHANGELOG.md` pour la note de migration.
+- `--trust-repo-agents` (défaut : désactivé, issue #26) — réautorise `<repo>/.warden/agents/{reviewer,tester}.md`
+  comme source pour le reviewer/tester lorsqu'aucun fichier n'existe côté configuration
+  utilisateur pour ce rôle (voir "Définir un agent" ci-dessous pour la justification
+  complète). Sans ce flag, ce fichier est **ignoré** — seulement signalé par un
+  `tracing::warn!` nommant le chemin, jamais lu. Quand le flag fait effectivement utiliser
+  un fichier du dépôt, c'est surfacé comme non fiable : un `tracing::warn!` et un
+  `RunEvent::UntrustedAgentDefinitionUsed` persisté sur le journal d'événements du run
+  (affiché par `warden-tui`). N'affecte jamais le fichier `coder.md`, déjà lu depuis le
+  dépôt quel que soit ce flag.
 - `--branch <NAME>` — nom de branche enregistré pour ce run. `warden` lui-même ne pousse
   toujours rien vers un remote (aucun credential remote côté orchestrateur, ADR-0006) ;
   c'est `warden-gated` qui reçoit un push vers son dépôt bare local et décide seul de le
@@ -274,12 +286,44 @@ finding bloquant.
 
 Aucune définition n'est requise : `--tool claude` fournit déjà un prompt et un jeu
 d'outils par défaut pour les trois rôles (voir "Flags de `warden run`" ci-dessus). Pour
-reprendre la main sur un rôle en particulier, placez un fichier markdown à l'emplacement
-**conventionnel** `<repo>/.warden/agents/<role>.md` (`coder.md`, `reviewer.md` ou
-`tester.md`, à la racine du dépôt passé à `--repo`) — Warden le détecte et le lit
-automatiquement, sans flag à passer. Le format est celui de **Claude Code**
-(`.claude/agents/*.md`, issue #24) : un frontmatter **YAML** fencé par `---`, puis le
-corps markdown — le **system prompt** du rôle.
+reprendre la main sur un rôle en particulier, placez un fichier markdown au format
+**Claude Code** (`.claude/agents/*.md`, issue #24) : un frontmatter **YAML** fencé par
+`---`, puis le corps markdown — le **system prompt** du rôle.
+
+**La résolution n'est plus la même pour les trois rôles (issue #26)** :
+
+- **`coder`** — inchangé depuis l'issue #24 : `<repo>/.warden/agents/coder.md` (à la racine
+  du dépôt passé à `--repo`) si présent, sinon le prompt/`tools` par défaut de l'adaptateur.
+  Warden le détecte et le lit automatiquement, sans flag à passer.
+- **`reviewer`/`tester`** — lus **uniquement** depuis le répertoire de configuration
+  **utilisateur** : `$XDG_CONFIG_HOME/warden/agents/<role>.md`, ou
+  `~/.config/warden/agents/<role>.md` si `XDG_CONFIG_HOME` n'est pas défini. Le fichier du
+  dépôt sous revue, `<repo>/.warden/agents/{reviewer,tester}.md`, est **ignoré par
+  défaut** — même s'il existe et est valide (un `tracing::warn!` nomme le chemin ignoré,
+  sans jamais l'ouvrir). Passer `--trust-repo-agents` réautorise ce fichier comme repli,
+  mais seulement quand aucun fichier n'existe côté configuration utilisateur pour ce
+  rôle — la configuration utilisateur a toujours priorité — et son utilisation est alors
+  surfacée comme non fiable (`tracing::warn!` + `RunEvent::UntrustedAgentDefinitionUsed`
+  persisté, affiché par `warden-tui`).
+
+**Pourquoi cette asymétrie.** Le reviewer et le tester existent pour juger le coder de
+façon **indépendante** (voir "État du projet" ci-dessus). Le coder est le seul rôle qui
+écrit dans le dépôt et commite : n'importe quel fichier lu depuis le dépôt sous revue est
+donc, en dernier ressort, écrivable et committable par le coder lui-même. Continuer à lire
+`reviewer.md`/`tester.md` depuis ce même dépôt par défaut permettrait à un coder — buggé,
+ou détourné par prompt injection depuis le code qu'il traite — de réécrire le prompt (ou
+d'affaiblir les `tools` accordés) du rôle censé le juger, sans qu'aucun autre garde-fou ne
+le remarque avant un futur run. Le coder, à l'inverse, est déjà le rôle non fiable du
+dépôt ; rien n'est gagné à lui cacher son propre prompt, et verrouiller `coder.md` casserait
+l'UX « zéro fichier `.md` » de l'issue #24 sans bénéfice de sécurité. `--trust-repo-agents`
+reste disponible pour le cas légitime d'un projet qui veut versionner ses propres prompts
+reviewer/tester à côté du code et accepte ce compromis — mais jamais de façon
+indistinguable d'une résolution fiable. La justification complète, y compris la
+vérification que le répertoire de configuration utilisateur n'est pas lui-même un chemin
+que le coder peut atteindre (`XDG_CONFIG_HOME` pointé dans le dépôt, symlink, worktree
+périmé), est documentée dans `warden::agent_def` et dans l'ADR de l'issue #26.
+
+Exemple de fichier :
 
 ```markdown
 ---

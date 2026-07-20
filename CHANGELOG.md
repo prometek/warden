@@ -7,6 +7,76 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #26 / ADR-0018 : résolution des définitions d'agent asymétrique par rôle + garde de chemin de programme
+
+**BREAKING** : `<repo>/.warden/agents/{reviewer,tester}.md` n'est plus lu par défaut.
+
+- **Reviewer/tester ne lisent plus le dépôt sous revue par défaut.** Le coder reste
+  inchangé (`<repo>/.warden/agents/coder.md` si présent, sinon le défaut de l'adaptateur).
+  Reviewer et tester résolvent désormais **uniquement** depuis le répertoire de
+  configuration utilisateur — `$XDG_CONFIG_HOME/warden/agents/<role>.md`, ou
+  `~/.config/warden/agents/<role>.md` si `XDG_CONFIG_HOME` est absent/vide
+  (`agent_def::default_user_config_agents_dir`) — jamais depuis `<repo>/.warden/agents/`.
+  Raison : ce dernier est committable par le coder lui-même, et le reviewer/tester
+  n'existent que pour le juger de façon indépendante — un coder buggé ou détourné par
+  prompt injection pourrait sinon réécrire le prompt (ou les `tools` accordés) du rôle
+  censé le contrôler et le faire juger sous ses propres règles à un futur run
+  (`warden::agent_def`, section "Security: role-asymmetric resolution").
+- **`--trust-repo-agents` (nouveau flag, défaut désactivé)** réautorise
+  `<repo>/.warden/agents/<role>.md` comme repli pour le reviewer/tester, mais seulement
+  quand aucun fichier n'existe côté configuration utilisateur pour ce rôle (la
+  configuration utilisateur a toujours priorité, même avec le flag activé). Quand le flag
+  fait effectivement utiliser un fichier du dépôt, c'est surfacé comme non fiable : un
+  `tracing::warn!` nommant le chemin, et un nouveau
+  `RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path }` publié et
+  persisté sur le journal d'événements du run (`warden-tui` l'affiche) — changement de
+  forme du JSON d'événement persisté. Sans le flag, un fichier repo-contrôlé qui existe
+  mais est ignoré émet quand même un `tracing::warn!` nommant le chemin (jamais lu —
+  simple `tokio::fs::try_exists`) plutôt que d'être silencieusement abandonné.
+- **Le répertoire de configuration utilisateur "fiable" est vérifié, pas supposé.** Un
+  `$XDG_CONFIG_HOME`/`~/.config` qui canonicalise à l'intérieur du dépôt sous revue, **ou**
+  sous `<warden_home>/worktrees/` (un worktree périmé d'un run précédent), est dégradé au
+  même traitement que le repli repo (`AgentDefinitionSource::UntrustedRepoOverride`) plutôt
+  que traité en silence comme fiable — sinon un `.envrc`/`devShell` committé par le coder,
+  ou un symlink planté, restaurerait exactement le contournement que cette issue ferme,
+  avec un journal d'audit affirmant le contraire. Les deux répertoires et le fichier
+  `<role>.md` résolu sont canonicalisés (symlinks résolus), pas seulement comparés
+  lexicalement.
+- **Garde de chemin de programme (belt-and-braces)** : avant de lancer un reviewer/tester,
+  `process::validate_agent_program` refuse un `program` relatif, ou un chemin absolu qui
+  résout à l'intérieur du dépôt de base, du worktree propre au rôle, ou du worktree de
+  **n'importe quel** rôle pour ce run (y compris celui du coder — le répertoire le plus
+  contrôlable par le coder qui existe sur disque). Un nom nu résolu via `PATH` reste
+  autorisé. Appliquée au point de spawn unique (`Orchestrator::run_agent`), jamais pour le
+  coder. Aucun adaptateur livré aujourd'hui ne peut déclencher ce refus (`ClaudeAdapter`
+  lance toujours `claude` via `PATH`) — le point 1 de l'issue #26 (`program`/`args`
+  relatifs) était déjà rendu sans objet par l'issue #24, qui a supprimé le schéma
+  warden-natif `runner`/`program`/`args` ; cette garde est ajoutée en ceinture-et-bretelles
+  pour tout futur adaptateur.
+- **Limite assumée** : ceci n'est ni un sandbox filesystem ni un sandbox de credentials
+  autour du coder — il tourne toujours avec un accès réel au dépôt et les grants par
+  défaut de l'adaptateur sélectionné (`Bash` compris). L'isolation réelle reste suivie par
+  l'issue #28.
+- **Migration** : un projet qui versionnait `reviewer.md`/`tester.md` sous
+  `<repo>/.warden/agents/` doit soit les déplacer vers
+  `$XDG_CONFIG_HOME/warden/agents/` (ou `~/.config/warden/agents/`), soit passer
+  `--trust-repo-agents` pour conserver le comportement précédent (désormais surfacé comme
+  non fiable).
+- **Correctifs incidents découverts en cours de route** :
+  - `WorktreeManager::new`, dont le contrôle de confinement dépôt/`worktrees_root`
+    n'échouait pas de façon fermée : il continuait à retirer des segments de chemin sur
+    *n'importe quelle* erreur de `canonicalize` (pas seulement `NotFound`), et abandonnait
+    silencieusement un échec de `strip_prefix`. Trouvé en extrayant le
+    `canonicalize_best_effort` triplement dupliqué (`agent_def.rs`, `process.rs`,
+    `worktree.rs`) vers le nouveau module partagé `crate::path_util`, qui fixe l'algorithme
+    une fois pour toutes et fait échouer fermé sur toute autre erreur.
+  - `main.rs` évaluait `warden_home.unwrap_or(default_warden_home()?)` de façon anticipée,
+    ce qui exigeait `HOME` même quand `--warden-home` était explicitement passé.
+  - La suite e2e ne surchargeait jamais `XDG_CONFIG_HOME` : une quarantaine de tests
+    lisaient le vrai `~/.config/warden/agents/` de la machine qui les exécutait.
+- Verrouillé par la suite de tests de `agent_def.rs`, `process.rs` et `path_util.rs`.
+- **ADR-0018 (nouvelle)** : voir la note de décision dans le vault de documentation du
+  projet.
 ### Added — Issue #39 : workflow de release CD (binaires prébuilts + GitHub Release)
 
 - Nouveau workflow `.github/workflows/release.yml`, déclenché par le push d'un tag

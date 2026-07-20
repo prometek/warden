@@ -78,6 +78,23 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Issue #26 (belt-and-braces): a reviewer/tester `command.program`
+    /// that would resolve to a path inside a repository the coder can write
+    /// to -- either a relative path (resolves against the role's own
+    /// worktree, a checkout of the repo under review) or an absolute path
+    /// that canonicalizes inside that worktree or the run's base repo. See
+    /// `process::validate_agent_program`'s own docs. Never raised for the
+    /// coder, which is already the repo's own untrusted role.
+    #[error(
+        "refusing to spawn {role} agent program {program:?}: {reason} -- this would let the \
+         coder control what an independent role executes"
+    )]
+    UntrustedAgentProgram {
+        role: &'static str,
+        program: String,
+        reason: String,
+    },
 }
 
 /// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).
@@ -144,6 +161,39 @@ pub enum AgentDefinitionError {
         path: PathBuf,
         #[source]
         source: warden_core::CoreError,
+    },
+
+    /// Issue #26: neither `XDG_CONFIG_HOME` nor `HOME` is usable, so the
+    /// user config directory the reviewer/tester's own trusted definitions
+    /// live under (`agent_def::default_user_config_agents_dir`) cannot be
+    /// resolved at all. Mirrors `main.rs::default_warden_home`'s own
+    /// `HOME`-not-set failure -- both are "tell the user to fix their
+    /// environment" errors, never a silent fallback to some other directory.
+    #[error(
+        "cannot resolve the user config directory for agent definitions: {reason} (checked \
+         XDG_CONFIG_HOME, then HOME)"
+    )]
+    UserConfigDirUnresolvable { reason: String },
+
+    /// Issue #26 review (HIGH, extended by the owner's ruling on the
+    /// escalated asymmetry): canonicalizing `repo_path`,
+    /// `warden_home`/worktrees root, `user_config_agents_dir`, or the
+    /// resolved `<role>.md` path under it failed for a reason other than
+    /// simply "doesn't exist yet" while checking whether a reviewer/tester's
+    /// supposedly trusted user-config source actually resolves inside the
+    /// repo under review or a worktree
+    /// (`agent_def::user_config_resolves_inside_repo_or_worktrees`). Fails
+    /// closed rather than silently skipping the containment check it could
+    /// no longer perform (code-standards.md: "no silent fallback") --
+    /// mirrors [`ProcessError::UntrustedAgentProgram`]'s own fail-closed
+    /// contract for the analogous `command.program` check.
+    #[error(
+        "cannot verify agent definition source {path} is outside the repo under review: {source}"
+    )]
+    PathResolutionFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 }
 

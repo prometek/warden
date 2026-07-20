@@ -11,6 +11,7 @@ use std::process::Command as SyncCommand;
 use tokio::process::Command;
 
 use crate::error::WorktreeError;
+use crate::path_util::canonicalize_best_effort;
 
 /// Creates isolated worktrees for a single main repository.
 ///
@@ -47,8 +48,16 @@ impl WorktreeManager {
         // past this guard and land inside the main working tree.
         let canonical_repo = main_repo_path.canonicalize().map_err(WorktreeError::Io)?;
         // worktrees_root doesn't need to exist yet; canonicalize its
-        // deepest existing ancestor instead.
-        let canonical_worktrees_root = canonicalize_best_effort(&worktrees_root)?;
+        // deepest existing ancestor instead. Issue #26 review, MEDIUM:
+        // shares `path_util::canonicalize_best_effort` with
+        // `process::validate_agent_program` and
+        // `agent_def::user_config_resolves_inside_repo_or_worktrees` rather
+        // than a separate copy -- see that module's own docs for why the
+        // earlier separate copy here quietly failed to fail closed (it kept
+        // popping path segments on *any* `canonicalize` error, not just
+        // `NotFound`).
+        let canonical_worktrees_root =
+            canonicalize_best_effort(&worktrees_root).map_err(WorktreeError::Io)?;
 
         if canonical_worktrees_root == canonical_repo
             || canonical_worktrees_root.starts_with(&canonical_repo)
@@ -168,31 +177,6 @@ pub async fn prune_worktrees(main_repo_path: &Path) -> Result<(), WorktreeError>
     }
 
     Ok(())
-}
-
-/// Canonicalizes `path`, walking up to the nearest existing ancestor if
-/// `path` itself doesn't exist yet.
-fn canonicalize_best_effort(path: &Path) -> Result<PathBuf, WorktreeError> {
-    let mut candidate = path.to_path_buf();
-    loop {
-        match candidate.canonicalize() {
-            Ok(canonical) => {
-                // Re-append the non-existent suffix we stripped off, so the
-                // containment check in `new` still sees the full intended
-                // path rather than an ancestor of it.
-                let suffix = path.strip_prefix(&candidate).unwrap_or(Path::new(""));
-                return Ok(canonical.join(suffix));
-            }
-            Err(_) => {
-                if !candidate.pop() {
-                    return Err(WorktreeError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("no existing ancestor found for {}", path.display()),
-                    )));
-                }
-            }
-        }
-    }
 }
 
 /// A single isolated, detached git worktree. Removed via `git worktree
@@ -316,6 +300,51 @@ mod tests {
             result,
             Err(WorktreeError::UnsafeWorktreesRoot { .. })
         ));
+    }
+
+    /// Issue #26 review, MEDIUM: `new`'s containment check must fail closed
+    /// when it can no longer verify what `worktrees_root` actually resolves
+    /// to -- a permissions error on an ancestor must never be silently
+    /// walked past and compared as a truncated path. Before switching to the
+    /// shared `path_util::canonicalize_best_effort`, this module's own copy
+    /// popped path segments on *any* `canonicalize` error (not just
+    /// `NotFound`), so a case exactly like this one would have silently
+    /// succeeded instead of surfacing the permissions failure -- this test
+    /// pins the fixed behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn fails_closed_when_an_ancestor_of_worktrees_root_cannot_be_canonicalized() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = init_test_repo();
+        let outside = TempDir::new().unwrap();
+        let locked = outside.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        // Two non-existent path segments below `locked`: resolving the
+        // deeper one requires *searching inside* `locked` (execute
+        // permission on `locked` itself, not just on its parent), so
+        // stripping `locked`'s own permissions actually triggers a
+        // permission error partway up the ancestor walk -- a single
+        // non-existent segment directly under `locked` would only need
+        // execute permission on `locked`'s *parent* (`outside`, left
+        // untouched) to resolve, and wouldn't exercise this path at all.
+        let worktrees_root = locked.join("nested").join("does-not-exist-yet");
+
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&locked, perms.clone()).unwrap();
+
+        let result = WorktreeManager::new(repo.path(), &worktrees_root);
+
+        // Restore permissions before any assertion can panic and leave a
+        // directory `TempDir::drop` can't clean up.
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        assert!(
+            matches!(result, Err(WorktreeError::Io(_))),
+            "expected a fail-closed WorktreeError::Io, got {result:?}"
+        );
     }
 
     #[test]
