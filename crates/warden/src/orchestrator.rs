@@ -53,6 +53,7 @@
 //! them. See [`Orchestrator::publish_progress_event`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -63,10 +64,11 @@ use warden_core::{
     decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiOutcome,
     CiResultMessage, EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
 };
+use warden_sandbox::{LocalSandbox, Sandbox};
 
 use crate::ci_channel::CiResultListener;
 use crate::db;
-use crate::error::{Result, WardenError, WorktreeError};
+use crate::error::{ProcessError, Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
@@ -432,6 +434,17 @@ pub struct Orchestrator {
     /// non-blocking, error-checked writes to stdout for exactly this
     /// reason -- see `print_run_started_hint`'s own docs there.
     on_run_started: Option<RunStartedCallback>,
+    /// Issue #50: the execution-environment isolation seam every
+    /// coder/reviewer/tester invocation runs through ([`run_agent`]). Boxed
+    /// behind `Arc<dyn Sandbox>` (rather than a generic parameter, unlike
+    /// `R: ToolAdapter`) so a backend can be selected once, at construction
+    /// time, without becoming part of every signature `Orchestrator`
+    /// exposes -- `warden_sandbox::LocalSandbox` by default (strict parity
+    /// with this crate's pre-issue-#50 hand-rolled process isolation, see
+    /// [`Orchestrator::new`]); [`Orchestrator::with_sandbox`] is the one
+    /// point a future `DockerSandbox` (#49) plugs into, with no other change
+    /// to this module.
+    sandbox: Arc<dyn Sandbox>,
 }
 
 /// See the `on_run_started` field docs on [`Orchestrator`]. Named alias
@@ -444,6 +457,7 @@ impl Orchestrator {
             pool,
             run_context: tokio::sync::OnceCell::new(),
             on_run_started: None,
+            sandbox: Arc::new(LocalSandbox::new()),
         }
     }
 
@@ -454,6 +468,17 @@ impl Orchestrator {
     /// same expression that constructs the orchestrator (`main.rs`).
     pub fn on_run_started(mut self, callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.on_run_started = Some(Box::new(callback));
+        self
+    }
+
+    /// Selects a [`Sandbox`] backend other than the [`LocalSandbox`] default
+    /// (issue #50's "backend sélectionnable" acceptance criterion). No
+    /// built-in backend other than `LocalSandbox` ships yet (`DockerSandbox`
+    /// is issue #49) -- this exists so a caller (`main.rs`, or a test) can
+    /// substitute one, and so #49 only ever has to add a variant/construction
+    /// path there, never touch [`Orchestrator::run_agent`] itself.
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -1680,19 +1705,26 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Spawns `command`, persisting its PID to `agent_processes` before
-    /// awaiting completion so a crash of the orchestrator itself (not the
-    /// agent) is still detectable on restart via [`recover_crashed_runs`].
+    /// Runs `command` through this orchestrator's [`Sandbox`] seam (issue
+    /// #50), persisting its PID to `agent_processes` before awaiting
+    /// completion so a crash of the orchestrator itself (not the agent) is
+    /// still detectable on restart via [`recover_crashed_runs`]. The
+    /// sandbox is created bound to `cwd` (the role's own worktree -- "the
+    /// sandbox runs on top of the worktree", `warden_sandbox`'s own docs)
+    /// and destroyed again once this invocation is done, regardless of
+    /// outcome.
     ///
     /// `stdin_payload` is the serialized `warden_core::AgentInputMessage`
     /// (ADR-0012, issue #20 Scope B) fed to the agent's stdin and then
-    /// closed by [`process::wait_with_progress`] -- the coder's run intent,
-    /// or the reviewer/tester's target commit/diff/prior findings.
+    /// closed by the sandbox -- the coder's run intent, or the
+    /// reviewer/tester's target commit/diff/prior findings.
     ///
     /// `env_allowlist` is this run's `--tool` adapter's own
     /// `ToolAdapter::env_allowlist` (issue #24) -- forwarded to
-    /// [`process::spawn_with_extra_env`] on top of the always-forwarded
-    /// `PATH`.
+    /// [`warden_sandbox::Command::env_allowlist`] on top of whatever
+    /// baseline the sandbox backend applies (for [`warden_sandbox::LocalSandbox`],
+    /// `env_clear()` + the always-forwarded `PATH`, strict parity with this
+    /// crate's pre-issue-#50 behaviour).
     ///
     /// `runner` (issue #33) is this same run's `ToolAdapter` -- generic here
     /// (rather than a `&dyn ToolAdapter`) for the same compile-time-seam
@@ -1711,9 +1743,9 @@ impl Orchestrator {
     /// (issue #26), the one choke point every coder/reviewer/tester spawn in
     /// this codebase goes through, so a future `ToolAdapter` that ever names
     /// a repo-relative or in-worktree `command.program` for the
-    /// reviewer/tester is refused here rather than silently spawning code
-    /// the coder controls. A no-op for the coder itself -- see that
-    /// function's own docs for why.
+    /// reviewer/tester is refused here, *before* the sandbox ever runs it,
+    /// rather than silently spawning code the coder controls. A no-op for
+    /// the coder itself -- see that function's own docs for why.
     #[allow(clippy::too_many_arguments)]
     async fn run_agent<R: ToolAdapter>(
         &self,
@@ -1735,17 +1767,52 @@ impl Orchestrator {
             repo_path,
             run_worktrees_root,
         )?;
-        let child = process::spawn_with_extra_env(command, cwd, env_allowlist)?;
-        // H1: never persist pid 0. A missing `Child::id()` right after
-        // spawn is a typed error, not a silent fallback — a persisted pid
-        // 0 would make `is_process_alive` misreport this run as having a
-        // live process forever (POSIX `kill(0, ...)` semantics), defeating
-        // crash recovery.
-        let pid = child
-            .id()
-            .ok_or_else(|| crate::error::ProcessError::MissingPid {
-                command: command.program.clone(),
-            })?;
+
+        let sandbox_id = self
+            .sandbox
+            .create(warden_sandbox::SandboxSpec {
+                cwd: cwd.to_path_buf(),
+            })
+            .await
+            .map_err(map_sandbox_error)?;
+
+        // Issue #33: translates each streamed stdout line into a progress
+        // detail (this run's `ToolAdapter`'s own concern -- e.g. `claude
+        // --output-format stream-json`'s NDJSON events, never a format this
+        // module itself understands) and broadcasts it live-only. Must stay
+        // synchronous (see `publish_progress_event`'s own docs).
+        let on_stdout_line = |line: &str| {
+            if let Some(detail) = runner.parse_progress_line(line) {
+                self.publish_progress_event(role, detail);
+            }
+        };
+        let sandbox_command = warden_sandbox::Command {
+            program: command.program.clone(),
+            args: command.args.clone(),
+            env_allowlist: env_allowlist.iter().map(|name| name.to_string()).collect(),
+            stdin: Some(stdin_payload),
+        };
+        let execution = self
+            .sandbox
+            .execute(
+                &sandbox_id,
+                sandbox_command,
+                warden_sandbox::ExecuteOptions {
+                    cancel,
+                    on_stdout_line: Some(&on_stdout_line),
+                },
+            )
+            .await
+            .map_err(map_sandbox_error)?;
+
+        // H1: never persist pid 0. A missing pid right after the sandbox
+        // started the process is a typed error, not a silent fallback — a
+        // persisted pid 0 would make `is_process_alive` misreport this run
+        // as having a live process forever (POSIX `kill(0, ...)`
+        // semantics), defeating crash recovery.
+        let pid = execution.pid.ok_or_else(|| ProcessError::MissingPid {
+            command: command.program.clone(),
+        })?;
         let process_id = Uuid::new_v4().to_string();
 
         db::insert_agent_process(
@@ -1762,29 +1829,30 @@ impl Orchestrator {
         })
         .await?;
 
-        // Issue #33: translates each streamed stdout line into a progress
-        // detail (this run's `ToolAdapter`'s own concern -- e.g. `claude
-        // --output-format stream-json`'s NDJSON events, never a format this
-        // module itself understands) and broadcasts it live-only. Must stay
-        // synchronous (see `publish_progress_event`'s own docs).
-        let on_stdout_line = |line: &str| {
-            if let Some(detail) = runner.parse_progress_line(line) {
-                self.publish_progress_event(role, detail);
-            }
-        };
-        let outcome_result = process::wait_with_progress(
-            child,
-            &command.program,
-            Some(stdin_payload),
-            cancel,
-            Some(&on_stdout_line),
-        )
-        .await;
+        let outcome_result = execution
+            .wait()
+            .await
+            .map(|result| AgentOutcome {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            })
+            .map_err(map_sandbox_error);
         let exit_code_for_db = match &outcome_result {
             Ok(outcome) => outcome.exit_code,
             Err(_) => -1,
         };
         db::mark_agent_process_ended(&self.pool, &process_id, exit_code_for_db).await?;
+
+        // Best-effort: `LocalSandbox::destroy` only ever drops this
+        // invocation's own bookkeeping entry (no real OS resource to leak),
+        // so a failure here must never mask the agent's own outcome above --
+        // logged, not propagated, the same "cleanup failure is secondary to
+        // the outcome already computed" convention this module already uses
+        // for worktree removal after a failed coder run.
+        if let Err(error) = self.sandbox.destroy(sandbox_id).await {
+            tracing::warn!(cycle_id, ?role, %error, "failed to destroy sandbox after agent invocation");
+        }
 
         // L1: log stderr on the success path too — previously only ever
         // surfaced when findings-parsing failed, so a noisy-but-successful
@@ -1800,7 +1868,41 @@ impl Orchestrator {
             .await?;
         }
 
-        Ok(outcome_result?)
+        outcome_result
+    }
+}
+
+/// Translates a [`warden_sandbox::SandboxError`] into this crate's own
+/// [`ProcessError`] (issue #50): every existing caller/test downstream of
+/// [`Orchestrator::run_agent`] -- CLI error text, `assert_cmd` assertions --
+/// was written against `ProcessError`'s `Display` output, and a `LocalSandbox`
+/// invocation must remain indistinguishable from it (strict parity is this
+/// issue's own acceptance criterion). A `SandboxError` variant with no
+/// natural `ProcessError` counterpart (only `UnknownSandbox` today -- an
+/// internal bug, never expected from a well-behaved backend) still becomes a
+/// typed, actionable error rather than a panic or a silently swallowed one.
+fn map_sandbox_error(error: warden_sandbox::SandboxError) -> WardenError {
+    use warden_sandbox::SandboxError;
+    match error {
+        SandboxError::Spawn { program, source } => ProcessError::Spawn {
+            command: program,
+            source,
+        }
+        .into(),
+        SandboxError::Cancelled { program } => ProcessError::Cancelled { command: program }.into(),
+        SandboxError::Wait { program, source } => ProcessError::Wait {
+            command: program,
+            source,
+        }
+        .into(),
+        SandboxError::StdinWrite { program, source } => ProcessError::StdinWrite {
+            command: program,
+            source,
+        }
+        .into(),
+        SandboxError::UnknownSandbox { id } => WardenError::Sandbox {
+            reason: format!("unknown sandbox id {id}"),
+        },
     }
 }
 

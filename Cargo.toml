@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/warden-core", "crates/warden", "crates/warden-gated", "crates/warden-tui"]
+members = ["crates/warden-core", "crates/warden-sandbox", "crates/warden", "crates/warden-gated", "crates/warden-tui"]
 
 [workspace.package]
 edition = "2021"
@@ -11,4 +11,7 @@ license = "MIT"
 # binary) -- see ADR-0002/ADR-0006 and issue #3. Phase 8 (issue #8) adds
 # `warden-tui`: a fourth, strictly read-only binary that subscribes to the
 # Event Bus + replays the `events` table (ADR-0008) -- it never shares I/O
-# code with `warden` any more than `warden-gated` does.
+# code with `warden` any more than `warden-gated` does. Issue #50 adds
+# `warden-sandbox`: the execution-environment isolation seam (`Sandbox`
+# trait + `LocalSandbox`), depended on by `warden` but never by
+# `warden-core` -- see `crates/warden-sandbox/src/lib.rs`'s own docs.

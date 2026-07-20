@@ -334,6 +334,15 @@ pub enum WardenError {
     /// value that failed to convert, not a placeholder.
     #[error("PR number {pr_number} does not fit in the column's numeric type")]
     PrNumberOverflow { pr_number: u64 },
+
+    /// Issue #50: a `warden_sandbox::SandboxError` that has no natural
+    /// [`ProcessError`] counterpart to translate into (see
+    /// `orchestrator::map_sandbox_error`'s own docs) -- every spawn/wait/
+    /// cancel/stdin-write shape a `LocalSandbox` invocation can produce maps
+    /// onto the existing `ProcessError` variants instead, for strict parity
+    /// with this crate's pre-issue-#50 error text.
+    #[error("sandbox error: {reason}")]
+    Sandbox { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;
