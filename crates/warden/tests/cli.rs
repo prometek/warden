@@ -187,6 +187,36 @@ fn path_with_fake_bin_first(fake_bin_dir: &Path) -> String {
     format!("{}:{real_path}", fake_bin_dir.display())
 }
 
+/// Issue #26 review, LOW: every `Command` driving the real `warden` binary
+/// in this file must go through this helper rather than
+/// `Command::cargo_bin("warden")` directly. `assert_cmd`'s `Command::env`
+/// only *adds* to the inherited environment, it never clears it -- a test
+/// that forgets to set `XDG_CONFIG_HOME`/`HOME` itself would otherwise
+/// silently fall through to whatever the real developer/CI environment
+/// happens to contain (code-standards.md: tests must never touch the real
+/// `~/.config` or real `$HOME`; this was a real bug -- see
+/// `e2e_non_git_repo_path_is_a_clean_cli_error`, which gets far enough into
+/// `main.rs` to actually read `~/.config/warden/agents/{reviewer,tester}.md`
+/// before its own assertion is even reached). Building every `Command` here
+/// makes that impossible to reintroduce by omission: a fresh, empty,
+/// hermetic directory is set as both unconditionally, and a test that needs
+/// its own fake `claude` on `PATH` (or its own explicit `XDG_CONFIG_HOME`)
+/// still overrides it with a later `.env(...)` call -- later calls win under
+/// `assert_cmd`/`std::process::Command`.
+///
+/// Returns the hermetic `TempDir` alongside the `Command` -- it must be kept
+/// alive by the caller for as long as the `Command` might still be read
+/// (through to `.assert()`/`.output()`), since dropping a `TempDir` deletes
+/// the directory it points at.
+fn warden_command() -> (Command, TempDir) {
+    let hermetic_home = TempDir::new().expect("tempdir");
+    let mut cmd = Command::cargo_bin("warden").unwrap();
+    cmd.env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("XDG_CONFIG_HOME", hermetic_home.path())
+        .env("HOME", hermetic_home.path());
+    (cmd, hermetic_home)
+}
+
 /// Stands in for the real `asciinema` binary (Evidence Capture Adapter,
 /// ADR-0009): `AsciinemaAdapter` always passes the destination `.cast` path
 /// as the last argument (`asciinema rec --quiet --overwrite --command <cmd>
@@ -841,23 +871,22 @@ async fn e2e_failing_coder_marks_run_failed_and_never_reaches_review() {
 fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("must not be blank"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("must not be blank"));
 
     assert!(
         !warden_home.path().join("state.db").exists(),
@@ -869,23 +898,22 @@ fn e2e_blank_intent_is_a_clean_cli_error_and_creates_no_run_row() {
 fn e2e_whitespace_only_intent_is_a_clean_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "   \n\t  ",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("must not be blank"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "   \n\t  ",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("must not be blank"));
 }
 
 /// `worktree::WorktreeManager::new` rejects a `--repo` with no `.git` --
@@ -894,22 +922,21 @@ fn e2e_whitespace_only_intent_is_a_clean_cli_error() {
 fn e2e_non_git_repo_path_is_a_clean_cli_error() {
     let not_a_repo = TempDir::new().unwrap();
     let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            not_a_repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure();
+    cmd.args([
+        "run",
+        "--repo",
+        not_a_repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure();
 }
 
 /// Issue #24 point 1: `--tool` is validated against a closed, compiled-in
@@ -921,23 +948,22 @@ fn e2e_non_git_repo_path_is_a_clean_cli_error() {
 fn e2e_an_unknown_tool_is_a_clean_cli_error_naming_the_value() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "aider",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("aider"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "aider",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("aider"));
 }
 
 /// `--tool` has no default: the target UX (issue #24) shows it explicitly on
@@ -947,21 +973,20 @@ fn e2e_an_unknown_tool_is_a_clean_cli_error_naming_the_value() {
 fn e2e_omitting_tool_entirely_is_a_clean_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("--tool"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("--tool"));
 }
 
 /// Issue #24 point 4: the flags this issue removes (`--coder-agent`/
@@ -975,25 +1000,24 @@ fn e2e_the_removed_agent_flags_are_rejected_by_the_cli_not_silently_ignored() {
     for removed_flag in ["--coder-agent", "--reviewer-agent", "--tester-agent"] {
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
+        let (mut cmd, _hermetic_home) = warden_command();
 
-        Command::cargo_bin("warden")
-            .unwrap()
-            .args([
-                "run",
-                "--repo",
-                repo.path().to_str().unwrap(),
-                "--intent",
-                "irrelevant",
-                "--warden-home",
-                warden_home.path().to_str().unwrap(),
-                "--tool",
-                "claude",
-                removed_flag,
-                "/dev/null",
-            ])
-            .assert()
-            .failure()
-            .stderr(contains("unexpected argument"));
+        cmd.args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            removed_flag,
+            "/dev/null",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("unexpected argument"));
 
         assert!(
             !warden_home.path().join("state.db").exists(),
@@ -1015,23 +1039,22 @@ fn e2e_an_agent_definition_with_an_unknown_key_is_a_clean_cli_error() {
         "model: opus\ntimeout: 30\n",
         "be a coder",
     );
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("timeout"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("timeout"));
 }
 
 #[test]
@@ -1039,23 +1062,22 @@ fn e2e_an_agent_definition_with_a_blank_system_prompt_is_a_clean_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     write_agent_definition(repo.path(), "coder", "", "   ");
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("blank"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("blank"));
 }
 
 /// LOW (carried over from ADR-0013's own review): a CRLF definition file's
@@ -1072,23 +1094,22 @@ fn e2e_a_crlf_definition_file_is_rejected_naming_the_line_endings_not_the_fence(
         "---\r\nmodel: opus\r\n---\r\nbe a coder\r\n",
     )
     .unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure()
-        .stderr(contains("CRLF"));
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("CRLF"));
 }
 
 /// A convention file that exists but fails to read for a reason other than
@@ -1099,22 +1120,21 @@ fn e2e_a_definition_path_that_is_a_directory_is_a_clean_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     std::fs::create_dir_all(repo.path().join(".warden/agents/coder.md")).unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
 
-    Command::cargo_bin("warden")
-        .unwrap()
-        .args([
-            "run",
-            "--repo",
-            repo.path().to_str().unwrap(),
-            "--intent",
-            "irrelevant",
-            "--warden-home",
-            warden_home.path().to_str().unwrap(),
-            "--tool",
-            "claude",
-        ])
-        .assert()
-        .failure();
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure();
 }
 
 /// ADR-0012, unchanged by issue #24: the reviewer/tester still receive
@@ -1556,6 +1576,512 @@ async fn e2e_reviewer_and_tester_definitions_each_reach_their_own_invocation_not
         !tester_argv.contains("be the reviewer"),
         "the tester's argv must never carry the reviewer's own prompt: {tester_argv:?}"
     );
+}
+
+/// Issue #26 review, MEDIUM: with `--trust-repo-agents` off (the default)
+/// and no user-config file, a repo-supplied `.warden/agents/reviewer.md`
+/// must be ignored -- the reviewer runs with the adapter's own default
+/// prompt, never the repo's, and the CLI's own stderr names the ignored path
+/// (this is the single most important assertion issue #26 exists to pin:
+/// nothing in `main.rs`'s wiring or `agent_def::resolve_agent_definition`
+/// accidentally lets a repo-controlled prompt reach an independent role by
+/// default).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_repo_reviewer_definition_is_ignored_by_default_and_warns() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    write_agent_definition(
+        repo.path(),
+        "reviewer",
+        "",
+        "REPO_CONTROLLED_REVIEWER_MARKER_PROMPT",
+    );
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        &format!(
+            r#"cp "$stdin_file" "{captures}/reviewer_stdin.json""#,
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+    );
+
+    let (mut cmd, _hermetic_home) = warden_command();
+    let assert = cmd
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "trust-repo-agents off: repo reviewer.md must be ignored",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            // Deliberately no `--trust-repo-agents`.
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    // The `tracing::warn!` this run emits is checked across both streams
+    // rather than assuming one specific stream: `init_tracing`'s own
+    // `tracing_subscriber::fmt()` builder uses its crate default writer
+    // (stdout) here, distinct from `main.rs`'s own deliberately-`stderr`-
+    // agnostic structured "run started"/"finished" lines -- this assertion
+    // only cares that the warning was emitted somewhere in this process's
+    // own output, not which stream carried it.
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_path = repo.path().join(".warden/agents/reviewer.md");
+    assert!(
+        combined.contains("ignoring a repo-controlled agent definition"),
+        "{combined:?}"
+    );
+    assert!(
+        combined.contains(&expected_path.display().to_string()),
+        "{combined:?}"
+    );
+
+    let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+    let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+    assert!(
+        !payload
+            .system_prompt
+            .contains("REPO_CONTROLLED_REVIEWER_MARKER_PROMPT"),
+        "the ignored repo definition must never reach the reviewer's own invocation: {}",
+        payload.system_prompt
+    );
+    assert!(
+        payload.system_prompt.contains("Warden's reviewer agent"),
+        "the adapter's own default prompt must be used instead: {}",
+        payload.system_prompt
+    );
+}
+
+/// Issue #26 review, MEDIUM: the opt-in escape hatch, driven end-to-end --
+/// `--trust-repo-agents` makes the repo's own `.warden/agents/reviewer.md`
+/// actually reach the reviewer's invocation, with the CLI naming the path as
+/// untrusted on stderr *and* persisting a
+/// `RunEvent::UntrustedAgentDefinitionUsed` for it, so both this process's
+/// own log and the run's own permanent, replayable event log carry the
+/// record (see `agent_def`'s own module docs on why the flag must never be
+/// silently indistinguishable from a trusted resolution).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_trust_repo_agents_uses_the_repo_definition_and_surfaces_it_as_untrusted() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+
+    write_agent_definition(
+        repo.path(),
+        "reviewer",
+        "",
+        "REPO_CONTROLLED_REVIEWER_MARKER_PROMPT",
+    );
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        &format!(
+            r#"cp "$stdin_file" "{captures}/reviewer_stdin.json""#,
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+    );
+
+    let (mut cmd, _hermetic_home) = warden_command();
+    let assert = cmd
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "trust-repo-agents on: repo reviewer.md must be used, surfaced as untrusted",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--trust-repo-agents",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_path = repo.path().join(".warden/agents/reviewer.md");
+    assert!(combined.contains("NOT trusted"), "{combined:?}");
+    assert!(
+        combined.contains(&expected_path.display().to_string()),
+        "{combined:?}"
+    );
+
+    let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+    let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+    assert!(
+        payload
+            .system_prompt
+            .contains("REPO_CONTROLLED_REVIEWER_MARKER_PROMPT"),
+        "the repo's own definition must reach the reviewer's invocation once trusted: {}",
+        payload.system_prompt
+    );
+
+    let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let events = warden::db::list_events_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    assert!(
+        events.iter().any(|record| matches!(
+            &record.event,
+            warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path }
+                if role == "reviewer" && path == &expected_path.display().to_string()
+        )),
+        "expected an UntrustedAgentDefinitionUsed event for the reviewer naming {}: {events:?}",
+        expected_path.display()
+    );
+}
+
+/// Issue #26 review, HIGH: a `user_config_agents_dir` that itself resolves
+/// *inside* the repo under review (the coder-controlled-`XDG_CONFIG_HOME`
+/// attack this fix closes -- e.g. a committed `.envrc` exporting
+/// `XDG_CONFIG_HOME=$PWD/.config`) must never be treated as the trusted
+/// `AgentDefinitionSource::UserConfig` -- with the flag off, it is ignored
+/// (with the same warning); with the flag on, it is used but surfaced as
+/// untrusted exactly like a repo convention file, never silently accepted as
+/// the genuinely trusted source.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_xdg_config_home_pointing_inside_the_repo_is_degraded_to_untrusted() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+    // The attack: `XDG_CONFIG_HOME` resolves to a directory *inside* the
+    // repo the coder controls, exactly as a committed `.envrc` picked up by
+    // the invoking shell would produce.
+    let malicious_xdg_config_home = repo.path().join(".config");
+    write_user_config_agent_definition(
+        &malicious_xdg_config_home,
+        "reviewer",
+        "",
+        "REPO_CONTROLLED_VIA_XDG_MARKER_PROMPT",
+    );
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        &format!(
+            r#"cp "$stdin_file" "{captures}/reviewer_stdin.json""#,
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+    );
+    let expected_path = malicious_xdg_config_home
+        .join("warden")
+        .join("agents")
+        .join("reviewer.md");
+
+    // Flag off: degraded source is ignored, exactly like a repo convention
+    // file.
+    {
+        let (mut cmd, _hermetic_home) = warden_command();
+        let assert = cmd
+            .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+            .env("XDG_CONFIG_HOME", &malicious_xdg_config_home)
+            .args([
+                "run",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--intent",
+                "HIGH fix, flag off: XDG-inside-repo must be ignored",
+                "--warden-home",
+                warden_home.path().to_str().unwrap(),
+                "--tool",
+                "claude",
+            ])
+            .assert()
+            .success()
+            .stdout(contains("finished: Converged"));
+
+        let output = assert.get_output();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("ignoring a repo-controlled agent definition"),
+            "{combined:?}"
+        );
+        assert!(
+            combined.contains(&expected_path.display().to_string()),
+            "{combined:?}"
+        );
+
+        let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+        let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+        assert!(
+            !payload
+                .system_prompt
+                .contains("REPO_CONTROLLED_VIA_XDG_MARKER_PROMPT"),
+            "{}",
+            payload.system_prompt
+        );
+    }
+
+    // Flag on: degraded source is used, but surfaced as untrusted.
+    {
+        let (mut cmd, _hermetic_home) = warden_command();
+        let assert = cmd
+            .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+            .env("XDG_CONFIG_HOME", &malicious_xdg_config_home)
+            .args([
+                "run",
+                "--repo",
+                repo.path().to_str().unwrap(),
+                "--intent",
+                "HIGH fix, flag on: XDG-inside-repo must be used, surfaced as untrusted",
+                "--warden-home",
+                warden_home.path().to_str().unwrap(),
+                "--tool",
+                "claude",
+                "--trust-repo-agents",
+            ])
+            .assert()
+            .success()
+            .stdout(contains("finished: Converged"));
+
+        let output = assert.get_output();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("NOT trusted"), "{combined:?}");
+        assert!(
+            combined.contains(&expected_path.display().to_string()),
+            "{combined:?}"
+        );
+
+        let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+        let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+        assert!(
+            payload
+                .system_prompt
+                .contains("REPO_CONTROLLED_VIA_XDG_MARKER_PROMPT"),
+            "{}",
+            payload.system_prompt
+        );
+
+        let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
+        let pool = warden::db::connect(&warden_home.path().join("state.db"))
+            .await
+            .unwrap();
+        let events = warden::db::list_events_for_run(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|record| matches!(
+                &record.event,
+                warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path }
+                    if role == "reviewer" && path == &expected_path.display().to_string()
+            )),
+            "{events:?}"
+        );
+    }
+}
+
+/// Issue #26 review, MEDIUM: `default_user_config_agents_dir`'s `HOME`-only
+/// fallback (`$HOME/.config/warden/agents`) -- an explicit ticket
+/// requirement -- exercised with `XDG_CONFIG_HOME` genuinely unset (not just
+/// empty), so the fallback branch is really what resolves the reviewer's
+/// trusted source, not `XDG_CONFIG_HOME` happening to agree with it.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_user_config_dir_falls_back_to_home_dot_config_when_xdg_is_unset() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+    let fake_home = TempDir::new().unwrap();
+
+    write_user_config_agent_definition(
+        &fake_home.path().join(".config"),
+        "reviewer",
+        "",
+        "HOME_FALLBACK_REVIEWER_MARKER_PROMPT",
+    );
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        &format!(
+            r#"cp "$stdin_file" "{captures}/reviewer_stdin.json""#,
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env_remove("XDG_CONFIG_HOME")
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("HOME", fake_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "HOME fallback when XDG_CONFIG_HOME is unset",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+    let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+    assert!(
+        payload
+            .system_prompt
+            .contains("HOME_FALLBACK_REVIEWER_MARKER_PROMPT"),
+        "expected the $HOME/.config fallback to resolve the reviewer's trusted definition: {}",
+        payload.system_prompt
+    );
+}
+
+/// The same fallback, exercised via the *other* documented trigger: a
+/// blank/whitespace-only `XDG_CONFIG_HOME` (set, but not usable) must fall
+/// back to `$HOME/.config` exactly like an unset one --
+/// `default_user_config_agents_dir`'s own `.trim().is_empty()` branch.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_user_config_dir_falls_back_to_home_dot_config_when_xdg_is_blank() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let captures = TempDir::new().unwrap();
+    let fake_home = TempDir::new().unwrap();
+
+    write_user_config_agent_definition(
+        &fake_home.path().join(".config"),
+        "reviewer",
+        "",
+        "HOME_FALLBACK_REVIEWER_MARKER_PROMPT",
+    );
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        &format!(
+            r#"cp "$stdin_file" "{captures}/reviewer_stdin.json""#,
+            captures = captures.path().display()
+        ),
+        NOOP_BODY,
+    );
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", "   ")
+        .env("HOME", fake_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "HOME fallback when XDG_CONFIG_HOME is blank",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let raw = std::fs::read_to_string(captures.path().join("reviewer_stdin.json")).unwrap();
+    let payload = warden_core::parse_agent_input_message(&raw).unwrap();
+    assert!(
+        payload
+            .system_prompt
+            .contains("HOME_FALLBACK_REVIEWER_MARKER_PROMPT"),
+        "expected a blank XDG_CONFIG_HOME to fall back to $HOME/.config: {}",
+        payload.system_prompt
+    );
+}
+
+/// `default_user_config_agents_dir`'s first `UserConfigDirUnresolvable`
+/// branch: neither `XDG_CONFIG_HOME` nor `HOME` set at all.
+#[test]
+fn e2e_missing_xdg_config_home_and_home_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot resolve the user config directory"));
+}
+
+/// `default_user_config_agents_dir`'s second `UserConfigDirUnresolvable`
+/// branch: `HOME` is set but empty, with `XDG_CONFIG_HOME` unset too.
+#[test]
+fn e2e_empty_home_with_no_xdg_config_home_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    Command::cargo_bin("warden")
+        .unwrap()
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", "")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("cannot resolve the user config directory"));
 }
 
 /// Architecture.md §10 (`ClaudeAdapter::env_allowlist`, issue #24 point 6):

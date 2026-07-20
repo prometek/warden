@@ -1234,6 +1234,7 @@ impl Orchestrator {
                 env_allowlist,
                 worktree.path(),
                 &config.repo_path,
+                &config.warden_home.join("worktrees").join(run_id),
                 stdin_payload,
                 cancel,
             )
@@ -1486,6 +1487,7 @@ impl Orchestrator {
                 env_allowlist,
                 worktree.path(),
                 &config.repo_path,
+                &config.warden_home.join("worktrees").join(run_id),
                 stdin_payload,
                 cancel.clone(),
             )
@@ -1695,13 +1697,16 @@ impl Orchestrator {
     /// would persist it (see this module's own ADR-0008 amendment docs).
     ///
     /// `repo_path` is the run's base repository (`RunConfig::repo_path`,
-    /// never a role's own worktree) -- passed through to
-    /// [`process::validate_agent_program`] (issue #26), the one choke point
-    /// every coder/reviewer/tester spawn in this codebase goes through, so a
-    /// future `ToolAdapter` that ever names a repo-relative or in-worktree
-    /// `command.program` for the reviewer/tester is refused here rather than
-    /// silently spawning code the coder controls. A no-op for the coder
-    /// itself -- see that function's own docs for why.
+    /// never a role's own worktree); `run_worktrees_root` is this run's own
+    /// `<warden_home>/worktrees/<run_id>` (the parent of every role's
+    /// worktree for this run, including the coder's -- issue #26 review,
+    /// MEDIUM) -- both passed through to [`process::validate_agent_program`]
+    /// (issue #26), the one choke point every coder/reviewer/tester spawn in
+    /// this codebase goes through, so a future `ToolAdapter` that ever names
+    /// a repo-relative or in-worktree `command.program` for the
+    /// reviewer/tester is refused here rather than silently spawning code
+    /// the coder controls. A no-op for the coder itself -- see that
+    /// function's own docs for why.
     #[allow(clippy::too_many_arguments)]
     async fn run_agent<R: ToolAdapter>(
         &self,
@@ -1712,10 +1717,17 @@ impl Orchestrator {
         env_allowlist: &[&str],
         cwd: &Path,
         repo_path: &Path,
+        run_worktrees_root: &Path,
         stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
-        process::validate_agent_program(role, &command.program, cwd, repo_path)?;
+        process::validate_agent_program(
+            role,
+            &command.program,
+            cwd,
+            repo_path,
+            run_worktrees_root,
+        )?;
         let child = process::spawn_with_extra_env(command, cwd, env_allowlist)?;
         // H1: never persist pid 0. A missing `Child::id()` right after
         // spawn is a typed error, not a silent fallback — a persisted pid

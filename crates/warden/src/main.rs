@@ -171,6 +171,17 @@ fn parse_tool(raw: &str) -> Result<ToolName, String> {
     }
 }
 
+/// A newtype around `--trust-repo-agents`'s `bool` (issue #26 review, LOW):
+/// `run`'s own parameter list carries this alongside `evidence_store_in_repo`
+/// (also a bare `bool`), separated only by a generic `adapter` and an
+/// `Option<EvidenceTool>` -- a future insertion there could silently
+/// transpose the two positionally, and this one is a security-relevant
+/// switch (it gates whether a reviewer/tester definition the coder can write
+/// to is ever used at all). Wrapping it in its own type makes that
+/// transposition a compile error instead of a silent bug.
+#[derive(Debug, Clone, Copy)]
+struct TrustRepoAgents(bool);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -231,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
                         max_test_cycles,
                         warden_home,
                         ClaudeAdapter,
-                        trust_repo_agents,
+                        TrustRepoAgents(trust_repo_agents),
                         evidence_tool,
                         evidence_store_in_repo,
                         gate,
@@ -288,13 +299,24 @@ async fn run<R: ToolAdapter>(
     max_test_cycles: u32,
     warden_home: Option<PathBuf>,
     adapter: R,
-    trust_repo_agents: bool,
+    trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
     tui_launch: Option<TuiLaunchConfig>,
 ) -> anyhow::Result<()> {
-    let warden_home = warden_home.unwrap_or(default_warden_home()?);
+    // Issue #26 review: `Option::unwrap_or` (the previous form here)
+    // evaluates its argument eagerly, so `default_warden_home()?` used to
+    // run -- and could fail on a missing `HOME` -- even when `--warden-home`
+    // was passed explicitly and its result would just be discarded. This
+    // `match` only calls `default_warden_home()` when `warden_home` is
+    // actually `None`, matching the flag's own documented "defaults to
+    // `~/.warden`" behaviour instead of silently requiring `HOME`
+    // unconditionally.
+    let warden_home = match warden_home {
+        Some(warden_home) => warden_home,
+        None => default_warden_home()?,
+    };
     let db_path = warden_home.join("state.db");
     let pool = db::connect(&db_path)
         .await
@@ -389,7 +411,7 @@ async fn run<R: ToolAdapter>(
         AgentRole::Coder,
         &adapter,
         &user_config_agents_dir,
-        trust_repo_agents,
+        trust_repo_agents.0,
     )
     .await?;
     let (reviewer_agent, reviewer_source) = resolve_agent_definition(
@@ -397,7 +419,7 @@ async fn run<R: ToolAdapter>(
         AgentRole::Reviewer,
         &adapter,
         &user_config_agents_dir,
-        trust_repo_agents,
+        trust_repo_agents.0,
     )
     .await?;
     let (tester_agent, tester_source) = resolve_agent_definition(
@@ -405,7 +427,7 @@ async fn run<R: ToolAdapter>(
         AgentRole::Tester,
         &adapter,
         &user_config_agents_dir,
-        trust_repo_agents,
+        trust_repo_agents.0,
     )
     .await?;
 

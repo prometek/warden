@@ -84,19 +84,28 @@ pub struct AgentOutcome {
 ///   resolves against `worktree_path` (the child chdirs there before exec)
 ///   -- exactly the `./reviewer.sh`-means-the-coder's-own-copy hazard
 ///   [`spawn`]'s own docs describe.
-/// - **an absolute path that resolves inside `worktree_path` or
-///   `repo_path`**: the role's own checked-out worktree, or the run's base
-///   repository, both of which are (transitively, for the worktree) exactly
-///   what the coder just committed to.
+/// - **an absolute path that resolves inside `worktree_path`, `repo_path`,
+///   or `run_worktrees_root`**: the role's own checked-out worktree, the
+///   run's base repository, or *any* role's worktree for this run
+///   (`<warden_home>/worktrees/<run_id>/`). Issue #26 review, MEDIUM: the
+///   original check covered only the checked role's own worktree and the
+///   base repo, leaving the *coder's* own worktree
+///   (`<run_worktrees_root>/coder`) unchecked -- the most coder-controllable
+///   directory on disk, since the coder runs with `Bash` there and writes
+///   freely, including files it never commits. `worktree_path` is always a
+///   subdirectory of `run_worktrees_root`, so the `run_worktrees_root` check
+///   alone already subsumes it; the separate `worktree_path` check is kept
+///   only for the more specific error message when the program resolves
+///   inside the checked role's *own* worktree specifically.
 ///
 /// A **bare program name with no path separator at all** (`"claude"`,
 /// `"echo"`) is always allowed: it resolves via `PATH`
 /// (`Command::new`/`execvp` semantics), never against `worktree_path`, so it
 /// carries none of the above hazard regardless of what the coder committed.
 ///
-/// Both `worktree_path` and `repo_path` are canonicalized before the
-/// containment check (walking up to the nearest existing ancestor for a
-/// `program` path that doesn't exist on disk -- see
+/// `worktree_path`, `repo_path`, and `run_worktrees_root` are all
+/// canonicalized before the containment check (walking up to the nearest
+/// existing ancestor for a `program` path that doesn't exist on disk -- see
 /// `canonicalize_best_effort`), so a `..`-laden or symlink-relative
 /// `program` can't slip past a purely lexical comparison. If canonicalizing
 /// `program` itself fails for a reason other than "doesn't exist" (e.g. a
@@ -109,6 +118,7 @@ pub fn validate_agent_program(
     program: &str,
     worktree_path: &Path,
     repo_path: &Path,
+    run_worktrees_root: &Path,
 ) -> Result<(), ProcessError> {
     if role == AgentRole::Coder {
         return Ok(());
@@ -167,6 +177,18 @@ pub fn validate_agent_program(
             ),
         }
     })?;
+    let canonical_run_worktrees_root =
+        canonicalize_best_effort(run_worktrees_root).map_err(|source| {
+            ProcessError::UntrustedAgentProgram {
+                role: role.as_str(),
+                program: program.to_string(),
+                reason: format!(
+                    "cannot resolve this run's own worktrees root ({}) to verify this program is \
+                 outside it: {source}",
+                    run_worktrees_root.display()
+                ),
+            }
+        })?;
 
     if canonical_candidate.starts_with(&canonical_worktree) {
         return Err(ProcessError::UntrustedAgentProgram {
@@ -176,6 +198,22 @@ pub fn validate_agent_program(
                 "resolves inside the role's own worktree ({}) -- a checkout of the repo the \
                  coder can write to",
                 worktree_path.display()
+            ),
+        });
+    }
+    // Issue #26 review, MEDIUM: catches a program under *another* role's
+    // worktree for this same run (most importantly the coder's own,
+    // `<run_worktrees_root>/coder` -- the coder writes there freely via
+    // `Bash`, including files it never commits) -- the check above only
+    // ever covered the checked role's own worktree.
+    if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
+        return Err(ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
+                 coder writes to freely via Bash, including files it never commits",
+                run_worktrees_root.display()
             ),
         });
     }
@@ -195,26 +233,37 @@ pub fn validate_agent_program(
 }
 
 /// Canonicalizes `path`, walking up to the nearest existing ancestor if
-/// `path` itself doesn't exist yet (e.g. a `program` argument nobody has
-/// spawned successfully before) -- mirrors `worktree.rs`'s own
-/// `canonicalize_best_effort` (kept as a separate, small copy rather than a
-/// shared helper: that one returns a `WorktreeError`, this one an
-/// `std::io::Error`, and threading a third error type across both modules
-/// just for a ten-line ancestor walk isn't worth the coupling).
+/// `path` itself (or some intermediate component of it) doesn't exist yet
+/// (e.g. a `program` argument nobody has spawned successfully before) --
+/// mirrors `worktree.rs`'s own `canonicalize_best_effort` (kept as a
+/// separate, small copy rather than a shared helper: that one returns a
+/// `WorktreeError`, this one an `std::io::Error`, and threading a third
+/// error type across both modules just for a ten-line ancestor walk isn't
+/// worth the coupling).
+///
+/// Issue #26 review, LOW: unlike a naive "pop segments until something
+/// resolves" walk, a canonicalize failure for any reason other than
+/// [`std::io::ErrorKind::NotFound`] (a permissions error, `ELOOP`, ...) is
+/// propagated immediately here rather than silently walked past -- an
+/// ancestor that exists but can't be canonicalized for some other reason
+/// means this function can no longer verify what `path` actually resolves
+/// to, and continuing to pop past it would defeat the exact containment
+/// check every caller uses this for (this is the fail-closed guarantee this
+/// function's callers already document).
 fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
-    let mut candidate = path.to_path_buf();
-    loop {
-        match candidate.canonicalize() {
-            Ok(canonical) => {
-                let suffix = path.strip_prefix(&candidate).unwrap_or(Path::new(""));
-                return Ok(canonical.join(suffix));
-            }
-            Err(error) => {
-                if !candidate.pop() {
-                    return Err(error);
-                }
-            }
+    match path.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file_name = path.file_name().ok_or(error)?;
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no existing ancestor found for {}", path.display()),
+                )
+            })?;
+            Ok(canonicalize_best_effort(parent)?.join(file_name))
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -697,22 +746,61 @@ mod tests {
     // `validate_agent_program` (issue #26, belt-and-braces)
     // -----------------------------------------------------------------
 
+    /// A dedicated `<run_worktrees_root>/<role>` layout, mirroring what
+    /// `WorktreeManager::create` actually produces
+    /// (`<warden_home>/worktrees/<run_id>/<role>`) -- used by every test
+    /// below instead of an unrelated bare `TempDir` for `worktree_path`, so
+    /// the MEDIUM (issue #26 review) coverage of *other* roles' worktrees
+    /// under the same `run_worktrees_root` has something real to check.
+    struct WorktreeLayout {
+        run_worktrees_root: TempDir,
+    }
+
+    impl WorktreeLayout {
+        fn new() -> Self {
+            Self {
+                run_worktrees_root: TempDir::new().unwrap(),
+            }
+        }
+
+        fn role_worktree(&self, role: &str) -> PathBuf {
+            let path = self.run_worktrees_root.path().join(role);
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        }
+    }
+
     #[test]
     fn a_bare_program_name_with_no_separator_is_always_allowed_for_reviewer_and_tester() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
         for role in [AgentRole::Reviewer, AgentRole::Tester] {
-            assert!(validate_agent_program(role, "claude", worktree.path(), repo.path()).is_ok());
+            assert!(validate_agent_program(
+                role,
+                "claude",
+                &worktree,
+                repo.path(),
+                layout.run_worktrees_root.path(),
+            )
+            .is_ok());
         }
     }
 
     #[test]
     fn a_relative_path_is_refused_for_reviewer_and_tester() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
         for role in [AgentRole::Reviewer, AgentRole::Tester] {
-            let error = validate_agent_program(role, "./reviewer.sh", worktree.path(), repo.path())
-                .unwrap_err();
+            let error = validate_agent_program(
+                role,
+                "./reviewer.sh",
+                &worktree,
+                repo.path(),
+                layout.run_worktrees_root.path(),
+            )
+            .unwrap_err();
             assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
             assert!(error.to_string().contains("./reviewer.sh"), "{error}");
         }
@@ -720,16 +808,18 @@ mod tests {
 
     #[test]
     fn an_absolute_path_inside_the_role_worktree_is_refused() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
-        let program = worktree.path().join("reviewer.sh");
+        let program = worktree.join("reviewer.sh");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         let error = validate_agent_program(
             AgentRole::Reviewer,
             program.to_str().unwrap(),
-            worktree.path(),
+            &worktree,
             repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -737,7 +827,8 @@ mod tests {
 
     #[test]
     fn an_absolute_path_inside_the_run_base_repo_is_refused() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("tester");
         let repo = TempDir::new().unwrap();
         let program = repo.path().join(".warden/agents/reviewer.sh");
         std::fs::create_dir_all(program.parent().unwrap()).unwrap();
@@ -746,16 +837,46 @@ mod tests {
         let error = validate_agent_program(
             AgentRole::Tester,
             program.to_str().unwrap(),
-            worktree.path(),
+            &worktree,
             repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
     }
 
+    /// Issue #26 review, MEDIUM: the original guard only checked the
+    /// checked role's own worktree and the base repo -- leaving the
+    /// *coder's* own worktree, under the same `run_worktrees_root`, entirely
+    /// unchecked even though it is the most coder-controllable directory on
+    /// disk (the coder runs with `Bash` there and writes freely, including
+    /// files it never commits). A reviewer `program` naming a script under
+    /// the coder's worktree must now be refused too.
     #[test]
-    fn an_absolute_path_outside_both_the_worktree_and_the_repo_is_allowed() {
-        let worktree = TempDir::new().unwrap();
+    fn an_absolute_path_inside_the_coders_own_worktree_for_this_run_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let program = coder_worktree.join("tool.sh");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            AgentRole::Reviewer,
+            program.to_str().unwrap(),
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+        assert!(error.to_string().contains("run's own worktrees"), "{error}");
+    }
+
+    #[test]
+    fn an_absolute_path_outside_the_worktree_the_repo_and_the_run_worktrees_root_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
         let elsewhere = TempDir::new().unwrap();
         let program = elsewhere.path().join("some-tool");
@@ -764,8 +885,9 @@ mod tests {
         assert!(validate_agent_program(
             AgentRole::Reviewer,
             program.to_str().unwrap(),
-            worktree.path(),
+            &worktree,
             repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .is_ok());
     }
@@ -776,7 +898,8 @@ mod tests {
     /// the reviewer/tester must pass unchanged for the coder.
     #[test]
     fn the_coder_is_never_subject_to_this_guard() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("coder");
         let repo = TempDir::new().unwrap();
         let program = repo.path().join(".warden/agents/coder.sh");
         std::fs::create_dir_all(program.parent().unwrap()).unwrap();
@@ -785,15 +908,17 @@ mod tests {
         assert!(validate_agent_program(
             AgentRole::Coder,
             program.to_str().unwrap(),
-            worktree.path(),
+            &worktree,
             repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .is_ok());
         assert!(validate_agent_program(
             AgentRole::Coder,
             "./coder.sh",
-            worktree.path(),
-            repo.path()
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .is_ok());
     }
@@ -804,15 +929,17 @@ mod tests {
     /// canonicalized outright.
     #[test]
     fn a_nonexistent_absolute_path_inside_the_worktree_is_still_refused() {
-        let worktree = TempDir::new().unwrap();
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
-        let program = worktree.path().join("does-not-exist-yet.sh");
+        let program = worktree.join("does-not-exist-yet.sh");
 
         let error = validate_agent_program(
             AgentRole::Reviewer,
             program.to_str().unwrap(),
-            worktree.path(),
+            &worktree,
             repo.path(),
+            layout.run_worktrees_root.path(),
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
