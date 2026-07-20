@@ -80,7 +80,7 @@ impl SandboxId {
 
     /// Wraps an already-known id (issue #50 review, MEDIUM 2). The public
     /// constructor `Sandbox` itself was missing: with only
-    /// [`SandboxId::generate`] (`pub(crate)`) available, no id could be
+    /// `SandboxId::generate` (`pub(crate)`) available, no id could be
     /// produced outside this crate, which made [`Sandbox::create`]'s return
     /// type -- and therefore the whole trait -- unimplementable by anything
     /// other than [`LocalSandbox`]. Paired with [`Execution::new`] (issue #50

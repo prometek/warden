@@ -33,11 +33,31 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
     anticipé (`?`) *et* sur l'abandon de la future `run_agent` elle-même
     (annulation de run, sortie de `warden run --tui`) — cas qu'un simple appel
     `destroy()` en fin de fonction ne couvrait pas.
-  - `SandboxId` gagne un constructeur public (`SandboxId::new`), rendant le trait
-    `Sandbox` réellement implémentable hors du crate — vérifié par un test dans
-    `warden` qui installe un faux `Sandbox` enregistreur via `with_sandbox` et
-    prouve que `run_agent` route bien `create`/`execute`/`destroy` à travers lui,
-    y compris sur un chemin d'erreur/annulation.
+  - `SandboxId` et `Execution` gagnent chacun un constructeur public
+    (`SandboxId::new`, `Execution::new`), rendant le trait `Sandbox` réellement
+    implémentable hors du crate — sans eux, seul `LocalSandbox` pouvait
+    produire les types que `Sandbox::create`/`execute` renvoient, ce qui
+    rendait le trait inutilisable comme point d'extension pour #49. Vérifié
+    par un test dans `warden` qui installe un faux `Sandbox` enregistreur via
+    `with_sandbox` et prouve que `run_agent` route bien
+    `create`/`execute`/`destroy` à travers lui, y compris sur un chemin
+    d'erreur/annulation ; une suite indépendante ajoutée ensuite (couvrant
+    `SandboxGuard::destroy` sur annulation propre, et `kill_on_drop` sur
+    abandon de `Execution` sans passer par le chemin d'annulation explicite)
+    verrouille les mêmes garanties depuis l'extérieur de l'implémentation.
+  - **Limite connue, à traiter par #49** : la récupération après crash
+    (`recover_crashed_runs`) continue d'appeler `process::kill_pid` sur un pid
+    hôte persisté en base — un raccourci qui ne passe pas par la seam. Sans
+    signification pour un futur backend conteneur (le pid hôte du process
+    `docker`/`runc` n'est pas le processus agent lui-même) : #49 devra faire
+    reposer cette récupération sur `Sandbox::destroy` plutôt que sur un pid nu.
+  - **ADR-0015 non écrite** : cette issue en attendait une, mais le dossier
+    d'architecture du projet (`docs/`) est un lien symbolique non versionné
+    vers un vault Obsidian externe, hors de ce dépôt git — rien à committer ici
+    pour la porter. Cette entrée de CHANGELOG en tient lieu d'enregistrement de
+    décision jusqu'à ce qu'une ADR-0015 réelle soit écrite dans ce vault, même
+    convention que les ADR-0014/ADR-0018 documentées uniquement ici faute de
+    dossier `ADR/` versionné dans ce dépôt.
   - Déduplication : `process::wait_with_progress`/`spawn_with_extra_env` (le
     callback de progression par ligne, l'allowlist d'env) sont supprimés —
     devenus du code mort une fois tous les agents passés par cette seam ; seule
