@@ -7,6 +7,74 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Security — Issue #30 : garde-fou cross-run des définitions d'agent — résolution via l'OS au lieu du matching de chaînes
+
+#### BREAKING — comportement du détecteur `agent_definition_tampering_finding` resserré
+
+- **Le détecteur `touched_agent_definition_paths` (issue #24 review, M4), qui modélisait la
+  résolution de chemin par comparaison de chaînes sur `git diff --name-status`, est remplacé
+  par un détecteur *resolve-and-compare* : en fin de cycle coder, les trois chemins littéraux
+  `.warden/agents/{coder,reviewer,tester}.md` sont **re-résolus à travers l'OS** — via un
+  worktree jetable (`git worktree add --detach`) checkouté sur le commit du cycle,
+  `agent_def::read_raw_definition`, octets bruts, **jamais parsés** — et comparés à un
+  snapshot de démarrage résolu de la même façon sur le commit de départ du run. Toute
+  divergence de présence/absence ou de contenu lève le finding bloquant `FindingSource::Warden`
+  existant.
+- **Ferme les deux contournements documentés depuis #24** (`orchestrator.rs`, revue cycle 3) :
+  le folding Unicode `.warden/agentſ/coder.md` (U+017F, que `str::to_lowercase` ratait car déjà
+  minuscule alors qu'APFS le fold vers `s`), et le composant parent symlinké
+  (`ln -s stash .warden` + `stash/agents/reviewer.md`, dont ni `.warden` ni
+  `stash/agents/reviewer.md` ne matchait jamais `AGENTS_DIR` par comparaison de chaînes). Les
+  deux côtés de la comparaison posent désormais la même question au même OS — rien à modéliser.
+- **Contenu non-parsable → finding, jamais `Err`** : une tentative antérieure inachevée
+  (branche `issue-24-m4-resolve-compare-wip`, `823f195`) re-résolvait via
+  `resolve_agent_definition`, qui parse — un coder écrivant des octets non-parsables dans une
+  définition faisait alors retourner `Err` au détecteur au lieu de lever un finding.
+  `read_raw_definition` ne parse jamais et est infaillible ; l'`Err` que la fonction
+  peut désormais renvoyer ne couvre plus que l'échec du `git worktree add`/`remove` lui-même,
+  jamais le contenu du fichier.
+- **Correctif de revue (HIGH) avant tout merge** : la première version de ce correctif
+  re-résolvait depuis le *répertoire de travail* du worktree du coder plutôt que depuis le
+  commit qui se propage réellement (`new_commit`, ce que `warden-gated` finit par pousser).
+  Un coder committant une définition empoisonnée puis faisant `rm -rf .warden` avant de sortir
+  laissait le détecteur lire un répertoire de travail nettoyé, identique au snapshot de
+  départ — le run convergeait avec le poison dans l'arbre du commit convergé. Corrigé en
+  re-résolvant, comme le snapshot de départ, via un worktree jetable checkouté sur le commit
+  lui-même — les deux côtés lisent désormais un checkout propre d'un commit, jamais un
+  répertoire de travail mutable qu'un process coder encore vivant pourrait modifier (ferme
+  aussi une fenêtre TOCTOU résiduelle). Pinné par
+  `a_coder_committing_a_poisoned_definition_then_deleting_it_from_the_working_tree_still_blocks` ;
+  son symétrique `uncommitted_junk_under_agents_dir_that_never_reaches_the_commit_does_not_block`
+  pin le faux positif miroir (du contenu jamais committé sous `.warden/agents/` ne doit jamais
+  bloquer, puisqu'il ne peut de toute façon jamais atteindre un run futur).
+- **Rétrécissement de comportement, à connaître** (raison du `!` ci-dessus) : sur un système
+  de fichiers *sensible à la casse* (Linux ext4 typique), committer
+  `.warden/Agents/coder.md` (casse différente) ne lève désormais **plus** de finding — c'est
+  correct (l'OS ne résoudrait jamais ce chemin depuis `.warden/agents/coder.md`, donc ce
+  n'est pas exploitable là), mais l'ancien détecteur, purement textuel, le signalait
+  inconditionnellement quelle que soit la plateforme. Le nouveau détecteur ne signale que ce
+  qu'un `warden run` futur lirait réellement sur la plateforme qui l'exécute — même chose sur
+  macOS/APFS (défaut insensible à la casse), différent sur un système de fichiers sensible à
+  la casse.
+- Snapshot de départ toujours ancré sur `run_base_commit_sha` (le vrai commit de départ du
+  run, jamais recalculé par cycle) — ce qui reste la bonne sémantique : ce qui peut empoisonner
+  un run futur, c'est ce qui est *committé*, pas l'état local du dépôt `--repo` de
+  l'utilisateur (qui peut légitimement porter une définition non committée, propre à cette
+  seule invocation).
+- Détecteur toujours défense en profondeur, pas une garantie : une définition empoisonnée doit
+  de toute façon passer une revue humaine de PR pour atteindre un run futur.
+- **Indépendant de la confiance asymétrique par rôle introduite par #26 (voir l'entrée
+  ci-dessous)** : le détecteur re-résout et compare toujours les trois chemins littéraux
+  `.warden/agents/{coder,reviewer,tester}.md`, **sans condition sur `--trust-repo-agents`**
+  — y compris pour reviewer/tester, alors même que leur résolution *normale* (via
+  `resolve_agent_definition`) ignore désormais ce chemin par défaut depuis #26.
+  `--trust-repo-agents` est un réglage *par run* : une définition empoisonnée committée sur
+  un run sans le flag reste latente, prête à s'appliquer au premier run futur lancé avec.
+  Bloquer inconditionnellement reste fail-closed et préserve les critères d'acceptation de
+  #30 tels quels. Le répertoire de configuration utilisateur (la source fiable de #26) est
+  volontairement hors du périmètre de ce garde-fou : il vit hors du dépôt, le coder ne peut
+  pas y committer, et ce détecteur ne défend que contre ce que le commit du coder change.
+
 ### Changed — Issue #26 / ADR-0018 : résolution des définitions d'agent asymétrique par rôle + garde de chemin de programme
 
 **BREAKING** : `<repo>/.warden/agents/{reviewer,tester}.md` n'est plus lu par défaut.

@@ -3565,7 +3565,11 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
 /// convergence loop and often cancel the run before it ever converges (the
 /// decided "TUI exit cancels the run" behaviour, exercised on its own by
 /// `e2e_tui_exit_cancels_a_still_running_run` below), which is not what
-/// this test is about.
+/// this test is about. Issue #30's own new tests (`AgentDefinitionSnapshot`
+/// re-resolution) added real `git worktree` subprocess work to every cycle,
+/// which measurably widened this race under `cargo test --workspace`'s full
+/// parallel load -- bumped from 1s to 3s for margin; still a real race in
+/// principle, just a much less likely one to lose in practice.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home() {
@@ -3585,7 +3589,7 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
         tui_dir.path(),
         "fake-warden-tui",
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 1\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
             captured_argv.display()
         ),
     );
