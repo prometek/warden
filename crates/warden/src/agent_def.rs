@@ -63,13 +63,17 @@
 //! rejected, since it would break the legitimate "improve our own agent
 //! prompts" workflow issue #24 exists to enable in the first place, and
 //! deferring the whole question to a follow-up ticket was also rejected, as
-//! cheap enough to close in this same pass. Instead, detection: a cycle
-//! whose coder diff touches anything under `.warden/agents/` (add, modify,
-//! delete, or rename in either direction) raises a **blocking**
-//! `FindingSource::Warden` finding (`orchestrator::agent_definition_tampering_finding`),
-//! through the exact same findings/severity machinery a reviewer/tester/CI
-//! finding already goes through -- so the change can never merge, and thus
-//! can never reach a future run, without a human noticing and reviewing it
+//! cheap enough to close in this same pass. Instead, detection: at the end
+//! of every coder cycle, the three literal `.warden/agents/{coder,reviewer,
+//! tester}.md` paths are re-resolved through the OS -- from a throwaway
+//! `git worktree` checkout of that cycle's resulting commit, raw bytes only,
+//! never parsed -- and compared against a run-start snapshot read the same
+//! way. Any divergence in presence or content raises a **blocking**
+//! `FindingSource::Warden` finding
+//! (`orchestrator::agent_definition_tampering_finding`, issue #30), through
+//! the exact same findings/severity machinery a reviewer/tester/CI finding
+//! already goes through -- so the change can never merge, and thus can
+//! never reach a future run, without a human noticing and reviewing it
 //! first. Together, the two halves are: within-run isolation (this
 //! module's snapshot) + cross-run detection (the blocking finding). Neither
 //! is a credential/filesystem sandbox around the coder itself -- the coder
@@ -222,9 +226,9 @@ use crate::tool_adapter::ToolAdapter;
 /// agent definitions (issue #24 point 3): `.warden/agents/coder.md`,
 /// `.warden/agents/reviewer.md`, `.warden/agents/tester.md`.
 ///
-/// `pub(crate)`: also read by `orchestrator::agent_definition_tampering_finding`
-/// (issue #24 review, M4) to recognize a coder diff touching this same
-/// convention directory -- kept as this module's one definition of the
+/// `pub(crate)`: also joined by `orchestrator::agent_definition_tampering_finding`
+/// (issue #30) to build the same three literal paths it re-resolves and
+/// compares every cycle -- kept as this module's one definition of the
 /// convention path rather than duplicated as a second string literal
 /// elsewhere in the crate, so the two can never silently drift apart.
 pub(crate) const AGENTS_DIR: &str = ".warden/agents";
@@ -718,6 +722,92 @@ pub fn default_user_config_agents_dir() -> Result<PathBuf> {
         }
     };
     Ok(base.join("warden").join("agents"))
+}
+
+/// Issue #30 (cross-run agent-definition poisoning, structural fix): the
+/// raw, *unparsed* state `role`'s convention file resolves to when read
+/// through the OS from `repo_path`, via the exact same literal path
+/// [`resolve_agent_definition`] joins (`AGENTS_DIR/<role>.md`).
+#[derive(Debug, Clone)]
+pub(crate) enum RawDefinition {
+    /// No file at the resolved path (`io::ErrorKind::NotFound`).
+    Absent,
+    /// The file's raw bytes, exactly as the OS returned them -- valid or
+    /// invalid UTF-8, parsable frontmatter or not. Never parsed here.
+    Present(Vec<u8>),
+    /// The path resolved to *something*, but the OS refused to read it for
+    /// a reason other than "missing" (permission denied, a directory
+    /// sitting at the path, ...). Kept as its own explicit state rather
+    /// than folded into `Absent` or discarded: a human comparing this
+    /// against a run-start snapshot needs to see *that* it changed, without
+    /// the detector itself failing the run over it. `kind` is what
+    /// [`PartialEq`] actually compares (see its own impl below); `message`
+    /// is display-only, carried through into the finding text a human
+    /// reads.
+    Unreadable {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+/// Issue #30 review (LOW): compares on `kind`, never on `message`. The
+/// derived comparison this replaced compared the OS's own rendered error
+/// string, which is both locale-dependent (a source of non-deterministic
+/// false findings across two otherwise-identical machines) and too coarse
+/// in the other direction (two genuinely different failures can render an
+/// identical message, silently comparing equal when they shouldn't).
+/// `io::ErrorKind` is what every other error-handling path in this crate
+/// already branches on (`resolve_agent_definition`'s own
+/// `ErrorKind::NotFound` check just above) -- stable, locale-independent,
+/// and precise enough to tell genuinely different read failures apart.
+impl PartialEq for RawDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::Present(a), Self::Present(b)) => a == b,
+            (Self::Unreadable { kind: a, .. }, Self::Unreadable { kind: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RawDefinition {}
+
+/// Reads `role`'s convention file at `repo_path` -- the same literal
+/// `AGENTS_DIR/<role>.md` join [`resolve_agent_definition`] uses for the
+/// coder unconditionally, and for the reviewer/tester only when
+/// `--trust-repo-agents` is set (issue #26; see this function's own callers'
+/// docs, `orchestrator::agent_definition_tampering_finding`, for why it is
+/// nonetheless always read here regardless of that flag) -- through the same
+/// OS resolution (case, Unicode normalization, symlinks, and everything else
+/// about that path) but with **no parsing step**, and infallible: every
+/// outcome, including a read failure, is folded into [`RawDefinition`]
+/// rather than returned as an `Err`.
+///
+/// This split from [`resolve_agent_definition`] is deliberate, not
+/// duplication. `orchestrator::agent_definition_tampering_finding` (issue
+/// #30) must compare a run-start snapshot of these raw bytes against a
+/// re-resolution of a cycle's resulting commit, and raise a blocking
+/// finding on any divergence -- including a coder having written
+/// non-parsable bytes into a definition. An earlier, unfinished attempt at
+/// this (branch `issue-24-m4-resolve-compare-wip`) re-resolved via
+/// `resolve_agent_definition` directly, so that exact case made the
+/// detector itself return `Err` instead of raising a finding -- the one
+/// thing the guard must never depend on is the poisoned file being
+/// well-formed.
+pub(crate) async fn read_raw_definition(repo_path: &Path, role: AgentRole) -> RawDefinition {
+    let path = repo_path
+        .join(AGENTS_DIR)
+        .join(format!("{}.md", role.as_str()));
+
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => RawDefinition::Present(bytes),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => RawDefinition::Absent,
+        Err(source) => RawDefinition::Unreadable {
+            kind: source.kind(),
+            message: source.to_string(),
+        },
+    }
 }
 
 /// See [`resolve_agent_definition`]'s own docs (B2): a file that explicitly
@@ -1682,5 +1772,81 @@ mod tests {
 
         assert_eq!(definition.system_prompt, "genuinely trusted");
         assert!(matches!(source, AgentDefinitionSource::UserConfig(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #30: `read_raw_definition` -- no convention file, an existing
+    // one (whatever its bytes), and a path that resolves to something
+    // unreadable must each land in a distinct, non-`Err` `RawDefinition`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_raw_definition_is_absent_when_no_convention_file_exists() {
+        let repo = TempDir::new().unwrap();
+
+        let raw = read_raw_definition(repo.path(), AgentRole::Reviewer).await;
+
+        assert_eq!(raw, RawDefinition::Absent);
+    }
+
+    /// Deliberately non-parsable content (no frontmatter at all) -- this
+    /// must still come back as `Present` with the exact bytes written, never
+    /// an error and never parsed.
+    #[tokio::test]
+    async fn read_raw_definition_returns_the_exact_bytes_even_when_not_parsable() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
+            .await
+            .unwrap();
+        let poisoned: &[u8] = b"not even close to valid frontmatter \xff\xfe";
+        tokio::fs::write(repo.path().join(AGENTS_DIR).join("reviewer.md"), poisoned)
+            .await
+            .unwrap();
+
+        let raw = read_raw_definition(repo.path(), AgentRole::Reviewer).await;
+
+        assert_eq!(raw, RawDefinition::Present(poisoned.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn read_raw_definition_is_unreadable_not_err_when_the_path_is_a_directory() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR).join("coder.md"))
+            .await
+            .unwrap();
+
+        let raw = read_raw_definition(repo.path(), AgentRole::Coder).await;
+
+        assert!(matches!(raw, RawDefinition::Unreadable { .. }));
+    }
+
+    /// Issue #30 review (LOW): `RawDefinition`'s `PartialEq` must compare on
+    /// `ErrorKind`, not on the OS's own rendered message -- two read
+    /// failures of the same kind compare equal even with deliberately
+    /// different message text (standing in for the real-world case: the
+    /// identical failure, rendered in two different locales).
+    #[test]
+    fn raw_definition_unreadable_compares_by_kind_not_by_message() {
+        let a = RawDefinition::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "Permission denied (os error 13)".to_string(),
+        };
+        let b = RawDefinition::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied,
+            message: "permission non accordée (erreur 13)".to_string(),
+        };
+        assert_eq!(
+            a, b,
+            "same ErrorKind must compare equal regardless of message text"
+        );
+
+        let different_kind = RawDefinition::Unreadable {
+            kind: std::io::ErrorKind::IsADirectory,
+            message: "Permission denied (os error 13)".to_string(),
+        };
+        assert_ne!(
+            a, different_kind,
+            "a different ErrorKind must never compare equal, even with the same message text"
+        );
     }
 }
