@@ -77,6 +77,23 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - Verrouillé par la suite de tests de `agent_def.rs`, `process.rs` et `path_util.rs`.
 - **ADR-0018 (nouvelle)** : voir la note de décision dans le vault de documentation du
   projet.
+### Added — Issue #39 : workflow de release CD (binaires prébuilts + GitHub Release)
+
+- Nouveau workflow `.github/workflows/release.yml`, déclenché par le push d'un tag
+  `vX.Y.Z` : un job `check-version` échoue si le tag ne correspond pas exactement à la
+  version des trois crates binaires (`warden`, `warden-gated`, `warden-tui`) — le tag est
+  la seule source de vérité, aucun bump automatique.
+- Build `--release` des trois binaires pour trois cibles (`aarch64-apple-darwin`,
+  `x86_64-apple-darwin` sur `macos-latest` ; `x86_64-unknown-linux-gnu` sur
+  `ubuntu-latest`), en mode `SQLX_OFFLINE` (mêmes caches `.sqlx/` committés que la CI).
+- Chaque cible est packagée en `warden-<version>-<target>.tar.gz` (les trois binaires,
+  `crates/warden-gated/contrib/{systemd,launchd}`, `README.md`, `LICENSE`) accompagnée
+  d'un `.sha256` ; un job final agrège un `checksums.txt` et publie une GitHub Release
+  via `gh release create`.
+- Nouveau fichier `LICENSE` (MIT) à la racine, embarqué dans chaque archive.
+- Toutes les actions tierces utilisées sont épinglées par SHA de commit.
+- Voir "Installer depuis une release prébuilt" et "Faire une release (mainteneurs)" dans
+  `README.md`.
 
 ### Changed — Issue #43 (sous-tâche #37.4) / ADR-0014 : budgets par phase, états par phase, migration DB, `decide_next_state` conscient de la phase
 

@@ -2880,8 +2880,11 @@ exit 0
 "#,
     );
 
-    // Comfortably over a typical 64KiB pipe buffer.
-    let large_intent = format!("large intent payload: {}", "x".repeat(200_000));
+    // Comfortably over a typical 64KiB pipe buffer, yet under Linux's
+    // per-argument limit (MAX_ARG_STRLEN = 128KiB): the intent travels as a
+    // single `--intent` argv entry, and a longer string fails with E2BIG
+    // ("Argument list too long") on Linux while silently passing on macOS.
+    let large_intent = format!("large intent payload: {}", "x".repeat(100_000));
 
     warden_command()
         .0
