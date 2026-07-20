@@ -3560,16 +3560,34 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
 /// `attach --run-id <id> --warden-home <warden_home>` -- the same argv a
 /// user would type by hand from the printed "attach:" hint (issue #31).
 ///
-/// The fake `warden-tui` sleeps briefly before exiting -- if it exited
-/// (correctly) instantly instead, it would race the (fast, fake-claude)
-/// convergence loop and often cancel the run before it ever converges (the
-/// decided "TUI exit cancels the run" behaviour, exercised on its own by
-/// `e2e_tui_exit_cancels_a_still_running_run` below), which is not what
-/// this test is about. Issue #30's own new tests (`AgentDefinitionSnapshot`
-/// re-resolution) added real `git worktree` subprocess work to every cycle,
-/// which measurably widened this race under `cargo test --workspace`'s full
-/// parallel load -- bumped from 1s to 3s for margin; still a real race in
-/// principle, just a much less likely one to lose in practice.
+/// The fake `warden-tui` sleeps well past this test's own runtime before
+/// exiting -- if it exited (correctly) instantly instead, it would race the
+/// (fast, fake-claude) convergence loop and cancel the run before it ever
+/// converges (the decided "TUI exit cancels the run" behaviour, exercised on
+/// its own by `e2e_tui_exit_cancels_a_still_running_run` below), which is not
+/// what this test is about.
+///
+/// The sleep is 30s, not a duration merely *expected* to outlast convergence.
+/// It was 1s, then 3s: issue #30's `AgentDefinitionSnapshot` re-resolution
+/// added real `git worktree` subprocess work to every cycle, which widened
+/// the race under `cargo test --workspace`'s full parallel load, and the
+/// bump to 3s bought margin while leaving "a real race in principle". It
+/// still lost that race on the issue #50 branch, failing with `process for
+/// \`claude\` was cancelled`. 30s stops picking a number that convergence is
+/// merely expected to beat.
+///
+/// The fake closes its inherited stdout/stderr (`exec 1>&- 2>&-`) *before*
+/// sleeping, which is what makes the long sleep free. `spawn_tui_attach`
+/// inherits stdio, so a fake that just slept would hold its own copy of
+/// `warden run`'s stdout pipe open for the full 30s, and `.assert()` -- which
+/// reads that pipe to EOF -- would wait on the fake TUI rather than on
+/// `warden run` (the hazard spelled out in
+/// `e2e_tui_flag_does_not_block_on_a_still_running_tui_when_stdout_is_not_a_terminal`'s
+/// own docs, which sidesteps it with `Child::wait()` instead). Closing the
+/// descriptors models what a real `warden-tui` does anyway -- it releases its
+/// inherited copy promptly once its Event Bus connection closes -- so this
+/// test asserts on `warden run`'s own output at `warden run`'s own pace,
+/// while the fake stays alive long enough to never cancel the run.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home() {
@@ -3589,7 +3607,7 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
         tui_dir.path(),
         "fake-warden-tui",
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nsleep 3\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexec 1>&- 2>&-\nsleep 30\n",
             captured_argv.display()
         ),
     );
