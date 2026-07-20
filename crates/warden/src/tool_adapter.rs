@@ -1,7 +1,8 @@
 //! The **tool adapter seam** (issue #24): maps a parsed markdown agent
 //! definition (`warden_core::AgentDefinition`) onto the concrete subprocess
-//! invocation [`crate::process::spawn`] executes, one built-in CLI at a
-//! time, selected once per run by `--tool <name>`.
+//! invocation `warden_sandbox::Sandbox::execute` runs (issue #50; strict
+//! parity with what used to be `crate::process::spawn` for this path), one
+//! built-in CLI at a time, selected once per run by `--tool <name>`.
 //!
 //! Shaped exactly like the trait it replaces, ADR-0013's
 //! `warden::agent_runner::AgentRunner` -- itself modelled on
@@ -39,8 +40,9 @@
 //!   args, this tool's own system-prompt flag, its own model flag) from a
 //!   definition's `tools`/`model`.
 //! - [`ToolAdapter::env_allowlist`] declares the env vars (beyond `PATH`)
-//!   this tool needs to run at all -- see [`crate::process::spawn`]'s docs
-//!   for the Architecture.md §10 relaxation this requires.
+//!   this tool needs to run at all -- see `warden_sandbox::LocalSandbox`'s
+//!   own docs for the Architecture.md §10 relaxation this requires (issue
+//!   #50: that forwarding now happens in `warden_sandbox`, not here).
 //! - [`ToolAdapter::extract_findings`] turns a reviewer/tester invocation's
 //!   raw captured stdout into the findings it reported, so a user never
 //!   writes an output-translation wrapper again.
@@ -69,12 +71,12 @@ use crate::process::AgentCommand;
 ///
 /// `Sync` supertrait (issue #33): `Orchestrator::run_agent` closes over a
 /// `&R` inside the `on_stdout_line` callback it hands to
-/// `process::wait_with_progress`, which itself must be `Send + Sync` so
-/// `wait`/`wait_with_progress`'s future stays spawnable from any caller
-/// (including one that runs it inside `tokio::spawn`, as some tests do).
-/// Every real and test implementor here is a stateless unit/plain struct, so
-/// this is free in practice, not a constraint that costs an adapter author
-/// anything.
+/// `warden_sandbox::Sandbox::execute` (issue #50: this used to be
+/// `process::wait_with_progress`), which itself must be `Send + Sync` so
+/// its future stays spawnable from any caller (including one that runs it
+/// inside `tokio::spawn`, as some tests do). Every real and test implementor
+/// here is a stateless unit/plain struct, so this is free in practice, not a
+/// constraint that costs an adapter author anything.
 pub trait ToolAdapter: Sync {
     /// Builds the concrete CLI invocation for `definition`: program, args,
     /// this tool's own system-prompt flag (fed `definition.system_prompt`),
@@ -82,10 +84,12 @@ pub trait ToolAdapter: Sync {
     fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand>;
 
     /// Environment variable names (beyond `PATH`, which
-    /// [`crate::process::spawn`] always forwards) this tool needs to find
-    /// its own configuration/auth. Never the whole environment -- see
-    /// [`crate::process::spawn`]'s own docs for why this remains a named
-    /// allowlist rather than `env_clear()` being dropped altogether.
+    /// `warden_sandbox::LocalSandbox::execute` always forwards) this tool
+    /// needs to find its own configuration/auth. Never the whole environment
+    /// -- see `warden_sandbox::LocalSandbox`'s own docs for why this remains
+    /// a named allowlist rather than `env_clear()` being dropped altogether
+    /// (issue #50: that forwarding now happens in `warden_sandbox`, not
+    /// `crate::process`).
     fn env_allowlist(&self) -> &'static [&'static str];
 
     /// Transforms one reviewer/tester invocation's raw captured stdout into
@@ -266,8 +270,9 @@ struct ClaudeResultEnvelope {
 /// This is the Architecture.md §10 relaxation issue #24 asks for by name: a
 /// documented, minimal, per-adapter allowlist, **not** a switch to
 /// inheriting the full environment (`env_clear()` still runs first in
-/// [`crate::process::spawn`] -- only these named variables are layered back
-/// on top, on an explicit opt-in basis per tool).
+/// `warden_sandbox::LocalSandbox::execute` -- issue #50: that's where this
+/// runs now, not `crate::process::spawn` -- only these named variables are
+/// layered back on top, on an explicit opt-in basis per tool).
 const CLAUDE_ENV_ALLOWLIST: &[&str] = &["HOME", "USER"];
 
 impl ToolAdapter for ClaudeAdapter {

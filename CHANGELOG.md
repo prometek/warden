@@ -7,6 +7,48 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #50 : seam d'isolation de l'environnement d'exécution (`warden-sandbox` + `LocalSandbox`)
+
+- **Nouveau crate `warden-sandbox`** : trait `Sandbox` (`create` → `execute` (N fois)
+  → `destroy`), distinct du worktree git (`warden::worktree`, qui isole le *code*) —
+  le sandbox isole l'*environnement d'exécution* du process d'un agent, et tourne
+  toujours **sur** un worktree, jamais à sa place. `warden-core` ne dépend de ce
+  crate dans aucun sens.
+- **`LocalSandbox`** : seule implémentation livrée ici, en parité stricte avec
+  l'isolation process que `warden::process` appliquait auparavant à la main pour
+  chaque coder/reviewer/tester (`env_clear()` + forwarding `PATH`/allowlist,
+  `cwd`, `kill_on_drop`, écriture stdin concurrente au drain stdout/stderr, callback
+  de progression par ligne, annulation). Un comportement identique, pas un
+  changement — le point d'extension pour un futur backend conteneur
+  (`DockerSandbox`, issue #49), livré sans lui.
+- **`Orchestrator::run_agent`** route désormais chaque invocation coder/reviewer/
+  tester via `Arc<dyn Sandbox>` (`LocalSandbox` par défaut), sélectionnable via le
+  nouveau `Orchestrator::with_sandbox` — le seul endroit où #49 branchera son
+  backend, sans retoucher `run_agent` lui-même. Les erreurs du sandbox sont
+  retraduites vers les variantes `ProcessError` existantes pour un texte de CLI
+  identique (parité stricte, critère d'acceptation de l'issue).
+- **Revue de code — durcissement avant merge** :
+  - Le couple `create`/`destroy` d'un sandbox est désormais structurel plutôt que
+    positionnel : `SandboxGuard` (RAII) garantit la destruction sur tout retour
+    anticipé (`?`) *et* sur l'abandon de la future `run_agent` elle-même
+    (annulation de run, sortie de `warden run --tui`) — cas qu'un simple appel
+    `destroy()` en fin de fonction ne couvrait pas.
+  - `SandboxId` gagne un constructeur public (`SandboxId::new`), rendant le trait
+    `Sandbox` réellement implémentable hors du crate — vérifié par un test dans
+    `warden` qui installe un faux `Sandbox` enregistreur via `with_sandbox` et
+    prouve que `run_agent` route bien `create`/`execute`/`destroy` à travers lui,
+    y compris sur un chemin d'erreur/annulation.
+  - Déduplication : `process::wait_with_progress`/`spawn_with_extra_env` (le
+    callback de progression par ligne, l'allowlist d'env) sont supprimés —
+    devenus du code mort une fois tous les agents passés par cette seam ; seule
+    `warden_sandbox::LocalSandbox` porte encore cette logique. `process::spawn`/
+    `wait` restent, réduits au strict besoin de l'Evidence Capture Adapter (seul
+    appelant restant).
+  - `Command::stdin` (le payload `AgentInputMessage` sérialisé — intent + diff
+    complet) est désormais exclu d'un `Debug` dérivé (redacté en nombre d'octets),
+    et `WardenError::Sandbox` conserve `#[source]` (`#[from] SandboxError`) au
+    lieu d'aplatir l'erreur dans un `String`.
+
 ### Changed — Issue #26 / ADR-0018 : résolution des définitions d'agent asymétrique par rôle + garde de chemin de programme
 
 **BREAKING** : `<repo>/.warden/agents/{reviewer,tester}.md` n'est plus lu par défaut.

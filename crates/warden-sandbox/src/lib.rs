@@ -65,7 +65,8 @@ pub use local::LocalSandbox;
 /// Opaque handle to one sandbox instance, scoped to a single
 /// [`Sandbox::create`]/[`Sandbox::destroy`] pair. Backend-specific
 /// (`LocalSandbox` mints a `uuid`; a future `DockerSandbox` would use the
-/// container id) -- callers never construct or parse one themselves.
+/// container id) -- a real caller only ever receives one back from
+/// [`Sandbox::create`], never constructs one to pass in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SandboxId(String);
 
@@ -75,6 +76,19 @@ impl SandboxId {
     /// returned by the Docker daemon instead.
     pub(crate) fn generate() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    /// Wraps an already-known id (issue #50 review, MEDIUM 2). The public
+    /// constructor `Sandbox` itself was missing: with only
+    /// [`SandboxId::generate`] (`pub(crate)`) available, no id could be
+    /// produced outside this crate, which made [`Sandbox::create`]'s return
+    /// type -- and therefore the whole trait -- unimplementable by anything
+    /// other than [`LocalSandbox`], including a recording fake a test would
+    /// install through `Orchestrator::with_sandbox`. A future `DockerSandbox`
+    /// (#49) uses this to wrap the container id the Docker daemon hands
+    /// back.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
     }
 }
 
@@ -98,12 +112,34 @@ pub struct SandboxSpec {
 /// resolving them is this crate's job, not the caller's) to forward on top of
 /// whatever baseline the backend applies, and an optional payload to write to
 /// the child's stdin before closing it.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Command {
     pub program: String,
     pub args: Vec<String>,
     pub env_allowlist: Vec<String>,
     pub stdin: Option<String>,
+}
+
+/// Hand-written (issue #50 review, LOW 7): `stdin` carries the serialized
+/// `warden_core::AgentInputMessage` -- the run intent plus the full diff --
+/// so a derived `Debug` would leak it into any log/panic message that prints
+/// a `Command`. Redacted to a byte count instead, the same shape
+/// `e2e_run_intent_never_leaks_into_argv` already guards for argv.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env_allowlist", &self.env_allowlist)
+            .field(
+                "stdin",
+                &self
+                    .stdin
+                    .as_ref()
+                    .map(|payload| format!("<{} bytes redacted>", payload.len())),
+            )
+            .finish()
+    }
 }
 
 /// Execution knobs that aren't part of the command itself: cancellation, and

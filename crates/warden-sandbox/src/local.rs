@@ -131,11 +131,14 @@ impl Sandbox for LocalSandbox {
 
 /// The actual spawn-to-completion drain, split out of
 /// [`LocalSandbox::execute`] so it can be boxed into the [`Execution`]
-/// returned to the caller rather than run inline. Ported from
-/// `warden::process::wait_with_progress` verbatim (same deadlock-avoidance
+/// returned to the caller rather than run inline. Ported from what used to
+/// be `warden::process::wait_with_progress` (same deadlock-avoidance
 /// property: stdin write, stdout drain, stderr drain, and the wait for exit
-/// all run *concurrently* via `tokio::join!`, never sequentially -- see that
-/// function's own docs in `warden` for the full reasoning, unchanged here).
+/// all run *concurrently* via `tokio::join!`, never sequentially). Issue #50
+/// review, MEDIUM 3: `warden::process::wait_with_progress` was narrowed back
+/// down to plain `wait` once every agent invocation moved onto this seam --
+/// this function (not `warden::process`) is now the one and only place the
+/// per-line callback and its deadlock-avoidance property actually run.
 async fn drain_and_wait(
     mut child: Child,
     program: String,
@@ -147,11 +150,12 @@ async fn drain_and_wait(
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
+    let stdin_program = program.clone();
     let stdin_task = async move {
         if let Some(mut stdin_handle) = stdin_handle {
             if let Some(payload) = stdin_payload {
                 if let Err(error) = stdin_handle.write_all(payload.as_bytes()).await {
-                    classify_stdin_write_error(error)?;
+                    classify_stdin_write_error(error, &stdin_program)?;
                 }
             }
             // Dropping `stdin_handle` here closes the write half, signalling
@@ -180,7 +184,7 @@ async fn drain_and_wait(
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(program = %stdout_program, %error, "failed to read agent stdout to completion");
+                        tracing::warn!(command = %stdout_program, %error, "failed to read agent stdout to completion");
                         break;
                     }
                 }
@@ -193,7 +197,7 @@ async fn drain_and_wait(
         let mut buf = Vec::new();
         if let Some(mut stderr_handle) = stderr_handle {
             if let Err(error) = stderr_handle.read_to_end(&mut buf).await {
-                tracing::warn!(program = %stderr_program, %error, "failed to read agent stderr to completion");
+                tracing::warn!(command = %stderr_program, %error, "failed to read agent stderr to completion");
             }
         }
         buf
@@ -229,10 +233,18 @@ async fn drain_and_wait(
 /// pipe (the agent closed or never opened its read side of stdin) is a
 /// legitimate outcome, logged but not fatal; anything else fails the
 /// execution outright, since the payload is a single JSON object and a
-/// partial write is unparsable by construction.
-fn classify_stdin_write_error(error: std::io::Error) -> std::result::Result<(), std::io::Error> {
+/// partial write is unparsable by construction. `program` is logged under
+/// the `command` field name -- unchanged from `warden::process`'s own log
+/// shape (issue #50 review, LOW 5) so existing log queries built against it
+/// still match, and so the warning says *which* agent closed stdin early
+/// rather than which of several concurrently-running ones.
+fn classify_stdin_write_error(
+    error: std::io::Error,
+    program: &str,
+) -> std::result::Result<(), std::io::Error> {
     if error.kind() == std::io::ErrorKind::BrokenPipe {
         tracing::warn!(
+            command = program,
             %error,
             "agent closed stdin before the full payload was written; continuing without a \
              guarantee it read the payload"
@@ -439,6 +451,134 @@ mod tests {
         execution.wait().await.unwrap();
 
         assert_eq!(seen.into_inner().unwrap(), vec!["one", "two"]);
+    }
+
+    /// Ported from `warden::process`'s own
+    /// `wait_with_progress_skips_blank_lines` (issue #50 review, LOW 8):
+    /// `process::wait_with_progress`'s callback support is now dead in
+    /// production (every remaining call site passes `None`), so this
+    /// coverage moved here, the only place the behaviour still runs for
+    /// real. Blank lines carry nothing worth surfacing and must not reach
+    /// the callback at all.
+    #[tokio::test]
+    async fn on_stdout_line_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = LocalSandbox::new();
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: dir.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
+
+        let execution = sandbox
+            .execute(
+                &id,
+                command("sh", &["-c", "printf 'a\\n\\nb\\n'"]),
+                ExecuteOptions {
+                    cancel: CancellationToken::new(),
+                    on_stdout_line: Some(&on_line),
+                },
+            )
+            .await
+            .unwrap();
+        execution.wait().await.unwrap();
+
+        assert_eq!(seen.into_inner().unwrap(), vec!["a", "b"]);
+    }
+
+    /// Ported from `warden::process`'s own
+    /// `wait_with_progress_invokes_the_callback_for_a_final_line_with_no_trailing_newline`
+    /// (issue #50 review, LOW 8; see [`on_stdout_line_skips_blank_lines`]'s
+    /// own docs on why this moved here). A line with no trailing newline
+    /// (the child exits without flushing one, e.g. the very last line of
+    /// output) must still reach the callback -- `read_until` returns it on
+    /// EOF even without the delimiter.
+    #[tokio::test]
+    async fn on_stdout_line_is_invoked_for_a_final_line_with_no_trailing_newline() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = LocalSandbox::new();
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: dir.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
+
+        let execution = sandbox
+            .execute(
+                &id,
+                command("sh", &["-c", "printf 'no newline at the end'"]),
+                ExecuteOptions {
+                    cancel: CancellationToken::new(),
+                    on_stdout_line: Some(&on_line),
+                },
+            )
+            .await
+            .unwrap();
+        execution.wait().await.unwrap();
+
+        assert_eq!(seen.into_inner().unwrap(), vec!["no newline at the end"]);
+    }
+
+    /// Ported from `warden::process`'s own
+    /// `wait_with_progress_does_not_deadlock_on_large_newline_free_stdout`
+    /// (issue #50 review, LOW 8; see [`on_stdout_line_skips_blank_lines`]'s
+    /// own docs on why this moved here). Same regression scenario as
+    /// [`writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`],
+    /// but with an `on_stdout_line` callback attached and stdout that has no
+    /// newline until EOF -- proves the line-buffered reader still drains
+    /// continuously rather than blocking on a delimiter that never arrives
+    /// mid-stream, and that the single oversized "line" is delivered whole,
+    /// in one callback invocation, right at EOF.
+    #[tokio::test]
+    async fn does_not_deadlock_on_large_newline_free_stdout_with_a_callback_attached() {
+        let dir = TempDir::new().unwrap();
+        let sandbox = LocalSandbox::new();
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: dir.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+
+        let mut cmd = command(
+            "sh",
+            &["-c", "head -c 200000 /dev/zero; cat > /dev/null; exit 0"],
+        );
+        cmd.stdin = Some("x".repeat(200_000));
+        let callback_invocations = std::sync::atomic::AtomicUsize::new(0);
+        let on_line = |_line: &str| {
+            callback_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+
+        let execution = sandbox
+            .execute(
+                &id,
+                cmd,
+                ExecuteOptions {
+                    cancel: CancellationToken::new(),
+                    on_stdout_line: Some(&on_line),
+                },
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), execution.wait())
+            .await
+            .expect("execution must not hang when stdout has no newlines at all");
+
+        assert_eq!(result.unwrap().exit_code, 0);
+        assert_eq!(
+            callback_invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the whole newline-free chunk must be delivered as exactly one line, at EOF"
+        );
     }
 
     #[tokio::test]

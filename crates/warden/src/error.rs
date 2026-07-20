@@ -335,14 +335,19 @@ pub enum WardenError {
     #[error("PR number {pr_number} does not fit in the column's numeric type")]
     PrNumberOverflow { pr_number: u64 },
 
-    /// Issue #50: a `warden_sandbox::SandboxError` that has no natural
-    /// [`ProcessError`] counterpart to translate into (see
+    /// Issue #50 review, LOW 6: a `warden_sandbox::SandboxError` that has no
+    /// natural [`ProcessError`] counterpart to translate into (see
     /// `orchestrator::map_sandbox_error`'s own docs) -- every spawn/wait/
-    /// cancel/stdin-write shape a `LocalSandbox` invocation can produce maps
-    /// onto the existing `ProcessError` variants instead, for strict parity
-    /// with this crate's pre-issue-#50 error text.
-    #[error("sandbox error: {reason}")]
-    Sandbox { reason: String },
+    /// cancel/stdin-write shape a `LocalSandbox` invocation can produce still
+    /// maps onto the existing `ProcessError` variants instead, for strict
+    /// parity with this crate's pre-issue-#50 error text. Everything else
+    /// (today: only `SandboxError::UnknownSandbox`, an internal bug never
+    /// expected from a well-behaved backend) is wrapped here via `#[from]`
+    /// rather than flattened into a hand-rolled `reason: String` -- keeping
+    /// `#[source]` intact so `anyhow`/log output still chains down to the
+    /// original typed error.
+    #[error(transparent)]
+    Sandbox(#[from] warden_sandbox::SandboxError),
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;
