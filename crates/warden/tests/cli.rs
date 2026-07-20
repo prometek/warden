@@ -92,6 +92,27 @@ fn write_agent_definition(repo: &Path, role: &str, frontmatter: &str, system_pro
     .unwrap();
 }
 
+/// Writes `<xdg_config_home>/warden/agents/<role>.md` -- the reviewer/
+/// tester's own trusted source since issue #26
+/// (`agent_def::default_user_config_agents_dir`). Distinct from
+/// `write_agent_definition` (the *repo's* `.warden/agents/` convention,
+/// reviewer/tester-ignored-by-default since the same issue): same file
+/// shape, a completely different root the coder has no write access to.
+fn write_user_config_agent_definition(
+    xdg_config_home: &Path,
+    role: &str,
+    frontmatter: &str,
+    system_prompt: &str,
+) {
+    let agents_dir = xdg_config_home.join("warden").join("agents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+    std::fs::write(
+        agents_dir.join(format!("{role}.md")),
+        format!("---\n{frontmatter}---\n\n{system_prompt}\n"),
+    )
+    .unwrap();
+}
+
 /// See this module's own docs. `coder_body`/`reviewer_body`/`tester_body`
 /// run with `cwd` already the role's own worktree
 /// (`ClaudeAdapter`/`process::spawn`, unchanged) and the raw
@@ -248,6 +269,7 @@ async fn e2e_run_id_and_attach_command_are_printed_at_start_before_finished_with
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         // Deliberately no `-v`/`-vv`/`-vvv`: the default verbosity is
         // `warn`, and these lines must be visible there without the caller
         // opting into any extra logging.
@@ -360,6 +382,7 @@ async fn e2e_attach_command_shows_the_resolved_default_warden_home_when_flag_is_
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", fake_home.path())
         .env("HOME", fake_home.path())
         .args([
             "run",
@@ -420,6 +443,7 @@ async fn e2e_attach_command_shell_quotes_a_warden_home_containing_a_space() {
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", &warden_home)
         .args([
             "run",
             "--repo",
@@ -516,6 +540,7 @@ async fn e2e_attach_command_absolutizes_a_relative_warden_home() {
         .unwrap()
         .current_dir(cwd_root.path())
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", cwd_root.path())
         .args([
             "run",
             "--repo",
@@ -597,6 +622,7 @@ async fn e2e_run_survives_a_closed_stdout_without_panicking() {
     let bin_path = env!("CARGO_BIN_EXE_warden");
     let mut child = SyncCommand::new(bin_path)
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -706,6 +732,7 @@ async fn e2e_full_convergence_cycle_reboucles_then_converges_via_cli() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -756,6 +783,7 @@ async fn e2e_zero_md_run_uses_the_adapters_defaults_and_converges() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -791,6 +819,7 @@ async fn e2e_failing_coder_marks_run_failed_and_never_reaches_review() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1115,6 +1144,7 @@ async fn e2e_reviewer_and_tester_receive_target_commit_diff_and_role_on_stdin() 
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1165,6 +1195,7 @@ async fn e2e_coder_receives_the_run_intent_on_stdin_as_a_versioned_role_tagged_p
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1214,6 +1245,7 @@ async fn e2e_home_reaches_claude_but_other_env_vars_do_not() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .env("WARDEN_TEST_SECRET", marker_value)
         .args([
             "run",
@@ -1273,6 +1305,7 @@ async fn e2e_run_intent_never_leaks_into_argv() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1329,6 +1362,7 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1386,6 +1420,7 @@ async fn e2e_definition_model_and_tools_reach_the_claude_invocation_argv() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1415,11 +1450,12 @@ async fn e2e_definition_model_and_tools_reach_the_claude_invocation_argv() {
 
 /// Issue #24 point 3, the other half of
 /// `e2e_definition_model_and_tools_reach_the_claude_invocation_argv` (which
-/// only covers the coder): the convention directory holds up to *three*
-/// independent files, `.warden/agents/{coder,reviewer,tester}.md`, and each
-/// role's own frontmatter/prompt must reach *that role's own* invocation --
-/// never the coder's definition leaking into the reviewer's argv or
-/// vice versa.
+/// only covers the coder): the coder's own convention file
+/// (`.warden/agents/coder.md`) and the reviewer/tester's own trusted source
+/// since issue #26 (`$XDG_CONFIG_HOME/warden/agents/{reviewer,tester}.md`)
+/// are three independent files, and each role's own frontmatter/prompt must
+/// reach *that role's own* invocation -- never the coder's definition
+/// leaking into the reviewer's argv or vice versa.
 #[cfg(unix)]
 #[tokio::test]
 async fn e2e_reviewer_and_tester_definitions_each_reach_their_own_invocation_not_each_others() {
@@ -1427,16 +1463,22 @@ async fn e2e_reviewer_and_tester_definitions_each_reach_their_own_invocation_not
     let warden_home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
     let captures = TempDir::new().unwrap();
+    // Issue #26: reviewer/tester definitions are resolved from the user
+    // config directory, not the repo under review -- a dedicated tempdir
+    // here (rather than reusing `warden_home`) both keeps this test hermetic
+    // (never touches the real `~/.config`) and exercises the trusted source
+    // this issue actually added.
+    let user_config = TempDir::new().unwrap();
 
     write_agent_definition(repo.path(), "coder", "", "be the coder");
-    write_agent_definition(
-        repo.path(),
+    write_user_config_agent_definition(
+        user_config.path(),
         "reviewer",
         "model: haiku\ntools: Read, Grep\n",
         "be the reviewer",
     );
-    write_agent_definition(
-        repo.path(),
+    write_user_config_agent_definition(
+        user_config.path(),
         "tester",
         "model: opus\ntools: Read, Bash\n",
         "be the tester",
@@ -1461,6 +1503,7 @@ async fn e2e_reviewer_and_tester_definitions_each_reach_their_own_invocation_not
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", user_config.path())
         .args([
             "run",
             "--repo",
@@ -1547,6 +1590,7 @@ async fn e2e_user_reaches_claude_alongside_home() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1644,6 +1688,7 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1720,6 +1765,7 @@ async fn e2e_converged_commit_is_persisted_and_protected_without_touching_main_b
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -1871,6 +1917,7 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2089,6 +2136,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2183,6 +2231,7 @@ async fn e2e_restart_backs_up_db_before_applying_pending_migrations_via_cli() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2271,6 +2320,7 @@ exit 0
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2350,6 +2400,7 @@ cp "$stdin_file" "{captures}/tester_stdin_$next.json"
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2494,6 +2545,7 @@ async fn e2e_non_ascii_multiline_prompt_and_intent_survive_the_stdin_round_trip(
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2558,6 +2610,7 @@ async fn e2e_cli_project_selects_asciinema_and_evidence_is_stored_and_committed_
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2664,6 +2717,7 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2740,6 +2794,7 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2797,6 +2852,7 @@ async fn e2e_evidence_store_in_repo_false_keeps_evidence_local_and_never_commits
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2891,6 +2947,7 @@ async fn e2e_evidence_capture_failure_when_tool_missing_is_non_fatal_and_run_sti
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -2967,6 +3024,7 @@ async fn e2e_tui_flag_spawns_the_configured_binary_with_run_id_and_warden_home()
     let assert = Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -3065,6 +3123,7 @@ fn e2e_tui_flag_does_not_block_on_a_still_running_tui_when_stdout_is_not_a_termi
 
     let mut child = SyncCommand::new(env!("CARGO_BIN_EXE_warden"))
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -3142,6 +3201,7 @@ async fn e2e_tui_exit_cancels_a_still_running_run() {
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",
@@ -3192,6 +3252,7 @@ async fn e2e_tui_spawn_failure_aborts_the_run_instead_of_degrading_to_headless()
     Command::cargo_bin("warden")
         .unwrap()
         .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
         .args([
             "run",
             "--repo",

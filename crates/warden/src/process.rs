@@ -18,11 +18,27 @@
 //! payload (if any) and closes the write half concurrently with draining
 //! stdout/stderr and awaiting exit — see its own docs for why writing stdin
 //! any other way can deadlock.
+//!
+//! # Issue #26: [`validate_agent_program`], a belt-and-braces guard on `program`
+//!
+//! No built-in [`crate::tool_adapter::ToolAdapter`] shipped today ever names
+//! a `command.program` that resolves inside the repo under review --
+//! `ClaudeAdapter::build_command` always names a bare `claude`, resolved via
+//! `PATH` (see [`spawn`]'s own docs on why a relative program is otherwise
+//! long-standing, accepted behaviour). But nothing in the type system stops
+//! a *future* adapter from doing exactly that, and the entire point of
+//! running the reviewer/tester as an independent gate (Architecture.md §1)
+//! is that the coder must never control what they execute -- so this is
+//! checked once, structurally, at the one call site every coder/reviewer/
+//! tester spawn in this codebase goes through
+//! (`orchestrator::Orchestrator::run_agent`), rather than trusted to stay
+//! true of every adapter forever.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
+use warden_core::AgentRole;
 
 use crate::error::ProcessError;
 
@@ -53,6 +69,155 @@ pub struct AgentOutcome {
     pub stderr: String,
 }
 
+/// Guards a reviewer/tester `program` against resolving to a path the coder
+/// controls (issue #26, belt-and-braces): no adapter shipped today can
+/// actually trigger this (see this module's own docs), but nothing stops a
+/// future one from naming a script inside the repo under review, and that
+/// would defeat the entire point of running the reviewer/tester as an
+/// independent gate. Always `Ok(())` for `AgentRole::Coder` -- the coder
+/// already runs with full repo access and is the repo's own untrusted role
+/// in the first place (`agent_def`'s own module docs), so there is nothing
+/// to protect it from here.
+///
+/// Refuses `program` when it is:
+/// - **a relative path** (contains a path separator and is not absolute):
+///   resolves against `worktree_path` (the child chdirs there before exec)
+///   -- exactly the `./reviewer.sh`-means-the-coder's-own-copy hazard
+///   [`spawn`]'s own docs describe.
+/// - **an absolute path that resolves inside `worktree_path` or
+///   `repo_path`**: the role's own checked-out worktree, or the run's base
+///   repository, both of which are (transitively, for the worktree) exactly
+///   what the coder just committed to.
+///
+/// A **bare program name with no path separator at all** (`"claude"`,
+/// `"echo"`) is always allowed: it resolves via `PATH`
+/// (`Command::new`/`execvp` semantics), never against `worktree_path`, so it
+/// carries none of the above hazard regardless of what the coder committed.
+///
+/// Both `worktree_path` and `repo_path` are canonicalized before the
+/// containment check (walking up to the nearest existing ancestor for a
+/// `program` path that doesn't exist on disk -- see
+/// `canonicalize_best_effort`), so a `..`-laden or symlink-relative
+/// `program` can't slip past a purely lexical comparison. If canonicalizing
+/// `program` itself fails for a reason other than "doesn't exist" (e.g. a
+/// permissions error walking its ancestors), this fails closed with
+/// [`ProcessError::UntrustedAgentProgram`] naming that reason, rather than
+/// silently skipping the containment check it could no longer perform
+/// (code-standards.md: "no silent fallback").
+pub fn validate_agent_program(
+    role: AgentRole,
+    program: &str,
+    worktree_path: &Path,
+    repo_path: &Path,
+) -> Result<(), ProcessError> {
+    if role == AgentRole::Coder {
+        return Ok(());
+    }
+
+    if !program.contains(std::path::MAIN_SEPARATOR) && !program.contains('/') {
+        // No path separator at all (checked for both this platform's own
+        // separator and `/`, since a Windows build must still refuse a
+        // Unix-style `agents/reviewer.sh` argument) -- a bare name, resolved
+        // via `PATH`, never against `worktree_path`.
+        return Ok(());
+    }
+
+    let candidate = Path::new(program);
+    if !candidate.is_absolute() {
+        return Err(ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "relative path -- would resolve against {}, the role's own worktree (a \
+                 checkout of the repo the coder can write to)",
+                worktree_path.display()
+            ),
+        });
+    }
+
+    let canonical_candidate = canonicalize_best_effort(candidate).map_err(|source| {
+        ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "cannot resolve its real location to verify it is outside the repo under \
+                 review: {source}"
+            ),
+        }
+    })?;
+    let canonical_worktree = canonicalize_best_effort(worktree_path).map_err(|source| {
+        ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "cannot resolve the role's own worktree ({}) to verify this program is outside \
+                 it: {source}",
+                worktree_path.display()
+            ),
+        }
+    })?;
+    let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
+        ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "cannot resolve the run's base repository ({}) to verify this program is \
+                 outside it: {source}",
+                repo_path.display()
+            ),
+        }
+    })?;
+
+    if canonical_candidate.starts_with(&canonical_worktree) {
+        return Err(ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "resolves inside the role's own worktree ({}) -- a checkout of the repo the \
+                 coder can write to",
+                worktree_path.display()
+            ),
+        });
+    }
+    if canonical_candidate.starts_with(&canonical_repo) {
+        return Err(ProcessError::UntrustedAgentProgram {
+            role: role.as_str(),
+            program: program.to_string(),
+            reason: format!(
+                "resolves inside the run's base repository ({}), which the coder can write to \
+                 and commit into",
+                repo_path.display()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Canonicalizes `path`, walking up to the nearest existing ancestor if
+/// `path` itself doesn't exist yet (e.g. a `program` argument nobody has
+/// spawned successfully before) -- mirrors `worktree.rs`'s own
+/// `canonicalize_best_effort` (kept as a separate, small copy rather than a
+/// shared helper: that one returns a `WorktreeError`, this one an
+/// `std::io::Error`, and threading a third error type across both modules
+/// just for a ten-line ancestor walk isn't worth the coupling).
+fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        match candidate.canonicalize() {
+            Ok(canonical) => {
+                let suffix = path.strip_prefix(&candidate).unwrap_or(Path::new(""));
+                return Ok(canonical.join(suffix));
+            }
+            Err(error) => {
+                if !candidate.pop() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
 /// Spawns `command` with `cwd` pointed at the agent's isolated worktree
 /// (code-standards.md: "Agent Subprocess Protocol"). The environment is not
 /// inherited from the current process — `env_clear()` always runs first, so
@@ -71,7 +236,12 @@ pub struct AgentOutcome {
 /// exist to serve outside a built-in `warden::tool_adapter::ToolAdapter`
 /// (which, for the adapters Warden ships, always names an absolute-lookup
 /// binary like `claude`, resolved via `PATH`, never a path relative to the
-/// worktree under review).
+/// worktree under review). This function itself stays permissive for that
+/// reason -- it is [`validate_agent_program`], called by
+/// `orchestrator::Orchestrator::run_agent` *before* every coder/reviewer/
+/// tester spawn (not by this lower-level primitive, which evidence capture
+/// and this module's own tests also call for non-agent subprocesses), that
+/// actually refuses a reviewer/tester program shaped like this (issue #26).
 ///
 /// stdin is piped (ADR-0012, issue #20 Scope B) rather than inherited, so
 /// the intent/target-commit/diff/findings payload [`wait`] writes never
@@ -522,6 +692,131 @@ pub fn kill_pid(pid: u32, expected_start_time: i64) -> Result<(), ProcessError> 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // -----------------------------------------------------------------
+    // `validate_agent_program` (issue #26, belt-and-braces)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_bare_program_name_with_no_separator_is_always_allowed_for_reviewer_and_tester() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            assert!(validate_agent_program(role, "claude", worktree.path(), repo.path()).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_refused_for_reviewer_and_tester() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            let error = validate_agent_program(role, "./reviewer.sh", worktree.path(), repo.path())
+                .unwrap_err();
+            assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+            assert!(error.to_string().contains("./reviewer.sh"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_path_inside_the_role_worktree_is_refused() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let program = worktree.path().join("reviewer.sh");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            AgentRole::Reviewer,
+            program.to_str().unwrap(),
+            worktree.path(),
+            repo.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+    }
+
+    #[test]
+    fn an_absolute_path_inside_the_run_base_repo_is_refused() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let program = repo.path().join(".warden/agents/reviewer.sh");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            AgentRole::Tester,
+            program.to_str().unwrap(),
+            worktree.path(),
+            repo.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+    }
+
+    #[test]
+    fn an_absolute_path_outside_both_the_worktree_and_the_repo_is_allowed() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let program = elsewhere.path().join("some-tool");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+
+        assert!(validate_agent_program(
+            AgentRole::Reviewer,
+            program.to_str().unwrap(),
+            worktree.path(),
+            repo.path(),
+        )
+        .is_ok());
+    }
+
+    /// The whole point of this guard: it must never apply to the coder,
+    /// which already has full repo access and is the repo's own untrusted
+    /// role in the first place -- even a program that would be refused for
+    /// the reviewer/tester must pass unchanged for the coder.
+    #[test]
+    fn the_coder_is_never_subject_to_this_guard() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let program = repo.path().join(".warden/agents/coder.sh");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+
+        assert!(validate_agent_program(
+            AgentRole::Coder,
+            program.to_str().unwrap(),
+            worktree.path(),
+            repo.path(),
+        )
+        .is_ok());
+        assert!(validate_agent_program(
+            AgentRole::Coder,
+            "./coder.sh",
+            worktree.path(),
+            repo.path()
+        )
+        .is_ok());
+    }
+
+    /// A `program` that doesn't exist on disk at all must still be checked
+    /// against the containment rule (via `canonicalize_best_effort`'s
+    /// ancestor walk), not silently allowed just because it can't be
+    /// canonicalized outright.
+    #[test]
+    fn a_nonexistent_absolute_path_inside_the_worktree_is_still_refused() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let program = worktree.path().join("does-not-exist-yet.sh");
+
+        let error = validate_agent_program(
+            AgentRole::Reviewer,
+            program.to_str().unwrap(),
+            worktree.path(),
+            repo.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+    }
 
     #[tokio::test]
     async fn captures_stdout_and_exit_code_of_a_successful_command() {

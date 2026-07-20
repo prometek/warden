@@ -224,6 +224,16 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
             Style::default().fg(Color::Magenta),
             format!("evidence captured ({evidence_type}): {file_path}"),
         ),
+        // Issue #26: styled the same yellow as a "warning"-severity finding
+        // -- this is exactly that in spirit, just about the *configuration*
+        // of an independent role rather than its output.
+        RunEvent::UntrustedAgentDefinitionUsed { role, path } => (
+            Style::default().fg(Color::Yellow),
+            format!(
+                "{role} definition read from the repo under review (--trust-repo-agents): \
+                 {path} -- untrusted, coder-controllable"
+            ),
+        ),
         RunEvent::RunFinished { final_state } => (
             Style::default().fg(Color::Green),
             format!("run finished: {final_state}"),
@@ -435,6 +445,35 @@ mod tests {
 
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("reviewer: reviewing the diff"));
+    }
+
+    /// Issue #26: `UntrustedAgentDefinitionUsed` must actually reach the
+    /// scrollable log, naming both the role and the path, not just be a
+    /// match arm nothing ever exercises end-to-end.
+    #[test]
+    fn draw_lists_an_untrusted_agent_definition_used_event_naming_the_role_and_path() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::UntrustedAgentDefinitionUsed {
+                role: "reviewer".to_string(),
+                path: "/repo/.warden/agents/reviewer.md".to_string(),
+            },
+        ));
+
+        let backend = TestBackend::new(220, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("reviewer"), "{content}");
+        assert!(
+            content.contains("/repo/.warden/agents/reviewer.md"),
+            "{content}"
+        );
+        assert!(content.contains("untrusted"), "{content}");
     }
 
     /// Acceptance criterion 3 (issue #8): the evidence pane must actually be

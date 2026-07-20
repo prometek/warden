@@ -77,8 +77,71 @@
 //! adapter's default grants allow (`ClaudeAdapter::default_tools`, `Bash`
 //! included); that broader exposure is an accepted, owner-reviewed trade
 //! for now, tracked for real isolation in issue #28.
+//!
+//! # Security: role-asymmetric resolution (issue #26)
+//!
+//! The within-run snapshot above closes half of issue #26's concern (a
+//! coder can't rewrite the reviewer/tester judging its own current run) and
+//! the tampering finding closes the other cross-run half (a rewrite can't
+//! *silently* reach a future run) -- but neither one changes *where* a
+//! future run's reviewer/tester definition is read from in the first place:
+//! before this issue, it was always `<repo>/.warden/agents/<role>.md`, a
+//! path inside the very repository the coder commits to. A human reviewing
+//! (and approving) a `.warden/agents/reviewer.md` change is the *only*
+//! thing standing between a coder-authored prompt and a future run's
+//! reviewer -- fine as defence in depth, not fine as the *sole* mechanism
+//! for a role whose entire purpose is judging the coder independently.
+//!
+//! The owner's ruling (confirmed, not re-litigated here): resolution is
+//! **role-asymmetric**.
+//!
+//! - **Coder**: unchanged from issue #24 -- `<repo>/.warden/agents/coder.md`
+//!   if present, else the adapter's default. The coder is already the
+//!   repo's own untrusted role (it writes the repo; nothing is gained by
+//!   hiding its own prompt from itself), and locking this path away would
+//!   break the zero-config "no markdown at all" UX issue #24 exists to
+//!   provide, for no security benefit.
+//! - **Reviewer/Tester**: resolved from the **user config directory only**
+//!   -- `$XDG_CONFIG_HOME/warden/agents/<role>.md`, falling back to
+//!   `~/.config/warden/agents/<role>.md` (see
+//!   [`default_user_config_agents_dir`]) -- which the coder has no write
+//!   access to at all; it lives outside every worktree `WorktreeManager`
+//!   ever creates and outside `RunConfig::repo_path` itself. The repo's own
+//!   `.warden/agents/{reviewer,tester}.md` is **ignored by default**, even
+//!   though the very same file is still honoured for the coder.
+//! - **`--trust-repo-agents` (opt-in, default off)**: when set, a reviewer/
+//!   tester definition absent from the user config directory falls back to
+//!   the repo's own `.warden/agents/<role>.md` exactly as it did before this
+//!   issue -- but only ever as a fallback, and only ever surfaced as
+//!   untrusted: [`resolve_agent_definition`] logs a `tracing::warn!` naming
+//!   the exact path the moment it reads one, and the caller
+//!   (`orchestrator::Orchestrator::run_convergence_loop`) publishes a
+//!   [`warden_core::RunEvent::UntrustedAgentDefinitionUsed`] for it right
+//!   after `RunStarted`, so the run's own permanent, replayable event log
+//!   (not just this process's own stderr) carries a record of which role(s)
+//!   ran under a definition the coder can write to. This flag exists for
+//!   the legitimate case where a project genuinely wants to version its own
+//!   reviewer/tester prompts alongside its code and accepts the trade-off
+//!   -- it must never be silently indistinguishable from a trusted
+//!   resolution.
+//!
+//! **Precedence when both exist** (`--trust-repo-agents` set, and *both* a
+//! user-config file and a repo file exist for the same role): the user
+//! config file **always wins**. The repo file is consulted at all only when
+//! no user-config file exists for that role -- an override for the *common*
+//! case (nothing in `~/.config/warden/agents/` yet), never a way for a
+//! project's own repo to shadow a value the user deliberately configured for
+//! themselves system-wide.
+//!
+//! A file that exists but fails to read or parse is a typed error naming
+//! the path -- the exact same rule issue #24 already established for the
+//! coder's convention file, extended here to the user-config path and the
+//! opt-in repo fallback alike (see [`resolve_agent_definition`]'s own
+//! docs). Only a **missing** file at a given location falls through to the
+//! next one in precedence order; nothing is ever silently treated as
+//! "absent" because it failed to read.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use warden_core::{parse_agent_definition, AgentDefinition, AgentRole};
 
@@ -96,77 +159,251 @@ use crate::tool_adapter::ToolAdapter;
 /// elsewhere in the crate, so the two can never silently drift apart.
 pub(crate) const AGENTS_DIR: &str = ".warden/agents";
 
-/// Resolves `role`'s definition for this run: `<repo>/.warden/agents/
-/// <role>.md` if present, else `adapter`'s own default prompt and `tools`
-/// grant (issue #24 point 3). See this module's own docs for why this must
-/// only ever be called once per role, at run start, against the base repo.
+/// Where a resolved [`AgentDefinition`] actually came from (issue #26) --
+/// lets a caller (`main.rs`) tell a reviewer/tester definition sourced from
+/// the trusted user config directory apart from one sourced from the repo
+/// under review, the one case that must be surfaced as untrusted (see this
+/// module's own "Security: role-asymmetric resolution" docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentDefinitionSource {
+    /// Coder only: `<repo>/.warden/agents/coder.md`. Not "untrusted" in the
+    /// sense issue #26 cares about -- the coder is already the repo's own
+    /// untrusted role, so nothing is gained by treating its own prompt file
+    /// specially.
+    RepoConvention(PathBuf),
+    /// Reviewer/tester only: `<user_config_agents_dir>/<role>.md`. The
+    /// trusted source -- outside the coder's write access entirely.
+    UserConfig(PathBuf),
+    /// Reviewer/tester only, and only reachable with `trust_repo_agents:
+    /// true` and no user-config file for that role:
+    /// `<repo>/.warden/agents/<role>.md`. The one variant a caller must
+    /// surface to the run as untrusted.
+    UntrustedRepoOverride(PathBuf),
+    /// No file at any location this role consults -- the selected tool
+    /// adapter's own default prompt/tools.
+    AdapterDefault,
+}
+
+/// Resolves `role`'s definition for this run (issue #24, extended by issue
+/// #26's role-asymmetric trust -- see this module's own docs for the full
+/// rationale). See the module docs for why this must only ever be called
+/// once per role, at run start, against the base repo.
 ///
-/// A convention file that exists but fails to read (permissions, not a
-/// regular file, ...) or fails to parse (bad frontmatter, unknown key, blank
-/// prompt, ...) is a typed error naming the path -- never silently treated
-/// as "absent, fall back to the default". Only a **missing** file
-/// (`io::ErrorKind::NotFound`) falls back; any other read failure is a
-/// [`AgentDefinitionError::Read`] naming the path, exactly like a parse
-/// failure is an [`AgentDefinitionError::Invalid`] naming it.
+/// - **Coder**: `<repo>/.warden/agents/coder.md` if present, else
+///   `adapter`'s own default -- unchanged from issue #24.
+/// - **Reviewer/Tester**: `<user_config_agents_dir>/<role>.md` if present;
+///   else, only when `trust_repo_agents` is `true`,
+///   `<repo>/.warden/agents/<role>.md` (logged with `tracing::warn!`,
+///   naming the path, the moment it's actually read -- see
+///   [`AgentDefinitionSource::UntrustedRepoOverride`]); else `adapter`'s own
+///   default. `user_config_agents_dir` is an explicit parameter rather than
+///   resolved from the environment in here -- see
+///   [`default_user_config_agents_dir`]'s own docs on why, and how a real
+///   caller (`main.rs`) obtains it.
+///
+/// Returns the resolved definition alongside where it came from
+/// ([`AgentDefinitionSource`]) -- callers that don't care (most of them) can
+/// simply discard the second element; `main.rs` uses it to decide which
+/// reviewer/tester resolutions need surfacing as untrusted.
+///
+/// A convention/config file that exists but fails to read (permissions, not
+/// a regular file, ...) or fails to parse (bad frontmatter, unknown key,
+/// blank prompt, ...) is a typed error naming the path -- never silently
+/// treated as "absent, fall back to the next source". Only a **missing**
+/// file (`io::ErrorKind::NotFound`) falls through; any other read failure is
+/// an [`AgentDefinitionError::Read`] naming the path, exactly like a parse
+/// failure is an [`AgentDefinitionError::Invalid`] naming it. This applies
+/// identically at every location consulted: the coder's convention file,
+/// the reviewer/tester's user-config file, and the reviewer/tester's opt-in
+/// repo fallback all go through the same [`try_read_definition`].
 ///
 /// # A *present* file that omits `tools` still gets the adapter's default
 /// grant (issue #24 review finding B2)
 ///
 /// "Every frontmatter key is optional" (issue #24 point 3, pinned by
 /// `warden_core::agent_def::tests::every_frontmatter_key_is_optional`) is a
-/// deliberately supported case: a `.warden/agents/reviewer.md` that only
-/// wants to override the system prompt, leaving `tools`/`model` to the
-/// adapter, must work. But `warden_core::AgentDefinition::tools` being
-/// `None` is not a neutral "no opinion" for every adapter -- verified
-/// directly against the real CLI (`ClaudeAdapter`'s own docs), a `claude -p`
-/// invocation with no `--allowedTools` at all denies every tool call
-/// outright. If a *present* file's omitted `tools` reached
-/// `ToolAdapter::build_command` as `None` unchanged, the agent would be
-/// silently muzzled: a reviewer that can't call any tool raises zero
-/// findings, a coder that can't `Write`/`Bash` commits nothing, and
-/// `decide_next_state` sees a clean cycle and converges -- a false pass, not
-/// a real one. So this only ever calls `parse_agent_definition` for a
-/// *present* file, then merges `adapter.default_tools(role)` in wherever the
-/// parsed `tools` came back `None` -- exactly as if the file had spelled the
-/// default out itself. A file that *does* set `tools` (even to something the
-/// adapter wouldn't have chosen) is never touched: only an omitted key is
-/// filled in, never an explicit one overridden.
+/// deliberately supported case: a definition file that only wants to
+/// override the system prompt, leaving `tools`/`model` to the adapter, must
+/// work. But `warden_core::AgentDefinition::tools` being `None` is not a
+/// neutral "no opinion" for every adapter -- verified directly against the
+/// real CLI (`ClaudeAdapter`'s own docs), a `claude -p` invocation with no
+/// `--allowedTools` at all denies every tool call outright. If a *present*
+/// file's omitted `tools` reached `ToolAdapter::build_command` as `None`
+/// unchanged, the agent would be silently muzzled: a reviewer that can't
+/// call any tool raises zero findings, a coder that can't `Write`/`Bash`
+/// commits nothing, and `decide_next_state` sees a clean cycle and
+/// converges -- a false pass, not a real one. So [`try_read_definition`]
+/// only ever calls `parse_agent_definition` for a *present* file, then
+/// merges `adapter.default_tools(role)` in wherever the parsed `tools` came
+/// back `None` -- exactly as if the file had spelled the default out
+/// itself. A file that *does* set `tools` (even to something the adapter
+/// wouldn't have chosen) is never touched: only an omitted key is filled
+/// in, never an explicit one overridden.
 pub async fn resolve_agent_definition(
     repo_path: &Path,
     role: AgentRole,
     adapter: &impl ToolAdapter,
-) -> Result<AgentDefinition> {
-    let path = repo_path
-        .join(AGENTS_DIR)
-        .join(format!("{}.md", role.as_str()));
+    user_config_agents_dir: &Path,
+    trust_repo_agents: bool,
+) -> Result<(AgentDefinition, AgentDefinitionSource)> {
+    match role {
+        AgentRole::Coder => {
+            let path = repo_path
+                .join(AGENTS_DIR)
+                .join(format!("{}.md", role.as_str()));
+            match try_read_definition(&path, role, adapter).await? {
+                Some(definition) => Ok((definition, AgentDefinitionSource::RepoConvention(path))),
+                None => Ok((
+                    adapter_default_definition(role, adapter)?,
+                    AgentDefinitionSource::AdapterDefault,
+                )),
+            }
+        }
+        AgentRole::Reviewer | AgentRole::Tester => {
+            let user_config_path = user_config_agents_dir.join(format!("{}.md", role.as_str()));
+            if let Some(definition) = try_read_definition(&user_config_path, role, adapter).await? {
+                return Ok((
+                    definition,
+                    AgentDefinitionSource::UserConfig(user_config_path),
+                ));
+            }
 
-    match tokio::fs::read_to_string(&path).await {
+            if trust_repo_agents {
+                let repo_override_path = repo_path
+                    .join(AGENTS_DIR)
+                    .join(format!("{}.md", role.as_str()));
+                if let Some(definition) =
+                    try_read_definition(&repo_override_path, role, adapter).await?
+                {
+                    // Issue #26: the moment a repo-sourced definition is
+                    // actually used for an independent role, this must be
+                    // impossible to miss -- see the module docs' own
+                    // "Security: role-asymmetric resolution" section for why
+                    // this is a `tracing::warn!` *and* (via the caller) a
+                    // persisted `RunEvent`, not either alone.
+                    tracing::warn!(
+                        role = role.as_str(),
+                        path = %repo_override_path.display(),
+                        "using a repo-supplied agent definition for an independent role \
+                         (--trust-repo-agents); this file is committable by the coder and is \
+                         NOT trusted the way a user-config definition is"
+                    );
+                    return Ok((
+                        definition,
+                        AgentDefinitionSource::UntrustedRepoOverride(repo_override_path),
+                    ));
+                }
+            }
+
+            Ok((
+                adapter_default_definition(role, adapter)?,
+                AgentDefinitionSource::AdapterDefault,
+            ))
+        }
+    }
+}
+
+/// Attempts to read, parse, and default-fill (B2) the definition at `path`.
+/// `Ok(None)` means "no file there" (`io::ErrorKind::NotFound`) -- the only
+/// case a caller may treat as "try the next source in precedence order".
+/// Every other outcome is either `Ok(Some(..))` (successfully read and
+/// parsed) or a typed `Err` naming `path` -- see
+/// [`resolve_agent_definition`]'s own docs for why a present-but-broken file
+/// must never be silently treated the same as an absent one.
+async fn try_read_definition(
+    path: &Path,
+    role: AgentRole,
+    adapter: &impl ToolAdapter,
+) -> Result<Option<AgentDefinition>> {
+    match tokio::fs::read_to_string(path).await {
         Ok(raw) => {
             let definition =
                 parse_agent_definition(&raw).map_err(|source| AgentDefinitionError::Invalid {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     source,
                 })?;
-            Ok(apply_default_tools_when_unset(definition, role, adapter))
+            Ok(Some(apply_default_tools_when_unset(
+                definition, role, adapter,
+            )))
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            // `AgentDefinition::new` enforces the exact same invariants
-            // `parse_agent_definition` does (agent_def.rs), so an adapter's
-            // own default prompt/tools can never produce a definition the
-            // parser would have refused. `default_tools` matters as much as
-            // `default_prompt` here -- see `ToolAdapter::default_tools`'s
-            // own docs for why a `None` grant would leave the "zero .md" UX
-            // unable to act at all for a tool like `claude`.
-            Ok(AgentDefinition::new(
-                None,
-                None,
-                adapter.default_tools(role).map(str::to_string),
-                None,
-                adapter.default_prompt(role),
-            )?)
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(AgentDefinitionError::Read {
+            path: path.to_path_buf(),
+            source,
         }
-        Err(source) => Err(AgentDefinitionError::Read { path, source }.into()),
+        .into()),
     }
+}
+
+/// The selected adapter's own default prompt/tools for `role`, used at
+/// every consulted location once none of them has a file (issue #24 point
+/// 3's "zero markdown at all" UX).
+///
+/// `AgentDefinition::new` enforces the exact same invariants
+/// `parse_agent_definition` does (`warden_core::agent_def`), so an adapter's
+/// own default prompt/tools can never produce a definition the parser would
+/// have refused. `default_tools` matters as much as `default_prompt` here
+/// -- see `ToolAdapter::default_tools`'s own docs for why a `None` grant
+/// would leave the "zero .md" UX unable to act at all for a tool like
+/// `claude`.
+fn adapter_default_definition(
+    role: AgentRole,
+    adapter: &impl ToolAdapter,
+) -> Result<AgentDefinition> {
+    Ok(AgentDefinition::new(
+        None,
+        None,
+        adapter.default_tools(role).map(str::to_string),
+        None,
+        adapter.default_prompt(role),
+    )?)
+}
+
+/// Resolves the user config directory agent definitions for the reviewer/
+/// tester are read from (issue #26): `$XDG_CONFIG_HOME/warden/agents` if
+/// `XDG_CONFIG_HOME` is set to a non-blank value, else
+/// `$HOME/.config/warden/agents`.
+///
+/// Hand-rolled rather than a `dirs`/`etcetera` dependency
+/// (code-standards.md: "Préférer la stdlib" / "N'inclure que les
+/// dépendances réellement utilisées") -- this codebase already has exactly
+/// this shape of lookup for `warden_home` (`main.rs::default_warden_home`,
+/// `$HOME`-based, no crate), and two env vars don't justify a new
+/// dependency just for this one.
+///
+/// Called exactly once, from `main.rs`, with the result threaded down into
+/// [`resolve_agent_definition`] as an explicit parameter rather than read
+/// from the environment deep inside this module. This is deliberate for
+/// testability: `agent_def.rs`'s own unit tests run in the same process as
+/// every other test in this crate, and mutating real process environment
+/// variables from there (`std::env::set_var`) would be exactly the
+/// "unsafely and with cross-test interference risk under a parallel test
+/// runner" hazard `process.rs`'s own tests already call out and avoid (see
+/// `spawn_tui_attach_inherits_the_full_parent_environment`'s doc comment)
+/// -- a `tempfile::TempDir` passed directly as `user_config_agents_dir`
+/// sidesteps it entirely. The CLI's own integration tests (`tests/cli.rs`),
+/// which drive the real compiled binary as a separate child process, don't
+/// have this hazard and are free to set `XDG_CONFIG_HOME`/`HOME` via
+/// `assert_cmd`'s own `Command::env` instead.
+pub fn default_user_config_agents_dir() -> Result<PathBuf> {
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
+        _ => {
+            let home = std::env::var("HOME").map_err(|_| {
+                AgentDefinitionError::UserConfigDirUnresolvable {
+                    reason: "neither XDG_CONFIG_HOME nor HOME is set".to_string(),
+                }
+            })?;
+            if home.trim().is_empty() {
+                return Err(AgentDefinitionError::UserConfigDirUnresolvable {
+                    reason: "HOME is set but empty".to_string(),
+                }
+                .into());
+            }
+            PathBuf::from(home).join(".config")
+        }
+    };
+    Ok(base.join("warden").join("agents"))
 }
 
 /// See [`resolve_agent_definition`]'s own docs (B2): a file that explicitly
@@ -231,22 +468,44 @@ mod tests {
 
     const DEFINITION: &str = "---\nmodel: opus\n---\n\nYou are Warden's reviewer.\n";
 
+    /// A `user_config_agents_dir` that doesn't exist at all -- the common
+    /// case for every test below that isn't specifically exercising the
+    /// user-config source, and for a real first-run user who has never
+    /// created `~/.config/warden/agents/`. `resolve_agent_definition` must
+    /// treat a missing *directory* exactly like a missing *file*
+    /// (`io::ErrorKind::NotFound` either way).
+    fn no_user_config_dir() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // Coder: unchanged from issue #24 -- repo convention file, or default.
+    // -----------------------------------------------------------------
+
     #[tokio::test]
-    async fn loads_and_validates_the_convention_file_when_present() {
+    async fn coder_loads_and_validates_the_repo_convention_file_when_present() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
         tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
             .await
             .unwrap();
-        tokio::fs::write(repo.path().join(AGENTS_DIR).join("reviewer.md"), DEFINITION)
+        tokio::fs::write(repo.path().join(AGENTS_DIR).join("coder.md"), DEFINITION)
             .await
             .unwrap();
 
-        let definition = resolve_agent_definition(repo.path(), AgentRole::Reviewer, &FakeAdapter)
-            .await
-            .unwrap();
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(definition.model.as_deref(), Some("opus"));
         assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+        assert!(matches!(source, AgentDefinitionSource::RepoConvention(_)));
     }
 
     /// B2 regression (issue #24 review): a convention file that overrides
@@ -257,33 +516,40 @@ mod tests {
     /// nothing, `decide_next_state` sees a clean cycle). See
     /// `apply_default_tools_when_unset`'s own docs.
     #[tokio::test]
-    async fn a_prompt_only_definition_still_gets_the_adapters_default_tools_grant() {
+    async fn coder_a_prompt_only_definition_still_gets_the_adapters_default_tools_grant() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
         tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
             .await
             .unwrap();
         tokio::fs::write(
-            repo.path().join(AGENTS_DIR).join("reviewer.md"),
-            "---\n---\nreview it\n",
+            repo.path().join(AGENTS_DIR).join("coder.md"),
+            "---\n---\nimplement it\n",
         )
         .await
         .unwrap();
 
-        let definition = resolve_agent_definition(repo.path(), AgentRole::Reviewer, &FakeAdapter)
-            .await
-            .unwrap();
+        let (definition, _source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(definition.tools.as_deref(), Some("fake-default-tools"));
-        assert_eq!(definition.system_prompt, "review it");
+        assert_eq!(definition.system_prompt, "implement it");
     }
 
     /// The other half of the B2 fix: a definition that *does* set `tools`
     /// explicitly must keep exactly what it wrote, never overridden by the
     /// adapter's own default.
     #[tokio::test]
-    async fn a_definition_that_sets_tools_explicitly_keeps_its_own_value_not_the_adapters_default()
-    {
+    async fn coder_a_definition_that_sets_tools_explicitly_keeps_its_own_value() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
         tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
             .await
             .unwrap();
@@ -294,29 +560,38 @@ mod tests {
         .await
         .unwrap();
 
-        let definition = resolve_agent_definition(repo.path(), AgentRole::Coder, &FakeAdapter)
-            .await
-            .unwrap();
+        let (definition, _source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(definition.tools.as_deref(), Some("Read, Edit"));
     }
 
     /// The zero-`.md` UX (issue #24): no convention file at all falls back
-    /// to the adapter's own default prompt for that role, never an error.
+    /// to the adapter's own default prompt, never an error.
     #[tokio::test]
-    async fn falls_back_to_the_adapters_default_prompt_when_no_convention_file_exists() {
+    async fn coder_falls_back_to_the_adapters_default_prompt_when_no_convention_file_exists() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
 
-        let coder = resolve_agent_definition(repo.path(), AgentRole::Coder, &FakeAdapter)
-            .await
-            .unwrap();
+        let (coder, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(coder.system_prompt, "default coder prompt");
         assert_eq!(coder.model, None);
-
-        let tester = resolve_agent_definition(repo.path(), AgentRole::Tester, &FakeAdapter)
-            .await
-            .unwrap();
-        assert_eq!(tester.system_prompt, "default tester prompt");
+        assert_eq!(source, AgentDefinitionSource::AdapterDefault);
     }
 
     /// A convention file that exists but is unreadable for a reason other
@@ -324,17 +599,24 @@ mod tests {
     /// silently treated as absent -- that would hide a real misconfiguration
     /// behind the adapter's default prompt.
     #[tokio::test]
-    async fn a_convention_path_that_is_not_a_regular_file_is_a_read_error_not_a_fallback() {
+    async fn coder_convention_path_that_is_not_a_regular_file_is_a_read_error_not_a_fallback() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
         tokio::fs::create_dir_all(
             repo.path().join(AGENTS_DIR).join("coder.md"), // a directory, not a file
         )
         .await
         .unwrap();
 
-        let error = resolve_agent_definition(repo.path(), AgentRole::Coder, &FakeAdapter)
-            .await
-            .unwrap_err();
+        let error = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -346,21 +628,246 @@ mod tests {
     /// fall back to the default), naming the file and the parser's own
     /// reason.
     #[tokio::test]
-    async fn an_invalid_convention_file_is_a_typed_error_naming_the_path_and_the_reason() {
+    async fn coder_invalid_convention_file_is_a_typed_error_naming_the_path_and_the_reason() {
         let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
         tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
             .await
             .unwrap();
         tokio::fs::write(
-            repo.path().join(AGENTS_DIR).join("tester.md"),
+            repo.path().join(AGENTS_DIR).join("coder.md"),
             "no frontmatter here\n",
         )
         .await
         .unwrap();
 
-        let error = resolve_agent_definition(repo.path(), AgentRole::Tester, &FakeAdapter)
+        let error = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WardenError::AgentDefinition(AgentDefinitionError::Invalid { .. })
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains("coder.md"), "{rendered}");
+        assert!(rendered.contains("frontmatter"), "{rendered}");
+    }
+
+    // -----------------------------------------------------------------
+    // Reviewer/Tester: issue #26's role-asymmetric trust.
+    // -----------------------------------------------------------------
+
+    async fn write_definition(dir: &Path, role: AgentRole, body: &str) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        tokio::fs::write(dir.join(format!("{}.md", role.as_str())), body)
             .await
-            .unwrap_err();
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reviewer_and_tester_load_the_user_config_file_when_present() {
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            let repo = TempDir::new().unwrap();
+            let user_config = TempDir::new().unwrap();
+            write_definition(user_config.path(), role, DEFINITION).await;
+
+            let (definition, source) = resolve_agent_definition(
+                repo.path(),
+                role,
+                &FakeAdapter,
+                user_config.path(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(definition.model.as_deref(), Some("opus"));
+            assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+            assert!(matches!(source, AgentDefinitionSource::UserConfig(_)));
+        }
+    }
+
+    /// The core security fix (issue #26): a repo-supplied reviewer/tester
+    /// definition must be silently *ignored* by default -- not read, not
+    /// erroring even if it's malformed (never consulted at all) -- unless
+    /// `trust_repo_agents` is explicitly set. Without this, a coder could
+    /// rewrite the very reviewer/tester judging a *future* run just by
+    /// committing `.warden/agents/reviewer.md`.
+    #[tokio::test]
+    async fn reviewer_and_tester_ignore_the_repo_convention_file_by_default() {
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            let repo = TempDir::new().unwrap();
+            let user_config = no_user_config_dir();
+            // Deliberately invalid -- proves the repo file is never even
+            // opened, not merely lower-precedence than the (absent) user
+            // config file.
+            write_definition(&repo.path().join(AGENTS_DIR), role, "no frontmatter here\n").await;
+
+            let (definition, source) = resolve_agent_definition(
+                repo.path(),
+                role,
+                &FakeAdapter,
+                user_config.path(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(source, AgentDefinitionSource::AdapterDefault);
+            assert_eq!(
+                definition.system_prompt,
+                if role == AgentRole::Reviewer {
+                    "default reviewer prompt"
+                } else {
+                    "default tester prompt"
+                }
+            );
+        }
+    }
+
+    /// The opt-in escape hatch: with `trust_repo_agents: true` and no
+    /// user-config file, the repo's own convention file is used -- but
+    /// surfaced as [`AgentDefinitionSource::UntrustedRepoOverride`], never
+    /// indistinguishable from a trusted resolution.
+    #[tokio::test]
+    async fn trust_repo_agents_falls_back_to_the_repo_file_when_no_user_config_file_exists() {
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            let repo = TempDir::new().unwrap();
+            let user_config = no_user_config_dir();
+            write_definition(&repo.path().join(AGENTS_DIR), role, DEFINITION).await;
+
+            let (definition, source) =
+                resolve_agent_definition(repo.path(), role, &FakeAdapter, user_config.path(), true)
+                    .await
+                    .unwrap();
+
+            assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+            let expected_path = repo
+                .path()
+                .join(AGENTS_DIR)
+                .join(format!("{}.md", role.as_str()));
+            assert_eq!(
+                source,
+                AgentDefinitionSource::UntrustedRepoOverride(expected_path)
+            );
+        }
+    }
+
+    /// Precedence (issue #26): when both a user-config file and a repo file
+    /// exist for the same role, the user-config file always wins -- the repo
+    /// file is a fallback for when nothing is configured yet, never a way to
+    /// shadow a value the user deliberately set for themselves.
+    #[tokio::test]
+    async fn user_config_file_wins_over_the_repo_file_even_with_trust_repo_agents() {
+        let repo = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        write_definition(
+            user_config.path(),
+            AgentRole::Reviewer,
+            "---\n---\nfrom user config\n",
+        )
+        .await;
+        write_definition(
+            &repo.path().join(AGENTS_DIR),
+            AgentRole::Reviewer,
+            "---\n---\nfrom the repo\n",
+        )
+        .await;
+
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Reviewer,
+            &FakeAdapter,
+            user_config.path(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.system_prompt, "from user config");
+        assert!(matches!(source, AgentDefinitionSource::UserConfig(_)));
+    }
+
+    /// `trust_repo_agents: true` with *neither* a user-config file nor a
+    /// repo file still falls all the way through to the adapter's own
+    /// default -- the flag only ever adds a fallback location, never removes
+    /// the final one.
+    #[tokio::test]
+    async fn trust_repo_agents_still_falls_back_to_the_adapter_default_when_nothing_exists() {
+        let repo = TempDir::new().unwrap();
+        let user_config = no_user_config_dir();
+
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Tester,
+            &FakeAdapter,
+            user_config.path(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.system_prompt, "default tester prompt");
+        assert_eq!(source, AgentDefinitionSource::AdapterDefault);
+    }
+
+    /// A user-config file that exists but is unreadable for a reason other
+    /// than "doesn't exist" must be a typed error, exactly like the coder's
+    /// own convention file -- never silently treated as absent.
+    #[tokio::test]
+    async fn reviewer_user_config_path_that_is_not_a_regular_file_is_a_read_error() {
+        let repo = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(user_config.path().join("reviewer.md")) // a directory
+            .await
+            .unwrap();
+
+        let error = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Reviewer,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WardenError::AgentDefinition(AgentDefinitionError::Read { .. })
+        ));
+    }
+
+    /// An invalid user-config file must surface as `Invalid`, naming the
+    /// path and the parser's own reason -- same rule as the coder's
+    /// convention file, applied to the trusted source.
+    #[tokio::test]
+    async fn reviewer_invalid_user_config_file_is_a_typed_error_naming_the_path_and_the_reason() {
+        let repo = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        write_definition(
+            user_config.path(),
+            AgentRole::Tester,
+            "no frontmatter here\n",
+        )
+        .await;
+
+        let error = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Tester,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -369,5 +876,32 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("tester.md"), "{rendered}");
         assert!(rendered.contains("frontmatter"), "{rendered}");
+    }
+
+    /// B2 applies identically to the user-config source: a prompt-only
+    /// override still gets the adapter's own default tools grant.
+    #[tokio::test]
+    async fn reviewer_user_config_prompt_only_definition_still_gets_the_adapters_default_tools() {
+        let repo = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        write_definition(
+            user_config.path(),
+            AgentRole::Reviewer,
+            "---\n---\nreview it\n",
+        )
+        .await;
+
+        let (definition, _source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Reviewer,
+            &FakeAdapter,
+            user_config.path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.tools.as_deref(), Some("fake-default-tools"));
+        assert_eq!(definition.system_prompt, "review it");
     }
 }

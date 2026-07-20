@@ -81,6 +81,21 @@ enum Commands {
         #[arg(long, value_parser = parse_tool)]
         tool: ToolName,
 
+        /// Issue #26: opts into honouring a repo-supplied reviewer/tester
+        /// definition (`<repo>/.warden/agents/{reviewer,tester}.md`) when no
+        /// user-config definition exists for that role. Off by default -- a
+        /// repo's own reviewer/tester convention file is otherwise ignored
+        /// entirely, since it is committable by the very coder that role
+        /// exists to judge independently (see `warden::agent_def`'s own
+        /// "Security: role-asymmetric resolution" docs). When this actually
+        /// causes a repo file to be used, it is surfaced as untrusted: a
+        /// `tracing::warn!` naming the path, and a
+        /// `RunEvent::UntrustedAgentDefinitionUsed` on the run's own event
+        /// log. Never affects the coder's own convention file, which was
+        /// already read from the repo regardless of this flag.
+        #[arg(long)]
+        trust_repo_agents: bool,
+
         /// Overrides automatic project-type detection for the Evidence
         /// Capture Adapter (ADR-0009): `playwright` for web/UI projects,
         /// `asciinema` for CLI projects. Detected from the repo when
@@ -170,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
             max_test_cycles,
             warden_home,
             tool,
+            trust_repo_agents,
             evidence_tool,
             evidence_store_in_repo,
             gate_bare_repo,
@@ -215,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
                         max_test_cycles,
                         warden_home,
                         ClaudeAdapter,
+                        trust_repo_agents,
                         evidence_tool,
                         evidence_store_in_repo,
                         gate,
@@ -271,6 +288,7 @@ async fn run<R: ToolAdapter>(
     max_test_cycles: u32,
     warden_home: Option<PathBuf>,
     adapter: R,
+    trust_repo_agents: bool,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
@@ -358,9 +376,57 @@ async fn run<R: ToolAdapter>(
     // worktree), before this run's `runs` row is even written -- see
     // `warden::agent_def::resolve_agent_definition`'s own docs for why that
     // timing is the security-relevant part of this call.
-    let coder_agent = resolve_agent_definition(&repo, AgentRole::Coder, &adapter).await?;
-    let reviewer_agent = resolve_agent_definition(&repo, AgentRole::Reviewer, &adapter).await?;
-    let tester_agent = resolve_agent_definition(&repo, AgentRole::Tester, &adapter).await?;
+    //
+    // Issue #26: the reviewer/tester's own trusted source
+    // (`user_config_agents_dir`) is resolved once here, from this process's
+    // real environment (`XDG_CONFIG_HOME`/`HOME`) -- see
+    // `agent_def::default_user_config_agents_dir`'s own docs for why that
+    // env read lives here rather than inside `resolve_agent_definition`
+    // itself.
+    let user_config_agents_dir = warden::agent_def::default_user_config_agents_dir()?;
+    let (coder_agent, _coder_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Coder,
+        &adapter,
+        &user_config_agents_dir,
+        trust_repo_agents,
+    )
+    .await?;
+    let (reviewer_agent, reviewer_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Reviewer,
+        &adapter,
+        &user_config_agents_dir,
+        trust_repo_agents,
+    )
+    .await?;
+    let (tester_agent, tester_source) = resolve_agent_definition(
+        &repo,
+        AgentRole::Tester,
+        &adapter,
+        &user_config_agents_dir,
+        trust_repo_agents,
+    )
+    .await?;
+
+    // Issue #26: `resolve_agent_definition` already `tracing::warn!`ed the
+    // moment it actually read a repo-sourced reviewer/tester definition
+    // (before this run, or its Event Bus, even exist) -- this just collects
+    // which role(s) that happened for, so `run_convergence_loop` can also
+    // publish a persisted `RunEvent::UntrustedAgentDefinitionUsed` for each,
+    // once the run's own event log exists to carry it.
+    let untrusted_repo_agent_definitions = [
+        (AgentRole::Reviewer, reviewer_source),
+        (AgentRole::Tester, tester_source),
+    ]
+    .into_iter()
+    .filter_map(|(role, source)| match source {
+        warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride(path) => {
+            Some(orchestrator::UntrustedRepoAgentDefinition { role, path })
+        }
+        _ => None,
+    })
+    .collect();
 
     // Issue #31: resolved before `warden_home` moves into `config` below --
     // this is the resolved `warden_home` (not the raw `--warden-home` flag,
@@ -422,6 +488,7 @@ async fn run<R: ToolAdapter>(
         evidence_tool,
         evidence_store_in_repo,
         gate,
+        untrusted_repo_agent_definitions,
     };
 
     let cancel_on_tui_exit = cancel.clone();

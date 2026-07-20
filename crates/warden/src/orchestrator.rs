@@ -131,6 +131,28 @@ pub struct RunConfig {
     /// crate's original behaviour exactly: a converged run stops at
     /// `Converged` and never reaches `Pushed`/`AwaitingCi`/`Done`.
     pub gate: Option<GateConfig>,
+    /// Issue #26: the reviewer/tester definitions (if any) that were
+    /// actually resolved from the repo under review rather than the user
+    /// config directory -- only ever non-empty when `--trust-repo-agents`
+    /// was passed *and* no user-config file existed for that role (see
+    /// `agent_def::resolve_agent_definition`'s own docs on precedence).
+    /// Published as [`warden_core::RunEvent::UntrustedAgentDefinitionUsed`]
+    /// right after `RunStarted` (see [`Orchestrator::run_convergence_loop`])
+    /// so this run's own event log carries a permanent, replayable record of
+    /// which role(s) ran under a definition the coder can write to --
+    /// `main.rs`'s `tracing::warn!` at resolution time is not itself
+    /// persisted anywhere a later `warden-tui attach`/history query could
+    /// still see it.
+    pub untrusted_repo_agent_definitions: Vec<UntrustedRepoAgentDefinition>,
+}
+
+/// One reviewer/tester definition sourced from the repo under review under
+/// `--trust-repo-agents` (issue #26) -- see the
+/// [`RunConfig::untrusted_repo_agent_definitions`] field docs.
+#[derive(Debug, Clone)]
+pub struct UntrustedRepoAgentDefinition {
+    pub role: AgentRole,
+    pub path: PathBuf,
 }
 
 /// Everything [`Orchestrator::drive_post_convergence_tail`] needs to trigger
@@ -560,6 +582,21 @@ impl Orchestrator {
             max_test_cycles: config.max_test_cycles,
         })
         .await?;
+
+        // Issue #26: one `UntrustedAgentDefinitionUsed` per repo-sourced
+        // reviewer/tester definition (`--trust-repo-agents`), right after
+        // `RunStarted` -- see `RunConfig::untrusted_repo_agent_definitions`'s
+        // own docs for why this is an event (persisted, replayable by a
+        // later `warden-tui attach`) rather than only the `tracing::warn!`
+        // `agent_def::resolve_agent_definition` already logged at resolution
+        // time, before this run (or its Event Bus) even existed.
+        for untrusted in &config.untrusted_repo_agent_definitions {
+            self.publish_event(RunEvent::UntrustedAgentDefinitionUsed {
+                role: untrusted.role.as_str().to_string(),
+                path: untrusted.path.display().to_string(),
+            })
+            .await?;
+        }
         // Issue #31: the `runs` row and the Event Bus socket both exist by
         // now, so `warden-tui attach --run-id <run_id>` is already a valid
         // command -- this is the earliest point at which printing it is
@@ -1196,6 +1233,7 @@ impl Orchestrator {
                 &agent.command,
                 env_allowlist,
                 worktree.path(),
+                &config.repo_path,
                 stdin_payload,
                 cancel,
             )
@@ -1447,6 +1485,7 @@ impl Orchestrator {
                 &agent.command,
                 env_allowlist,
                 worktree.path(),
+                &config.repo_path,
                 stdin_payload,
                 cancel.clone(),
             )
@@ -1654,6 +1693,15 @@ impl Orchestrator {
     /// [`publish_progress_event`](Orchestrator::publish_progress_event) --
     /// never through [`publish_event`](Orchestrator::publish_event), which
     /// would persist it (see this module's own ADR-0008 amendment docs).
+    ///
+    /// `repo_path` is the run's base repository (`RunConfig::repo_path`,
+    /// never a role's own worktree) -- passed through to
+    /// [`process::validate_agent_program`] (issue #26), the one choke point
+    /// every coder/reviewer/tester spawn in this codebase goes through, so a
+    /// future `ToolAdapter` that ever names a repo-relative or in-worktree
+    /// `command.program` for the reviewer/tester is refused here rather than
+    /// silently spawning code the coder controls. A no-op for the coder
+    /// itself -- see that function's own docs for why.
     #[allow(clippy::too_many_arguments)]
     async fn run_agent<R: ToolAdapter>(
         &self,
@@ -1663,9 +1711,11 @@ impl Orchestrator {
         command: &AgentCommand,
         env_allowlist: &[&str],
         cwd: &Path,
+        repo_path: &Path,
         stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
+        process::validate_agent_program(role, &command.program, cwd, repo_path)?;
         let child = process::spawn_with_extra_env(command, cwd, env_allowlist)?;
         // H1: never persist pid 0. A missing `Child::id()` right after
         // spawn is a typed error, not a silent fallback — a persisted pid
@@ -2967,6 +3017,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let runner = FakeRunner::new();
@@ -2976,6 +3027,94 @@ mod tests {
             .unwrap();
 
         assert_eq!(final_state, RunState::Converged);
+    }
+
+    /// Issue #26: `run_convergence_loop` publishes one persisted
+    /// `RunEvent::UntrustedAgentDefinitionUsed` per entry in
+    /// `RunConfig::untrusted_repo_agent_definitions`, right after
+    /// `RunStarted` -- so a later `warden-tui attach`/history query still
+    /// sees which role(s) ran under a definition the coder can write to, not
+    /// just this process's own `tracing::warn!` at resolution time (see
+    /// `agent_def::resolve_agent_definition`'s own docs).
+    #[tokio::test]
+    async fn untrusted_repo_agent_definitions_are_published_right_after_run_started() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let reviewer_path = repo.path().join(".warden/agents/reviewer.md");
+        let tester_path = repo.path().join(".warden/agents/tester.md");
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue #26: surface an untrusted repo-sourced definition".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: vec![
+                UntrustedRepoAgentDefinition {
+                    role: AgentRole::Reviewer,
+                    path: reviewer_path.clone(),
+                },
+                UntrustedRepoAgentDefinition {
+                    role: AgentRole::Tester,
+                    path: tester_path.clone(),
+                },
+            ],
+        };
+
+        let runner = FakeRunner::new();
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, runner, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        let run_started_index = persisted
+            .iter()
+            .position(|record| matches!(record.event, RunEvent::RunStarted { .. }))
+            .expect("RunStarted must be persisted");
+
+        assert!(
+            matches!(
+                persisted[run_started_index + 1].event,
+                RunEvent::UntrustedAgentDefinitionUsed { .. }
+            ),
+            "{persisted:?}"
+        );
+        assert!(
+            matches!(
+                persisted[run_started_index + 2].event,
+                RunEvent::UntrustedAgentDefinitionUsed { .. }
+            ),
+            "{persisted:?}"
+        );
+
+        let untrusted: Vec<&RunEvent> = persisted
+            .iter()
+            .map(|record| &record.event)
+            .filter(|event| matches!(event, RunEvent::UntrustedAgentDefinitionUsed { .. }))
+            .collect();
+        assert_eq!(untrusted.len(), 2, "{persisted:?}");
+        assert!(untrusted.iter().any(|event| matches!(
+            event,
+            RunEvent::UntrustedAgentDefinitionUsed { role, path }
+                if role == "reviewer" && path == &reviewer_path.display().to_string()
+        )));
+        assert!(untrusted.iter().any(|event| matches!(
+            event,
+            RunEvent::UntrustedAgentDefinitionUsed { role, path }
+                if role == "tester" && path == &tester_path.display().to_string()
+        )));
     }
 
     /// A definition the runner cannot honour must fail the run *before* any
@@ -3003,6 +3142,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let result = orchestrator
@@ -3086,6 +3226,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3131,6 +3272,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (_run_id, final_state) = orchestrator
@@ -3243,6 +3385,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3428,6 +3571,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         // The whole point: this must resolve to `Converged`, not panic or
@@ -3521,6 +3665,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3588,6 +3733,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3666,6 +3812,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3752,6 +3899,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3817,6 +3965,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -3923,6 +4072,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4042,6 +4192,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (_run_id, final_state) = orchestrator
@@ -4128,6 +4279,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (_run_id, final_state) = orchestrator
@@ -4169,6 +4321,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4255,6 +4408,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4319,6 +4473,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4392,6 +4547,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4511,6 +4667,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4622,6 +4779,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (_run_id, final_state) = orchestrator
@@ -4747,6 +4905,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -4910,6 +5069,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -5322,6 +5482,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
 
@@ -5443,6 +5604,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
@@ -5528,6 +5690,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
@@ -5608,6 +5771,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -5753,6 +5917,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
@@ -5845,6 +6010,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
@@ -5929,6 +6095,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
@@ -6317,6 +6484,7 @@ mod tests {
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
         };
 
         let (run_id, final_state) = orchestrator
@@ -6468,6 +6636,7 @@ mod tests {
                 poll_interval_secs: 1,
                 inactivity_timeout_secs: 3600,
             }),
+            untrusted_repo_agent_definitions: Vec::new(),
         };
         // Leaked deliberately: `warden_home`'s TempDir must outlive the
         // `CiResultListener` bound inside it for the duration of this test,
