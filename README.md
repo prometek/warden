@@ -103,9 +103,15 @@ Documenté sans l'euphémiser dans `docs/Architecture.md` (ADR-0006, amendement 
 
 - `crates/warden-core/` — logique pure (state machine des runs, interprétation des
   findings), 100 % testable sans I/O.
+- `crates/warden-sandbox/` — seam d'isolation de l'environnement d'exécution (issue
+  #50) : trait `Sandbox` (`create`/`execute`/`destroy`) + `LocalSandbox`, le backend
+  par défaut, en parité stricte avec l'isolation process que `warden` appliquait
+  auparavant à la main (`env_clear()`, `cwd`, `kill_on_drop`). Dont dépend
+  `crates/warden/` (jamais `warden-core`, dans aucun sens) — prêt pour un futur
+  backend conteneur (`DockerSandbox`, issue #49) sans retoucher les points d'appel.
 - `crates/warden/` — binaire orchestrateur (`[[bin]] warden`) : CLI, gestion des
-  worktrees git, spawn des agents en sous-processus, persistance SQLite (`sqlx`),
-  boucle de convergence.
+  worktrees git, spawn des agents via la seam `warden-sandbox`, persistance SQLite
+  (`sqlx`), boucle de convergence.
 - `crates/warden-gated/` — binaire du gate git (`[[bin]] warden-gated`) : seul détenteur
   des credentials vers `origin`, hook `post-receive` minimal + revérification indépendante
   de l'état avant tout push (voir "Le gate git (`warden-gated`)" ci-dessous).

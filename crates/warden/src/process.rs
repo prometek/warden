@@ -1,23 +1,29 @@
-//! Agent Subprocess Adapter (ADR-0005): spawns a single agent invocation as
-//! a `tokio::process::Command`, cancellable via a `CancellationToken`
+//! Subprocess Adapter (ADR-0005): spawns one child as a
+//! `tokio::process::Command`, cancellable via a `CancellationToken`
 //! (code-standards.md: "tokio pour l'annulation propre des sous-process").
 //! stdout is captured and handed back as-is — parsing/validating it into
 //! [`warden_core::Finding`]s happens at the boundary in `warden-core`, this
 //! module never interprets agent output itself.
 //!
-//! `spawn` and `wait` are split so a caller (the orchestrator) can persist
-//! the child's PID to SQLite *before* awaiting completion — that's what
-//! makes crash detection meaningful: if the orchestrator itself dies while
-//! awaiting, the PID it already wrote is what recovery checks on restart.
+//! **Issue #50: this is no longer the coder/reviewer/tester invocation
+//! path.** Every agent now runs through `warden_sandbox::Sandbox`
+//! (`warden_sandbox::LocalSandbox` by default -- a strict-parity port of
+//! what [`spawn`]/[`wait`] used to do for that path, including its own
+//! per-invocation env-allowlist forwarding and per-line progress callback),
+//! wired in by `orchestrator::Orchestrator::run_agent`. [`spawn`]/[`wait`]
+//! remain here for the one caller that still needs the general primitive
+//! for a non-agent subprocess: the Evidence Capture Adapter (`evidence.rs`,
+//! via [`spawn_and_wait`]).
 //!
-//! ADR-0012 (issue #20 Scope B): `spawn` also pipes stdin, so a caller can
-//! feed the agent the run intent / target commit+diff+findings
-//! (`warden_core::AgentInputMessage`) over the one channel
-//! code-standards.md's Agent Subprocess Protocol already sanctions for this
-//! ("Échange JSON en streaming sur stdin/stdout"). [`wait`] writes that
-//! payload (if any) and closes the write half concurrently with draining
-//! stdout/stderr and awaiting exit — see its own docs for why writing stdin
-//! any other way can deadlock.
+//! `spawn` and `wait` are split so a caller can persist the child's PID to
+//! SQLite *before* awaiting completion — that's the same crash-detection
+//! shape `warden_sandbox::Execution` gives the agent path (its own
+//! `pid`/`wait` split, `warden_sandbox`'s own docs), just for a plain
+//! subprocess here instead.
+//!
+//! [`wait`] writes an optional stdin payload (if any) and closes the write
+//! half concurrently with draining stdout/stderr and awaiting exit — see its
+//! own docs for why writing stdin any other way can deadlock.
 //!
 //! # Issue #26: [`validate_agent_program`], a belt-and-braces guard on `program`
 //!
@@ -233,66 +239,46 @@ pub fn validate_agent_program(
     Ok(())
 }
 
-/// Spawns `command` with `cwd` pointed at the agent's isolated worktree
-/// (code-standards.md: "Agent Subprocess Protocol"). The environment is not
-/// inherited from the current process — `env_clear()` always runs first, so
-/// agents never see credentials sitting in the orchestrator's shell
-/// environment by default (Architecture.md §10, "Isolation environnement des
-/// sous-processus"). Convenience wrapper over [`spawn_with_extra_env`] with
-/// an empty allowlist — every call site that doesn't need extra env vars
-/// (evidence capture, every test in this module) uses this directly.
+/// Spawns `command` with `cwd` set (code-standards.md: "Agent Subprocess
+/// Protocol"). The environment is not inherited from the current process —
+/// `env_clear()` always runs first, only `PATH` forwarded on top
+/// (Architecture.md §10, "Isolation environnement des sous-processus").
 ///
-/// **A relative `command.program` resolves against `cwd`**, i.e. against the
-/// worktree — the child chdirs before exec, so `./reviewer.sh` means *the
-/// repo's own copy of that script at the commit under review*, which the
-/// coder can rewrite and commit. Long-standing behaviour, documented here
-/// rather than changed — refusing relative paths is a product decision, and
-/// it would break the plain-script case a custom `AgentCommand` might still
-/// exist to serve outside a built-in `warden::tool_adapter::ToolAdapter`
-/// (which, for the adapters Warden ships, always names an absolute-lookup
-/// binary like `claude`, resolved via `PATH`, never a path relative to the
-/// worktree under review). This function itself stays permissive for that
-/// reason -- it is [`validate_agent_program`], called by
-/// `orchestrator::Orchestrator::run_agent` *before* every coder/reviewer/
-/// tester spawn (not by this lower-level primitive, which evidence capture
-/// and this module's own tests also call for non-agent subprocesses), that
-/// actually refuses a reviewer/tester program shaped like this (issue #26).
+/// Issue #50 review, MEDIUM 3: this and [`wait`] no longer sit on the
+/// coder/reviewer/tester invocation path at all — every agent runs through
+/// `warden_sandbox::Sandbox` now (`warden_sandbox::LocalSandbox::execute` is
+/// the strict-parity port of what used to live here, including its own
+/// env-allowlist forwarding and per-line progress callback), routed via
+/// `orchestrator::Orchestrator::run_agent`. What remains here is the
+/// narrower subset the Evidence Capture Adapter (`evidence.rs`, via
+/// [`spawn_and_wait`]) actually needs: no extra env allowlist, no per-line
+/// callback — carrying that now-dead functionality forward as a second,
+/// separately maintained copy of `LocalSandbox`'s own deadlock-avoidance
+/// logic was exactly the drift risk two copies of the same subprocess-drain
+/// code creates. `[`validate_agent_program`]` is unaffected by this — it is
+/// still the one checkpoint every coder/reviewer/tester spawn goes through,
+/// just called from `Orchestrator::run_agent` before the sandbox's own
+/// `execute`, not before this function.
 ///
-/// stdin is piped (ADR-0012, issue #20 Scope B) rather than inherited, so
-/// the intent/target-commit/diff/findings payload [`wait`] writes never
-/// leaks the orchestrator's own stdin into the agent. An agent that never
-/// reads stdin at all is *not* unconditionally unaffected: a payload small
-/// enough to fit in the OS pipe buffer (typically 64KiB) is written without
-/// blocking and simply sits there unread until the agent exits, but a
-/// larger payload blocks [`wait`]'s write until either the agent reads
-/// enough to make room or exits and closes its read end (a broken pipe,
-/// handled explicitly — see [`wait`]).
+/// **A relative `command.program` resolves against `cwd`** — the child
+/// chdirs before exec. Long-standing behaviour, documented here rather than
+/// changed — refusing relative paths is a product decision, and it would
+/// break the plain-script case a custom `AgentCommand` might still exist to
+/// serve for a non-agent subprocess (evidence capture).
+///
+/// stdin is piped (ADR-0012, issue #20 Scope B heritage) rather than
+/// inherited, so [`wait`]'s optional payload write never leaks the
+/// orchestrator's own stdin into the child. A child that never reads stdin
+/// at all is *not* unconditionally unaffected: a payload small enough to fit
+/// in the OS pipe buffer (typically 64KiB) is written without blocking and
+/// simply sits there unread until the child exits, but a larger payload
+/// blocks [`wait`]'s write until either the child reads enough to make room
+/// or exits and closes its read end (a broken pipe, handled explicitly —
+/// see [`wait`]).
 ///
 /// Returns the still-running [`Child`] so the caller can read its PID
 /// (`child.id()`) and persist it before calling [`wait`].
 pub fn spawn(command: &AgentCommand, cwd: &Path) -> Result<Child, ProcessError> {
-    spawn_with_extra_env(command, cwd, &[])
-}
-
-/// Like [`spawn`], but also forwards each variable named in
-/// `extra_env_vars` — if it is actually set in `warden`'s own environment —
-/// on top of the always-forwarded `PATH`.
-///
-/// This is the Architecture.md §10 relaxation issue #24 asks for by name,
-/// implementing `warden_core`-agnostic infrastructure for
-/// `warden::tool_adapter::ToolAdapter::env_allowlist` (e.g. `claude` needs
-/// `HOME` to find its own auth/config): **`env_clear()` still runs first,
-/// unconditionally** — this is a small, explicit, per-invocation opt-in
-/// allowlist layered back on top, never a switch to inheriting the full
-/// environment. A caller that doesn't pass an adapter-provided allowlist
-/// (every non-agent subprocess: evidence capture, git plumbing) is
-/// unaffected and gets exactly the previous `PATH`-only behaviour via
-/// [`spawn`].
-pub fn spawn_with_extra_env(
-    command: &AgentCommand,
-    cwd: &Path,
-    extra_env_vars: &[&str],
-) -> Result<Child, ProcessError> {
     let mut cmd = Command::new(&command.program);
     cmd.args(&command.args)
         .current_dir(cwd)
@@ -305,29 +291,6 @@ pub fn spawn_with_extra_env(
     if let Ok(path) = std::env::var("PATH") {
         cmd.env("PATH", path);
     }
-    for var_name in extra_env_vars {
-        match std::env::var(var_name) {
-            Ok(value) => {
-                cmd.env(var_name, value);
-            }
-            Err(_) => {
-                // Not fatal (a missing allowlisted var is not necessarily
-                // wrong -- `USER` may genuinely be unset in some
-                // environments), but silent otherwise: the observable
-                // symptom downstream is the *tool's own* cryptic failure
-                // (e.g. claude's "Not logged in" when `HOME` never made it
-                // through), not anything naming Warden or the missing var.
-                // code-standards.md forbids exactly this catch-and-ignore
-                // shape without at least a named, actionable trace.
-                tracing::warn!(
-                    var = var_name,
-                    program = %command.program,
-                    "adapter-requested environment variable is not set in warden's own \
-                     process environment; the child will run without it"
-                );
-            }
-        }
-    }
 
     cmd.spawn().map_err(|source| ProcessError::Spawn {
         command: command.program.clone(),
@@ -335,81 +298,48 @@ pub fn spawn_with_extra_env(
     })
 }
 
-/// Awaits a previously [`spawn`]ed child, cancellable via `cancel`. Thin
-/// wrapper over [`wait_with_progress`] for the (still overwhelmingly common)
-/// case where nothing needs to observe stdout as it arrives -- see that
-/// function's own docs for the full behaviour, including deadlock avoidance
-/// and stdin write-failure handling, both unchanged by this wrapper.
-pub async fn wait(
-    child: Child,
-    command_name: &str,
-    stdin_payload: Option<String>,
-    cancel: CancellationToken,
-) -> Result<AgentOutcome, ProcessError> {
-    wait_with_progress(child, command_name, stdin_payload, cancel, None).await
-}
-
-/// Like [`wait`], but additionally invokes `on_stdout_line` (if given) once
-/// per complete line of stdout, *as it arrives* rather than only once the
-/// child has exited (issue #33: what lets a caller turn a streaming agent's
-/// output into live progress instead of five minutes of silence between
-/// `AgentStarted` and `AgentFinished`). `on_stdout_line` is called with the
-/// line's text, trailing `\n`/`\r` stripped, blank lines skipped; it must
-/// not block (no I/O of its own) -- it runs inline on the same task draining
-/// stdout, so a slow callback would itself throttle the drain this function
-/// exists to keep unblocked. What a line *means* (e.g. a `claude
-/// --output-format stream-json` event) is entirely the caller's concern --
-/// this module has no opinion on any agent's own wire format.
+/// Awaits a previously [`spawn`]ed child, cancellable via `cancel`.
 ///
 /// If `cancel` fires first, the child is killed and
 /// [`ProcessError::Cancelled`] is returned.
 ///
 /// `stdin_payload`, if given, is written to the child's stdin and the write
-/// half is then closed (dropped) so the agent sees EOF rather than hanging
+/// half is then closed (dropped) so the child sees EOF rather than hanging
 /// forever waiting for more input — this happens even when `stdin_payload`
 /// is `None`, since a piped stdin ([`spawn`]) that's never closed would
-/// otherwise hang an agent that reads until EOF before proceeding.
+/// otherwise hang a child that reads until EOF before proceeding.
 ///
 /// **Deadlock avoidance**: the write, the stdout/stderr draining, and the
 /// wait for exit all run *concurrently* (`tokio::join!`), not sequentially.
 /// Writing the whole payload before draining anything (or draining only
-/// after exit, as this function used to) risks a classic pipe deadlock: an
-/// agent that interleaves reading stdin with writing enough stdout/stderr to
+/// after exit, as this function used to) risks a classic pipe deadlock: a
+/// child that interleaves reading stdin with writing enough stdout/stderr to
 /// fill the OS pipe buffer (typically 64KiB) before it has consumed all of
-/// stdin will block on its own full stdout/stderr
-/// pipe; meanwhile we'd be blocked writing to a stdin the agent has stopped
-/// reading — neither side can make progress. Running all four concurrently
-/// means each blocked read/write just yields to the executor, and progress
-/// on any one of them unblocks the others. Reading stdout **line-by-line**
-/// (`AsyncBufReadExt::read_until`) rather than in one `read_to_end` shot
-/// changes nothing about this property: it is still a single continuous
-/// drain of the same pipe, byte-for-byte identical to what `read_to_end`
-/// would have accumulated (see
-/// `writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`, whose
-/// 200KiB payload has no newlines in it at all and still must not hang) --
-/// it is simply chunked at `\n` boundaries so a caller can be notified as
-/// each line completes instead of only once the stream ends.
+/// stdin will block on its own full stdout/stderr pipe; meanwhile we'd be
+/// blocked writing to a stdin the child has stopped reading — neither side
+/// can make progress. Running all four concurrently means each blocked
+/// read/write just yields to the executor, and progress on any one of them
+/// unblocks the others.
 ///
 /// **Stdin write failures** (H1, issue #20 review): a broken pipe (the
-/// agent closed or never read stdin before exiting) is logged at `warn` and
+/// child closed or never read stdin before exiting) is logged at `warn` and
 /// treated as a normal, non-fatal outcome — see
 /// [`classify_stdin_write_error`]. Any other write error fails this call
 /// with [`ProcessError::StdinWrite`] instead of letting the run continue
 /// silently: `stdin_payload` is always a single JSON object, so a partial
-/// write is unparsable by the agent by construction, and there is no
+/// write is unparsable by the child by construction, and there is no
 /// recovery short of failing the invocation.
 ///
 /// Uses `child.wait()` (borrows `&mut self`) rather than
 /// `wait_with_output()` (which consumes `self`) so `child` is still
 /// available to `kill()` in the cancellation branch of the `select!` below.
-pub async fn wait_with_progress(
+pub async fn wait(
     mut child: Child,
     command_name: &str,
     stdin_payload: Option<String>,
     cancel: CancellationToken,
-    on_stdout_line: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<AgentOutcome, ProcessError> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let stdin_handle = child.stdin.take();
     let stdout_handle = child.stdout.take();
@@ -430,35 +360,9 @@ pub async fn wait_with_progress(
     };
     let stdout_task = async move {
         let mut buf = Vec::new();
-        if let Some(stdout_handle) = stdout_handle {
-            // Line-by-line rather than `read_to_end` (issue #33): still a
-            // single continuous drain of the pipe (same deadlock-avoidance
-            // property, see this function's own docs), just chunked at `\n`
-            // so `on_stdout_line` can be notified as each line completes.
-            // `buf` ends up byte-for-byte identical to what `read_to_end`
-            // would have produced -- each `line` (delimiter included) is
-            // appended to it exactly as read.
-            let mut reader = BufReader::new(stdout_handle);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match reader.read_until(b'\n', &mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        buf.extend_from_slice(&line);
-                        if let Some(callback) = on_stdout_line {
-                            let text = String::from_utf8_lossy(&line);
-                            let trimmed = text.trim_end_matches(['\n', '\r']);
-                            if !trimmed.is_empty() {
-                                callback(trimmed);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(command = command_name, %error, "failed to read agent stdout to completion");
-                        break;
-                    }
-                }
+        if let Some(mut stdout_handle) = stdout_handle {
+            if let Err(error) = stdout_handle.read_to_end(&mut buf).await {
+                tracing::warn!(command = command_name, %error, "failed to read agent stdout to completion");
             }
         }
         buf
@@ -1015,129 +919,14 @@ mod tests {
         assert_eq!(result.unwrap().exit_code, 0);
     }
 
-    /// Issue #33: `wait_with_progress`'s deadlock-avoidance property must
-    /// hold identically to `wait`'s (the same regression scenario as
-    /// [`writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`]),
-    /// even with an `on_stdout_line` callback attached and even though the
-    /// stdout in this scenario has no newline *until EOF* -- proves the
-    /// line-buffered reader still drains continuously rather than blocking
-    /// on a delimiter that never arrives mid-stream (`read_until` only
-    /// returns once it hits either `\n` or EOF, so the single oversized
-    /// "line" here is delivered whole, in one callback invocation, right at
-    /// EOF -- exercised precisely by asserting that below).
-    #[tokio::test]
-    async fn wait_with_progress_does_not_deadlock_on_large_newline_free_stdout() {
-        let dir = TempDir::new().unwrap();
-        let cmd = AgentCommand::new(
-            "sh",
-            ["-c", "head -c 200000 /dev/zero; cat > /dev/null; exit 0"],
-        );
-        let child = spawn(&cmd, dir.path()).unwrap();
-        let large_payload = "x".repeat(200_000);
-        let callback_invocations = std::sync::atomic::AtomicUsize::new(0);
-        let on_line = |_line: &str| {
-            callback_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        };
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            wait_with_progress(
-                child,
-                "sh",
-                Some(large_payload),
-                CancellationToken::new(),
-                Some(&on_line),
-            ),
-        )
-        .await
-        .expect("wait_with_progress must not hang when stdout has no newlines at all");
-
-        assert_eq!(result.unwrap().exit_code, 0);
-        assert_eq!(
-            callback_invocations.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the whole newline-free chunk must be delivered as exactly one line, at EOF"
-        );
-    }
-
-    /// Issue #33: the whole point of `wait_with_progress` -- a caller must
-    /// be notified of each stdout line as it arrives, not only once the
-    /// child has exited and the buffer is fully collected.
-    #[tokio::test]
-    async fn wait_with_progress_invokes_the_callback_once_per_stdout_line() {
-        let dir = TempDir::new().unwrap();
-        let cmd = AgentCommand::new(
-            "sh",
-            ["-c", "echo line-one; echo line-two; echo line-three"],
-        );
-        let child = spawn(&cmd, dir.path()).unwrap();
-        let seen = std::sync::Mutex::new(Vec::new());
-        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
-
-        let outcome =
-            wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
-                .await
-                .unwrap();
-
-        assert_eq!(outcome.exit_code, 0);
-        assert_eq!(
-            seen.into_inner().unwrap(),
-            vec!["line-one", "line-two", "line-three"]
-        );
-    }
-
-    /// Issue #33: a line with no trailing newline (the child exits without
-    /// flushing one, e.g. the very last line of output) must still reach the
-    /// callback -- `read_until` returns it on EOF even without the
-    /// delimiter, and the loop's `Ok(_)` arm doesn't require one either.
-    #[tokio::test]
-    async fn wait_with_progress_invokes_the_callback_for_a_final_line_with_no_trailing_newline() {
-        let dir = TempDir::new().unwrap();
-        let cmd = AgentCommand::new("sh", ["-c", "printf 'no newline at the end'"]);
-        let child = spawn(&cmd, dir.path()).unwrap();
-        let seen = std::sync::Mutex::new(Vec::new());
-        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
-
-        wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
-            .await
-            .unwrap();
-
-        assert_eq!(seen.into_inner().unwrap(), vec!["no newline at the end"]);
-    }
-
-    /// Issue #33: blank lines carry nothing worth surfacing and must not
-    /// reach the callback at all.
-    #[tokio::test]
-    async fn wait_with_progress_skips_blank_lines() {
-        let dir = TempDir::new().unwrap();
-        let cmd = AgentCommand::new("sh", ["-c", "printf 'a\\n\\nb\\n'"]);
-        let child = spawn(&cmd, dir.path()).unwrap();
-        let seen = std::sync::Mutex::new(Vec::new());
-        let on_line = |line: &str| seen.lock().unwrap().push(line.to_string());
-
-        wait_with_progress(child, "sh", None, CancellationToken::new(), Some(&on_line))
-            .await
-            .unwrap();
-
-        assert_eq!(seen.into_inner().unwrap(), vec!["a", "b"]);
-    }
-
-    /// Issue #33: `wait_with_progress(..., None)` must behave exactly like
-    /// `wait` -- both the accumulated stdout and the exit code are
-    /// unaffected by the line-by-line reading change.
-    #[tokio::test]
-    async fn wait_with_progress_without_a_callback_matches_plain_wait() {
-        let dir = TempDir::new().unwrap();
-        let cmd = AgentCommand::new("sh", ["-c", "echo hello"]);
-        let child = spawn(&cmd, dir.path()).unwrap();
-
-        let outcome = wait_with_progress(child, "sh", None, CancellationToken::new(), None)
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.exit_code, 0);
-        assert_eq!(outcome.stdout, "hello\n");
-    }
+    // Issue #50 review, MEDIUM 3: the `on_stdout_line` callback tests that
+    // used to live here (`wait_with_progress_*`) moved to
+    // `warden_sandbox::local`'s own test module -- that per-line callback is
+    // now dead code on this side (every remaining `wait` caller passes no
+    // callback at all; only `warden_sandbox::LocalSandbox::execute` still
+    // offers one, to the sandbox seam's own caller). See
+    // `warden_sandbox::local::tests::on_stdout_line_skips_blank_lines` and
+    // its neighbours for that coverage, unchanged in substance.
 
     /// H1 (issue #20 review): an agent that exits immediately without ever
     /// reading stdin at all must not fail the invocation — a broken pipe is
