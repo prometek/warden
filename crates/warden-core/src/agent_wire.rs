@@ -3,13 +3,13 @@
 //! target commit/diff/prior-cycle findings for the reviewer/tester, plus the
 //! agent's own role in every payload. This is the channel
 //! code-standards.md's Agent Subprocess Protocol already sanctions
-//! ("Échange JSON en streaming sur stdin/stdout"), but `process::spawn`
-//! never actually fed one until this issue -- previously the coder received
-//! no warden-managed context at all, and the reviewer/tester received none
-//! either.
+//! ("Échange JSON en streaming sur stdin/stdout"), but nothing actually fed
+//! one until this issue -- previously the coder received no warden-managed
+//! context at all, and the reviewer/tester received none either.
 //!
 //! Pure/serializable shape only -- the I/O (writing to a child's stdin,
-//! closing it) lives in `warden::process`, mirroring the
+//! closing it) lives in `warden_sandbox::LocalSandbox` (issue #50; this
+//! crate has no dependency on it, and never should), mirroring the
 //! `warden_core::CiResultMessage` / `warden::ci_channel` split. Constructed
 //! here with the same "wire struct + typed constructor + validated parse"
 //! convention as `ci_channel`/`evidence_wire`: `AgentInputMessage` is never
@@ -301,8 +301,8 @@ impl AgentInputMessage {
 
     /// Serializes to the exact wire form [`parse_agent_input_message`] parses
     /// back -- one JSON object written to the agent's stdin, then the write
-    /// half is closed (`warden::process::spawn`/`wait`), never left open
-    /// waiting for more input.
+    /// half is closed (`warden_sandbox::LocalSandbox::execute`, issue #50),
+    /// never left open waiting for more input.
     pub fn to_json(&self) -> Result<String> {
         let wire = AgentInputWire {
             version: AGENT_INPUT_VERSION,

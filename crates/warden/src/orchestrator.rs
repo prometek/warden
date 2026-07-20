@@ -1903,64 +1903,93 @@ impl Orchestrator {
 /// call reachable only from the straight-line success path). The common
 /// case -- still inside `run_agent`'s own future, whether it ends in `Ok` or
 /// `Err` -- always goes through the explicit, awaited [`SandboxGuard::destroy`],
-/// which disarms `Drop` by taking the id out first, so the failure a caller
-/// observes/logs is the real one, not one fired from a detached task nothing
-/// awaits. `Drop` only ever fires as the backstop for the one path an
-/// awaited call can never cover: this whole future being dropped mid-await
-/// (run cancellation, `warden run --tui` exit) before it ever reaches that
-/// explicit call. Since `Drop` cannot itself `.await`, that backstop
-/// dispatches the destroy onto a detached task instead -- `LocalSandbox::destroy`
-/// today is pure in-memory bookkeeping (nothing to actually await), but a
-/// future `DockerSandbox` (#49) container teardown plugs into this exact
-/// same seam unchanged.
+/// which flips `destroyed` only once that await resolves, so the failure a
+/// caller observes/logs is the real one, not one fired from a detached task
+/// nothing awaits. `Drop` only ever fires as the backstop for the one path
+/// an awaited call can never cover: this whole future being dropped
+/// mid-await (run cancellation, `warden run --tui` exit) before
+/// [`SandboxGuard::destroy`] ever resolves -- including if it is dropped
+/// itself while its own `destroy(id).await` is in flight (issue #50 review,
+/// LOW D): `id` stays on `self` the whole time (never taken out up front),
+/// so `Drop` still has it to retry with.
+///
+/// `id` is never `Option` (issue #50 review, MEDIUM B): every caller only
+/// ever needs it before teardown, so a plain `destroyed` flag is enough to
+/// track whether teardown already ran, without an `expect()`-guarded
+/// `Option` a caller could theoretically observe empty.
 struct SandboxGuard {
     sandbox: Arc<dyn Sandbox>,
-    id: Option<warden_sandbox::SandboxId>,
+    id: warden_sandbox::SandboxId,
+    destroyed: bool,
 }
 
 impl SandboxGuard {
     fn new(sandbox: Arc<dyn Sandbox>, id: warden_sandbox::SandboxId) -> Self {
         Self {
             sandbox,
-            id: Some(id),
+            id,
+            destroyed: false,
         }
     }
 
-    /// The id this guard owns. Every caller in this module reads it only
-    /// before [`SandboxGuard::destroy`] ever runs (destroy always runs
-    /// last), so the id is always present here.
+    /// The id this guard owns.
     fn id(&self) -> &warden_sandbox::SandboxId {
-        self.id
-            .as_ref()
-            .expect("SandboxGuard::id called after destroy")
+        &self.id
     }
 
     /// Explicit, awaited teardown for the common (still-inside-`run_agent`'s-
     /// own-future) exit path -- see this type's own docs on why this is
     /// preferred over letting `Drop` handle it whenever the caller can
-    /// still `.await`.
+    /// still `.await`, and on why `destroyed` is only set *after* the
+    /// `.await` resolves.
     async fn destroy(&mut self) -> warden_sandbox::Result<()> {
-        let Some(id) = self.id.take() else {
+        if self.destroyed {
             return Ok(());
-        };
-        self.sandbox.destroy(id).await
+        }
+        let result = self.sandbox.destroy(self.id.clone()).await;
+        self.destroyed = true;
+        result
     }
 }
 
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
-        let Some(id) = self.id.take() else {
+        if self.destroyed {
             return;
-        };
-        // Backstop only -- see this type's own docs. Fire-and-forget:
-        // `Drop` cannot `.await`, and by the time this runs there is no
-        // `run_agent` future left to propagate a destroy failure to anyway.
-        let sandbox = Arc::clone(&self.sandbox);
-        tokio::spawn(async move {
-            if let Err(error) = sandbox.destroy(id).await {
-                tracing::warn!(%error, "failed to destroy sandbox during drop cleanup");
+        }
+        self.destroyed = true;
+        // Backstop only -- see this type's own docs. `Drop` cannot itself
+        // `.await`, so the destroy is dispatched onto the ambient tokio
+        // runtime instead -- but only if one is actually available (issue
+        // #50 review, LOW C): calling `tokio::spawn` with no runtime context
+        // panics outright, and a panic while already unwinding from a drop
+        // aborts the process. This is a best-effort backstop, not a
+        // guarantee: if this drop happens during runtime shutdown (the
+        // `warden run --tui` exit case this type's own docs cite), a
+        // successfully spawned task can still be cancelled before it runs,
+        // silently leaving the sandbox undestroyed -- for `LocalSandbox`
+        // that is only an in-memory bookkeeping entry, but a future
+        // `DockerSandbox` (#49) container leak here is a real, open
+        // limitation of this backstop, not one this guard can close on its
+        // own.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let sandbox = Arc::clone(&self.sandbox);
+                let id = self.id.clone();
+                handle.spawn(async move {
+                    if let Err(error) = sandbox.destroy(id).await {
+                        tracing::warn!(%error, "failed to destroy sandbox during drop cleanup");
+                    }
+                });
             }
-        });
+            Err(_) => {
+                tracing::warn!(
+                    id = %self.id,
+                    "sandbox guard dropped with no tokio runtime available to dispatch \
+                     teardown onto; sandbox left undestroyed"
+                );
+            }
+        }
     }
 }
 
@@ -8531,25 +8560,31 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Issue #50 review, MEDIUM 1 / MEDIUM 2: `Orchestrator::with_sandbox`
-    // must be a usable extension point, not just an unreachable builder
-    // method -- a fake `Sandbox` constructible entirely outside
-    // `warden_sandbox` (now that `SandboxId::new` is public) must actually
+    // Issue #50 review, MEDIUM 1 / MEDIUM 2 / MEDIUM A: `Orchestrator::
+    // with_sandbox` must be a usable extension point, not just an
+    // unreachable builder method -- a fake `Sandbox` implemented entirely
+    // outside `warden_sandbox` (via the now-public `SandboxId::new` and
+    // `Execution::new`, never by delegating to `LocalSandbox`) must actually
     // be installable and routed through by `run_agent`'s
     // create/execute/destroy calls, including on a failing/early-return
     // path (MEDIUM 1's own concern: the sandbox created for a failed
     // invocation must still be destroyed).
     // -----------------------------------------------------------------
 
-    /// Delegates every call to a real [`LocalSandbox`] (so `execute` still
-    /// produces a genuine `warden_sandbox::Execution` without needing
-    /// anything private to `warden_sandbox`) while recording which of
-    /// `create`/`execute`/`destroy` ran, in order -- and can be told to fail
+    /// Implements [`Sandbox`] from scratch -- own bookkeeping, own process
+    /// spawn, own [`warden_sandbox::Execution`] -- using nothing but this
+    /// crate's public API (`SandboxId::new`, `Execution::new`; issue #50
+    /// review, MEDIUM A). Deliberately *not* a delegate to [`LocalSandbox`]:
+    /// a delegate would only prove `with_sandbox` can carry a wrapper around
+    /// the one implementation already in-crate, not that the trait itself is
+    /// implementable by an out-of-crate backend, which is exactly what
+    /// `DockerSandbox` (#49) will need to be. Records which of
+    /// `create`/`execute`/`destroy` ran, in order, and can be told to fail
     /// `execute` outright, to exercise the early-return path `run_agent`'s
     /// own `?` takes right after `execute`.
     struct RecordingSandbox {
         calls: std::sync::Mutex<Vec<&'static str>>,
-        inner: warden_sandbox::LocalSandbox,
+        cwds: std::sync::Mutex<std::collections::HashMap<warden_sandbox::SandboxId, PathBuf>>,
         fail_execute: bool,
     }
 
@@ -8557,7 +8592,7 @@ mod tests {
         fn new(fail_execute: bool) -> Self {
             Self {
                 calls: std::sync::Mutex::new(Vec::new()),
-                inner: warden_sandbox::LocalSandbox::new(),
+                cwds: std::sync::Mutex::new(std::collections::HashMap::new()),
                 fail_execute,
             }
         }
@@ -8574,7 +8609,9 @@ mod tests {
             spec: warden_sandbox::SandboxSpec,
         ) -> warden_sandbox::Result<warden_sandbox::SandboxId> {
             self.calls.lock().unwrap().push("create");
-            self.inner.create(spec).await
+            let id = warden_sandbox::SandboxId::new(uuid::Uuid::new_v4().to_string());
+            self.cwds.lock().unwrap().insert(id.clone(), spec.cwd);
+            Ok(id)
         }
 
         async fn execute<'a>(
@@ -8590,12 +8627,103 @@ mod tests {
                     source: std::io::Error::from(std::io::ErrorKind::NotFound),
                 });
             }
-            self.inner.execute(id, command, options).await
+            let cwd = self
+                .cwds
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .expect("test fixture: execute always called with an id create just returned");
+
+            let mut spawn = tokio::process::Command::new(&command.program);
+            spawn
+                .args(&command.args)
+                .current_dir(&cwd)
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child =
+                spawn
+                    .spawn()
+                    .map_err(|source| warden_sandbox::SandboxError::Spawn {
+                        program: command.program.clone(),
+                        source,
+                    })?;
+            let pid = child.id();
+
+            let program = command.program;
+            let stdin_payload = command.stdin;
+            let cancel = options.cancel;
+
+            Ok(warden_sandbox::Execution::new(pid, async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut stdin_handle = child.stdin.take();
+                let mut stdout_handle = child.stdout.take();
+                let mut stderr_handle = child.stderr.take();
+
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        let _ = child.kill().await;
+                        Err(warden_sandbox::SandboxError::Cancelled { program })
+                    }
+                    result = async {
+                        let stdin_task = async {
+                            if let Some(mut handle) = stdin_handle.take() {
+                                if let Some(payload) = stdin_payload {
+                                    handle.write_all(payload.as_bytes()).await?;
+                                }
+                            }
+                            Ok::<(), std::io::Error>(())
+                        };
+                        let stdout_task = async {
+                            let mut buf = Vec::new();
+                            if let Some(mut handle) = stdout_handle.take() {
+                                handle.read_to_end(&mut buf).await?;
+                            }
+                            Ok::<Vec<u8>, std::io::Error>(buf)
+                        };
+                        let stderr_task = async {
+                            let mut buf = Vec::new();
+                            if let Some(mut handle) = stderr_handle.take() {
+                                handle.read_to_end(&mut buf).await?;
+                            }
+                            Ok::<Vec<u8>, std::io::Error>(buf)
+                        };
+                        let (stdin_result, stdout_result, stderr_result, status_result) =
+                            tokio::join!(stdin_task, stdout_task, stderr_task, child.wait());
+                        let status = status_result.map_err(|source| warden_sandbox::SandboxError::Wait {
+                            program: program.clone(),
+                            source,
+                        })?;
+                        stdin_result.map_err(|source| warden_sandbox::SandboxError::StdinWrite {
+                            program: program.clone(),
+                            source,
+                        })?;
+                        let stdout_buf = stdout_result.map_err(|source| warden_sandbox::SandboxError::Wait {
+                            program: program.clone(),
+                            source,
+                        })?;
+                        let stderr_buf = stderr_result.map_err(|source| warden_sandbox::SandboxError::Wait {
+                            program: program.clone(),
+                            source,
+                        })?;
+                        Ok(warden_sandbox::ExecutionResult {
+                            exit_code: status.code().unwrap_or(-1),
+                            stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+                            stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+                        })
+                    } => result,
+                }
+            }))
         }
 
         async fn destroy(&self, id: warden_sandbox::SandboxId) -> warden_sandbox::Result<()> {
             self.calls.lock().unwrap().push("destroy");
-            self.inner.destroy(id).await
+            self.cwds.lock().unwrap().remove(&id);
+            Ok(())
         }
     }
 
@@ -8751,8 +8879,15 @@ mod tests {
                 .await;
         });
 
-        // Give the task time to get past `create`/`execute` and into the
-        // long `execution.wait()` await before dropping it mid-flight.
+        // Give the task time to get past `create` and into the long
+        // `execution.wait()` await before dropping it mid-flight. Issue #50
+        // review, LOW E: this is a best-effort delay, not a synchronization
+        // point -- under load the abort can in principle land before
+        // `execute` itself has even recorded its call, so what this test
+        // asserts below is the property under test (the sandbox created for
+        // this invocation is destroyed), not the exact call vector, which a
+        // slow scheduler could otherwise make flaky for a reason that has
+        // nothing to do with the guard's actual correctness.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         handle.abort();
         let _ = handle.await;
@@ -8765,6 +8900,15 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(sandbox.calls(), vec!["create", "execute", "destroy"]);
+        let calls = sandbox.calls();
+        assert!(
+            calls.contains(&"create"),
+            "expected the sandbox to have been created before the abort, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&"destroy"),
+            "expected `SandboxGuard::drop`'s backstop to destroy the sandbox created for a \
+             future dropped mid-flight, got {calls:?}"
+        );
     }
 }

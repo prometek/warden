@@ -83,10 +83,12 @@ impl SandboxId {
     /// [`SandboxId::generate`] (`pub(crate)`) available, no id could be
     /// produced outside this crate, which made [`Sandbox::create`]'s return
     /// type -- and therefore the whole trait -- unimplementable by anything
-    /// other than [`LocalSandbox`], including a recording fake a test would
-    /// install through `Orchestrator::with_sandbox`. A future `DockerSandbox`
-    /// (#49) uses this to wrap the container id the Docker daemon hands
-    /// back.
+    /// other than [`LocalSandbox`]. Paired with [`Execution::new`] (issue #50
+    /// review, MEDIUM A), this is what `warden::orchestrator`'s own
+    /// `RecordingSandbox` test fake uses to implement [`Sandbox`] end to end
+    /// without reaching into anything private to this crate. A future
+    /// `DockerSandbox` (#49) uses this to wrap the container id the Docker
+    /// daemon hands back.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -144,10 +146,11 @@ impl std::fmt::Debug for Command {
 
 /// Execution knobs that aren't part of the command itself: cancellation, and
 /// an optional per-stdout-line callback (issue #33 parity -- see
-/// [`LocalSandbox`]'s own docs for the same deadlock-avoidance and
-/// must-not-block contract `warden::process::wait_with_progress` already
-/// documented). Kept out of [`Command`] so that type stays a plain,
-/// `Debug`/`Clone`-able description of what to run.
+/// [`LocalSandbox`]'s own `drain_and_wait` docs for the same
+/// deadlock-avoidance and must-not-block contract, the successor to the now-
+/// deleted `warden::process::wait_with_progress`). Kept out of [`Command`]
+/// so that type stays a plain, `Debug`/`Clone`-able description of what to
+/// run.
 pub struct ExecuteOptions<'a> {
     pub cancel: CancellationToken,
     pub on_stdout_line: Option<&'a (dyn Fn(&str) + Send + Sync)>,
@@ -182,7 +185,14 @@ pub struct Execution<'a> {
 }
 
 impl<'a> Execution<'a> {
-    fn new(
+    /// Public (issue #50 review, MEDIUM A) so a [`Sandbox`] implementation
+    /// built entirely outside this crate -- a test fake, or a future
+    /// `DockerSandbox` (#49) -- can actually return one: `pid` being `pub`
+    /// was not enough on its own, since `future` has no other constructor.
+    /// Without this, `Sandbox::execute`'s return type was unimplementable
+    /// by anything but [`LocalSandbox`], which defeated the whole point of
+    /// the trait as an extension point.
+    pub fn new(
         pid: Option<u32>,
         future: impl Future<Output = Result<ExecutionResult>> + Send + 'a,
     ) -> Self {

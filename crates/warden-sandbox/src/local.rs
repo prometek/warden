@@ -68,8 +68,8 @@ impl Sandbox for LocalSandbox {
     ) -> Result<Execution<'a>> {
         let cwd = self.cwd_for(id)?;
 
-        // Mirrors `warden::process::spawn_with_extra_env` exactly:
-        // `env_clear()` always runs first (agents never inherit the
+        // Mirrors the now-deleted `warden::process::spawn_with_extra_env`
+        // exactly: `env_clear()` always runs first (agents never inherit the
         // orchestrator's own shell environment), `PATH` is always forwarded
         // on top, and `command.env_allowlist` is resolved from *this*
         // process's own environment one variable at a time -- a missing
