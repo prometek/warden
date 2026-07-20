@@ -11,12 +11,14 @@ use crate::state::{AgentRole, RunState};
 
 /// Which agent (or, for CI/Warden itself, which non-agent process) raised a
 /// finding (`FINDINGS.source`). `Ci` (issue #5) covers a failing check
-/// surfaced by `warden-gated`'s CI watcher; `Warden` (issue #24 review, M4)
-/// covers a finding the orchestrator raises directly from a structural check
-/// against the coder's own diff (currently: a cycle's coder commit touching
-/// `.warden/agents/`, `warden::orchestrator::agent_definition_tampering_finding`)
-/// -- both are distinct from `Reviewer`/`Tester` since neither ever comes
-/// from an agent subprocess's own judgement at all.
+/// surfaced by `warden-gated`'s CI watcher; `Warden` (issue #24 review, M4;
+/// resolve-and-compare rework in issue #30) covers a finding the orchestrator
+/// raises directly from a structural check that re-resolves the three
+/// literal paths `.warden/agents/{coder,reviewer,tester}.md` through the OS
+/// from a cycle's resulting commit and compares them against the run-start
+/// snapshot (`warden::orchestrator::agent_definition_tampering_finding`) --
+/// both are distinct from `Reviewer`/`Tester` since neither ever comes from
+/// an agent subprocess's own judgement at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
     Reviewer,
