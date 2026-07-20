@@ -227,12 +227,32 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         // Issue #26: styled the same yellow as a "warning"-severity finding
         // -- this is exactly that in spirit, just about the *configuration*
         // of an independent role rather than its output.
-        RunEvent::UntrustedAgentDefinitionUsed { role, path } => (
+        //
+        // Issue #26 review, LOW: `path` alone (the literal,
+        // pre-canonicalization path) is what an operator recognizes, but for
+        // the degraded-user-config case (a coder-controlled
+        // `XDG_CONFIG_HOME`, or a symlinked `<role>.md`) it doesn't
+        // literally look like it's inside the repo/a worktree at all --
+        // `canonical_path` is rendered too, whenever it actually differs, so
+        // an operator sees where it really resolved to rather than just the
+        // technically-true-but-unactionable literal path.
+        RunEvent::UntrustedAgentDefinitionUsed {
+            role,
+            path,
+            canonical_path,
+        } => (
             Style::default().fg(Color::Yellow),
-            format!(
-                "{role} definition read from the repo under review (--trust-repo-agents): \
-                 {path} -- untrusted, coder-controllable"
-            ),
+            if path == canonical_path {
+                format!(
+                    "{role} definition read from the repo under review (--trust-repo-agents): \
+                     {path} -- untrusted, coder-controllable"
+                )
+            } else {
+                format!(
+                    "{role} definition read from the repo under review (--trust-repo-agents): \
+                     {path} (resolves to {canonical_path}) -- untrusted, coder-controllable"
+                )
+            },
         ),
         RunEvent::RunFinished { final_state } => (
             Style::default().fg(Color::Green),
@@ -449,7 +469,9 @@ mod tests {
 
     /// Issue #26: `UntrustedAgentDefinitionUsed` must actually reach the
     /// scrollable log, naming both the role and the path, not just be a
-    /// match arm nothing ever exercises end-to-end.
+    /// match arm nothing ever exercises end-to-end. `path` and
+    /// `canonical_path` agree here (the plain repo-convention case), so only
+    /// one copy of the path should be rendered.
     #[test]
     fn draw_lists_an_untrusted_agent_definition_used_event_naming_the_role_and_path() {
         let mut model = RunModel::new();
@@ -458,6 +480,7 @@ mod tests {
             RunEvent::UntrustedAgentDefinitionUsed {
                 role: "reviewer".to_string(),
                 path: "/repo/.warden/agents/reviewer.md".to_string(),
+                canonical_path: "/repo/.warden/agents/reviewer.md".to_string(),
             },
         ));
 
@@ -474,6 +497,42 @@ mod tests {
             "{content}"
         );
         assert!(content.contains("untrusted"), "{content}");
+    }
+
+    /// Issue #26 review, LOW: for the degraded-user-config case, `path` (the
+    /// literal, pre-canonicalization path an operator recognizes -- here
+    /// looking like a perfectly ordinary user-config location) and
+    /// `canonical_path` (where it actually resolves to, inside the repo)
+    /// differ -- both must reach the rendered log line, not just the literal
+    /// path, or an operator sees a technically-true-but-unactionable record.
+    #[test]
+    fn draw_lists_an_untrusted_agent_definition_used_event_naming_both_the_literal_and_canonical_path(
+    ) {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::UntrustedAgentDefinitionUsed {
+                role: "reviewer".to_string(),
+                path: "/home/dev/.config/warden/agents/reviewer.md".to_string(),
+                canonical_path: "/repo/.warden/agents/reviewer.md".to_string(),
+            },
+        ));
+
+        let backend = TestBackend::new(220, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            content.contains("/home/dev/.config/warden/agents/reviewer.md"),
+            "{content}"
+        );
+        assert!(
+            content.contains("/repo/.warden/agents/reviewer.md"),
+            "{content}"
+        );
     }
 
     /// Acceptance criterion 3 (issue #8): the evidence pane must actually be

@@ -152,7 +152,13 @@ pub struct RunConfig {
 #[derive(Debug, Clone)]
 pub struct UntrustedRepoAgentDefinition {
     pub role: AgentRole,
+    /// The literal, pre-canonicalization path that was actually read.
     pub path: PathBuf,
+    /// Issue #26 review, LOW: what `path` actually canonicalizes to
+    /// (symlinks resolved) -- see
+    /// [`warden_core::RunEvent::UntrustedAgentDefinitionUsed`]'s own docs for
+    /// why this is carried alongside `path`, never instead of it.
+    pub canonical_path: PathBuf,
 }
 
 /// Everything [`Orchestrator::drive_post_convergence_tail`] needs to trigger
@@ -594,6 +600,7 @@ impl Orchestrator {
             self.publish_event(RunEvent::UntrustedAgentDefinitionUsed {
                 role: untrusted.role.as_str().to_string(),
                 path: untrusted.path.display().to_string(),
+                canonical_path: untrusted.canonical_path.display().to_string(),
             })
             .await?;
         }
@@ -3058,6 +3065,12 @@ mod tests {
         let orchestrator = Orchestrator::new(pool.clone());
         let reviewer_path = repo.path().join(".warden/agents/reviewer.md");
         let tester_path = repo.path().join(".warden/agents/tester.md");
+        // Distinct from `path` so the test can tell the two fields apart --
+        // a real caller sets this to the canonicalized (symlink-resolved)
+        // form of `path`, but any distinct value proves the event carries
+        // both independently.
+        let reviewer_canonical_path = repo.path().join("canonical-reviewer.md");
+        let tester_canonical_path = repo.path().join("canonical-tester.md");
         let config = RunConfig {
             repo_path: repo.path().to_path_buf(),
             warden_home: warden_home.path().to_path_buf(),
@@ -3075,10 +3088,12 @@ mod tests {
                 UntrustedRepoAgentDefinition {
                     role: AgentRole::Reviewer,
                     path: reviewer_path.clone(),
+                    canonical_path: reviewer_canonical_path.clone(),
                 },
                 UntrustedRepoAgentDefinition {
                     role: AgentRole::Tester,
                     path: tester_path.clone(),
+                    canonical_path: tester_canonical_path.clone(),
                 },
             ],
         };
@@ -3119,13 +3134,17 @@ mod tests {
         assert_eq!(untrusted.len(), 2, "{persisted:?}");
         assert!(untrusted.iter().any(|event| matches!(
             event,
-            RunEvent::UntrustedAgentDefinitionUsed { role, path }
-                if role == "reviewer" && path == &reviewer_path.display().to_string()
+            RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path }
+                if role == "reviewer"
+                    && path == &reviewer_path.display().to_string()
+                    && canonical_path == &reviewer_canonical_path.display().to_string()
         )));
         assert!(untrusted.iter().any(|event| matches!(
             event,
-            RunEvent::UntrustedAgentDefinitionUsed { role, path }
-                if role == "tester" && path == &tester_path.display().to_string()
+            RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path }
+                if role == "tester"
+                    && path == &tester_path.display().to_string()
+                    && canonical_path == &tester_canonical_path.display().to_string()
         )));
     }
 

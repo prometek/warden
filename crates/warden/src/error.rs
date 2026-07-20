@@ -175,16 +175,18 @@ pub enum AgentDefinitionError {
     )]
     UserConfigDirUnresolvable { reason: String },
 
-    /// Issue #26 review (HIGH): canonicalizing `repo_path`,
-    /// `user_config_agents_dir`, or the resolved `<role>.md` path under it
-    /// failed for a reason other than simply "doesn't exist yet" while
-    /// checking whether a reviewer/tester's supposedly trusted user-config
-    /// source actually resolves inside the repo under review
-    /// (`agent_def::user_config_resolves_inside_repo`). Fails closed rather
-    /// than silently skipping the containment check it could no longer
-    /// perform (code-standards.md: "no silent fallback") -- mirrors
-    /// [`ProcessError::UntrustedAgentProgram`]'s own fail-closed contract
-    /// for the analogous `command.program` check.
+    /// Issue #26 review (HIGH, extended by the owner's ruling on the
+    /// escalated asymmetry): canonicalizing `repo_path`,
+    /// `warden_home`/worktrees root, `user_config_agents_dir`, or the
+    /// resolved `<role>.md` path under it failed for a reason other than
+    /// simply "doesn't exist yet" while checking whether a reviewer/tester's
+    /// supposedly trusted user-config source actually resolves inside the
+    /// repo under review or a worktree
+    /// (`agent_def::user_config_resolves_inside_repo_or_worktrees`). Fails
+    /// closed rather than silently skipping the containment check it could
+    /// no longer perform (code-standards.md: "no silent fallback") --
+    /// mirrors [`ProcessError::UntrustedAgentProgram`]'s own fail-closed
+    /// contract for the analogous `command.program` check.
     #[error(
         "cannot verify agent definition source {path} is outside the repo under review: {source}"
     )]

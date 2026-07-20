@@ -78,6 +78,33 @@
 //! included); that broader exposure is an accepted, owner-reviewed trade
 //! for now, tracked for real isolation in issue #28.
 //!
+//! # Owner's ruling: the same coder-writable-directory concern also covers a stale worktree (issue #26 review, escalated asymmetry)
+//!
+//! [`crate::process::validate_agent_program`]'s `program` containment check
+//! refuses a path resolving inside `worktree_path`, `repo_path`, *or*
+//! `run_worktrees_root` (`<warden_home>/worktrees/<run_id>/`) -- the coder's
+//! own worktree for this run is exactly as coder-writable as the base repo
+//! itself (`Bash` included), so both are refused symmetrically. The HIGH fix
+//! below (see "the trusted user-config directory is verified, not assumed")
+//! originally compared `user_config_agents_dir`/`<role>.md` against
+//! `repo_path` only, leaving an asymmetry a reviewer flagged: an
+//! `XDG_CONFIG_HOME` resolving under `<warden_home>/worktrees/` -- e.g. a
+//! stale worktree left behind by a crashed run, referenced by a committed
+//! `.envrc` a human's shell still picks up on the *next* invocation -- would
+//! resolve as trusted [`AgentDefinitionSource::UserConfig`], even though
+//! that directory was written to by a previous run's coder exactly as freely
+//! as `repo_path` itself.
+//!
+//! The owner's ruling: close the asymmetry. [`user_config_resolves_inside_repo_or_worktrees`]
+//! degrades a user-config dir or `<role>.md` resolving under
+//! `<warden_home>/worktrees/` (the whole worktrees tree this `warden_home`
+//! has ever created worktrees under, not just this not-yet-created run's own
+//! `<run_id>` subdirectory -- at the point this check runs, this run's own
+//! `run_id` doesn't exist yet, so only a *stale* worktree from an earlier run
+//! is even reachable here) to [`AgentDefinitionSource::UntrustedRepoOverride`]
+//! exactly like one resolving inside `repo_path` -- same degrade-not-fail
+//! rationale, same `--trust-repo-agents` gate, same warning.
+//!
 //! # Security: role-asymmetric resolution (issue #26)
 //!
 //! The within-run snapshot above closes half of issue #26's concern (a
@@ -165,18 +192,20 @@
 //! So [`resolve_agent_definition`] canonicalizes both
 //! `user_config_agents_dir` and the resolved `<user_config_agents_dir>/<role>.md`
 //! (resolving any symlink in either, exactly like the `command.program`
-//! check) and compares them against the canonicalized `repo_path`. When
-//! *either* resolves inside the repo under review, this is **not** a hard
-//! failure -- a hard failure here would be a denial-of-service any coder
-//! could trigger against its own reviewer/tester just by planting a
-//! throwaway `XDG_CONFIG_HOME` override, and it would erase the distinction
-//! between "genuinely misconfigured" and "actively adversarial" that this
-//! module otherwise preserves. Instead, the resolution is **degraded**:
-//! treated exactly like a repo-sourced definition (the same
-//! [`AgentDefinitionSource::UntrustedRepoOverride`] variant, subject to the
-//! exact same `--trust-repo-agents` gate, the same `tracing::warn!` naming
-//! the path the moment it is actually read, and the same "ignored but
-//! warned about" treatment when the flag is off -- see
+//! check) and compares them against the canonicalized `repo_path` --
+//! and, per the owner's ruling above ("the same coder-writable-directory
+//! concern also covers a stale worktree"), against `<warden_home>/worktrees/`
+//! too. When *any* of those resolve inside the repo under review or a
+//! worktree, this is **not** a hard failure -- a hard failure here would be a
+//! denial-of-service any coder could trigger against its own reviewer/tester
+//! just by planting a throwaway `XDG_CONFIG_HOME` override, and it would
+//! erase the distinction between "genuinely misconfigured" and "actively
+//! adversarial" that this module otherwise preserves. Instead, the
+//! resolution is **degraded**: treated exactly like a repo-sourced
+//! definition (the same [`AgentDefinitionSource::UntrustedRepoOverride`]
+//! variant, subject to the exact same `--trust-repo-agents` gate, the same
+//! `tracing::warn!` naming the path the moment it is actually read, and the
+//! same "ignored but warned about" treatment when the flag is off -- see
 //! [`resolve_agent_definition`]'s own docs). The trust label a caller
 //! observes always matches what the path actually is, never what
 //! `XDG_CONFIG_HOME`/`HOME` merely claim it is.
@@ -186,6 +215,7 @@ use std::path::{Path, PathBuf};
 use warden_core::{parse_agent_definition, AgentDefinition, AgentRole};
 
 use crate::error::{AgentDefinitionError, Result};
+use crate::path_util::canonicalize_best_effort;
 use crate::tool_adapter::ToolAdapter;
 
 /// The directory, relative to a repo's root, that holds convention-based
@@ -216,15 +246,33 @@ pub enum AgentDefinitionSource {
     UserConfig(PathBuf),
     /// Reviewer/tester only, and only reachable with `trust_repo_agents:
     /// true`: either `<repo>/.warden/agents/<role>.md` (no user-config file
-    /// for that role), or -- issue #26 review, HIGH -- a would-be
-    /// `<user_config_agents_dir>/<role>.md` that canonicalizes inside
-    /// `repo_path` itself (a coder-controlled `XDG_CONFIG_HOME`/symlink;
+    /// for that role), or -- issue #26 review, HIGH / escalated asymmetry --
+    /// a would-be `<user_config_agents_dir>/<role>.md` that canonicalizes
+    /// inside `repo_path` or `<warden_home>/worktrees/` (a coder-controlled
+    /// `XDG_CONFIG_HOME`/symlink, or a stale worktree from a crashed run;
     /// see this module's own "the trusted user-config directory is
     /// verified, not assumed" docs), degraded to this same untrusted
     /// treatment instead of being silently accepted as
     /// [`AgentDefinitionSource::UserConfig`]. The one variant a caller must
     /// surface to the run as untrusted.
-    UntrustedRepoOverride(PathBuf),
+    UntrustedRepoOverride {
+        /// The literal, pre-canonicalization path that was actually read --
+        /// what an operator recognizes: `<repo>/.warden/agents/<role>.md`
+        /// for the plain repo-convention case, or the would-be
+        /// `<user_config_agents_dir>/<role>.md` for the degraded case.
+        path: PathBuf,
+        /// Issue #26 review, LOW: what `path` actually canonicalizes to
+        /// (symlinks resolved). For the plain repo-convention case this
+        /// usually agrees with `path` itself; for the degraded case (a
+        /// coder-controlled `XDG_CONFIG_HOME`, or a symlinked `<role>.md`)
+        /// `path` may not *look* like it is inside the repo/a worktree at
+        /// all -- e.g. `~/.config/warden/agents/reviewer.md` -- while this
+        /// field names exactly where it actually resolved to. Carried
+        /// alongside `path`, never instead of it: `path` is what the
+        /// operator typed/configured and recognizes, `canonical_path` is
+        /// what it was actually proven to be.
+        canonical_path: PathBuf,
+    },
     /// No file at any location this role consults -- the selected tool
     /// adapter's own default prompt/tools.
     AdapterDefault,
@@ -238,18 +286,20 @@ pub enum AgentDefinitionSource {
 /// - **Coder**: `<repo>/.warden/agents/coder.md` if present, else
 ///   `adapter`'s own default -- unchanged from issue #24.
 /// - **Reviewer/Tester**: `<user_config_agents_dir>/<role>.md` if present
-///   *and* it genuinely resolves outside `repo_path` (issue #26 review,
-///   HIGH -- see this module's own "the trusted user-config directory is
-///   verified, not assumed" docs); else, only when `trust_repo_agents` is
-///   `true`, either that same user-config path (if it *does* resolve inside
-///   the repo) or `<repo>/.warden/agents/<role>.md`, whichever is checked
-///   first and actually has a file (logged with `tracing::warn!`, naming the
-///   path, the moment it's actually read -- see
+///   *and* it genuinely resolves outside both `repo_path` and
+///   `<warden_home>/worktrees/` (issue #26 review, HIGH / escalated
+///   asymmetry -- see this module's own "the trusted user-config directory
+///   is verified, not assumed" and "the same coder-writable-directory
+///   concern also covers a stale worktree" docs); else, only when
+///   `trust_repo_agents` is `true`, either that same user-config path (if it
+///   *does* resolve inside one of those) or `<repo>/.warden/agents/<role>.md`,
+///   whichever is checked first and actually has a file (logged with
+///   `tracing::warn!`, naming the path, the moment it's actually read -- see
 ///   [`AgentDefinitionSource::UntrustedRepoOverride`]); else `adapter`'s own
-///   default. `user_config_agents_dir` is an explicit parameter rather than
-///   resolved from the environment in here -- see
-///   [`default_user_config_agents_dir`]'s own docs on why, and how a real
-///   caller (`main.rs`) obtains it.
+///   default. `user_config_agents_dir` and `warden_home` are explicit
+///   parameters rather than resolved/derived from the environment in here --
+///   see [`default_user_config_agents_dir`]'s own docs on why, and how a
+///   real caller (`main.rs`) obtains them.
 ///
 /// Returns the resolved definition alongside where it came from
 /// ([`AgentDefinitionSource`]) -- callers that don't care (most of them) can
@@ -308,6 +358,7 @@ pub async fn resolve_agent_definition(
     role: AgentRole,
     adapter: &impl ToolAdapter,
     user_config_agents_dir: &Path,
+    warden_home: &Path,
     trust_repo_agents: bool,
 ) -> Result<(AgentDefinition, AgentDefinitionSource)> {
     match role {
@@ -325,37 +376,61 @@ pub async fn resolve_agent_definition(
         }
         AgentRole::Reviewer | AgentRole::Tester => {
             let user_config_path = user_config_agents_dir.join(format!("{}.md", role.as_str()));
+            // Owner's ruling ("the same coder-writable-directory concern
+            // also covers a stale worktree"): the whole worktrees tree this
+            // `warden_home` has ever created worktrees under, not just this
+            // not-yet-created run's own `<run_id>` subdirectory -- see this
+            // module's own docs.
+            let warden_home_worktrees_root = warden_home.join("worktrees");
 
-            // Issue #26 review, HIGH: a "trusted" user-config location that
-            // actually resolves inside the repo under review (a
-            // coder-controlled `XDG_CONFIG_HOME` override, or a symlink) is
-            // never treated as `UserConfig` -- see this module's own docs.
-            if !user_config_resolves_inside_repo(
+            // Issue #26 review, HIGH / escalated asymmetry: a "trusted"
+            // user-config location that actually resolves inside the repo
+            // under review or this warden home's own worktrees (a
+            // coder-controlled `XDG_CONFIG_HOME` override, a symlink, or a
+            // stale worktree referenced by a committed `.envrc`) is never
+            // treated as `UserConfig` -- see this module's own docs.
+            match user_config_resolves_inside_repo_or_worktrees(
                 user_config_agents_dir,
                 &user_config_path,
                 repo_path,
+                &warden_home_worktrees_root,
             )? {
-                if let Some(definition) =
-                    try_read_definition(&user_config_path, role, adapter).await?
-                {
-                    return Ok((
-                        definition,
-                        AgentDefinitionSource::UserConfig(user_config_path),
-                    ));
+                None => {
+                    if let Some(definition) =
+                        try_read_definition(&user_config_path, role, adapter).await?
+                    {
+                        return Ok((
+                            definition,
+                            AgentDefinitionSource::UserConfig(user_config_path),
+                        ));
+                    }
                 }
-            } else if let Some(result) =
-                try_untrusted_repo_source(role, &user_config_path, adapter, trust_repo_agents)
+                Some(canonical_user_config_path) => {
+                    if let Some(result) = try_untrusted_repo_source(
+                        role,
+                        &user_config_path,
+                        adapter,
+                        trust_repo_agents,
+                        Some(&canonical_user_config_path),
+                    )
                     .await?
-            {
-                return Ok(result);
+                    {
+                        return Ok(result);
+                    }
+                }
             }
 
             let repo_override_path = repo_path
                 .join(AGENTS_DIR)
                 .join(format!("{}.md", role.as_str()));
-            if let Some(result) =
-                try_untrusted_repo_source(role, &repo_override_path, adapter, trust_repo_agents)
-                    .await?
+            if let Some(result) = try_untrusted_repo_source(
+                role,
+                &repo_override_path,
+                adapter,
+                trust_repo_agents,
+                None,
+            )
+            .await?
             {
                 return Ok(result);
             }
@@ -369,31 +444,51 @@ pub async fn resolve_agent_definition(
 }
 
 /// Whether `user_config_agents_dir` (or the specific `<role>.md` path
-/// resolved under it) actually resolves inside `repo_path` -- issue #26
-/// review, HIGH: both are canonicalized (resolving any symlink) before the
-/// comparison, exactly like [`crate::process::validate_agent_program`]'s own
-/// `command.program` containment check, so a coder-controlled
-/// `XDG_CONFIG_HOME` pointed at (or symlinked into) the repo under review
-/// can't slip past a purely lexical comparison. See this module's own "the
-/// trusted user-config directory is verified, not assumed" docs for why this
+/// resolved under it) actually resolves inside `repo_path` or
+/// `warden_home_worktrees_root` (`<warden_home>/worktrees/`) -- issue #26
+/// review, HIGH, extended by the owner's ruling on the escalated asymmetry
+/// ("the same coder-writable-directory concern also covers a stale
+/// worktree"): all four paths are canonicalized (resolving any symlink)
+/// before the comparison, exactly like
+/// [`crate::process::validate_agent_program`]'s own `command.program`
+/// containment check, so a coder-controlled `XDG_CONFIG_HOME` pointed at (or
+/// symlinked into) the repo under review or a stale worktree can't slip past
+/// a purely lexical comparison. See this module's own "the trusted
+/// user-config directory is verified, not assumed" docs for why this
 /// degrades the resolution rather than failing the run outright.
 ///
+/// Returns `Ok(None)` when `user_config_path` is genuinely trusted, or
+/// `Ok(Some(canonical_user_config_path))` (the canonicalized
+/// `<user_config_agents_dir>/<role>.md`) when it is degraded -- the caller
+/// threads that canonical path into [`try_untrusted_repo_source`] so both
+/// the warning and [`AgentDefinitionSource::UntrustedRepoOverride`] can name
+/// exactly where it actually resolved to (issue #26 review, LOW), without
+/// canonicalizing the same path a second time.
+///
 /// Fails closed ([`AgentDefinitionError::PathResolutionFailed`]) if any of
-/// the three paths can't be canonicalized for a reason other than "doesn't
+/// the four paths can't be canonicalized for a reason other than "doesn't
 /// exist yet" -- code-standards.md's "no silent fallback": a containment
 /// check this function could no longer actually perform must never be
 /// silently skipped.
-fn user_config_resolves_inside_repo(
+fn user_config_resolves_inside_repo_or_worktrees(
     user_config_agents_dir: &Path,
     user_config_path: &Path,
     repo_path: &Path,
-) -> Result<bool> {
+    warden_home_worktrees_root: &Path,
+) -> Result<Option<PathBuf>> {
     let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
         AgentDefinitionError::PathResolutionFailed {
             path: repo_path.to_path_buf(),
             source,
         }
     })?;
+    let canonical_worktrees_root =
+        canonicalize_best_effort(warden_home_worktrees_root).map_err(|source| {
+            AgentDefinitionError::PathResolutionFailed {
+                path: warden_home_worktrees_root.to_path_buf(),
+                source,
+            }
+        })?;
     let canonical_dir = canonicalize_best_effort(user_config_agents_dir).map_err(|source| {
         AgentDefinitionError::PathResolutionFailed {
             path: user_config_agents_dir.to_path_buf(),
@@ -407,42 +502,20 @@ fn user_config_resolves_inside_repo(
         }
     })?;
 
-    Ok(canonical_dir.starts_with(&canonical_repo) || canonical_path.starts_with(&canonical_repo))
-}
+    let degraded = canonical_dir.starts_with(&canonical_repo)
+        || canonical_path.starts_with(&canonical_repo)
+        || canonical_dir.starts_with(&canonical_worktrees_root)
+        || canonical_path.starts_with(&canonical_worktrees_root);
 
-/// Canonicalizes `path`, walking up to the nearest existing ancestor if
-/// `path` itself (or an intermediate component) doesn't exist yet -- e.g.
-/// `~/.config/warden/agents/reviewer.md` before the user has ever created
-/// that directory. A small, separate copy of the same fixed algorithm as
-/// `process::canonicalize_best_effort`/`worktree::canonicalize_best_effort`
-/// (see `process.rs`'s own docs for why a shared helper isn't worth the
-/// coupling across modules with different error types) -- propagates any
-/// canonicalize failure other than [`std::io::ErrorKind::NotFound`] instead
-/// of silently walking past it, since a permissions error partway up the
-/// tree means this function can no longer verify what `path` actually
-/// resolves to.
-fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
-    match path.canonicalize() {
-        Ok(canonical) => Ok(canonical),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let file_name = path.file_name().ok_or(error)?;
-            let parent = path.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no existing ancestor found for {}", path.display()),
-                )
-            })?;
-            Ok(canonicalize_best_effort(parent)?.join(file_name))
-        }
-        Err(error) => Err(error),
-    }
+    Ok(degraded.then_some(canonical_path))
 }
 
 /// Attempts to use `candidate_path` as a repo-controlled ("untrusted")
 /// reviewer/tester definition source -- shared by both the repo's own
 /// `.warden/agents/<role>.md` convention file and a would-be "trusted"
-/// user-config resolution that turned out to canonicalize inside the repo
-/// (issue #26 review, HIGH). Both must be judged by the exact same rule:
+/// user-config resolution that turned out to canonicalize inside the repo or
+/// a worktree (issue #26 review, HIGH). Both must be judged by the exact
+/// same rule:
 ///
 /// - `trust_repo_agents == false`: never opened. If a file genuinely exists
 ///   there (`tokio::fs::try_exists`, an existence check only), a
@@ -453,11 +526,22 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
 ///   is a `tracing::warn!` naming the path plus
 ///   [`AgentDefinitionSource::UntrustedRepoOverride`]; `None` (no file
 ///   there) is `Ok(None)`, same as above.
+///
+/// `degraded_user_config_canonical_path` distinguishes the two situations
+/// this fn is shared between (issue #26 review, LOW: the two need different
+/// advice -- "move it to `$XDG_CONFIG_HOME/warden/agents/`" is a no-op for a
+/// file that is *already* there, just resolving somewhere unexpected):
+/// `None` means `candidate_path` is the plain `<repo>/.warden/agents/<role>.md`
+/// convention file; `Some(canonical)` means `candidate_path` is a would-be
+/// user-config path that [`user_config_resolves_inside_repo_or_worktrees`]
+/// already proved resolves to `canonical`, inside the repo or a worktree --
+/// reused here rather than canonicalized a second time.
 async fn try_untrusted_repo_source(
     role: AgentRole,
     candidate_path: &Path,
     adapter: &impl ToolAdapter,
     trust_repo_agents: bool,
+    degraded_user_config_canonical_path: Option<&Path>,
 ) -> Result<Option<(AgentDefinition, AgentDefinitionSource)>> {
     if !trust_repo_agents {
         let exists = tokio::fs::try_exists(candidate_path)
@@ -467,13 +551,25 @@ async fn try_untrusted_repo_source(
                 source,
             })?;
         if exists {
-            tracing::warn!(
-                role = role.as_str(),
-                path = %candidate_path.display(),
-                "ignoring a repo-controlled agent definition for an independent role; move it \
-                 to $XDG_CONFIG_HOME/warden/agents/ (or ~/.config/warden/agents/) to use it as \
-                 the trusted source, or pass --trust-repo-agents to use it as-is (untrusted)"
-            );
+            match degraded_user_config_canonical_path {
+                Some(canonical) => tracing::warn!(
+                    role = role.as_str(),
+                    path = %candidate_path.display(),
+                    resolves_to = %canonical.display(),
+                    "ignoring a reviewer/tester definition that looked like the trusted user \
+                     config source but actually resolves inside the repo under review or this \
+                     warden home's own worktrees (see `resolves_to`), both of which the coder \
+                     can write to; point XDG_CONFIG_HOME/HOME at a directory genuinely outside \
+                     both, or pass --trust-repo-agents to use it as-is (untrusted)"
+                ),
+                None => tracing::warn!(
+                    role = role.as_str(),
+                    path = %candidate_path.display(),
+                    "ignoring a repo-controlled agent definition for an independent role; move it \
+                     to $XDG_CONFIG_HOME/warden/agents/ (or ~/.config/warden/agents/) to use it as \
+                     the trusted source, or pass --trust-repo-agents to use it as-is (untrusted)"
+                ),
+            }
         }
         return Ok(None);
     }
@@ -492,9 +588,29 @@ async fn try_untrusted_repo_source(
                  (--trust-repo-agents); this file is committable by the coder and is NOT \
                  trusted the way a genuine user-config definition is"
             );
+            // Issue #26 review, LOW: the canonical path was already computed
+            // by `user_config_resolves_inside_repo_or_worktrees` for the
+            // degraded-user-config case -- reuse it rather than
+            // canonicalizing `candidate_path` a second time. For the plain
+            // repo-convention case there is no prior canonicalization to
+            // reuse, so compute it fresh; the file was just read
+            // successfully above, so this can only fail for a reason other
+            // than "doesn't exist" via a genuine race.
+            let canonical_path = match degraded_user_config_canonical_path {
+                Some(canonical) => canonical.to_path_buf(),
+                None => canonicalize_best_effort(candidate_path).map_err(|source| {
+                    AgentDefinitionError::PathResolutionFailed {
+                        path: candidate_path.to_path_buf(),
+                        source,
+                    }
+                })?,
+            };
             Ok(Some((
                 definition,
-                AgentDefinitionSource::UntrustedRepoOverride(candidate_path.to_path_buf()),
+                AgentDefinitionSource::UntrustedRepoOverride {
+                    path: candidate_path.to_path_buf(),
+                    canonical_path,
+                },
             )))
         }
         None => Ok(None),
@@ -728,6 +844,16 @@ mod tests {
         TempDir::new().unwrap()
     }
 
+    /// A `warden_home` whose `worktrees/` subdirectory doesn't exist at all
+    /// -- the common case for every test below that isn't specifically
+    /// exercising the escalated-asymmetry worktrees-root check (owner's
+    /// ruling: "the same coder-writable-directory concern also covers a
+    /// stale worktree"), and for a real first run of a fresh `warden_home`
+    /// that has never created a worktree yet.
+    fn no_warden_home_worktrees() -> TempDir {
+        TempDir::new().unwrap()
+    }
+
     // -----------------------------------------------------------------
     // Coder: unchanged from issue #24 -- repo convention file, or default.
     // -----------------------------------------------------------------
@@ -748,6 +874,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -784,6 +911,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -815,6 +943,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -835,6 +964,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -863,6 +993,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -896,6 +1027,7 @@ mod tests {
             AgentRole::Coder,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -933,6 +1065,7 @@ mod tests {
                 role,
                 &FakeAdapter,
                 user_config.path(),
+                no_warden_home_worktrees().path(),
                 false,
             )
             .await
@@ -972,6 +1105,7 @@ mod tests {
                 role,
                 &FakeAdapter,
                 user_config.path(),
+                no_warden_home_worktrees().path(),
                 false,
             ))
             .await;
@@ -1013,19 +1147,33 @@ mod tests {
             let user_config = no_user_config_dir();
             write_definition(&repo.path().join(AGENTS_DIR), role, DEFINITION).await;
 
-            let (definition, source) =
-                resolve_agent_definition(repo.path(), role, &FakeAdapter, user_config.path(), true)
-                    .await
-                    .unwrap();
+            let (definition, source) = resolve_agent_definition(
+                repo.path(),
+                role,
+                &FakeAdapter,
+                user_config.path(),
+                no_warden_home_worktrees().path(),
+                true,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
             let expected_path = repo
                 .path()
                 .join(AGENTS_DIR)
                 .join(format!("{}.md", role.as_str()));
+            // Compared via `.canonicalize()` (not a raw string/`PathBuf`
+            // equality against `expected_path` itself) since a tempdir's own
+            // path may itself sit behind a symlink (e.g. macOS's `/var` ->
+            // `/private/var`) -- both sides must go through the exact same
+            // resolution to agree.
             assert_eq!(
                 source,
-                AgentDefinitionSource::UntrustedRepoOverride(expected_path)
+                AgentDefinitionSource::UntrustedRepoOverride {
+                    path: expected_path.clone(),
+                    canonical_path: expected_path.canonicalize().unwrap(),
+                }
             );
         }
     }
@@ -1056,6 +1204,7 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             true,
         )
         .await
@@ -1079,6 +1228,7 @@ mod tests {
             AgentRole::Tester,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             true,
         )
         .await
@@ -1104,6 +1254,7 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -1134,6 +1285,7 @@ mod tests {
             AgentRole::Tester,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -1166,6 +1318,7 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             false,
         )
         .await
@@ -1183,11 +1336,17 @@ mod tests {
     /// The core of the HIGH fix: `user_config_agents_dir` pointing *inside*
     /// `repo_path` (the coder-controlled-`XDG_CONFIG_HOME` attack) must never
     /// be treated as [`AgentDefinitionSource::UserConfig`] -- with the flag
-    /// off, it is ignored exactly like a repo convention file (with the same
-    /// "ignored but warned about" treatment), never silently read as
-    /// trusted.
+    /// off, it is ignored, never silently read as trusted.
+    ///
+    /// Issue #26 review, LOW: the warning text here must be the
+    /// *degraded-user-config* message, distinct from the plain
+    /// repo-convention-file one (`reviewer_and_tester_ignore_the_repo_convention_file_by_default_but_warn_about_it`
+    /// pins that shape) -- "move it to `$XDG_CONFIG_HOME/warden/agents/`" is
+    /// a no-op for a file that is *already* there, just resolving somewhere
+    /// unexpected.
     #[tokio::test]
-    async fn a_user_config_dir_resolving_inside_the_repo_is_ignored_by_default_and_warns() {
+    async fn a_user_config_dir_resolving_inside_the_repo_is_ignored_by_default_and_warns_with_the_degraded_message(
+    ) {
         for role in [AgentRole::Reviewer, AgentRole::Tester] {
             let repo = TempDir::new().unwrap();
             // The attack this fix closes: XDG_CONFIG_HOME pointed at a
@@ -1206,6 +1365,7 @@ mod tests {
                 role,
                 &FakeAdapter,
                 &malicious_user_config_dir.join("warden").join("agents"),
+                no_warden_home_worktrees().path(),
                 false,
             ))
             .await;
@@ -1223,8 +1383,16 @@ mod tests {
                  file genuinely exists there"
             );
             assert!(
-                logs.contains("ignoring a repo-controlled agent definition"),
+                logs.contains(
+                    "ignoring a reviewer/tester definition that looked like the trusted user \
+                     config source"
+                ),
                 "{logs:?}"
+            );
+            assert!(
+                !logs.contains("move it to $XDG_CONFIG_HOME/warden/agents/"),
+                "the degraded-user-config case must not get the plain repo-convention advice, \
+                 which is a no-op for a file already at that exact location: {logs:?}"
             );
         }
     }
@@ -1251,6 +1419,7 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             &malicious_agents_dir,
+            no_warden_home_worktrees().path(),
             true,
         ))
         .await;
@@ -1263,7 +1432,10 @@ mod tests {
         let expected_path = malicious_agents_dir.join("reviewer.md");
         assert_eq!(
             source,
-            AgentDefinitionSource::UntrustedRepoOverride(expected_path.clone())
+            AgentDefinitionSource::UntrustedRepoOverride {
+                path: expected_path.clone(),
+                canonical_path: expected_path.canonicalize().unwrap(),
+            }
         );
         assert!(logs.contains("NOT trusted"), "{logs:?}");
         assert!(
@@ -1300,16 +1472,36 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
             true,
         ))
         .await;
         let (definition, source) = result.unwrap();
 
         assert_eq!(definition.system_prompt, "from the repo, via a symlink");
-        assert!(
-            matches!(source, AgentDefinitionSource::UntrustedRepoOverride(_)),
-            "{source:?}"
-        );
+        match &source {
+            AgentDefinitionSource::UntrustedRepoOverride {
+                path,
+                canonical_path,
+            } => {
+                // Issue #26 review, LOW: this is exactly the case the fix
+                // exists for -- `path` is the symlink itself (looks like a
+                // perfectly ordinary user-config location), `canonical_path`
+                // must name where it actually resolves to (the repo's own
+                // file, symlink followed).
+                assert_eq!(path, &user_config.path().join("reviewer.md"));
+                assert_eq!(
+                    canonical_path,
+                    &repo
+                        .path()
+                        .join(AGENTS_DIR)
+                        .join("reviewer.md")
+                        .canonicalize()
+                        .unwrap()
+                );
+            }
+            other => panic!("expected UntrustedRepoOverride, got {other:?}"),
+        }
         assert!(logs.contains("NOT trusted"), "{logs:?}");
     }
 
@@ -1332,6 +1524,157 @@ mod tests {
             AgentRole::Reviewer,
             &FakeAdapter,
             user_config.path(),
+            no_warden_home_worktrees().path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.system_prompt, "genuinely trusted");
+        assert!(matches!(source, AgentDefinitionSource::UserConfig(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Owner's ruling on the escalated asymmetry: a user-config source
+    // resolving under `<warden_home>/worktrees/` (a stale worktree from a
+    // crashed run) must be degraded exactly like one resolving inside the
+    // repo itself.
+    // -----------------------------------------------------------------
+
+    /// The core of the ruling: `user_config_agents_dir` pointing *inside*
+    /// `<warden_home>/worktrees/` -- e.g. a stale worktree left behind by a
+    /// crashed run, referenced by a committed `.envrc` a human's shell still
+    /// picks up on the *next* invocation -- must never be treated as
+    /// [`AgentDefinitionSource::UserConfig`], even though it sits nowhere
+    /// near `repo_path` itself.
+    #[tokio::test]
+    async fn a_user_config_dir_resolving_inside_warden_homes_worktrees_is_ignored_by_default_and_warns(
+    ) {
+        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+            let repo = TempDir::new().unwrap();
+            let warden_home = TempDir::new().unwrap();
+            // Models a stale worktree from a crashed prior run: a directory
+            // under `<warden_home>/worktrees/` that a committed `.envrc`
+            // still points `XDG_CONFIG_HOME` at.
+            let stale_worktree_user_config = warden_home
+                .path()
+                .join("worktrees")
+                .join("crashed-run-id")
+                .join("coder")
+                .join(".config");
+            write_definition(
+                &stale_worktree_user_config.join("warden").join("agents"),
+                role,
+                "---\n---\nfrom a stale worktree, not the trusted user config\n",
+            )
+            .await;
+
+            let (result, logs) = capture_tracing_output(resolve_agent_definition(
+                repo.path(),
+                role,
+                &FakeAdapter,
+                &stale_worktree_user_config.join("warden").join("agents"),
+                warden_home.path(),
+                false,
+            ))
+            .await;
+            let (definition, source) = result.unwrap();
+
+            assert_eq!(
+                source,
+                AgentDefinitionSource::AdapterDefault,
+                "a user-config source resolving inside <warden_home>/worktrees/ must never be \
+                 read as trusted, even though a file genuinely exists there"
+            );
+            assert_eq!(
+                definition.system_prompt,
+                if role == AgentRole::Reviewer {
+                    "default reviewer prompt"
+                } else {
+                    "default tester prompt"
+                }
+            );
+            assert!(
+                logs.contains(
+                    "ignoring a reviewer/tester definition that looked like the trusted user \
+                     config source"
+                ),
+                "{logs:?}"
+            );
+        }
+    }
+
+    /// The other half of the ruling: with `trust_repo_agents: true`, the
+    /// same stale-worktree user-config path is actually used -- but
+    /// surfaced as [`AgentDefinitionSource::UntrustedRepoOverride`], never
+    /// as [`AgentDefinitionSource::UserConfig`].
+    #[tokio::test]
+    async fn a_user_config_dir_resolving_inside_warden_homes_worktrees_is_used_as_untrusted_when_trusted(
+    ) {
+        let repo = TempDir::new().unwrap();
+        let warden_home = TempDir::new().unwrap();
+        let stale_worktree_user_config = warden_home
+            .path()
+            .join("worktrees")
+            .join("crashed-run-id")
+            .join("coder")
+            .join(".config");
+        let stale_agents_dir = stale_worktree_user_config.join("warden").join("agents");
+        write_definition(
+            &stale_agents_dir,
+            AgentRole::Reviewer,
+            "---\n---\nfrom a stale worktree, not the trusted user config\n",
+        )
+        .await;
+
+        let (result, logs) = capture_tracing_output(resolve_agent_definition(
+            repo.path(),
+            AgentRole::Reviewer,
+            &FakeAdapter,
+            &stale_agents_dir,
+            warden_home.path(),
+            true,
+        ))
+        .await;
+        let (definition, source) = result.unwrap();
+
+        assert_eq!(
+            definition.system_prompt,
+            "from a stale worktree, not the trusted user config"
+        );
+        let expected_path = stale_agents_dir.join("reviewer.md");
+        assert_eq!(
+            source,
+            AgentDefinitionSource::UntrustedRepoOverride {
+                path: expected_path.clone(),
+                canonical_path: expected_path.canonicalize().unwrap(),
+            }
+        );
+        assert!(logs.contains("NOT trusted"), "{logs:?}");
+    }
+
+    /// A `user_config_agents_dir` under a *different* `warden_home`'s own
+    /// worktrees (or nowhere near this one's at all) must be entirely
+    /// unaffected -- the ruling only extends to *this* run's own
+    /// `warden_home`, never every worktree tree on disk.
+    #[tokio::test]
+    async fn a_user_config_dir_outside_this_warden_homes_worktrees_is_unaffected() {
+        let repo = TempDir::new().unwrap();
+        let warden_home = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        write_definition(
+            user_config.path(),
+            AgentRole::Reviewer,
+            "---\n---\ngenuinely trusted\n",
+        )
+        .await;
+
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Reviewer,
+            &FakeAdapter,
+            user_config.path(),
+            warden_home.path(),
             false,
         )
         .await

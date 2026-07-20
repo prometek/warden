@@ -404,13 +404,17 @@ async fn run<R: ToolAdapter>(
     // real environment (`XDG_CONFIG_HOME`/`HOME`) -- see
     // `agent_def::default_user_config_agents_dir`'s own docs for why that
     // env read lives here rather than inside `resolve_agent_definition`
-    // itself.
+    // itself. `warden_home` is passed alongside it (owner's ruling,
+    // "escalated asymmetry"): a user-config source resolving under
+    // `<warden_home>/worktrees/` -- a stale worktree from a crashed run --
+    // must be degraded exactly like one resolving inside the repo itself.
     let user_config_agents_dir = warden::agent_def::default_user_config_agents_dir()?;
     let (coder_agent, _coder_source) = resolve_agent_definition(
         &repo,
         AgentRole::Coder,
         &adapter,
         &user_config_agents_dir,
+        &warden_home,
         trust_repo_agents.0,
     )
     .await?;
@@ -419,6 +423,7 @@ async fn run<R: ToolAdapter>(
         AgentRole::Reviewer,
         &adapter,
         &user_config_agents_dir,
+        &warden_home,
         trust_repo_agents.0,
     )
     .await?;
@@ -427,6 +432,7 @@ async fn run<R: ToolAdapter>(
         AgentRole::Tester,
         &adapter,
         &user_config_agents_dir,
+        &warden_home,
         trust_repo_agents.0,
     )
     .await?;
@@ -443,9 +449,14 @@ async fn run<R: ToolAdapter>(
     ]
     .into_iter()
     .filter_map(|(role, source)| match source {
-        warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride(path) => {
-            Some(orchestrator::UntrustedRepoAgentDefinition { role, path })
-        }
+        warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
+            path,
+            canonical_path,
+        } => Some(orchestrator::UntrustedRepoAgentDefinition {
+            role,
+            path,
+            canonical_path,
+        }),
         _ => None,
     })
     .collect();

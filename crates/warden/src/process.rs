@@ -34,13 +34,14 @@
 //! (`orchestrator::Orchestrator::run_agent`), rather than trusted to stay
 //! true of every adapter forever.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 use warden_core::AgentRole;
 
 use crate::error::ProcessError;
+use crate::path_util::canonicalize_best_effort;
 
 /// A single agent invocation to run in an isolated worktree.
 #[derive(Debug, Clone)]
@@ -230,41 +231,6 @@ pub fn validate_agent_program(
     }
 
     Ok(())
-}
-
-/// Canonicalizes `path`, walking up to the nearest existing ancestor if
-/// `path` itself (or some intermediate component of it) doesn't exist yet
-/// (e.g. a `program` argument nobody has spawned successfully before) --
-/// mirrors `worktree.rs`'s own `canonicalize_best_effort` (kept as a
-/// separate, small copy rather than a shared helper: that one returns a
-/// `WorktreeError`, this one an `std::io::Error`, and threading a third
-/// error type across both modules just for a ten-line ancestor walk isn't
-/// worth the coupling).
-///
-/// Issue #26 review, LOW: unlike a naive "pop segments until something
-/// resolves" walk, a canonicalize failure for any reason other than
-/// [`std::io::ErrorKind::NotFound`] (a permissions error, `ELOOP`, ...) is
-/// propagated immediately here rather than silently walked past -- an
-/// ancestor that exists but can't be canonicalized for some other reason
-/// means this function can no longer verify what `path` actually resolves
-/// to, and continuing to pop past it would defeat the exact containment
-/// check every caller uses this for (this is the fail-closed guarantee this
-/// function's callers already document).
-fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
-    match path.canonicalize() {
-        Ok(canonical) => Ok(canonical),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let file_name = path.file_name().ok_or(error)?;
-            let parent = path.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no existing ancestor found for {}", path.display()),
-                )
-            })?;
-            Ok(canonicalize_best_effort(parent)?.join(file_name))
-        }
-        Err(error) => Err(error),
-    }
 }
 
 /// Spawns `command` with `cwd` pointed at the agent's isolated worktree
@@ -740,6 +706,7 @@ pub fn kill_pid(pid: u32, expected_start_time: i64) -> Result<(), ProcessError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     // -----------------------------------------------------------------

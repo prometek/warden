@@ -156,11 +156,24 @@ pub enum RunEvent {
     /// See [`EventKind::UntrustedAgentDefinitionUsed`]'s own docs. `role` is
     /// always `"reviewer"` or `"tester"` (`AgentRole::as_str`) -- the coder
     /// is never subject to this (`warden::agent_def`'s own docs). `path` is
-    /// the repo-relative-looking but actually already-resolved absolute path
-    /// that was read, exactly as `Path::display` renders it.
+    /// the literal, pre-canonicalization path that was actually read (what
+    /// an operator recognizes -- `.warden/agents/reviewer.md`, or the
+    /// would-be user-config path), exactly as `Path::display` renders it.
+    ///
+    /// `canonical_path` (issue #26 review, LOW) is what `path` actually
+    /// canonicalizes to (symlinks resolved) -- carried *alongside* `path`,
+    /// never instead of it. For the plain repo-convention case the two
+    /// usually agree; for the degraded-user-config case (a coder-controlled
+    /// `XDG_CONFIG_HOME`, or a symlinked `<role>.md`) `path` may not
+    /// literally look like it is inside the repo/a worktree at all -- e.g.
+    /// `~/.config/warden/agents/reviewer.md` -- while `canonical_path` names
+    /// exactly where it actually resolved to. Without this, an operator
+    /// replaying the event for exactly the adversarial case this record
+    /// exists for sees a path that is technically true but unactionable.
     UntrustedAgentDefinitionUsed {
         role: String,
         path: String,
+        canonical_path: String,
     },
     RunFinished {
         final_state: String,
@@ -277,6 +290,7 @@ mod tests {
             EventKind::UntrustedAgentDefinitionUsed => RunEvent::UntrustedAgentDefinitionUsed {
                 role: "reviewer".to_string(),
                 path: "/repo/.warden/agents/reviewer.md".to_string(),
+                canonical_path: "/repo/.warden/agents/reviewer.md".to_string(),
             },
             EventKind::RunFinished => RunEvent::RunFinished {
                 final_state: "converged".to_string(),
