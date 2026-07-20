@@ -9441,7 +9441,26 @@ mod tests {
                         let stdin_task = async {
                             if let Some(mut handle) = stdin_handle.take() {
                                 if let Some(payload) = stdin_payload {
-                                    handle.write_all(payload.as_bytes()).await?;
+                                    // A broken pipe here is not a failure --
+                                    // it means the child exited without
+                                    // reading its payload, which the fake
+                                    // `claude` scripts these tests use do
+                                    // routinely. `LocalSandbox` classifies it
+                                    // the same way (see
+                                    // `warden_sandbox::local::classify_stdin_write_error`,
+                                    // which logs and continues); propagating
+                                    // it instead made this fake diverge from
+                                    // the production backend it stands in for,
+                                    // and the test fail intermittently with
+                                    // `StdinWrite { .. BrokenPipe }` whenever
+                                    // the child won the race to exit.
+                                    if let Err(error) =
+                                        handle.write_all(payload.as_bytes()).await
+                                    {
+                                        if error.kind() != std::io::ErrorKind::BrokenPipe {
+                                            return Err(error);
+                                        }
+                                    }
                                 }
                             }
                             Ok::<(), std::io::Error>(())
