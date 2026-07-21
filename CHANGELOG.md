@@ -7,6 +7,71 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #55 / ADR-0017 : fondation des hooks de cycle de vie (actions déterministes)
+
+> **Fondation seulement** : types, trait, registre et seam de dispatch. **Aucun
+> hook concret** (fmt/test/commit/lint…) et **aucun format de config** ici — ils
+> viendront par-dessus. Registre **vide par défaut → comportement strictement
+> inchangé** (suite existante verte).
+
+- **Décision (ADR-0017)** : certaines actions d'un run sont **répétables et
+  déterministes** (formater, lancer les tests, committer, lint). Les déléguer à
+  l'**agent** (dans son prompt) est mauvais sur trois axes — sécurité (l'agent a
+  besoin de `Bash`/outillage, ce qui élargit sa surface), tokens (chaque action =
+  un aller-retour LLM), déterminisme (un LLM peut oublier, varier, mal exécuter un
+  geste mécanique). Ces actions deviennent des **hooks de cycle de vie** exécutés
+  **par Warden** aux transitions du run, pas demandés à l'agent. Un hook qui lance
+  une commande est prévu pour passer par la **même seam `Sandbox` (#50)** qu'un
+  agent — même isolation, mais action fixe, pas de LLM.
+- **Types purs dans `warden-core`** (`hook.rs`, aucune dépendance FS/process,
+  garde la pureté du crate) :
+  - `HookPoint` — enum des moments du cycle de vie (`OnCycleStart`,
+    `BeforeCoder`/`AfterCoder`, `OnCommit`, `BeforeReview`/`AfterReview`,
+    `BeforeTest`/`AfterTest`, `OnCycleEnd`, `OnConverged`, `BeforePush`), plus
+    `HookPoint::on_entering(RunState)` qui mappe l'entrée dans un état sur son
+    point de cycle de vie (le mapping qu'utilise le seam de dispatch).
+  - `HookContext<'a>` — bundle de **références empruntées** (`run_id`, `state`,
+    `cycle`, `worktree`, `commit`, `diff`), aucune possession, aucune I/O ;
+    `worktree`/`commit`/`diff` sont `Option` (tous les points ne les portent pas).
+  - `HookOutcome` — `Continue` | `Block { reason }` | `EmitFindings(Vec<Finding>)`.
+    `EmitFindings` réutilise le `Finding` existant pour alimenter la boucle de
+    convergence **comme les findings reviewer/tester/CI (ADR-0011)**, pas un canal
+    parallèle.
+- **Trait + registre côté `warden`** (`hook.rs`, là où vivent FS/process/sandbox) :
+  - `#[async_trait] trait Hook { fn points() -> &[HookPoint]; async fn run(&ctx) -> Result<HookOutcome>; }`.
+    Un `Err` = échec réel d'exécution de l'action (propagé) ; un hook qui tourne
+    mais veut bloquer/reboucler le dit via `HookOutcome`, jamais via `Err`.
+  - `HookRegistry` (Vec plat, **ordre d'enregistrement** = ordre d'exécution
+    déterministe). `run_hooks(point, ctx)` agrège : le **premier** `Block`
+    court-circuite (arrêt dur) ; sinon les `EmitFindings` sont concaténés dans
+    l'ordre ; sinon `Continue`.
+- **Câblage du dispatch aux transitions** : `Orchestrator` porte un `HookRegistry`
+  (vide par défaut, `with_hooks(...)` pour l'installer) ; `Orchestrator::transition`
+  dispatche, après la mise à jour d'état, les hooks du `HookPoint::on_entering(to)`.
+  Garde `is_empty()` : registre vide ⇒ le `HookContext` n'est même pas construit,
+  comportement strictement inchangé.
+- **Hors périmètre, explicite** : **consommer** un `Block`/`EmitFindings` à ce
+  seam (gate de politique, injection des findings dans la boucle) est **#51** — en
+  attendant, un outcome non-`Continue` est **tracé (`warn!`), jamais silencieusement
+  ignoré**, mais pas encore agi ; l'agrégation d'outcome est verrouillée par les
+  tests de `HookRegistry::run_hooks`. L'exécution effective dans un sandbox Docker
+  est **#49**. La sous-partie des `HookPoint` non mappée sur une entrée d'état
+  (`BeforeCoder`/`AfterCoder`, `AfterReview`, `AfterTest`, `OnCommit`,
+  `OnCycleEnd`) fait partie du vocabulaire et sera câblée aux sites qui portent
+  leur contexte quand les hooks concrets arriveront — sans changement d'enum.
+- **Désambiguïsation** : « hook » ici = hook de **cycle de vie** Warden, distinct
+  du git `post-receive` de `warden-gated` (`hook.rs` de ce crate).
+- **ADR-0017 non écrite dans le vault** : même convention que les
+  ADR-0014/0015/0018 — le dossier d'architecture (`docs/`) est un lien symbolique
+  non versionné vers un vault Obsidian externe, hors de ce dépôt git. Cette entrée
+  de CHANGELOG tient lieu d'enregistrement de décision jusqu'à ce qu'une ADR-0017
+  réelle y soit écrite.
+- **Tests** : mapping `on_entering` + unicité des chaînes `HookPoint` (core) ;
+  no-op du registre vide, tir d'un hook sur son point (pas sur un autre), ordre
+  d'enregistrement, court-circuit au premier `Block`, agrégation ordonnée des
+  `EmitFindings` (warden) ; et le dispatch réel via `Orchestrator::transition`
+  (`transition_dispatches_the_hook_for_the_entered_state`).
+
 ### Added — Issue #50 : seam d'isolation de l'environnement d'exécution (`warden-sandbox` + `LocalSandbox`)
 
 - **Nouveau crate `warden-sandbox`** : trait `Sandbox` (`create` → `execute` (N fois)

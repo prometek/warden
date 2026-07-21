@@ -62,7 +62,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
     decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiOutcome,
-    CiResultMessage, EvidenceTool, Finding, RunEvent, RunState, DIFF_TRUNCATED_MARKER,
+    CiResultMessage, EvidenceTool, Finding, HookContext, HookOutcome, HookPoint, RunEvent,
+    RunState, DIFF_TRUNCATED_MARKER,
 };
 use warden_sandbox::{LocalSandbox, Sandbox};
 
@@ -73,6 +74,7 @@ use crate::error::{ProcessError, Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
+use crate::hook::HookRegistry;
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::tool_adapter::ToolAdapter;
 use crate::worktree::{self, WorktreeManager};
@@ -449,6 +451,14 @@ pub struct Orchestrator {
     /// point a future `DockerSandbox` (#49) plugs into, with no other change
     /// to this module.
     sandbox: Arc<dyn Sandbox>,
+    /// Issue #55: the lifecycle-hook registry dispatched at every relevant
+    /// state transition (see [`Orchestrator::transition`]). **Empty by
+    /// default** ([`HookRegistry::new`]), which makes that dispatch a strict
+    /// no-op -- behaviour is unchanged until a caller installs hooks via
+    /// [`Orchestrator::with_hooks`] and #51 wires their outcomes into the
+    /// convergence loop. No concrete hook ships yet (issue #55 is foundation
+    /// only).
+    hooks: HookRegistry,
 }
 
 /// See the `on_run_started` field docs on [`Orchestrator`]. Named alias
@@ -462,6 +472,7 @@ impl Orchestrator {
             run_context: tokio::sync::OnceCell::new(),
             on_run_started: None,
             sandbox: Arc::new(LocalSandbox::new()),
+            hooks: HookRegistry::new(),
         }
     }
 
@@ -483,6 +494,17 @@ impl Orchestrator {
     /// path there, never touch [`Orchestrator::run_agent`] itself.
     pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>) -> Self {
         self.sandbox = sandbox;
+        self
+    }
+
+    /// Installs the lifecycle-hook [`HookRegistry`] dispatched at each relevant
+    /// transition (issue #55). Defaults to empty (a no-op seam); this is how a
+    /// caller -- or, once #51 lands, `main.rs` from a resolved config -- swaps
+    /// in real hooks. Builder-style for the same reason as
+    /// [`Orchestrator::with_sandbox`]: a construction-time choice that never
+    /// becomes part of any run-time signature.
+    pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -565,6 +587,46 @@ impl Orchestrator {
                 })?;
         run.state.validate_transition(to)?;
         db::update_run_state(&self.pool, run_id, to).await?;
+
+        // Issue #55: the single lifecycle-hook dispatch seam. Every legal
+        // transition names the state it enters; a subset of those states is a
+        // lifecycle milestone with a `HookPoint` (`HookPoint::on_entering`),
+        // and hooks registered on it fire here, in registration order. With
+        // the default *empty* registry there is provably nothing to dispatch
+        // to (`is_empty` guard) -- the `HookContext` is not even built and
+        // behaviour is strictly unchanged, which is the foundation's contract.
+        //
+        // Acting on the outcome -- honouring a `Block`, folding
+        // `EmitFindings` into the convergence loop the way reviewer/tester/CI
+        // findings are -- is deliberately out of scope (issue #51). Until it
+        // lands, a non-`Continue` outcome is surfaced (a visible `warn!`,
+        // never silently dropped) but not yet consumed at this seam; the
+        // outcome is exercised directly against `HookRegistry::run_hooks` in
+        // `crate::hook`'s tests. An `Err` -- a hook that genuinely failed to
+        // run -- propagates and fails the transition.
+        if !self.hooks.is_empty() {
+            if let Some(point) = HookPoint::on_entering(to) {
+                let ctx = HookContext {
+                    point,
+                    run_id,
+                    state: to,
+                    cycle: None,
+                    worktree: None,
+                    commit: None,
+                    diff: None,
+                };
+                match self.hooks.run_hooks(point, &ctx).await? {
+                    HookOutcome::Continue => {}
+                    other => tracing::warn!(
+                        run_id,
+                        point = point.as_str(),
+                        ?other,
+                        "lifecycle hook returned a non-Continue outcome; consuming it \
+                         (Block / EmitFindings) is not wired yet (issue #51)"
+                    ),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3370,6 +3432,87 @@ mod tests {
             .unwrap();
 
         assert_eq!(final_state, RunState::Converged);
+    }
+
+    /// Issue #55: the lifecycle-hook dispatch seam is wired to `transition`.
+    /// A hook registered on the point a state maps to
+    /// (`HookPoint::on_entering`) fires when the run enters that state, and is
+    /// handed a `HookContext` naming that point/state/run -- the foundation's
+    /// "hook factice appelé au bon point avec le bon contexte" criterion,
+    /// proven through the real orchestrator path rather than the registry in
+    /// isolation.
+    #[tokio::test]
+    async fn transition_dispatches_the_hook_for_the_entered_state() {
+        use crate::hook::Hook;
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Seen {
+            point: HookPoint,
+            state: RunState,
+            run_id: String,
+        }
+
+        struct RecordingHook {
+            points: Vec<HookPoint>,
+            seen: Arc<Mutex<Vec<Seen>>>,
+        }
+
+        #[async_trait]
+        impl Hook for RecordingHook {
+            fn points(&self) -> &[HookPoint] {
+                &self.points
+            }
+
+            async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
+                self.seen.lock().unwrap().push(Seen {
+                    point: ctx.point,
+                    state: ctx.state,
+                    run_id: ctx.run_id.to_string(),
+                });
+                Ok(HookOutcome::Continue)
+            }
+        }
+
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "hook seam", 3, 3)
+            .await
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(RecordingHook {
+            // Registered on `OnCycleStart` (what `CoderRunning` maps to) but
+            // not on `BeforeReview` -- so the `Pending -> CoderRunning`
+            // transition fires it and the `CoderRunning -> Reviewing` one does
+            // not.
+            points: vec![HookPoint::OnCycleStart],
+            seen: seen.clone(),
+        }));
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+
+        orchestrator
+            .transition(&run_id, RunState::CoderRunning)
+            .await
+            .unwrap();
+        orchestrator
+            .transition(&run_id, RunState::Reviewing)
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![Seen {
+                point: HookPoint::OnCycleStart,
+                state: RunState::CoderRunning,
+                run_id: run_id.clone(),
+            }],
+            "hook fires once, on entering CoderRunning, with the matching context"
+        );
     }
 
     /// Issue #26: `run_convergence_loop` publishes one persisted
