@@ -2133,7 +2133,14 @@ fn map_sandbox_error(error: warden_sandbox::SandboxError) -> WardenError {
         // this one (an internal bug, never expected from a well-behaved
         // backend) -- wrapped via `WardenError`'s own `#[from]` instead of a
         // hand-rolled `reason: String` that would have discarded `#[source]`.
-        error @ SandboxError::UnknownSandbox { .. } => WardenError::Sandbox(error),
+        //
+        // Issue #49: `DockerUnavailable` has no `ProcessError` counterpart
+        // either -- a docker-specific configuration/precondition failure
+        // (a missing `~/.claude`, an unresolvable bind-mount path), not a
+        // spawn/wait/stdin-write/cancel shape `LocalSandbox` ever produces.
+        error @ (SandboxError::UnknownSandbox { .. } | SandboxError::DockerUnavailable { .. }) => {
+            WardenError::Sandbox(error)
+        }
     }
 }
 

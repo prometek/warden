@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 use tempfile::TempDir;
 use warden_core::{AgentRole, FindingSource, RunState};
@@ -1003,6 +1004,64 @@ fn e2e_omitting_tool_entirely_is_a_clean_cli_error() {
     .assert()
     .failure()
     .stderr(contains("--tool"));
+}
+
+/// Issue #49: `--isolation` is validated against a closed, compiled-in set
+/// at the CLI boundary (code-standards.md: "valider toute entrée externe...
+/// à la frontière"), the exact same pattern `--tool` already uses -- an
+/// unsupported value is a clean parse error naming what was given, never
+/// silently defaulted to `worktree`.
+#[test]
+fn e2e_an_unknown_isolation_is_a_clean_cli_error_naming_the_value() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+        "--isolation",
+        "firecracker",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("firecracker"));
+}
+
+/// Issue #49: `--isolation` defaults to `worktree` when omitted entirely --
+/// unlike `--tool` (which has no default, issue #24), omitting `--isolation`
+/// must not itself fail arg parsing; it is exercised indirectly by every
+/// other `e2e_*` test in this file that never passes `--isolation` at all
+/// and still runs a real (non-docker) convergence loop successfully.
+#[test]
+fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    // Fails downstream (no fake `claude` on `PATH`), never on arg parsing --
+    // proven by never seeing clap's own "--isolation" complaint.
+    .stderr(contains("--isolation").not());
 }
 
 /// Issue #24 point 4: the flags this issue removes (`--coder-agent`/
