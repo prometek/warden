@@ -7,6 +7,26 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #53 : visibilité de la consommation de tokens (par agent/cycle/run)
+
+- **`warden_core::TokenUsage`** (pur, sans dépendance outil) : `input_tokens`,
+  `output_tokens`, `cache_read_tokens`/`cache_creation_tokens` (`Option<u64>`,
+  distincts de `0` — la mise en cache n'est pas rapportée par tous les outils),
+  plus `total()`/`merge()`/`sum()`.
+- **Nouveau seam optionnel `ToolAdapter::extract_usage(stdout) -> Option<TokenUsage>`**,
+  calqué sur `extract_findings` (défaut `None` → « n/a », jamais un `0` fabriqué).
+  `ClaudeAdapter` l'implémente en relisant le même envelope `result` déjà capturé
+  pour les findings (`claude --output-format stream-json`), sans second parcours
+  du flux.
+- **Agrégation et persistance** : `Orchestrator::run_agent` accumule l'usage
+  extrait sur le total per-rôle du cycle et le total courant du run ; migration
+  `crates/warden/migrations/0008_token_usage.sql` (colonnes nullables par rôle
+  sur `cycles`, colonnes totales sur `runs`). Publié sur l'Event Bus via
+  `RunEvent::AgentFinished { usage: Option<TokenUsage>, .. }`.
+- **`warden-tui`** affiche désormais l'usage en direct — par agent, par cycle
+  (coder/reviewer/tester) et le total du run — avec repli sur « n/a » tant
+  qu'aucun outil n'a rapporté d'usage.
+
 ### Added — Issue #55 / ADR-0017 : fondation des hooks de cycle de vie (actions déterministes)
 
 > **Fondation seulement** : types, trait, registre et seam de dispatch. **Aucun

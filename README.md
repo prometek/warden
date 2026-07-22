@@ -489,6 +489,14 @@ direct. C'est aussi une observation **déclarative** (ce que l'agent affirme fai
 preuve vérifiée d'exécution — voir "Preuve d'exécution (Evidence)" ci-dessus (ADR-0009) pour
 la seule source qui porte une valeur de preuve.
 
+**Consommation de tokens (issue #53, §12 dans `docs/Architecture.md`)** : à la fin de chaque
+agent, `warden-tui` affiche l'usage de tokens rapporté — entrée/sortie et, si l'outil les
+fournit, lecture/écriture de cache — agrégé par agent, par cycle (coder/reviewer/tester) et
+en total du run, mis à jour en direct. Un tool qui n'a rien rapporté (`ToolAdapter::extract_usage`
+retourne `None`) s'affiche « n/a », jamais un `0` fabriqué. `ClaudeAdapter` l'extrait du même
+envelope `result` déjà capturé pour les findings (`--output-format stream-json`), sans second
+parcours du flux ; persisté en base par la migration `crates/warden/migrations/0008_token_usage.sql`.
+
 Sur un terminal dont la sortie standard n'est pas un TTY (pipe, redirection), `warden-tui`
 bascule automatiquement sur un mode texte qui affiche un événement par ligne en NDJSON —
 pratique pour scripter/observer un run sans interface plein écran.
