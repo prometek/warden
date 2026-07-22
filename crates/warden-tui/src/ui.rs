@@ -931,6 +931,173 @@ mod tests {
         );
     }
 
+    /// Acceptance criteria (issue #54): a tester-driven reloop must render
+    /// its own distinct return-edge label ("tester -> coder -> reviewer ->
+    /// tester"), not be conflated with the reviewer-driven edge covered by
+    /// the test above.
+    #[test]
+    fn draw_shows_the_workflow_tree_with_a_tester_driven_reloop_edge() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentStarted {
+                role: "coder".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e4",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        model.apply(record(
+            "e5",
+            RunEvent::AgentStarted {
+                role: "reviewer".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e6",
+            RunEvent::AgentFinished {
+                role: "reviewer".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        model.apply(record(
+            "e7",
+            RunEvent::AgentStarted {
+                role: "tester".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e8",
+            RunEvent::AgentFinished {
+                role: "tester".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        model.apply(record(
+            "e9",
+            RunEvent::FindingRaised {
+                cycle_number: 1,
+                source: "tester".to_string(),
+                severity: "blocking".to_string(),
+                file: None,
+                description: "flaky assertion".to_string(),
+                action: None,
+            },
+        ));
+        model.apply(record("e10", RunEvent::CycleStarted { cycle_number: 2 }));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("cycle 1"), "{content}");
+        assert!(content.contains("tester"), "{content}");
+        assert!(content.contains("findings"), "{content}");
+        assert!(
+            content.contains("tester -> coder -> reviewer -> tester"),
+            "the return edge must name the tester-driven reloop, not the review one: {content}"
+        );
+        assert!(
+            !content.contains("reviewer -> coder"),
+            "must not also render the review-reloop label: {content}"
+        );
+    }
+
+    /// Acceptance criteria (issue #54): a CI-driven reloop (issue
+    /// #15/ADR-0011's `ChecksFailed` outcome, whose `FindingRaised` is
+    /// attributed to the *next* cycle it seeds, per
+    /// `RunModel::workflow_tree`'s own docs) must render its own distinct
+    /// return-edge label on the *prior*, fully-clean cycle.
+    #[test]
+    fn draw_shows_the_workflow_tree_with_a_ci_driven_reloop_edge() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentStarted {
+                role: "reviewer".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e4",
+            RunEvent::AgentFinished {
+                role: "reviewer".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        model.apply(record(
+            "e5",
+            RunEvent::AgentStarted {
+                role: "tester".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e6",
+            RunEvent::AgentFinished {
+                role: "tester".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        // Cycle 1 itself is entirely clean -- it only reboucles because of
+        // what CI reported after convergence, seeded into cycle 2.
+        model.apply(record("e7", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record(
+            "e8",
+            RunEvent::FindingRaised {
+                cycle_number: 2,
+                source: "ci".to_string(),
+                severity: "blocking".to_string(),
+                file: None,
+                description: "checks failed".to_string(),
+                action: None,
+            },
+        ));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("cycle 1"), "{content}");
+        assert!(
+            content.contains("CI checks failed -> coder (ci reloop)"),
+            "the return edge must name the ci-driven reloop distinctly: {content}"
+        );
+    }
+
     /// Degradation (issue #54): a node whose invocation never reported
     /// usage shows "n/a", never a fabricated `0`.
     #[test]
