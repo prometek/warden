@@ -7,6 +7,37 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #54 : vue arborescente du workflow + intent du run dans le header (`warden-tui`)
+
+- **`RunModel::workflow_tree()`** (`warden-tui`, projection pure, sans I/O) :
+  dérive un arbre git-graph-like à partir du flux d'événements déjà répliqué —
+  une branche par cycle, portant ses nœuds d'invocation d'agent (coder /
+  reviewer / tester, dans l'ordre où l'orchestrateur les lance réellement au
+  sein d'un cycle) avec statut (`Running`/`Clean`/`Findings`/`Failed`) et
+  tokens consommés (issue #53, « n/a » si non rapporté, jamais un `0`
+  fabriqué). Le `phase`/`cycle_number` n'existant pas comme champ explicite
+  sur `AgentStarted`/`AgentFinished` (vérifié dans `warden_core::event`),
+  chaque invocation est attribuée au dernier `CycleStarted` vu — exact, pas
+  une heuristique, car l'orchestrateur ne lance jamais un agent hors de son
+  propre cycle.
+- **Retours visuellement distincts** (« return edges ») : reviewer → coder
+  (finding bloquant reviewer/tampering, décision #37 Q1), tester → coder →
+  reviewer → tester (finding bloquant tester, re-review scopée), et CI →
+  coder (issue #15/ADR-0011, `ChecksFailed`). Un cycle qui a épuisé son
+  budget sans qu'un cycle suivant existe réellement n'affiche aucun retour
+  fabriqué.
+- **`crate::ui::workflow_tree_widget`** rend cet arbre avec des rails
+  ratatui (`│`, `├─`, `╰─`), dans un panneau à budget fixe (comme le panneau
+  evidence existant) entre le header et le journal d'événements — layout
+  stable, aucune nouvelle donnée métier inventée côté rendu.
+- **Header** : l'intent du run (déjà affiché) est désormais tronqué
+  (`truncate_intent`, ellipse) au-delà de 60 caractères pour ne jamais
+  écraser le reste de la ligne (id de run, branche, statut, progression
+  live).
+- Toujours strictement en lecture seule (ADR-0008/0010) : aucune nouvelle
+  source de données, uniquement une nouvelle projection du flux
+  d'événements/DB déjà consommé.
+
 ### Added — Issue #53 : visibilité de la consommation de tokens (par agent/cycle/run)
 
 - **`warden_core::TokenUsage`** (pur, sans dépendance outil) : `input_tokens`,

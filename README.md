@@ -497,6 +497,18 @@ retourne `None`) s'affiche « n/a », jamais un `0` fabriqué. `ClaudeAdapter` l
 envelope `result` déjà capturé pour les findings (`--output-format stream-json`), sans second
 parcours du flux ; persisté en base par la migration `crates/warden/migrations/0008_token_usage.sql`.
 
+**Vue arborescente du workflow (issue #54)** : entre le header et le journal d'événements,
+un panneau dédié projette le run sous forme d'arbre git-graph-like (rails `│`/`├─`/`╰─`) —
+une branche par cycle, portant ses nœuds d'invocation d'agent (coder/reviewer/tester, dans
+l'ordre où l'orchestrateur les lance) avec statut (running/clean/findings/failed) et tokens
+consommés (« n/a » si non rapporté). Les retours (« return edges ») sont visuellement
+distincts selon leur origine : reviewer → coder (finding bloquant reviewer/tampering),
+tester → coder → reviewer → tester (finding bloquant tester, re-review scopée), CI → coder
+(`ChecksFailed`, issue #15/ADR-0011). Purement dérivé du flux d'événements déjà consommé
+(aucune nouvelle source) ; se dégrade proprement (« n/a », pas de retour affiché) sur un run
+antérieur aux issues #37/#53 dont les événements ne portent pas cette information. L'intent
+du run, déjà affiché dans le header, y est désormais tronqué au-delà de 60 caractères.
+
 Sur un terminal dont la sortie standard n'est pas un TTY (pipe, redirection), `warden-tui`
 bascule automatiquement sur un mode texte qui affiche un événement par ligne en NDJSON —
 pratique pour scripter/observer un run sans interface plein écran.
