@@ -19,7 +19,18 @@ use warden_core::{RunEvent, RunEventRecord, TokenUsage};
 
 use crate::capabilities::GraphicsCapability;
 use crate::evidence::{self, Evidence, EvidenceKind};
-use crate::model::RunModel;
+use crate::model::{AgentNode, CycleNode, NodeStatus, ReloopCause, RunModel};
+
+/// Fixed height of the one-line run header.
+const HEADER_HEIGHT: u16 = 3;
+
+/// Fixed height reserved for the workflow tree pane (issue #54) -- like
+/// [`EVIDENCE_PANE_HEIGHT`], not dynamically sized off its content: a fixed
+/// budget keeps the rest of the layout (header/events/evidence) stable
+/// across draws instead of jumping around as cycles come and go. A run with
+/// more branches than fit simply scrolls off the bottom, exactly like the
+/// events pane already does without an explicit scroll offset.
+const TREE_PANE_HEIGHT: u16 = 12;
 
 /// Fixed height reserved for the evidence pane when the model has evidence
 /// to show. Not dynamically sized off the image itself: `ratatui_image`
@@ -27,6 +38,11 @@ use crate::model::RunModel;
 /// a fixed budget keeps the rest of the layout (header/events) stable
 /// across draws instead of jumping around as evidence comes and goes.
 const EVIDENCE_PANE_HEIGHT: u16 = 12;
+
+/// Longest intent shown in the header before truncation (issue #54) --
+/// keeps a pathologically long intent from crowding out the rest of the
+/// header's single unwrapped line (run id, branch, status, live progress).
+const MAX_HEADER_INTENT_LEN: usize = 60;
 
 /// Draws the whole screen: a one-line run header, a scrollable event log,
 /// and (only once the model has an `EvidenceCaptured` event to show) an
@@ -48,21 +64,28 @@ pub fn draw(
     let latest_evidence = model.latest_evidence();
 
     if let Some(evidence_record) = latest_evidence {
-        let [header_area, events_area, evidence_area] = Layout::vertical([
-            Constraint::Length(3),
+        let [header_area, tree_area, events_area, evidence_area] = Layout::vertical([
+            Constraint::Length(HEADER_HEIGHT),
+            Constraint::Length(TREE_PANE_HEIGHT),
             Constraint::Min(0),
             Constraint::Length(EVIDENCE_PANE_HEIGHT),
         ])
         .areas(area);
 
         frame.render_widget(header_widget(model), header_area);
+        frame.render_widget(workflow_tree_widget(model), tree_area);
         frame.render_widget(events_widget(model), events_area);
         render_evidence_pane(frame, evidence_record, capability, picker, evidence_area);
     } else {
-        let [header_area, events_area] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+        let [header_area, tree_area, events_area] = Layout::vertical([
+            Constraint::Length(HEADER_HEIGHT),
+            Constraint::Length(TREE_PANE_HEIGHT),
+            Constraint::Min(0),
+        ])
+        .areas(area);
 
         frame.render_widget(header_widget(model), header_area);
+        frame.render_widget(workflow_tree_widget(model), tree_area);
         frame.render_widget(events_widget(model), events_area);
     }
 }
@@ -161,13 +184,28 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
                     None => cycle_status,
                 }
             };
-            format!("run {run_id} [{branch}] \"{intent}\" -- {status}")
+            format!(
+                "run {run_id} [{branch}] \"{}\" -- {status}",
+                truncate_intent(intent, MAX_HEADER_INTENT_LEN)
+            )
         }
         _ => "waiting for run history...".to_string(),
     };
 
     Paragraph::new(text)
         .block(Block::bordered().title(" warden-tui (read-only) -- press q to quit "))
+}
+
+/// Truncates `intent` to at most `max_len` characters, appending `"..."` when
+/// it was cut (issue #54: "Header shows run intent/task ... truncation alone
+/// is acceptable"). Operates on characters, not bytes, so a multi-byte UTF-8
+/// intent is never sliced mid-codepoint.
+fn truncate_intent(intent: &str, max_len: usize) -> String {
+    if intent.chars().count() <= max_len {
+        return intent.to_string();
+    }
+    let truncated: String = intent.chars().take(max_len.saturating_sub(3)).collect();
+    format!("{truncated}...")
 }
 
 /// Renders `usage` (issue #53) as a compact, human-readable fragment --
@@ -303,6 +341,103 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
     };
 
     ListItem::new(Line::styled(format!("{} {text}", record.created_at), style))
+}
+
+/// Renders the run's workflow tree (issue #54) as a git-graph-like pane:
+/// one branch per cycle, each carrying its agent-invocation nodes in order
+/// plus (if it reboucled into another cycle) a visually distinct return
+/// edge. The run itself is the implicit root -- already named in the header
+/// -- so this pane starts directly at the first cycle's own branch.
+fn workflow_tree_widget(model: &RunModel) -> List<'static> {
+    let tree = model.workflow_tree();
+    let items: Vec<ListItem> = if tree.cycles.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no cycle started yet",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        workflow_tree_lines(&tree.cycles)
+    };
+    List::new(items).block(Block::bordered().title(" workflow tree "))
+}
+
+/// Lays out every cycle's branch, its agent nodes, and its return edge (if
+/// any) using git-graph rails (`│`, `├─`, `╰─`) -- pure formatting over
+/// already-derived [`CycleNode`]s, no business logic (code-standards.md,
+/// "TUI (ratatui)": "aucune logique métier dans le code de rendu").
+fn workflow_tree_lines(cycles: &[CycleNode]) -> Vec<ListItem<'static>> {
+    let mut lines = Vec::new();
+    let last_index = cycles.len() - 1;
+
+    for (index, cycle) in cycles.iter().enumerate() {
+        let is_last_cycle = index == last_index;
+        let branch_glyph = if is_last_cycle { "╰─" } else { "├─" };
+        lines.push(ListItem::new(Line::styled(
+            format!("{branch_glyph}● cycle {}", cycle.cycle_number),
+            Style::default().fg(Color::Blue),
+        )));
+
+        // Continuation rail for every line belonging to this branch: a
+        // dangling "│" only when a later branch still follows.
+        let rail = if is_last_cycle { "   " } else { "│  " };
+        let agent_count = cycle.agents.len();
+        for (agent_index, agent) in cycle.agents.iter().enumerate() {
+            let is_last_agent = agent_index + 1 == agent_count && cycle.reloop.is_none();
+            let agent_glyph = if is_last_agent {
+                "╰──"
+            } else {
+                "├──"
+            };
+            lines.push(ListItem::new(agent_node_line(rail, agent_glyph, agent)));
+        }
+
+        // Issue #54 acceptance criterion: reloops (coder<->reviewer, scoped
+        // re-review, tester return) must be visually distinct -- rendered
+        // as its own return-edge line, styled apart from a plain node.
+        if let Some(reloop) = cycle.reloop {
+            lines.push(ListItem::new(Line::styled(
+                format!("{rail}╰─↺ {}", reloop_description(reloop)),
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+
+        if !is_last_cycle {
+            lines.push(ListItem::new(Line::raw("│")));
+        }
+    }
+
+    lines
+}
+
+/// Renders one agent-invocation node: role, clean/findings/failed/running
+/// status, and tokens spent (issue #53) -- "n/a" via [`format_token_usage`]
+/// when the tool reported none, or while the invocation is still running.
+fn agent_node_line(rail: &str, glyph: &str, agent: &AgentNode) -> Line<'static> {
+    let (marker, label, style) = match agent.status {
+        NodeStatus::Running => ("…", "running", Style::default().fg(Color::Yellow)),
+        NodeStatus::Clean => ("✓", "clean", Style::default().fg(Color::Green)),
+        NodeStatus::Findings => ("✗", "findings", Style::default().fg(Color::Red)),
+        NodeStatus::Failed => ("!", "failed", Style::default().fg(Color::Red)),
+    };
+    let tokens = format_token_usage(&agent.tokens);
+    Line::styled(
+        format!(
+            "{rail}{glyph} {:<9} {marker} {label:<9} {tokens}",
+            agent.role
+        ),
+        style,
+    )
+}
+
+/// The human-readable label for a [`ReloopCause`] return edge -- names the
+/// actual role-to-role path the orchestrator takes (`warden::orchestrator`'s
+/// main loop), not just an abstract "reboucle".
+fn reloop_description(cause: ReloopCause) -> &'static str {
+    match cause {
+        ReloopCause::ReviewFinding => "reviewer -> coder (review reloop, scoped re-review next)",
+        ReloopCause::TestFinding => "tester -> coder -> reviewer -> tester (test reloop)",
+        ReloopCause::CiFailure => "CI checks failed -> coder (ci reloop)",
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +832,176 @@ mod tests {
             "{content}"
         );
         assert!(content.contains("run total tokens: 160"), "{content}");
+    }
+
+    // -----------------------------------------------------------------
+    // Workflow tree pane (issue #54)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn draw_shows_a_placeholder_in_the_tree_pane_before_any_cycle_has_started() {
+        let model = RunModel::new();
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("no cycle started yet"), "{content}");
+    }
+
+    /// Acceptance criteria (issue #54): the tree pane shows a node per
+    /// agent invocation (role + clean/findings status + tokens), and a
+    /// visually-labeled return edge for a reviewer-driven reloop.
+    #[test]
+    fn draw_shows_the_workflow_tree_with_node_status_tokens_and_a_review_reloop_edge() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentStarted {
+                role: "coder".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e4",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+                usage: Some(warden_core::TokenUsage::new(100, 50, None, None)),
+            },
+        ));
+        model.apply(record(
+            "e5",
+            RunEvent::AgentStarted {
+                role: "reviewer".to_string(),
+            },
+        ));
+        model.apply(record(
+            "e6",
+            RunEvent::AgentFinished {
+                role: "reviewer".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+        model.apply(record(
+            "e7",
+            RunEvent::FindingRaised {
+                cycle_number: 1,
+                source: "reviewer".to_string(),
+                severity: "blocking".to_string(),
+                file: None,
+                description: "missing test".to_string(),
+                action: None,
+            },
+        ));
+        model.apply(record("e8", RunEvent::CycleStarted { cycle_number: 2 }));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("workflow tree"), "{content}");
+        assert!(content.contains("cycle 1"), "{content}");
+        assert!(content.contains("coder"), "{content}");
+        assert!(content.contains("clean"), "{content}");
+        assert!(content.contains("reviewer"), "{content}");
+        assert!(content.contains("findings"), "{content}");
+        assert!(
+            content.contains("tokens: 150 (in 100, out 50)"),
+            "{content}"
+        );
+        assert!(
+            content.contains("reviewer -> coder"),
+            "the return edge must name the reviewer-driven reloop: {content}"
+        );
+    }
+
+    /// Degradation (issue #54): a node whose invocation never reported
+    /// usage shows "n/a", never a fabricated `0`.
+    #[test]
+    fn draw_shows_n_a_tokens_for_a_tree_node_that_reported_no_usage() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e2",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ));
+
+        let backend = TestBackend::new(100, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("tokens: n/a"), "{content}");
+    }
+
+    // -----------------------------------------------------------------
+    // Header intent truncation (issue #54)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn truncate_intent_leaves_a_short_intent_unchanged() {
+        assert_eq!(
+            truncate_intent("add email validation", 60),
+            "add email validation"
+        );
+    }
+
+    #[test]
+    fn truncate_intent_cuts_a_long_intent_and_appends_an_ellipsis() {
+        let intent = "a".repeat(100);
+        let truncated = truncate_intent(&intent, 60);
+        assert_eq!(truncated.chars().count(), 60);
+        assert!(truncated.ends_with("..."), "{truncated}");
+    }
+
+    #[test]
+    fn draw_truncates_a_very_long_intent_in_the_header() {
+        let mut model = RunModel::new();
+        let long_intent = "x".repeat(200);
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: long_intent.clone(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+
+        let backend = TestBackend::new(220, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !content.contains(&long_intent),
+            "the full 200-char intent must not appear verbatim: {content}"
+        );
+        assert!(content.contains("..."), "{content}");
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {

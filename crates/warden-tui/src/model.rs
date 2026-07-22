@@ -211,6 +211,255 @@ impl RunModel {
             .collect();
         warden_core::TokenUsage::sum(&usages)
     }
+
+    /// Derives the run's workflow tree (issue #54): one branch per cycle,
+    /// each carrying its agent-invocation nodes (coder/reviewer/tester, in
+    /// the order the orchestrator actually runs them within a cycle --
+    /// `warden::orchestrator`'s main loop: coder, then reviewer, then
+    /// tester only if the review came back clean) plus, if the cycle
+    /// reboucled into another one, *why* (a distinct "return edge" per
+    /// issue #54's acceptance criteria).
+    ///
+    /// Pure projection over already-applied events, recomputed on every
+    /// call -- cheap enough at the event volumes a single run produces, and
+    /// keeps this in the same "no incremental derived state to keep in
+    /// sync" shape as the rest of this module (`token_usage_entries` and
+    /// friends).
+    pub fn workflow_tree(&self) -> WorkflowTree {
+        let mut cycles: Vec<CycleNode> = Vec::new();
+        // Issue #37: `RunEvent` carries no explicit phase/cycle field on
+        // `AgentStarted`/`AgentFinished` (verified by reading `event.rs` --
+        // it doesn't exist), so, exactly like `token_usage_entries` already
+        // does, an invocation is attributed to whichever `CycleStarted` most
+        // recently preceded it -- the orchestrator always runs a cycle's
+        // agents strictly between that cycle's own `CycleStarted` and the
+        // next one's, so this is exact, not a heuristic.
+        let mut findings_by_cycle: std::collections::HashMap<u32, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+
+        for record in &self.events {
+            match &record.event {
+                RunEvent::CycleStarted { cycle_number } => {
+                    cycles.push(CycleNode {
+                        cycle_number: *cycle_number,
+                        agents: Vec::new(),
+                        reloop: None,
+                    });
+                }
+                RunEvent::AgentStarted { role } => {
+                    if let Some(cycle) = cycles.last_mut() {
+                        cycle.agents.push(AgentNode {
+                            role: role.clone(),
+                            status: NodeStatus::Running,
+                            tokens: None,
+                        });
+                    }
+                }
+                RunEvent::AgentFinished {
+                    role,
+                    exit_code,
+                    usage,
+                } => {
+                    if let Some(cycle) = cycles.last_mut() {
+                        let status = if *exit_code == 0 {
+                            NodeStatus::Clean
+                        } else {
+                            NodeStatus::Failed
+                        };
+                        match cycle
+                            .agents
+                            .iter_mut()
+                            .rev()
+                            .find(|node| &node.role == role && node.status == NodeStatus::Running)
+                        {
+                            Some(node) => {
+                                node.status = status;
+                                node.tokens = *usage;
+                            }
+                            // Defensive (code-standards.md: validate at the
+                            // boundary, never trust a gap in the stream to
+                            // mean "nothing happened"): an `AgentFinished`
+                            // with no matching `AgentStarted` in this cycle
+                            // -- e.g. a late attach whose history replay
+                            // started mid-invocation -- still surfaces as a
+                            // node rather than being silently dropped.
+                            None => cycle.agents.push(AgentNode {
+                                role: role.clone(),
+                                status,
+                                tokens: *usage,
+                            }),
+                        }
+                    }
+                }
+                RunEvent::FindingRaised {
+                    cycle_number,
+                    source,
+                    severity,
+                    ..
+                } => {
+                    findings_by_cycle
+                        .entry(*cycle_number)
+                        .or_default()
+                        .push((source.clone(), severity.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: elevate a reviewer/tester node from `Clean` to
+        // `Findings` where a blocking finding attributed to that role
+        // landed in the same cycle -- findings are only known in full once
+        // the whole cycle (which may include both the reviewer and the
+        // tester) has been walked, so this can't be decided during the
+        // first pass above.
+        for cycle in &mut cycles {
+            if let Some(findings) = findings_by_cycle.get(&cycle.cycle_number) {
+                for agent in &mut cycle.agents {
+                    if agent.status == NodeStatus::Clean
+                        && findings.iter().any(|(source, severity)| {
+                            severity == "blocking" && role_owns_finding_source(&agent.role, source)
+                        })
+                    {
+                        agent.status = NodeStatus::Findings;
+                    }
+                }
+            }
+        }
+
+        // Third pass: a cycle only actually "returned" if there is a next
+        // cycle to return *to* -- a cycle that hit its budget
+        // (`MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded`) also raised a
+        // blocking finding but the run stopped right there, and drawing a
+        // return edge to a cycle that never happened would be fabricating
+        // structure the event stream never showed.
+        let cycle_count = cycles.len();
+        for i in 0..cycle_count {
+            if i + 1 >= cycle_count {
+                continue;
+            }
+            let this_cycle_number = cycles[i].cycle_number;
+            let next_cycle_number = cycles[i + 1].cycle_number;
+            let this_findings = findings_by_cycle.get(&this_cycle_number);
+            let review_blocking = this_findings.is_some_and(|findings| {
+                findings.iter().any(|(source, severity)| {
+                    severity == "blocking" && role_owns_finding_source("reviewer", source)
+                })
+            });
+            let test_blocking = this_findings.is_some_and(|findings| {
+                findings
+                    .iter()
+                    .any(|(source, severity)| severity == "blocking" && source == "tester")
+            });
+            cycles[i].reloop = if review_blocking {
+                Some(ReloopCause::ReviewFinding)
+            } else if test_blocking {
+                Some(ReloopCause::TestFinding)
+            } else {
+                // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles
+                // to the coder one step later in the pipeline than a
+                // reviewer/tester finding does -- its `FindingRaised` (see
+                // `warden::orchestrator`, `pending_ci_findings`) is
+                // attributed to the *next* cycle it seeds, not to this one,
+                // so it's detected by looking there instead.
+                let next_cycle_has_ci_finding = findings_by_cycle
+                    .get(&next_cycle_number)
+                    .is_some_and(|findings| findings.iter().any(|(source, _)| source == "ci"));
+                if next_cycle_has_ci_finding {
+                    Some(ReloopCause::CiFailure)
+                } else {
+                    None
+                }
+            };
+        }
+
+        WorkflowTree { cycles }
+    }
+}
+
+/// `true` if a blocking finding from `source` (a raw `FindingSource::as_str`
+/// value, per `warden_core::convergence`) is charged to `role`'s gate --
+/// mirrors `warden_core::decide_next_state`'s own imputation rule
+/// (`Reviewer`/`Warden` sourced findings gate the reviewer, decision #37
+/// Q1's tampering-finding carve-out included; only `Tester`-sourced
+/// findings gate the tester). The coder never owns a finding source itself
+/// (it doesn't raise findings, only the roles reviewing/testing its work
+/// do), so this is always `false` for any other role.
+fn role_owns_finding_source(role: &str, source: &str) -> bool {
+    match role {
+        "reviewer" => source == "reviewer" || source == "warden",
+        "tester" => source == "tester",
+        _ => false,
+    }
+}
+
+/// The outcome of one agent invocation node in [`WorkflowTree`] (issue #54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeStatus {
+    /// `AgentStarted` seen, no matching `AgentFinished` yet -- the
+    /// invocation is still running.
+    Running,
+    /// Finished with a zero exit code and, for the reviewer/tester, no
+    /// blocking finding attributed to that role in this cycle.
+    Clean,
+    /// Finished with a zero exit code, but at least one blocking finding
+    /// attributed to this role landed in this cycle (reviewer/tester
+    /// only -- the coder never carries this status, see
+    /// `role_owns_finding_source`).
+    Findings,
+    /// Finished with a non-zero exit code -- the agent process itself
+    /// failed, independent of any finding.
+    Failed,
+}
+
+/// One agent invocation inside a cycle -- a node in [`WorkflowTree`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentNode {
+    pub role: String,
+    pub status: NodeStatus,
+    /// Issue #53: `None` both while `status` is [`NodeStatus::Running`]
+    /// (no `AgentFinished` yet) and for a tool that reported no usage at
+    /// all once finished -- rendered "n/a" either way by [`crate::ui`],
+    /// never a fabricated `0`.
+    pub tokens: Option<warden_core::TokenUsage>,
+}
+
+/// Why a cycle reboucled into the next one -- what makes a "return edge"
+/// (issue #54's acceptance criteria: "Reloops (coder<->reviewer, scoped
+/// re-review, tester return) are visually distinct") distinguishable from a
+/// plain fresh cycle by [`crate::ui`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloopCause {
+    /// A reviewer- or tampering-sourced blocking finding (decision #37 Q1)
+    /// -- charged to the review budget; the next cycle's reviewer only
+    /// re-reviews the coder's latest correctif (`ReviewScope::Correctif`),
+    /// never the whole diff again.
+    ReviewFinding,
+    /// A tester-sourced blocking finding -- charged to the test budget; the
+    /// next cycle still runs a scoped re-review before the tester is
+    /// allowed to run again (Phase A gate, issue #41), so this reboucle is
+    /// coder -> reviewer -> tester, not a direct return to the tester.
+    TestFinding,
+    /// A `ChecksFailed` CI outcome (issue #15/ADR-0011) reboucling a
+    /// post-convergence run back to the coder.
+    CiFailure,
+}
+
+/// One cycle's worth of agent-invocation nodes, plus (if this cycle
+/// reboucled into another one) why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleNode {
+    pub cycle_number: u32,
+    pub agents: Vec<AgentNode>,
+    pub reloop: Option<ReloopCause>,
+}
+
+/// The whole run projected as a tree (issue #54): the run itself is the
+/// implicit root: `crate::ui` renders that root from
+/// [`RunModel::run_started`] directly, so this only carries the branches
+/// (cycles) hanging off it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkflowTree {
+    pub cycles: Vec<CycleNode>,
 }
 
 #[cfg(test)]
@@ -568,5 +817,272 @@ mod tests {
         assert_eq!(total.input_tokens, 130);
         assert_eq!(total.output_tokens, 60);
         assert_eq!(total.cache_read_tokens, Some(5));
+    }
+
+    // -----------------------------------------------------------------
+    // Workflow tree derivation (issue #54)
+    // -----------------------------------------------------------------
+
+    fn agent_started(role: &str) -> RunEvent {
+        RunEvent::AgentStarted {
+            role: role.to_string(),
+        }
+    }
+
+    fn agent_finished_with_exit(
+        role: &str,
+        exit_code: i32,
+        usage: Option<warden_core::TokenUsage>,
+    ) -> RunEvent {
+        RunEvent::AgentFinished {
+            role: role.to_string(),
+            exit_code,
+            usage,
+        }
+    }
+
+    fn finding(cycle_number: u32, source: &str, severity: &str) -> RunEvent {
+        RunEvent::FindingRaised {
+            cycle_number,
+            source: source.to_string(),
+            severity: severity.to_string(),
+            file: None,
+            description: "some finding".to_string(),
+            action: None,
+        }
+    }
+
+    #[test]
+    fn workflow_tree_is_empty_before_any_cycle_has_started() {
+        let model = RunModel::new();
+        assert!(model.workflow_tree().cycles.is_empty());
+    }
+
+    #[test]
+    fn workflow_tree_builds_one_branch_per_cycle_with_its_agent_nodes_in_order() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+        model.apply(record(
+            "e3",
+            agent_finished_with_exit(
+                "coder",
+                0,
+                Some(warden_core::TokenUsage::new(100, 50, None, None)),
+            ),
+        ));
+        model.apply(record("e4", agent_started("reviewer")));
+        model.apply(record("e5", agent_finished_with_exit("reviewer", 0, None)));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles.len(), 1);
+        let cycle = &tree.cycles[0];
+        assert_eq!(cycle.cycle_number, 1);
+        assert_eq!(cycle.agents.len(), 2);
+        assert_eq!(cycle.agents[0].role, "coder");
+        assert_eq!(cycle.agents[0].status, NodeStatus::Clean);
+        assert_eq!(
+            cycle.agents[0].tokens,
+            Some(warden_core::TokenUsage::new(100, 50, None, None))
+        );
+        assert_eq!(cycle.agents[1].role, "reviewer");
+        assert_eq!(cycle.agents[1].status, NodeStatus::Clean);
+        assert_eq!(
+            cycle.agents[1].tokens, None,
+            "degrades to n/a, not a fabricated 0"
+        );
+        assert_eq!(
+            cycle.reloop, None,
+            "no next cycle, no findings -- nothing reboucled"
+        );
+    }
+
+    #[test]
+    fn workflow_tree_shows_an_invocation_still_running_as_such() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Running);
+        assert_eq!(tree.cycles[0].agents[0].tokens, None);
+    }
+
+    #[test]
+    fn workflow_tree_marks_a_nonzero_exit_as_failed_regardless_of_findings() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+        model.apply(record("e3", agent_finished_with_exit("coder", 1, None)));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Failed);
+    }
+
+    /// A blocking reviewer finding elevates the reviewer node to `Findings`
+    /// and reboucles review-driven (decision #37 Q1) -- the coder never
+    /// carries a `Findings` status, only a role that actually raises
+    /// findings does.
+    #[test]
+    fn workflow_tree_attributes_a_blocking_reviewer_finding_to_the_reviewer_node_and_reloops() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+        model.apply(record("e3", agent_finished_with_exit("coder", 0, None)));
+        model.apply(record("e4", agent_started("reviewer")));
+        model.apply(record("e5", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e6", finding(1, "reviewer", "blocking")));
+        model.apply(record("e7", RunEvent::CycleStarted { cycle_number: 2 }));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles.len(), 2);
+        assert_eq!(
+            tree.cycles[0].agents[0].status,
+            NodeStatus::Clean,
+            "coder is never a finding source"
+        );
+        assert_eq!(tree.cycles[0].agents[1].status, NodeStatus::Findings);
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
+    }
+
+    /// A tampering finding (`FindingSource::Warden`) is charged to the
+    /// review gate exactly like a real reviewer finding (decision #37 Q1's
+    /// carve-out, code review issue #24 M4).
+    #[test]
+    fn workflow_tree_attributes_a_warden_sourced_tampering_finding_to_the_review_reloop() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("reviewer")));
+        model.apply(record("e3", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e4", finding(1, "warden", "blocking")));
+        model.apply(record("e5", RunEvent::CycleStarted { cycle_number: 2 }));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Findings);
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
+    }
+
+    /// Phase B (issue #42): a review-clean cycle whose tester raises a
+    /// blocking finding reboucles test-driven, distinct from a review
+    /// reloop -- the tester node (not the reviewer) is the one elevated.
+    #[test]
+    fn workflow_tree_attributes_a_blocking_tester_finding_to_the_tester_node_and_reloops() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+        model.apply(record("e3", agent_finished_with_exit("coder", 0, None)));
+        model.apply(record("e4", agent_started("reviewer")));
+        model.apply(record("e5", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e6", agent_started("tester")));
+        model.apply(record("e7", agent_finished_with_exit("tester", 0, None)));
+        model.apply(record("e8", finding(1, "tester", "blocking")));
+        model.apply(record("e9", RunEvent::CycleStarted { cycle_number: 2 }));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents[1].role, "reviewer");
+        assert_eq!(tree.cycles[0].agents[1].status, NodeStatus::Clean);
+        assert_eq!(tree.cycles[0].agents[2].role, "tester");
+        assert_eq!(tree.cycles[0].agents[2].status, NodeStatus::Findings);
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::TestFinding));
+    }
+
+    /// A non-blocking (warning) finding must never elevate a node's status
+    /// or trigger a reloop -- only a `Severity::Blocking` finding gates
+    /// anything (`warden_core::decide_next_state`'s own rule).
+    #[test]
+    fn workflow_tree_ignores_a_non_blocking_finding() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("reviewer")));
+        model.apply(record("e3", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e4", finding(1, "reviewer", "warning")));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Clean);
+        assert_eq!(tree.cycles[0].reloop, None);
+    }
+
+    /// A cycle that hit its budget still raised a blocking finding, but the
+    /// run never actually reboucled (no next `CycleStarted` follows) -- a
+    /// return edge to a cycle that never happened would be fabricated
+    /// structure, not something the event stream actually showed.
+    #[test]
+    fn workflow_tree_shows_no_reloop_when_a_blocking_finding_is_this_run_s_last_cycle() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("reviewer")));
+        model.apply(record("e3", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e4", finding(1, "reviewer", "blocking")));
+        model.apply(record(
+            "e5",
+            RunEvent::RunFinished {
+                final_state: "max_review_cycles_exceeded".to_string(),
+            },
+        ));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles.len(), 1);
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Findings);
+        assert_eq!(tree.cycles[0].reloop, None);
+    }
+
+    /// Issue #15/ADR-0011: a `ChecksFailed` CI reboucle's `FindingRaised` is
+    /// attributed to the cycle it seeds (the next one), not the converged
+    /// cycle it reboucles from -- so the return edge on the *prior* cycle
+    /// must still be detected from there.
+    #[test]
+    fn workflow_tree_detects_a_ci_driven_reloop_seeded_into_the_next_cycle() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("reviewer")));
+        model.apply(record("e3", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e4", agent_started("tester")));
+        model.apply(record("e5", agent_finished_with_exit("tester", 0, None)));
+        // Cycle 1 itself is entirely clean -- it only reboucles because of
+        // what CI reported after convergence.
+        model.apply(record("e6", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record("e7", finding(2, "ci", "blocking")));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::CiFailure));
+    }
+
+    /// An `AgentFinished` with no preceding `AgentStarted` in the same
+    /// cycle (a late attach whose history replay started mid-invocation)
+    /// still surfaces as a node instead of being silently dropped.
+    #[test]
+    fn workflow_tree_surfaces_an_agent_finished_with_no_matching_started_event() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_finished_with_exit("coder", 0, None)));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles[0].agents.len(), 1);
+        assert_eq!(tree.cycles[0].agents[0].role, "coder");
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Clean);
+    }
+
+    /// A converged run's final cycle (review clean, test clean, no
+    /// following cycle) never reboucles.
+    #[test]
+    fn workflow_tree_shows_no_reloop_for_a_fully_clean_final_cycle() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+        model.apply(record("e3", agent_finished_with_exit("coder", 0, None)));
+        model.apply(record("e4", agent_started("reviewer")));
+        model.apply(record("e5", agent_finished_with_exit("reviewer", 0, None)));
+        model.apply(record("e6", agent_started("tester")));
+        model.apply(record("e7", agent_finished_with_exit("tester", 0, None)));
+        model.apply(record(
+            "e8",
+            RunEvent::RunFinished {
+                final_state: "converged".to_string(),
+            },
+        ));
+
+        let tree = model.workflow_tree();
+        assert_eq!(tree.cycles.len(), 1);
+        assert_eq!(tree.cycles[0].reloop, None);
     }
 }
