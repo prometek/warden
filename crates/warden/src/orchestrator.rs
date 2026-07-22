@@ -4296,10 +4296,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the tester reported usage");
-        assert_eq!(
-            tester_usage,
-            warden_core::TokenUsage::new(7, 3, None, None)
-        );
+        assert_eq!(tester_usage, warden_core::TokenUsage::new(7, 3, None, None));
 
         let run_usage = db::get_run_token_usage(&pool, &run_id)
             .await
