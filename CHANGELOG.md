@@ -7,6 +7,35 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #49 : isolation Docker pour l'exécution des agents (`--isolation docker`)
+
+- **`warden run --isolation <worktree|docker>`** (défaut `worktree`, comportement
+  inchangé) : sélectionne le backend `warden_sandbox::Sandbox` utilisé pour chaque
+  invocation d'agent du run. `docker` sélectionne le nouveau `DockerSandbox`
+  (`crates/warden-sandbox/src/docker.rs`) : chaque invocation tourne dans un conteneur
+  `docker run --rm` séparé, avec le worktree du rôle et le `.git` du dépôt de base
+  montés en lecture-écriture (pour que git fonctionne normalement), et `~/.claude` de
+  l'hôte monté en **lecture seule** comme unique source d'authentification — aucun
+  autre chemin de l'hôte (`~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`) n'est jamais
+  atteignable. `git push origin` échoue par construction (aucun credential monté,
+  ferme l'issue #28) ; les secrets réels de l'hôte sont inatteignables par chemin
+  absolu (ferme l'issue #25).
+- **`--isolation-image <name>`** (défaut `warden-agent:latest`, ignoré sans
+  `--isolation docker`) : surcharge l'image exécutée pour chaque invocation.
+- Les invocations git de `warden` lui-même contre le dépôt de base désactivent
+  désormais les hooks côté hôte (`-c core.hooksPath=/dev/null`) — le `.git` monté en
+  lecture-écriture pour le conteneur ouvrait sinon un vecteur où un agent contenu
+  pourrait planter un hook (`pre-push`, `post-checkout`…) exécuté ensuite côté hôte
+  avec les vrais credentials.
+- Nouvelle image de référence `crates/warden-sandbox/docker/Dockerfile`
+  (`node:20-slim` + `git` + `@anthropic-ai/claude-code`), documentée dans
+  `crates/warden-sandbox/docker/README.md` (build, tag attendu, limites acceptées).
+- Un démon Docker indisponible ou une image manquante remonte désormais une erreur
+  typée et actionnable (`SandboxError::DockerUnavailable`) plutôt qu'un échec d'agent
+  ordinaire sans cause apparente.
+- Limite acceptée pour cette version : pas de filtrage d'egress réseau (le conteneur
+  garde un accès réseau normal, y compris vers l'API Anthropic) — voir ADR-0019.
+
 ### Added — Issue #54 : vue arborescente du workflow + intent du run dans le header (`warden-tui`)
 
 - **`RunModel::workflow_tree()`** (`warden-tui`, projection pure, sans I/O) :
