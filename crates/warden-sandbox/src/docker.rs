@@ -1060,12 +1060,17 @@ mod tests {
         sandbox.destroy(id).await.unwrap();
     }
 
-    /// Issue #49 acceptance criterion (issue #25): the host's real `~/.ssh`
-    /// (and `~/.aws`) must not be reachable by absolute path from inside the
-    /// container -- only `~/.claude` is ever mounted, nothing else of the
-    /// host's real `$HOME`.
+    /// Issue #49 acceptance criterion (issue #25): the host's real `~/.ssh`,
+    /// `~/.aws`, `~/.config/gh`, and `~/.env` must not be reachable by
+    /// absolute path from inside the container -- only `~/.claude` is ever
+    /// mounted, nothing else of the host's real `$HOME`. `~/.config/gh` (the
+    /// `gh` CLI's own credential store) and `~/.env` close a gap the
+    /// argv-level `argv_never_mounts_ssh_aws_or_gh_config` test only
+    /// asserted indirectly (no `--mount` flag *string* naming it) -- this
+    /// proves it from inside a real, running container, the same way
+    /// `~/.ssh`/`~/.aws` already were.
     #[tokio::test]
-    async fn e2e_host_ssh_and_aws_dirs_are_not_reachable_inside_the_container() {
+    async fn e2e_host_ssh_aws_gh_and_env_are_not_reachable_inside_the_container() {
         if !docker_daemon_available().await {
             eprintln!("skipping: no docker daemon reachable");
             return;
@@ -1092,6 +1097,7 @@ mod tests {
                     args: vec![
                         "-c".to_string(),
                         "test -e /root/.ssh && echo SSH_FOUND; test -e /root/.aws && echo AWS_FOUND; \
+                         test -e /root/.config/gh && echo GH_FOUND; test -e /root/.env && echo ENV_FOUND; \
                          test -e $HOME/.claude/.credentials.json && echo CLAUDE_FOUND; exit 0"
                             .to_string(),
                     ],
@@ -1112,6 +1118,16 @@ mod tests {
         assert!(
             !outcome.stdout.contains("AWS_FOUND"),
             "host ~/.aws must not be reachable inside the container: stdout was {}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.contains("GH_FOUND"),
+            "host ~/.config/gh must not be reachable inside the container: stdout was {}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.contains("ENV_FOUND"),
+            "host ~/.env must not be reachable inside the container: stdout was {}",
             outcome.stdout
         );
         assert!(
