@@ -1662,6 +1662,77 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(15));
     }
 
+    /// Issue #53: a `u64` token count too large for SQLite's native `i64`
+    /// column must surface as a typed `WardenError::TokenCountOverflow`
+    /// naming the real value that failed to convert -- never silently
+    /// truncated/clamped (same "no silent fallback" contract
+    /// `set_run_pr_number_overflow_reports_the_real_value` already pins for
+    /// `runs.pr_number`).
+    #[tokio::test]
+    async fn add_run_token_usage_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-usage-overflow",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = add_run_token_usage(
+            &pool,
+            "run-usage-overflow",
+            &TokenUsage::new(overflowing, 0, None, None),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
+        ));
+    }
+
+    /// Same contract as
+    /// [`add_run_token_usage_overflow_reports_the_real_value`], for the
+    /// per-cycle-role columns [`add_cycle_role_token_usage`] writes.
+    #[tokio::test]
+    async fn add_cycle_role_token_usage_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-cycle-usage-overflow",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        insert_cycle(&pool, "cycle-usage-overflow", "run-cycle-usage-overflow", 1)
+            .await
+            .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage-overflow",
+            AgentRole::Coder,
+            &TokenUsage::new(overflowing, 0, None, None),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
+        ));
+    }
+
     #[tokio::test]
     async fn get_run_returns_none_for_an_unknown_id() {
         let (_dir, pool) = test_pool().await;

@@ -4132,6 +4132,216 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Issue #53: token usage wiring through the real orchestrator.
+    // `TokenUsage::merge`/`sum` (warden-core), `ClaudeAdapter::extract_usage`
+    // (this crate's `tool_adapter.rs`), and the db read/write pair
+    // (`db.rs`) are each already unit-tested in isolation -- nothing yet
+    // proves the three actually connect: that `Orchestrator::run_agent`
+    // itself calls `ToolAdapter::extract_usage` on a real invocation's
+    // captured stdout, persists the result through
+    // `db::add_cycle_role_token_usage`/`db::add_run_token_usage`, and
+    // carries it on the `AgentFinished` event it publishes.
+    // -----------------------------------------------------------------
+
+    /// A `FakeCommandAdapter` variant that also reports token usage (issue
+    /// #53): recognizes the literal marker `TOKENS <input> <output>`
+    /// anywhere in an invocation's captured stdout (a made-up convention for
+    /// this fake only, unrelated to any real tool's wire format -- see
+    /// `ClaudeAdapter::extract_usage`'s own docs for the production
+    /// equivalent) and reports it as that invocation's usage. Digits are
+    /// found by scanning past the marker rather than requiring the rest of
+    /// the line to be isolated JSON, so the marker can be embedded inside a
+    /// reviewer/tester's own NDJSON finding line without breaking
+    /// `extract_findings`'s "every non-blank line is one JSON finding"
+    /// contract.
+    struct UsageReportingAdapter;
+
+    impl ToolAdapter for UsageReportingAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+
+        fn extract_usage(&self, stdout: &str) -> Option<warden_core::TokenUsage> {
+            const MARKER: &str = "TOKENS ";
+            let start = stdout.find(MARKER)? + MARKER.len();
+            let mut numbers = stdout[start..]
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty());
+            let input_tokens = numbers.next()?.parse().ok()?;
+            let output_tokens = numbers.next()?.parse().ok()?;
+            Some(warden_core::TokenUsage::new(
+                input_tokens,
+                output_tokens,
+                None,
+                None,
+            ))
+        }
+    }
+
+    /// Proves the full issue #53 pipeline through the real orchestrator: a
+    /// coder/reviewer/tester invocation that each report usage lands on that
+    /// cycle's own per-role total (never leaking into a sibling role's
+    /// columns), the run's running total sums across all three, and the
+    /// persisted `AgentFinished` event for each role carries the exact
+    /// usage its own invocation reported.
+    #[tokio::test]
+    async fn a_reported_usage_is_persisted_per_role_and_on_the_run_total_and_carried_on_agent_finished(
+    ) {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        // The coder is judged by exit code alone (`extract_findings` is
+        // never called for it -- ADR-0012), so its stdout needs no NDJSON
+        // shape at all, just the usage marker.
+        let coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                echo "TOKENS 100 50"
+                echo done > work.txt
+                git add work.txt
+                git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                "#,
+            ],
+        );
+        // Non-blocking ("info") findings whose own `description` embeds
+        // this fixture's usage marker -- a valid NDJSON line, so
+        // `extract_findings` still succeeds and the run converges after one
+        // cycle, while `extract_usage` finds the same marker in the same
+        // captured stdout.
+        let reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"reviewer","severity":"info","description":"TOKENS 30 10"}'"#,
+            ],
+        );
+        let tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"tester","severity":"info","description":"TOKENS 7 3"}'"#,
+            ],
+        );
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue #53: token usage is persisted and published".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(coder),
+            reviewer_agent: definition(reviewer),
+            tester_agent: definition(tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, UsageReportingAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let (cycle_id,): (String,) = sqlx::query_as(
+            "SELECT id FROM cycles WHERE run_id = ? ORDER BY cycle_number ASC LIMIT 1",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let coder_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Coder)
+            .await
+            .unwrap()
+            .expect("the coder reported usage");
+        assert_eq!(
+            coder_usage,
+            warden_core::TokenUsage::new(100, 50, None, None)
+        );
+
+        let reviewer_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Reviewer)
+            .await
+            .unwrap()
+            .expect("the reviewer reported usage");
+        assert_eq!(
+            reviewer_usage,
+            warden_core::TokenUsage::new(30, 10, None, None)
+        );
+
+        let tester_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Tester)
+            .await
+            .unwrap()
+            .expect("the tester reported usage");
+        assert_eq!(
+            tester_usage,
+            warden_core::TokenUsage::new(7, 3, None, None)
+        );
+
+        let run_usage = db::get_run_token_usage(&pool, &run_id)
+            .await
+            .unwrap()
+            .expect("the run accumulated usage across all three roles");
+        assert_eq!(
+            run_usage,
+            warden_core::TokenUsage::new(137, 63, None, None),
+            "the run total must sum every role's own reported usage, not just one of them"
+        );
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        let agent_finished_usages: std::collections::HashMap<String, warden_core::TokenUsage> =
+            persisted
+                .iter()
+                .filter_map(|record| match &record.event {
+                    RunEvent::AgentFinished {
+                        role,
+                        usage: Some(usage),
+                        ..
+                    } => Some((role.clone(), *usage)),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(
+            agent_finished_usages.get("coder"),
+            Some(&warden_core::TokenUsage::new(100, 50, None, None)),
+            "{persisted:?}"
+        );
+        assert_eq!(
+            agent_finished_usages.get("reviewer"),
+            Some(&warden_core::TokenUsage::new(30, 10, None, None)),
+            "{persisted:?}"
+        );
+        assert_eq!(
+            agent_finished_usages.get("tester"),
+            Some(&warden_core::TokenUsage::new(7, 3, None, None)),
+            "{persisted:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Issue #24 review, M4: cross-run agent-definition poisoning. A coder
     // diff touching `.warden/agents/` must raise a blocking `Warden`-sourced
     // finding through the ordinary findings machinery -- reboucling (or
