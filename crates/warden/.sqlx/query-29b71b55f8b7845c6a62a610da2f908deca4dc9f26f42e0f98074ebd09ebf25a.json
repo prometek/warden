@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE runs SET\n            total_input_tokens = COALESCE(total_input_tokens, 0) + ?,\n            total_output_tokens = COALESCE(total_output_tokens, 0) + ?,\n            total_cache_read_tokens = CASE WHEN ? IS NULL THEN total_cache_read_tokens ELSE COALESCE(total_cache_read_tokens, 0) + ? END,\n            total_cache_creation_tokens = CASE WHEN ? IS NULL THEN total_cache_creation_tokens ELSE COALESCE(total_cache_creation_tokens, 0) + ? END,\n            updated_at = ?\n        WHERE id = ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "29b71b55f8b7845c6a62a610da2f908deca4dc9f26f42e0f98074ebd09ebf25a"
+}

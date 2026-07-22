@@ -1821,6 +1821,12 @@ impl Orchestrator {
     /// [`publish_progress_event`](Orchestrator::publish_progress_event) --
     /// never through [`publish_event`](Orchestrator::publish_event), which
     /// would persist it (see this module's own ADR-0008 amendment docs).
+    /// `runner` is also asked, once the invocation completes, for the token
+    /// usage it reported (issue #53: [`ToolAdapter::extract_usage`]) --
+    /// persisted onto this cycle's and the run's running totals
+    /// (`db::add_cycle_role_token_usage`/`db::add_run_token_usage`) and
+    /// carried on the `AgentFinished` event this function publishes, right
+    /// alongside `exit_code`.
     ///
     /// `repo_path` is the run's base repository (`RunConfig::repo_path`,
     /// never a role's own worktree); `run_worktrees_root` is this run's own
@@ -1950,9 +1956,32 @@ impl Orchestrator {
                 if !outcome.stderr.trim().is_empty() {
                     tracing::debug!(cycle_id, ?role, stderr = %outcome.stderr, "agent stderr output");
                 }
+
+                // Issue #53: grafts onto the exact same captured stdout
+                // `extract_findings` (the caller's own concern, once this
+                // returns) reads -- never a second read of the stream, just a
+                // second, tolerant parse of the buffer already in hand.
+                // `extract_usage` is infallible (`Option`, "n/a" for a tool
+                // that reports nothing) by design -- see its own docs -- so
+                // this never fails an otherwise-successful invocation.
+                let usage = runner.extract_usage(&outcome.stdout);
+                if let Some(usage) = &usage {
+                    db::add_cycle_role_token_usage(&self.pool, cycle_id, role, usage).await?;
+                    // Only reachable with a run in progress (see
+                    // `publish_event`'s own docs on why a missing
+                    // `run_context` is a silent no-op here too): a test that
+                    // calls `run_agent` directly without going through
+                    // `run_convergence_loop` has no run id to attribute a
+                    // run-level total to.
+                    if let Some(context) = self.run_context.get() {
+                        db::add_run_token_usage(&self.pool, &context.run_id, usage).await?;
+                    }
+                }
+
                 self.publish_event(RunEvent::AgentFinished {
                     role: role.as_str().to_string(),
                     exit_code: outcome.exit_code,
+                    usage,
                 })
                 .await?;
             }

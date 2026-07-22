@@ -20,6 +20,7 @@ mod hook;
 mod pr_body;
 mod socket;
 mod state;
+mod token_usage;
 
 pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
@@ -42,3 +43,4 @@ pub use hook::{HookContext, HookOutcome, HookPoint};
 pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use state::{AgentRole, RunState};
+pub use token_usage::TokenUsage;

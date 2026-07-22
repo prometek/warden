@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                UPDATE cycles SET\n                    tester_input_tokens = COALESCE(tester_input_tokens, 0) + ?,\n                    tester_output_tokens = COALESCE(tester_output_tokens, 0) + ?,\n                    tester_cache_read_tokens = CASE WHEN ? IS NULL THEN tester_cache_read_tokens ELSE COALESCE(tester_cache_read_tokens, 0) + ? END,\n                    tester_cache_creation_tokens = CASE WHEN ? IS NULL THEN tester_cache_creation_tokens ELSE COALESCE(tester_cache_creation_tokens, 0) + ? END\n                WHERE id = ?\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "39cb3428b28afb03b10f54d480113615546de9dc4e2a7fd9caa68bf8bb559fa4"
+}

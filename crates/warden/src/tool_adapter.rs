@@ -52,7 +52,7 @@
 //!   `warden run --repo ... --intent ... --tool claude` zero-`.md` UX issue
 //!   #24 exists to enable.
 
-use warden_core::{AgentDefinition, AgentRole, Finding};
+use warden_core::{AgentDefinition, AgentRole, Finding, TokenUsage};
 
 use crate::error::Result;
 use crate::process::AgentCommand;
@@ -138,6 +138,26 @@ pub trait ToolAdapter: Sync {
     /// progress signal, degrading gracefully to the pre-issue-#33 silence
     /// between `AgentStarted`/`AgentFinished` rather than failing anything.
     fn parse_progress_line(&self, _line: &str) -> Option<String> {
+        None
+    }
+
+    /// Extracts the token usage this invocation's underlying tool CLI
+    /// reported for it (issue #53), from the exact same captured stdout
+    /// [`extract_findings`](ToolAdapter::extract_findings) parses -- never a
+    /// second read of the stream (this run's own progress/findings/usage
+    /// extraction all graft onto the one captured buffer `Orchestrator::run_agent`
+    /// already has). `None` is a legitimate answer, exactly like
+    /// [`default_tools`](ToolAdapter::default_tools) and
+    /// [`parse_progress_line`](ToolAdapter::parse_progress_line) returning
+    /// `None`: a tool whose CLI never reports usage at all (or a malformed
+    /// invocation this adapter can't make sense of) yields "n/a" to a caller,
+    /// never a fabricated zero.
+    ///
+    /// Defaults to `None` for every adapter that doesn't override it -- usage
+    /// extraction is optional per tool (issue #53 scope: "extraction pour
+    /// d'autres CLI que claude" is out of scope, the seam is simply ready for
+    /// a future adapter to fill in).
+    fn extract_usage(&self, _stdout: &str) -> Option<TokenUsage> {
         None
     }
 }
@@ -232,12 +252,12 @@ pub struct ClaudeAdapter;
 /// `--output-format stream-json` (the last NDJSON line of stdout; every
 /// earlier line is some other `"type"`, left to [`ClaudeAdapter::parse_progress_line`]).
 /// Verified directly against the real CLI in both modes -- not documented
-/// CLI output, so only the two fields this adapter actually needs are
-/// modelled; every other field the real CLI emits is ignored by `serde`'s
-/// default "extra fields are fine" behaviour, not `deny_unknown_fields` --
-/// this is *not* a Warden-owned wire contract like `agent_wire`/`agent_def`,
-/// it's a third party's output format Warden has no say over and must
-/// tolerate changing underneath it).
+/// CLI output, so only the fields this adapter actually needs are modelled;
+/// every other field the real CLI emits is ignored by `serde`'s default
+/// "extra fields are fine" behaviour, not `deny_unknown_fields` -- this is
+/// *not* a Warden-owned wire contract like `agent_wire`/`agent_def`, it's a
+/// third party's output format Warden has no say over and must tolerate
+/// changing underneath it).
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeResultEnvelope {
     /// The agent's final answer text. Absent on some non-success `subtype`s
@@ -245,6 +265,30 @@ struct ClaudeResultEnvelope {
     /// defaulted to `""`, so that case is reported as the malformed/unusable
     /// output it is instead of being silently treated as "zero findings".
     result: Option<String>,
+    /// Issue #53: this invocation's token usage, cumulative for the whole
+    /// turn -- absent entirely on some non-success `subtype`s, same as
+    /// `result` above, and modelled as `Option` for exactly that reason
+    /// (never defaulted to a zeroed [`ClaudeUsage`], which would misreport
+    /// "unknown" as "zero", see `crate::tool_adapter::ClaudeAdapter::extract_usage`).
+    #[serde(default)]
+    usage: Option<ClaudeUsage>,
+}
+
+/// `claude`'s own `usage` object, nested in [`ClaudeResultEnvelope`] --
+/// verified directly against the real CLI (see that struct's own docs on
+/// this not being a documented, stable wire contract). `cache_read_input_tokens`/
+/// `cache_creation_input_tokens` are independently optional: a turn that
+/// never engages prompt caching at all is not the same fact as "0 tokens
+/// cached", so both are modelled as `Option` rather than defaulted to `0`
+/// (`warden_core::TokenUsage`'s own docs make the same distinction).
+#[derive(Debug, serde::Deserialize)]
+struct ClaudeUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 /// Env vars `claude` needs beyond `PATH` to find its own configuration and
@@ -393,6 +437,28 @@ impl ToolAdapter for ClaudeAdapter {
         } else {
             Some(parts.join(" | "))
         }
+    }
+
+    /// Issue #53: reads the exact same last non-blank stdout line
+    /// [`extract_findings`](ClaudeAdapter::extract_findings) unwraps its
+    /// envelope from -- no second read of the stream, just a second, more
+    /// tolerant parse of the buffer already captured for this invocation.
+    /// Deliberately infallible (`Option`, not `warden_core::Result`) unlike
+    /// `extract_findings`: usage is observability, not something a caller
+    /// must act on, so a missing/malformed line yields "n/a" (`None`)
+    /// rather than failing the whole invocation over a CLI's own output
+    /// this adapter can't parse -- see [`ToolAdapter::extract_usage`]'s own
+    /// docs on why `None` is a legitimate answer, not a swallowed error.
+    fn extract_usage(&self, stdout: &str) -> Option<TokenUsage> {
+        let last_line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
+        let envelope: ClaudeResultEnvelope = serde_json::from_str(last_line).ok()?;
+        let usage = envelope.usage?;
+        Some(TokenUsage::new(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+        ))
     }
 }
 
@@ -810,6 +876,81 @@ mod tests {
             !error.contains("envelope"),
             "must fail on the inner NDJSON, not on unwrapping the envelope: {error}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `extract_usage` (issue #53)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_usage_reads_input_output_and_cache_tokens_from_the_result_envelope() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":120,"output_tokens":45,"cache_read_input_tokens":10,"cache_creation_input_tokens":3}}"#;
+        let usage = ClaudeAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cache_read_tokens, Some(10));
+        assert_eq!(usage.cache_creation_tokens, Some(3));
+    }
+
+    #[test]
+    fn extract_usage_tolerates_missing_cache_fields() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":120,"output_tokens":45}}"#;
+        let usage = ClaudeAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    /// Issue #53 scope: a tool CLI that reports no usage at all (or an
+    /// invocation this adapter otherwise can't make sense of) must yield
+    /// "n/a" (`None`), never a fabricated zero and never a failed invocation
+    /// -- `extract_usage` is infallible by design, unlike `extract_findings`.
+    #[test]
+    fn extract_usage_returns_none_when_the_result_envelope_has_no_usage_field() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        assert_eq!(ClaudeAdapter.extract_usage(stdout), None);
+    }
+
+    #[test]
+    fn extract_usage_returns_none_for_output_that_is_not_the_envelope_json() {
+        assert_eq!(ClaudeAdapter.extract_usage("not json at all"), None);
+    }
+
+    #[test]
+    fn extract_usage_returns_none_for_completely_empty_output() {
+        assert_eq!(ClaudeAdapter.extract_usage(""), None);
+    }
+
+    /// Same "last non-blank line, not the whole buffer" contract
+    /// `extract_findings` already relies on for `--output-format
+    /// stream-json`'s multi-line transcripts (issue #33) -- `extract_usage`
+    /// must find the same terminal `result` line, ignoring every earlier
+    /// NDJSON event.
+    #[test]
+    fn extract_usage_finds_the_result_envelope_as_the_last_line_of_a_stream_json_transcript() {
+        let stdout = concat!(
+            r#"{"type":"system","subtype":"init","cwd":"/tmp"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":7,"output_tokens":2}}"#,
+            "\n",
+        );
+        let usage = ClaudeAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    /// Regression coverage using the same real-captured `result` line
+    /// `extract_findings_handles_a_real_captured_result_line` uses -- that
+    /// fixture's real invocation reported no `usage` field at all, so this
+    /// pins `extract_usage`'s "n/a, not an error" contract against real CLI
+    /// output, not just a hand-written approximation.
+    #[test]
+    fn extract_usage_returns_none_for_the_real_captured_result_line_with_no_usage_field() {
+        let stdout = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":8120,"result":"Files:\n- `err.log` — empty\n- `out.ndjson` — 11.7 KB\n\nHello.","stop_reason":"end_turn","session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","total_cost_usd":0.1483495,"permission_denials":[],"terminal_reason":"completed","uuid":"1d4ae256-0ea2-4dc3-addd-526a68c08806"}"#;
+        assert_eq!(ClaudeAdapter.extract_usage(stdout), None);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::Image;
-use warden_core::{RunEvent, RunEventRecord};
+use warden_core::{RunEvent, RunEventRecord, TokenUsage};
 
 use crate::capabilities::GraphicsCapability;
 use crate::evidence::{self, Evidence, EvidenceKind};
@@ -130,16 +130,25 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
     let text = match (model.run_id(), model.run_started()) {
         (Some(run_id), Some((intent, branch, max_review_cycles, max_test_cycles))) => {
             let status = if let Some(final_state) = model.final_state() {
-                format!("finished: {final_state}")
+                format!(
+                    "finished: {final_state} -- run total {}",
+                    format_token_usage(&model.total_token_usage())
+                )
             } else {
                 // Issue #43: separate per-phase budgets replace the single
                 // "cycle N/max" the header used to show. Kept compact
                 // (`review N, test N` rather than spelling out "budget"
                 // twice) so it still leaves room for the live agent-progress
                 // suffix below within a narrow terminal.
+                // Issue #53: the run-wide running total, next to the
+                // per-invocation figure each `AgentFinished` line in the
+                // scrollable log already carries -- "n/a" (never `0`) until
+                // at least one invocation has reported usage.
                 let cycle_status = format!(
-                    "cycle {} in progress (review {max_review_cycles}, test {max_test_cycles})",
-                    model.current_cycle_number()
+                    "cycle {} in progress (review {max_review_cycles}, test {max_test_cycles}) \
+                     -- run total {}",
+                    model.current_cycle_number(),
+                    format_token_usage(&model.total_token_usage())
                 );
                 // Issue #33: what actually makes the header alive during a
                 // long-running agent -- `None` before any progress has
@@ -159,6 +168,32 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
 
     Paragraph::new(text)
         .block(Block::bordered().title(" warden-tui (read-only) -- press q to quit "))
+}
+
+/// Renders `usage` (issue #53) as a compact, human-readable fragment --
+/// "n/a" when `None` (a tool that reported no usage at all, never a
+/// fabricated `0` -- see `warden_core::TokenUsage`'s own docs), otherwise
+/// the grand total followed by its input/output/cache breakdown. No
+/// business logic here beyond formatting already-validated data
+/// (code-standards.md, "TUI (ratatui)": "aucune logique métier dans le code
+/// de rendu") -- every number comes straight from the model's own
+/// [`TokenUsage`].
+fn format_token_usage(usage: &Option<TokenUsage>) -> String {
+    let Some(usage) = usage else {
+        return "tokens: n/a".to_string();
+    };
+
+    let mut parts = vec![
+        format!("in {}", usage.input_tokens),
+        format!("out {}", usage.output_tokens),
+    ];
+    if let Some(cache_read) = usage.cache_read_tokens {
+        parts.push(format!("cache-read {cache_read}"));
+    }
+    if let Some(cache_creation) = usage.cache_creation_tokens {
+        parts.push(format!("cache-write {cache_creation}"));
+    }
+    format!("tokens: {} ({})", usage.total(), parts.join(", "))
 }
 
 fn events_widget(model: &RunModel) -> List<'static> {
@@ -195,13 +230,20 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
             Style::default().fg(Color::DarkGray),
             format!("{role}: {detail}"),
         ),
-        RunEvent::AgentFinished { role, exit_code } => (
+        RunEvent::AgentFinished {
+            role,
+            exit_code,
+            usage,
+        } => (
             if *exit_code == 0 {
                 Style::default().fg(Color::Gray)
             } else {
                 Style::default().fg(Color::Red)
             },
-            format!("{role} finished (exit {exit_code})"),
+            format!(
+                "{role} finished (exit {exit_code}) -- {}",
+                format_token_usage(usage)
+            ),
         ),
         RunEvent::FindingRaised {
             severity,
@@ -366,7 +408,10 @@ mod tests {
             },
         ));
 
-        let backend = TestBackend::new(100, 20);
+        // Issue #53: the header's single (unwrapped) line now also carries a
+        // "run total" token suffix ahead of this progress detail -- wide
+        // enough that it doesn't get clipped off before reaching it.
+        let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
@@ -385,8 +430,11 @@ mod tests {
     /// it.
     #[test]
     fn draw_omits_stale_progress_from_the_header_after_the_agent_finishes() {
+        // Issue #53: wide enough that the header's own single (unwrapped)
+        // line -- now also carrying a "run total" token suffix -- isn't
+        // clipped before its trailing progress detail, in either draw below.
         let events_only = |model: &RunModel| {
-            let backend = TestBackend::new(100, 20);
+            let backend = TestBackend::new(160, 20);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
                 .draw(|frame| draw(frame, model, GraphicsCapability::None, None))
@@ -425,10 +473,11 @@ mod tests {
             RunEvent::AgentFinished {
                 role: "coder".to_string(),
                 exit_code: 0,
+                usage: None,
             },
         ));
         let content_after_finish = {
-            let backend = TestBackend::new(100, 20);
+            let backend = TestBackend::new(160, 20);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
                 .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
@@ -578,6 +627,76 @@ mod tests {
 
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(!content.contains("evidence"));
+    }
+
+    // -----------------------------------------------------------------
+    // Token usage rendering (issue #53)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn draw_shows_n_a_for_token_usage_before_any_agent_reports_it() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("tokens: n/a"), "{content}");
+    }
+
+    #[test]
+    fn draw_shows_the_token_breakdown_for_a_finished_agent_and_the_running_run_total() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e3",
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+                usage: Some(warden_core::TokenUsage::new(100, 50, Some(10), None)),
+            },
+        ));
+
+        // Wide enough that the header's own single (unwrapped) line comfortably
+        // fits the run total suffix alongside everything else it already
+        // shows -- a `ratatui::Paragraph` without `.wrap(..)` clips rather
+        // than wraps, so a too-narrow backend would silently truncate the
+        // very suffix this test asserts on.
+        let backend = TestBackend::new(220, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            content
+                .contains("coder finished (exit 0) -- tokens: 160 (in 100, out 50, cache-read 10)"),
+            "{content}"
+        );
+        assert!(content.contains("run total tokens: 160"), "{content}");
     }
 
     fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
