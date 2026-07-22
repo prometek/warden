@@ -148,6 +148,69 @@ impl RunModel {
         }
         None
     }
+
+    /// Issue #53: every `(cycle_number, role, usage)` an `AgentFinished`
+    /// event has reported non-`None` usage for, oldest first -- the raw
+    /// "per agent" facts [`token_usage_by_cycle`](RunModel::token_usage_by_cycle)
+    /// and [`total_token_usage`](RunModel::total_token_usage) roll up from.
+    /// `cycle_number` is the most recent `CycleStarted` seen before that
+    /// `AgentFinished` (`0` before any cycle has started -- not reachable in
+    /// a real run, since no agent runs before its own cycle's
+    /// `CycleStarted`).
+    ///
+    /// A tool that reported no usage at all for a given invocation
+    /// contributes nothing here (its `AgentFinished { usage: None, .. }` is
+    /// simply skipped) rather than a fabricated zero entry -- see
+    /// `warden_core::TokenUsage`'s own docs on why "n/a" and "zero" are
+    /// different facts.
+    pub fn token_usage_entries(&self) -> Vec<(u32, &str, warden_core::TokenUsage)> {
+        let mut cycle_number: u32 = 0;
+        let mut entries = Vec::new();
+        for record in &self.events {
+            match &record.event {
+                RunEvent::CycleStarted {
+                    cycle_number: started,
+                } => cycle_number = *started,
+                RunEvent::AgentFinished {
+                    role,
+                    usage: Some(usage),
+                    ..
+                } => entries.push((cycle_number, role.as_str(), *usage)),
+                _ => {}
+            }
+        }
+        entries
+    }
+
+    /// [`token_usage_entries`](RunModel::token_usage_entries), rolled up per
+    /// cycle -- the "per cycle" half of issue #53's aggregation. Ordered by
+    /// first appearance (cycle numbers only ever increase within a run, so
+    /// this is already ascending in practice).
+    pub fn token_usage_by_cycle(&self) -> Vec<(u32, warden_core::TokenUsage)> {
+        let mut by_cycle: Vec<(u32, warden_core::TokenUsage)> = Vec::new();
+        for (cycle_number, _role, usage) in self.token_usage_entries() {
+            match by_cycle
+                .iter_mut()
+                .find(|(number, _)| *number == cycle_number)
+            {
+                Some((_, total)) => *total = total.merge(&usage),
+                None => by_cycle.push((cycle_number, usage)),
+            }
+        }
+        by_cycle
+    }
+
+    /// The run-wide grand total across every invocation that has reported
+    /// usage so far (issue #53) -- `None` until at least one has, never a
+    /// fabricated `0` (rendered "n/a" by [`crate::ui`]).
+    pub fn total_token_usage(&self) -> Option<warden_core::TokenUsage> {
+        let usages: Vec<warden_core::TokenUsage> = self
+            .token_usage_entries()
+            .into_iter()
+            .map(|(_, _, usage)| usage)
+            .collect();
+        warden_core::TokenUsage::sum(&usages)
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +318,7 @@ mod tests {
             RunEvent::AgentFinished {
                 role: "reviewer".to_string(),
                 exit_code: 0,
+                usage: None,
             },
         ));
 
@@ -358,6 +422,7 @@ mod tests {
             RunEvent::AgentFinished {
                 role: "coder".to_string(),
                 exit_code: 0,
+                usage: None,
             },
         ));
 
@@ -382,6 +447,7 @@ mod tests {
             RunEvent::AgentFinished {
                 role: "coder".to_string(),
                 exit_code: 0,
+                usage: None,
             },
         ));
         model.apply(record(
@@ -396,5 +462,111 @@ mod tests {
             model.current_progress(),
             Some(("reviewer", "reviewing the diff"))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Token usage aggregation (issue #53)
+    // -----------------------------------------------------------------
+
+    fn agent_finished(role: &str, usage: Option<warden_core::TokenUsage>) -> RunEvent {
+        RunEvent::AgentFinished {
+            role: role.to_string(),
+            exit_code: 0,
+            usage,
+        }
+    }
+
+    #[test]
+    fn token_usage_entries_is_empty_when_nothing_has_reported_usage() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_finished("coder", None)));
+
+        assert!(model.token_usage_entries().is_empty());
+        assert_eq!(model.total_token_usage(), None);
+    }
+
+    #[test]
+    fn token_usage_entries_attributes_each_reported_usage_to_the_role_and_current_cycle() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e2",
+            agent_finished(
+                "coder",
+                Some(warden_core::TokenUsage::new(100, 50, None, None)),
+            ),
+        ));
+        model.apply(record("e3", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record(
+            "e4",
+            agent_finished(
+                "reviewer",
+                Some(warden_core::TokenUsage::new(30, 10, Some(5), None)),
+            ),
+        ));
+
+        let entries = model.token_usage_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[0].1, "coder");
+        assert_eq!(
+            entries[0].2,
+            warden_core::TokenUsage::new(100, 50, None, None)
+        );
+        assert_eq!(entries[1].0, 2);
+        assert_eq!(entries[1].1, "reviewer");
+    }
+
+    #[test]
+    fn token_usage_by_cycle_rolls_up_every_role_reporting_usage_within_the_same_cycle() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e2",
+            agent_finished(
+                "coder",
+                Some(warden_core::TokenUsage::new(100, 50, None, None)),
+            ),
+        ));
+        model.apply(record(
+            "e3",
+            agent_finished(
+                "reviewer",
+                Some(warden_core::TokenUsage::new(30, 10, None, None)),
+            ),
+        ));
+
+        let by_cycle = model.token_usage_by_cycle();
+        assert_eq!(by_cycle.len(), 1);
+        assert_eq!(by_cycle[0].0, 1);
+        assert_eq!(by_cycle[0].1.input_tokens, 130);
+        assert_eq!(by_cycle[0].1.output_tokens, 60);
+    }
+
+    #[test]
+    fn total_token_usage_sums_across_every_cycle_and_role() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record(
+            "e2",
+            agent_finished(
+                "coder",
+                Some(warden_core::TokenUsage::new(100, 50, None, None)),
+            ),
+        ));
+        model.apply(record("e3", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record(
+            "e4",
+            agent_finished(
+                "reviewer",
+                Some(warden_core::TokenUsage::new(30, 10, Some(5), None)),
+            ),
+        ));
+
+        let total = model.total_token_usage().unwrap();
+        assert_eq!(total.input_tokens, 130);
+        assert_eq!(total.output_tokens, 60);
+        assert_eq!(total.cache_read_tokens, Some(5));
     }
 }

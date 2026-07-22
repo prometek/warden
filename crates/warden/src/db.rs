@@ -13,7 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
     AgentRole, EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState,
-    Severity,
+    Severity, TokenUsage,
 };
 
 use crate::error::{Result, WardenError};
@@ -185,6 +185,46 @@ fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
     u32::try_from(value).map_err(|_| WardenError::InvalidStoredValue { column, value })
 }
 
+/// Same contract as [`checked_u32`], for the wider token-count columns
+/// (issue #53) -- a single agent invocation's usage comfortably fits `u32`,
+/// but a run's accumulated total (`add_run_token_usage`) is not bounded the
+/// same way over an arbitrarily long-running convergence loop.
+fn checked_u64(value: i64, column: &'static str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| WardenError::InvalidStoredValue { column, value })
+}
+
+/// Converts a possibly-`NULL` `TokenUsage` column group read back from
+/// `cycles`/`runs` (issue #53) into `Option<TokenUsage>` -- `None` only when
+/// *every* one of the four columns is `NULL` (no usage was ever recorded for
+/// this role/run), never when just the two cache columns are (a tool that
+/// reports input/output but never caching is still a real, known usage
+/// report, not "n/a" -- see `warden_core::TokenUsage`'s own docs on this
+/// distinction).
+fn row_to_token_usage(
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+) -> Result<Option<TokenUsage>> {
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_read_tokens.is_none()
+        && cache_creation_tokens.is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(TokenUsage::new(
+        checked_u64(input_tokens.unwrap_or(0), "input_tokens")?,
+        checked_u64(output_tokens.unwrap_or(0), "output_tokens")?,
+        cache_read_tokens
+            .map(|value| checked_u64(value, "cache_read_tokens"))
+            .transpose()?,
+        cache_creation_tokens
+            .map(|value| checked_u64(value, "cache_creation_tokens"))
+            .transpose()?,
+    )))
+}
+
 /// A `runs` row, with `state` already validated into [`RunState`].
 ///
 /// Issue #43 (#37.4) / ADR-0014: `max_cycles`/`current_cycle` are gone,
@@ -354,6 +394,93 @@ pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) 
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Issue #53: accumulates one agent invocation's token usage onto `run_id`'s
+/// running total -- the run-level half of the "per agent / per cycle / run
+/// total" aggregation (the cycle-level half is
+/// [`add_cycle_role_token_usage`]). Both are always called together, from
+/// the same call site (`orchestrator::Orchestrator::run_agent`), right after
+/// an invocation's `ToolAdapter::extract_usage` reports `Some`.
+///
+/// `input_tokens`/`output_tokens` are unconditionally summed
+/// (`COALESCE(column, 0) + ?`); the cache columns only advance when `usage`
+/// itself reports that dimension (`CASE WHEN ? IS NULL THEN <unchanged>
+/// ELSE ...`) -- an invocation that doesn't report caching must never reset
+/// a running cache total a prior invocation already built up. See
+/// [`row_to_token_usage`] for the read-back side of this same "`NULL` means
+/// never-reported, not zero" contract.
+pub async fn add_run_token_usage(
+    pool: &SqlitePool,
+    run_id: &str,
+    usage: &TokenUsage,
+) -> Result<()> {
+    let input_tokens = checked_i64(usage.input_tokens, "runs.total_input_tokens")?;
+    let output_tokens = checked_i64(usage.output_tokens, "runs.total_output_tokens")?;
+    let cache_read_tokens = usage
+        .cache_read_tokens
+        .map(|value| checked_i64(value, "runs.total_cache_read_tokens"))
+        .transpose()?;
+    let cache_creation_tokens = usage
+        .cache_creation_tokens
+        .map(|value| checked_i64(value, "runs.total_cache_creation_tokens"))
+        .transpose()?;
+    let now = now_rfc3339();
+    sqlx::query!(
+        r#"
+        UPDATE runs SET
+            total_input_tokens = COALESCE(total_input_tokens, 0) + ?,
+            total_output_tokens = COALESCE(total_output_tokens, 0) + ?,
+            total_cache_read_tokens = CASE WHEN ? IS NULL THEN total_cache_read_tokens ELSE COALESCE(total_cache_read_tokens, 0) + ? END,
+            total_cache_creation_tokens = CASE WHEN ? IS NULL THEN total_cache_creation_tokens ELSE COALESCE(total_cache_creation_tokens, 0) + ? END,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        cache_creation_tokens,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The run total accumulated so far by [`add_run_token_usage`], or `None` if
+/// this run's tool never reported any usage at all (rendered "n/a" by every
+/// caller, never `0` -- see [`row_to_token_usage`]).
+pub async fn get_run_token_usage(pool: &SqlitePool, run_id: &str) -> Result<Option<TokenUsage>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens
+        FROM runs WHERE id = ?
+        "#,
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    row_to_token_usage(
+        row.total_input_tokens,
+        row.total_output_tokens,
+        row.total_cache_read_tokens,
+        row.total_cache_creation_tokens,
+    )
+}
+
+/// Converts a `u64` [`TokenUsage`] field into the `i64` SQLite's native
+/// integer column actually stores -- same contract as `set_run_pr_number`'s
+/// own `u64` -> `i64` conversion (issue #15 review, L2): surfaces the real
+/// value that overflowed rather than silently truncating/clamping it
+/// (code-standards.md: "no silent fallback").
+fn checked_i64(value: u64, column: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| WardenError::TokenCountOverflow { column, value })
 }
 
 /// Raw shape of a `runs` row as decoded by sqlx, before `state` has been
@@ -587,6 +714,170 @@ pub async fn clear_cycle_worktree_path(
         }
     }
     Ok(())
+}
+
+/// Issue #53: accumulates one agent invocation's token usage onto `role`'s
+/// running total for this cycle -- the cycle-level half of the aggregation
+/// (see [`add_run_token_usage`]'s own docs for the run-level half and the
+/// shared "cache columns only advance when reported" rule both follow).
+/// Three near-identical arms rather than a dynamic column name, matching
+/// [`set_cycle_worktree_path`]'s own per-role match (code-standards.md: no
+/// SQL built by string concatenation).
+pub async fn add_cycle_role_token_usage(
+    pool: &SqlitePool,
+    cycle_id: &str,
+    role: AgentRole,
+    usage: &TokenUsage,
+) -> Result<()> {
+    let input_tokens = checked_i64(usage.input_tokens, "cycles.<role>_input_tokens")?;
+    let output_tokens = checked_i64(usage.output_tokens, "cycles.<role>_output_tokens")?;
+    let cache_read_tokens = usage
+        .cache_read_tokens
+        .map(|value| checked_i64(value, "cycles.<role>_cache_read_tokens"))
+        .transpose()?;
+    let cache_creation_tokens = usage
+        .cache_creation_tokens
+        .map(|value| checked_i64(value, "cycles.<role>_cache_creation_tokens"))
+        .transpose()?;
+
+    match role {
+        AgentRole::Coder => {
+            sqlx::query!(
+                r#"
+                UPDATE cycles SET
+                    coder_input_tokens = COALESCE(coder_input_tokens, 0) + ?,
+                    coder_output_tokens = COALESCE(coder_output_tokens, 0) + ?,
+                    coder_cache_read_tokens = CASE WHEN ? IS NULL THEN coder_cache_read_tokens ELSE COALESCE(coder_cache_read_tokens, 0) + ? END,
+                    coder_cache_creation_tokens = CASE WHEN ? IS NULL THEN coder_cache_creation_tokens ELSE COALESCE(coder_cache_creation_tokens, 0) + ? END
+                WHERE id = ?
+                "#,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                cache_creation_tokens,
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+        AgentRole::Reviewer => {
+            sqlx::query!(
+                r#"
+                UPDATE cycles SET
+                    reviewer_input_tokens = COALESCE(reviewer_input_tokens, 0) + ?,
+                    reviewer_output_tokens = COALESCE(reviewer_output_tokens, 0) + ?,
+                    reviewer_cache_read_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_read_tokens ELSE COALESCE(reviewer_cache_read_tokens, 0) + ? END,
+                    reviewer_cache_creation_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_creation_tokens ELSE COALESCE(reviewer_cache_creation_tokens, 0) + ? END
+                WHERE id = ?
+                "#,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                cache_creation_tokens,
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+        AgentRole::Tester => {
+            sqlx::query!(
+                r#"
+                UPDATE cycles SET
+                    tester_input_tokens = COALESCE(tester_input_tokens, 0) + ?,
+                    tester_output_tokens = COALESCE(tester_output_tokens, 0) + ?,
+                    tester_cache_read_tokens = CASE WHEN ? IS NULL THEN tester_cache_read_tokens ELSE COALESCE(tester_cache_read_tokens, 0) + ? END,
+                    tester_cache_creation_tokens = CASE WHEN ? IS NULL THEN tester_cache_creation_tokens ELSE COALESCE(tester_cache_creation_tokens, 0) + ? END
+                WHERE id = ?
+                "#,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                cache_creation_tokens,
+                cycle_id,
+            )
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Raw shape of `cycles`' twelve per-role token-count columns (issue #53),
+/// read back once per [`get_cycle_role_token_usage`] call and then narrowed
+/// to the requested `role`'s four columns -- avoids three near-duplicate
+/// `SELECT`s (one per role) for what is, from the database's own point of
+/// view, a single row read.
+struct CycleTokenUsageRow {
+    coder_input_tokens: Option<i64>,
+    coder_output_tokens: Option<i64>,
+    coder_cache_read_tokens: Option<i64>,
+    coder_cache_creation_tokens: Option<i64>,
+    reviewer_input_tokens: Option<i64>,
+    reviewer_output_tokens: Option<i64>,
+    reviewer_cache_read_tokens: Option<i64>,
+    reviewer_cache_creation_tokens: Option<i64>,
+    tester_input_tokens: Option<i64>,
+    tester_output_tokens: Option<i64>,
+    tester_cache_read_tokens: Option<i64>,
+    tester_cache_creation_tokens: Option<i64>,
+}
+
+/// The running total accumulated by [`add_cycle_role_token_usage`] for
+/// `role` on `cycle_id`, or `None` if that role never reported any usage on
+/// this cycle (e.g. it hasn't run yet, or its tool reports no usage at all
+/// -- rendered "n/a" by every caller, see [`row_to_token_usage`]).
+pub async fn get_cycle_role_token_usage(
+    pool: &SqlitePool,
+    cycle_id: &str,
+    role: AgentRole,
+) -> Result<Option<TokenUsage>> {
+    let row = sqlx::query_as!(
+        CycleTokenUsageRow,
+        r#"
+        SELECT coder_input_tokens, coder_output_tokens, coder_cache_read_tokens, coder_cache_creation_tokens,
+               reviewer_input_tokens, reviewer_output_tokens, reviewer_cache_read_tokens, reviewer_cache_creation_tokens,
+               tester_input_tokens, tester_output_tokens, tester_cache_read_tokens, tester_cache_creation_tokens
+        FROM cycles WHERE id = ?
+        "#,
+        cycle_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) = match role {
+        AgentRole::Coder => (
+            row.coder_input_tokens,
+            row.coder_output_tokens,
+            row.coder_cache_read_tokens,
+            row.coder_cache_creation_tokens,
+        ),
+        AgentRole::Reviewer => (
+            row.reviewer_input_tokens,
+            row.reviewer_output_tokens,
+            row.reviewer_cache_read_tokens,
+            row.reviewer_cache_creation_tokens,
+        ),
+        AgentRole::Tester => (
+            row.tester_input_tokens,
+            row.tester_output_tokens,
+            row.tester_cache_read_tokens,
+            row.tester_cache_creation_tokens,
+        ),
+    };
+    row_to_token_usage(
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )
 }
 
 pub async fn close_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<()> {
@@ -1211,6 +1502,237 @@ mod tests {
         close_cycle(&pool, "cycle-1").await.unwrap();
     }
 
+    // -----------------------------------------------------------------
+    // Token usage (issue #53)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn cycle_role_token_usage_is_none_until_something_is_recorded() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-usage-none", "/tmp/repo", "main", "intent", 3, 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-usage-none", "run-usage-none", 1)
+            .await
+            .unwrap();
+
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage-none", AgentRole::Coder)
+            .await
+            .unwrap();
+        assert_eq!(
+            usage, None,
+            "no usage was ever recorded -- must be n/a, not zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_cycle_role_token_usage_accumulates_across_multiple_invocations() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-usage", "/tmp/repo", "main", "intent", 3, 3)
+            .await
+            .unwrap();
+        insert_cycle(&pool, "cycle-usage", "run-usage", 1)
+            .await
+            .unwrap();
+
+        add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage",
+            AgentRole::Coder,
+            &TokenUsage::new(100, 50, Some(10), None),
+        )
+        .await
+        .unwrap();
+        add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage",
+            AgentRole::Coder,
+            &TokenUsage::new(20, 10, None, Some(3)),
+        )
+        .await
+        .unwrap();
+
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage", AgentRole::Coder)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 60);
+        // The second invocation didn't report `cache_read_tokens` -- must not
+        // reset the first invocation's own reported total.
+        assert_eq!(usage.cache_read_tokens, Some(10));
+        assert_eq!(usage.cache_creation_tokens, Some(3));
+    }
+
+    /// Each role's own running total on the same cycle must be tracked
+    /// independently -- recording the coder's usage must never leak into the
+    /// reviewer's columns on that same row.
+    #[tokio::test]
+    async fn add_cycle_role_token_usage_keeps_each_role_independent() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-usage-roles",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        insert_cycle(&pool, "cycle-usage-roles", "run-usage-roles", 1)
+            .await
+            .unwrap();
+
+        add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage-roles",
+            AgentRole::Coder,
+            &TokenUsage::new(100, 50, None, None),
+        )
+        .await
+        .unwrap();
+        add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage-roles",
+            AgentRole::Reviewer,
+            &TokenUsage::new(7, 3, None, None),
+        )
+        .await
+        .unwrap();
+
+        let coder_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Coder)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(coder_usage.input_tokens, 100);
+
+        let tester_usage =
+            get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Tester)
+                .await
+                .unwrap();
+        assert_eq!(
+            tester_usage, None,
+            "the tester never ran on this cycle -- must stay n/a"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_token_usage_is_none_until_something_is_recorded_then_accumulates() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-total-usage",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_run_token_usage(&pool, "run-total-usage").await.unwrap(),
+            None
+        );
+
+        add_run_token_usage(
+            &pool,
+            "run-total-usage",
+            &TokenUsage::new(100, 50, Some(10), None),
+        )
+        .await
+        .unwrap();
+        add_run_token_usage(
+            &pool,
+            "run-total-usage",
+            &TokenUsage::new(20, 10, Some(5), None),
+        )
+        .await
+        .unwrap();
+
+        let usage = get_run_token_usage(&pool, "run-total-usage")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 60);
+        assert_eq!(usage.cache_read_tokens, Some(15));
+    }
+
+    /// Issue #53: a `u64` token count too large for SQLite's native `i64`
+    /// column must surface as a typed `WardenError::TokenCountOverflow`
+    /// naming the real value that failed to convert -- never silently
+    /// truncated/clamped (same "no silent fallback" contract
+    /// `set_run_pr_number_overflow_reports_the_real_value` already pins for
+    /// `runs.pr_number`).
+    #[tokio::test]
+    async fn add_run_token_usage_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-usage-overflow",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = add_run_token_usage(
+            &pool,
+            "run-usage-overflow",
+            &TokenUsage::new(overflowing, 0, None, None),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
+        ));
+    }
+
+    /// Same contract as
+    /// [`add_run_token_usage_overflow_reports_the_real_value`], for the
+    /// per-cycle-role columns [`add_cycle_role_token_usage`] writes.
+    #[tokio::test]
+    async fn add_cycle_role_token_usage_overflow_reports_the_real_value() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-cycle-usage-overflow",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        insert_cycle(&pool, "cycle-usage-overflow", "run-cycle-usage-overflow", 1)
+            .await
+            .unwrap();
+
+        let overflowing = u64::try_from(i64::MAX).unwrap() + 1;
+        let result = add_cycle_role_token_usage(
+            &pool,
+            "cycle-usage-overflow",
+            AgentRole::Coder,
+            &TokenUsage::new(overflowing, 0, None, None),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
+        ));
+    }
+
     #[tokio::test]
     async fn get_run_returns_none_for_an_unknown_id() {
         let (_dir, pool) = test_pool().await;
@@ -1552,8 +2074,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
 
+        // Issue #53 review: found by description, not by position relative
+        // to the end of the migration list -- `migrations.len() - 2` (this
+        // test's original technique) silently pointed at the wrong migration
+        // the moment 0008 was appended after 0007, since "second-to-last"
+        // stopped meaning "the one right before phase_budgets". Robust to any
+        // number of migrations appended after 0007, as long as it keeps this
+        // description.
         let migrations: Vec<_> = MIGRATOR.iter().collect();
-        let pre_phase_budgets_version = migrations[migrations.len() - 2].version;
+        let phase_budgets_index = migrations
+            .iter()
+            .position(|migration| migration.description.contains("phase budgets"))
+            .expect("0007_phase_budgets.sql must still be a migration in this set");
+        let pre_phase_budgets_version = migrations[phase_budgets_index - 1].version;
 
         {
             let options = SqliteConnectOptions::new()

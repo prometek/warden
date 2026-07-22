@@ -348,6 +348,14 @@ pub enum WardenError {
     /// original typed error.
     #[error(transparent)]
     Sandbox(#[from] warden_sandbox::SandboxError),
+
+    /// Issue #53: a `warden_core::TokenUsage` field too large for `i64`
+    /// (SQLite's native integer type) to hold -- surfaces the real `u64`
+    /// value that failed to convert, not a placeholder. Same shape as
+    /// `PrNumberOverflow` above, for a token-count column instead of a PR
+    /// number.
+    #[error("token count {value} for column `{column}` does not fit in the column's numeric type")]
+    TokenCountOverflow { column: &'static str, value: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;

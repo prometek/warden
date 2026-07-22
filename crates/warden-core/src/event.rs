@@ -136,6 +136,14 @@ pub enum RunEvent {
     AgentFinished {
         role: String,
         exit_code: i32,
+        /// Issue #53: what this invocation's tool CLI reported spending, via
+        /// `warden::tool_adapter::ToolAdapter::extract_usage` -- `None` for a
+        /// tool that reports no usage at all (rendered "n/a", never `0`; see
+        /// `crate::TokenUsage`'s own docs), and for every event persisted
+        /// before this field existed (`#[serde(default)]`, decoded as `None`
+        /// rather than a hard deserialize error on old `events` rows).
+        #[serde(default)]
+        usage: Option<crate::TokenUsage>,
     },
     FindingRaised {
         cycle_number: u32,
@@ -272,6 +280,7 @@ mod tests {
             EventKind::AgentFinished => RunEvent::AgentFinished {
                 role: "coder".to_string(),
                 exit_code: 0,
+                usage: Some(crate::TokenUsage::new(100, 50, Some(10), None)),
             },
             EventKind::FindingRaised => RunEvent::FindingRaised {
                 cycle_number: 1,
@@ -328,5 +337,37 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         let decoded: RunEventRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, record);
+    }
+
+    /// Issue #53: a tool that reports no usage at all yields `usage: None`
+    /// on `AgentFinished` -- must round-trip cleanly, not be coerced into a
+    /// zeroed [`crate::TokenUsage`].
+    #[test]
+    fn agent_finished_round_trips_with_no_usage_reported() {
+        let event = RunEvent::AgentFinished {
+            role: "coder".to_string(),
+            exit_code: 0,
+            usage: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    /// A pre-issue-#53 `events` row has no `usage` key in its `payload_json`
+    /// at all -- `#[serde(default)]` must decode that as `None`, not fail
+    /// the whole row.
+    #[test]
+    fn agent_finished_decodes_from_a_pre_issue_53_payload_missing_the_usage_field() {
+        let json = r#"{"kind":"agent_finished","role":"coder","exit_code":0}"#;
+        let decoded: RunEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            decoded,
+            RunEvent::AgentFinished {
+                role: "coder".to_string(),
+                exit_code: 0,
+                usage: None,
+            }
+        );
     }
 }

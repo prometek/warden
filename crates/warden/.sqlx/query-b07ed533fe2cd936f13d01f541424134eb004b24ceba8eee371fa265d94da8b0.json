@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT total_input_tokens, total_output_tokens, total_cache_read_tokens, total_cache_creation_tokens\n        FROM runs WHERE id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "total_input_tokens",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_input_tokens"
+          }
+        }
+      },
+      {
+        "name": "total_output_tokens",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_output_tokens"
+          }
+        }
+      },
+      {
+        "name": "total_cache_read_tokens",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_cache_read_tokens"
+          }
+        }
+      },
+      {
+        "name": "total_cache_creation_tokens",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_cache_creation_tokens"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b07ed533fe2cd936f13d01f541424134eb004b24ceba8eee371fa265d94da8b0"
+}
