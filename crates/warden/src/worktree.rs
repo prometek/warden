@@ -11,6 +11,7 @@ use std::process::Command as SyncCommand;
 use tokio::process::Command;
 
 use crate::error::WorktreeError;
+use crate::git_util::NO_HOST_HOOKS;
 use crate::path_util::canonicalize_best_effort;
 
 /// Creates isolated worktrees for a single main repository.
@@ -89,9 +90,13 @@ impl WorktreeManager {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        // `NO_HOST_HOOKS` (issue #49 review, HIGH): `worktree add` is a
+        // checkout, which runs `post-checkout` -- see `crate::git_util`'s
+        // own docs.
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
+            .args(NO_HOST_HOOKS)
             .args(["worktree", "add", "--detach"])
             .arg(&path)
             .arg(commit_ish)
@@ -135,9 +140,14 @@ pub async fn remove_orphan_worktree(
         return Ok(());
     }
 
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth): `worktree
+    // remove` doesn't itself run a checkout, but shares `main_repo_path`'s
+    // common `.git`/hooks like every other invocation in this file -- see
+    // `crate::git_util`'s own docs.
     let output = Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
+        .args(NO_HOST_HOOKS)
         .args(["worktree", "remove", "--force"])
         .arg(path)
         .output()
@@ -161,9 +171,12 @@ pub async fn remove_orphan_worktree(
 /// processing all of a crashed run's recorded worktree paths, not per-path —
 /// pruning is a whole-repository operation.
 pub async fn prune_worktrees(main_repo_path: &Path) -> Result<(), WorktreeError> {
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+    // `crate::git_util`'s own docs.
     let output = Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
+        .args(NO_HOST_HOOKS)
         .args(["worktree", "prune"])
         .output()
         .await?;
@@ -198,9 +211,12 @@ impl Worktree {
     /// caller. Prefer this over relying on `Drop` when the caller can
     /// meaningfully react to a cleanup error.
     pub async fn remove(mut self) -> Result<(), WorktreeError> {
+        // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+        // `crate::git_util`'s own docs.
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
+            .args(NO_HOST_HOOKS)
             .args(["worktree", "remove", "--force"])
             .arg(&self.path)
             .output()
@@ -227,9 +243,13 @@ impl Drop for Worktree {
         // Drop can't be async: fall back to a synchronous git invocation.
         // Best-effort only — a failure here is logged, never panics, and
         // never propagates (nothing to propagate to).
+        //
+        // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+        // `crate::git_util`'s own docs.
         match SyncCommand::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
+            .args(NO_HOST_HOOKS)
             .args(["worktree", "remove", "--force"])
             .arg(&self.path)
             .output()

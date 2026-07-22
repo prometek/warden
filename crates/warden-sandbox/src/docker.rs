@@ -13,16 +13,16 @@
 //!   pointed at it. Read-write: it is the one place this invocation is
 //!   meant to write.
 //! - **The base repo's `.git` directory** (`DockerConfig::repo_path` joined
-//!   with `.git`), also bind-mounted at its own host-absolute path. A git
-//!   *worktree*'s own `.git` is a one-line file, not a directory --
-//!   `gitdir: <absolute path into the parent repo's .git/worktrees/<id>>` --
-//!   so every git operation inside the worktree resolves that absolute
-//!   pointer first. Mounting only the worktree and leaving that pointer
-//!   dangling would make `git status`/`git diff`/`git commit` fail the
-//!   moment they touch anything beyond the worktree's own checked-out
-//!   files. Mounting the parent `.git` at the *identical* host path makes
-//!   the pointer resolve inside the container exactly as it does on the
-//!   host, with no path rewriting anywhere.
+//!   with `.git`), also bind-mounted at its own host-absolute path,
+//!   **read-write**. A git *worktree*'s own `.git` is a one-line file, not a
+//!   directory -- `gitdir: <absolute path into the parent repo's
+//!   .git/worktrees/<id>>` -- so every git operation inside the worktree
+//!   resolves that absolute pointer first. Mounting only the worktree and
+//!   leaving that pointer dangling would make `git status`/`git diff`/`git
+//!   commit` fail the moment they touch anything beyond the worktree's own
+//!   checked-out files. Mounting the parent `.git` at the *identical* host
+//!   path makes the pointer resolve inside the container exactly as it does
+//!   on the host, with no path rewriting anywhere.
 //! - **The host's `~/.claude` directory, read-only**, at
 //!   `<container_home>/.claude` -- the *only* host path mounted for
 //!   authentication. This is a deliberate narrowing of issue #49's literal
@@ -32,8 +32,25 @@
 //!   that carries it, read-only. `~/.ssh`, `~/.aws`, `~/.config/gh`, any
 //!   `.env`, or the rest of the host's real `$HOME` are **never** mounted --
 //!   issue #25's guarantee (no ambient git/cloud credentials reachable by an
-//!   agent) holds exactly as before, since none of those paths exist inside
-//!   the container by any name.
+//!   agent) holds for anything reachable *from inside the container*, since
+//!   none of those paths exist there by any name.
+//!
+//! # The rw `.git` mount and host-side git hooks (issue #49 review, HIGH)
+//!
+//! Hooks live in the *common* git dir, shared by the main repo and every one
+//! of its worktrees. Because the base repo's `.git` above is mounted
+//! **read-write**, a contained agent could write `.git/hooks/pre-push`,
+//! `post-checkout`, `reference-transaction`, etc. and have it run **on the
+//! host** -- as the host user, with real credentials -- the next time
+//! `warden` itself (never the agent) runs a git command against that same
+//! repo (a converged run's `git push` to the local gate repo, a
+//! `git worktree add` for the next role, an evidence commit). That would
+//! defeat issue #25's guarantee entirely on the host side, no matter how
+//! tight this module's own container-side mounts are. Every such host-side
+//! invocation passes `warden::git_util::NO_HOST_HOOKS` -- see that module's
+//! own docs (crate `warden`, not this one: the host-side git invocations
+//! this vector is about are `warden`'s, not `warden-sandbox`'s) for the full
+//! reasoning and the exact call sites.
 //!
 //! # Network: default bridge, no egress filtering yet (accepted v1 limit)
 //!
@@ -274,7 +291,55 @@ async fn drain_and_wait_with_container_cleanup(
     if matches!(result, Err(SandboxError::Cancelled { .. })) {
         force_remove_container(&container_name).await;
     }
-    result
+    let result = result?;
+
+    // Issue #49 review, MEDIUM: `docker run` reserves exit code 125 for a
+    // failure of the `docker` client/daemon itself (daemon unreachable,
+    // image missing, invalid flags) -- never for whatever ran *inside* the
+    // container, which exits through this same path with its own code. Left
+    // unclassified, this surfaced downstream as an ordinary (if puzzling)
+    // agent failure -- "produced no parseable output", with the real reason
+    // buried in a stderr nobody inspected -- instead of the actionable,
+    // typed error a daemon-down/image-missing case deserves (image-missing
+    // in particular is the most likely first-run error, since the image is
+    // hand-built, not published anywhere). See
+    // [`classify_docker_startup_failure`]'s own docs for why exit code
+    // alone is not enough to make this call.
+    if let Some(reason) = classify_docker_startup_failure(result.exit_code, &result.stderr) {
+        return Err(SandboxError::DockerUnavailable { reason });
+    }
+
+    Ok(result)
+}
+
+/// Distinguishes a `docker run` startup failure (daemon down, image
+/// missing) from a normal -- if non-zero -- exit of whatever ran *inside*
+/// the container. Exit code 125 alone is not a reliable enough signal on
+/// its own: nothing stops a contained process from legitimately choosing to
+/// exit with 125 for its own reasons, and that outcome must still reach the
+/// caller as a normal [`ExecutionResult`], not a fabricated
+/// [`SandboxError::DockerUnavailable`]. Corroborating against `docker`'s own
+/// stderr markers (verified directly against real `docker run`, issue #49
+/// review) keeps this specific to an actual client/daemon-level failure.
+fn classify_docker_startup_failure(exit_code: i32, stderr: &str) -> Option<String> {
+    if exit_code != 125 {
+        return None;
+    }
+    if stderr.contains("Cannot connect to the Docker daemon") {
+        return Some(format!(
+            "the docker daemon is not reachable -- start Docker and retry. docker's own stderr: {}",
+            stderr.trim()
+        ));
+    }
+    if stderr.contains("Unable to find image") || stderr.contains("No such image") {
+        return Some(format!(
+            "the docker image was not found -- build it via \
+             crates/warden-sandbox/docker/Dockerfile (see \
+             crates/warden-sandbox/docker/README.md) and retry. docker's own stderr: {}",
+            stderr.trim()
+        ));
+    }
+    None
 }
 
 /// Best-effort `docker rm -f` for the cancellation cleanup path above --
@@ -282,19 +347,22 @@ async fn drain_and_wait_with_container_cleanup(
 /// already returning `SandboxError::Cancelled`; a cleanup failure on top of
 /// that is logged, not compounded into a second error).
 async fn force_remove_container(container_name: &str) {
-    let status = tokio::process::Command::new(DOCKER_BIN)
+    let output = tokio::process::Command::new(DOCKER_BIN)
         .args(["rm", "-f", container_name])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .await;
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
+    match output {
+        Ok(output) if output.status.success() => {}
+        // Same benign race as `remove_container` -- see
+        // `is_benign_removal_race`'s own docs. Not worth even a `debug!`
+        // here: this is the expected shape on a clean cancellation.
+        Ok(output) if is_benign_removal_race(&String::from_utf8_lossy(&output.stderr)) => {}
+        Ok(output) => {
             tracing::warn!(
                 container_name,
-                ?status,
+                status = ?output.status,
+                stderr = %String::from_utf8_lossy(&output.stderr),
                 "docker rm -f exited non-zero during cancellation cleanup"
             );
         }
@@ -326,12 +394,29 @@ async fn remove_container(container_name: &str) -> Result<()> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("No such container") {
+    if is_benign_removal_race(&stderr) {
         return Ok(());
     }
     Err(SandboxError::DockerUnavailable {
         reason: format!("`docker rm -f {container_name}` failed: {}", stderr.trim()),
     })
+}
+
+/// Whether `docker rm -f`'s stderr indicates there is nothing left to do,
+/// rather than a real failure -- the same "already gone is not an error"
+/// convention [`crate::error::SandboxError::UnknownSandbox`]'s own docs and
+/// `warden::process::kill_pid` both use. Two distinct benign cases (issue
+/// #49 review, LOW): "No such container" (already fully gone -- `--rm`
+/// already reaped it, or a prior `destroy` already ran), and "already in
+/// progress"/"is being removed" (`--rm`'s own async removal is racing this
+/// exact call on the happy path -- `docker rm -f` reliably reports this
+/// verbatim wording when it loses that race, verified directly against real
+/// `docker`, issue #49 review). Both mean the container is going away (or
+/// gone) regardless of what this call does.
+fn is_benign_removal_race(stderr: &str) -> bool {
+    stderr.contains("No such container")
+        || stderr.contains("already in progress")
+        || stderr.contains("is being removed")
 }
 
 /// Resolves `env_allowlist` against this process's own environment,
@@ -362,7 +447,7 @@ fn resolve_forwarded_env(env_allowlist: &[String], program: &str) -> Vec<(String
 
 /// Resolves a host path this backend needs to bind-mount to its canonical,
 /// absolute form -- a relative or symlinked path would otherwise produce a
-/// `-v` mount whose host side does not match what git/the worktree actually
+/// `--mount` whose host side does not match what git/the worktree actually
 /// resolve to. Any failure here (path does not exist, permission denied) is
 /// a configuration problem, not a docker daemon one -- typed as
 /// [`SandboxError::DockerUnavailable`] rather than `Spawn`/`Wait`, neither of
@@ -406,12 +491,12 @@ fn build_docker_run_argv(
         "--name".to_string(),
         container_name.to_string(),
         "-i".to_string(),
-        "-v".to_string(),
-        format!("{worktree}:{worktree}"),
-        "-v".to_string(),
-        format!("{repo_git}:{repo_git}"),
-        "-v".to_string(),
-        format!("{claude_dir}:{container_home}/.claude:ro"),
+        "--mount".to_string(),
+        format!("type=bind,source={worktree},target={worktree}"),
+        "--mount".to_string(),
+        format!("type=bind,source={repo_git},target={repo_git}"),
+        "--mount".to_string(),
+        format!("type=bind,source={claude_dir},target={container_home}/.claude,readonly"),
         "-e".to_string(),
         format!("HOME={container_home}"),
     ];
@@ -460,8 +545,35 @@ mod tests {
             &[],
         );
 
-        assert!(argv.contains(&"/host/worktrees/coder:/host/worktrees/coder".to_string()));
-        assert!(argv.contains(&"/host/repo/.git:/host/repo/.git".to_string()));
+        assert!(argv.contains(
+            &"type=bind,source=/host/worktrees/coder,target=/host/worktrees/coder".to_string()
+        ));
+        assert!(
+            argv.contains(&"type=bind,source=/host/repo/.git,target=/host/repo/.git".to_string())
+        );
+    }
+
+    /// Issue #49 review, LOW: the legacy `-v {p}:{p}` field-separator syntax
+    /// is ambiguous the moment a host path contains a colon (legal on Linux,
+    /// and `--repo`/a role's own worktree path are external input) --
+    /// `--mount` has no such ambiguity (`source=`/`target=` are exact
+    /// strings, not colon-split fields).
+    #[test]
+    fn argv_uses_mount_not_the_colon_ambiguous_v_flag() {
+        let argv = build_docker_run_argv(
+            "warden-test",
+            "warden-agent:latest",
+            Path::new("/host/worktrees/coder"),
+            Path::new("/host/repo/.git"),
+            Path::new("/host/home/.claude"),
+            "/root",
+            &[],
+            "claude",
+            &[],
+        );
+
+        assert!(!argv.contains(&"-v".to_string()));
+        assert_eq!(argv.iter().filter(|arg| *arg == "--mount").count(), 3);
     }
 
     #[test]
@@ -478,7 +590,9 @@ mod tests {
             &[],
         );
 
-        assert!(argv.contains(&"/host/home/.claude:/root/.claude:ro".to_string()));
+        assert!(argv.contains(
+            &"type=bind,source=/host/home/.claude,target=/root/.claude,readonly".to_string()
+        ));
     }
 
     #[test]
@@ -621,6 +735,76 @@ mod tests {
         let forwarded =
             resolve_forwarded_env(&["THIS_VAR_DOES_NOT_EXIST_ANYWHERE".to_string()], "claude");
         assert!(forwarded.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // `classify_docker_startup_failure` (issue #49 review, MEDIUM) -- no
+    // daemon required, pure function.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classifies_exit_125_with_daemon_unreachable_stderr_as_docker_unavailable() {
+        let reason = classify_docker_startup_failure(
+            125,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker \
+             daemon running?",
+        );
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("start Docker"));
+    }
+
+    #[test]
+    fn classifies_exit_125_with_missing_image_stderr_as_docker_unavailable() {
+        let reason = classify_docker_startup_failure(
+            125,
+            "Unable to find image 'warden-agent:latest' locally\ndocker: Error response from \
+             daemon: pull access denied for warden-agent, repository does not exist or may \
+             require 'docker login'",
+        );
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("Dockerfile"));
+    }
+
+    /// A contained process is free to legitimately exit 125 for its own
+    /// reasons -- without a corroborating docker-level stderr marker, this
+    /// must stay a normal (if puzzling) exit code, not a fabricated
+    /// `DockerUnavailable`.
+    #[test]
+    fn does_not_classify_exit_125_without_a_docker_level_stderr_marker() {
+        assert!(classify_docker_startup_failure(125, "some unrelated agent error").is_none());
+    }
+
+    #[test]
+    fn does_not_classify_a_non_125_exit_code_even_with_a_docker_level_looking_stderr() {
+        assert!(classify_docker_startup_failure(1, "Unable to find image 'x' locally").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // `is_benign_removal_race` (issue #49 review, LOW) -- no daemon
+    // required, pure function.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn treats_already_gone_and_removal_races_as_benign() {
+        assert!(is_benign_removal_race(
+            "Error: No such container: warden-abc123"
+        ));
+        // Exact wording verified against real docker (issue #49 review): two
+        // concurrent `docker rm -f` calls on the same container.
+        assert!(is_benign_removal_race(
+            "Error response from daemon: removal of container warden-abc123 is already in \
+             progress"
+        ));
+        assert!(is_benign_removal_race(
+            "Error response from daemon: container warden-abc123 is being removed"
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_an_unrelated_failure_as_benign() {
+        assert!(!is_benign_removal_race(
+            "Error response from daemon: permission denied"
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -770,6 +954,57 @@ mod tests {
         std::fs::write(claude_dir.path().join(".credentials.json"), "{}").unwrap();
 
         (repo, worktree, claude_dir)
+    }
+
+    /// Issue #49 review, MEDIUM: a missing image (the most likely first-run
+    /// error, since the image is hand-built, never published anywhere) must
+    /// surface as a typed, actionable `DockerUnavailable` -- not exit code
+    /// 125 silently reinterpreted downstream as "the agent produced no
+    /// parseable output". Requires a reachable daemon (to actually get as
+    /// far as `docker`'s own "image not found" path) but mutates nothing on
+    /// it -- `docker run` against a nonexistent image never touches
+    /// anything persistent.
+    #[tokio::test]
+    async fn execute_reports_docker_unavailable_when_the_image_does_not_exist() {
+        if !docker_daemon_available().await {
+            eprintln!("skipping: no docker daemon reachable");
+            return;
+        }
+
+        let (repo, worktree, claude_dir) = init_repo_with_worktree_and_claude_dir();
+        let sandbox = DockerSandbox::new(DockerConfig {
+            image: "warden-agent-image-that-does-not-exist-anywhere:latest".to_string(),
+            repo_path: repo.path().to_path_buf(),
+            claude_config_dir: claude_dir.path().to_path_buf(),
+        });
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: worktree.clone(),
+            })
+            .await
+            .unwrap();
+
+        let execution = sandbox
+            .execute(
+                &id,
+                Command {
+                    program: "true".to_string(),
+                    args: Vec::new(),
+                    env_allowlist: Vec::new(),
+                    stdin: None,
+                },
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let result = execution.wait().await;
+
+        assert!(
+            matches!(result, Err(SandboxError::DockerUnavailable { .. })),
+            "expected a typed DockerUnavailable for a missing image, got {result:?}"
+        );
+
+        sandbox.destroy(id).await.unwrap();
     }
 
     /// Issue #49 acceptance criterion (issue #28): from inside the
