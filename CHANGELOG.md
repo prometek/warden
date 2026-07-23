@@ -7,6 +7,32 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Hooks run-level `OnRunStart` / `OnRunEnd` (suite de #55)
+
+- **Deux points de cycle de vie qui encadrent le run entier** (`warden-core`) :
+  `HookPoint::OnRunStart` (une fois, avant le premier cycle coder, run encore
+  `Pending`) et `HookPoint::OnRunEnd` (une fois, après la sortie de boucle,
+  quel que soit l'état final). Contrairement aux points existants, ils ne sont
+  **pas** exposés via `HookPoint::on_entering` : ils bornent le run, pas une
+  entrée d'état, et sont dispatchés explicitement au début / à la fin de
+  `run_convergence_loop`. C'est le point d'accroche de la préparation
+  d'environnement déterministe (`docker compose up -d`, `git fetch`/pull,
+  install de dépendances) — faite par Warden plutôt que dépensée en tokens
+  d'agent.
+- **`HookContext::repo_path`** : le répertoire de travail du dépôt du run,
+  toujours présent. C'est le `cwd` naturel d'une action setup/teardown, qui
+  opère sur le dépôt entier et non sur le worktree d'un rôle.
+- **Conso du `Block` au setup** : un `OnRunStart` qui renvoie
+  `HookOutcome::Block` fait échouer le run **avant** que le coder ne tourne
+  (environnement non établi → rien à coder). Nouvelle transition légale
+  `Pending → Failed`. Le teardown (`OnRunEnd`) tourne quand même sur ce chemin
+  d'abandon — sémantique `finally`. La conso du `Block` aux autres points
+  (seam `transition`) et de `EmitFindings` reste hors scope (moteur de
+  politiques, #51).
+- **`OnRunEnd` best-effort** : un `Block` (le run est déjà fini) comme une
+  erreur d'exécution du hook de teardown sont avalés en `warn!` — le teardown
+  ne doit jamais masquer l'état final du run.
+
 ### Added — Issue #54 : vue arborescente du workflow + intent du run dans le header (`warden-tui`)
 
 - **`RunModel::workflow_tree()`** (`warden-tui`, projection pure, sans I/O) :

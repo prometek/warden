@@ -115,6 +115,7 @@ impl HookRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use warden_core::{Finding, FindingSource, RunState, Severity};
@@ -150,6 +151,7 @@ mod tests {
             point,
             run_id: "run-1",
             state: RunState::CoderRunning,
+            repo_path: Path::new("/tmp/repo"),
             cycle: Some(0),
             worktree: None,
             commit: None,

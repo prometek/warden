@@ -49,6 +49,21 @@ use crate::state::RunState;
 /// enum change is needed then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {
+    /// The run is starting -- fires **once**, before the first coder cycle and
+    /// before any state transition, so a deterministic *environment setup*
+    /// action (bring a `docker compose` stack up, `git fetch`/pull, install
+    /// dependencies) runs before the coder ever does. This is the token-saving
+    /// motivation for hooks in the first place: such setup is repeatable and
+    /// mechanical, so Warden does it itself rather than spending an LLM
+    /// round-trip (and widening the agent's tool surface) on it.
+    ///
+    /// Unlike the cycle/transition points below, this is **not** reachable via
+    /// [`HookPoint::on_entering`]: it fires from an explicit dispatch at run
+    /// start (while the run is still `Pending`), not on entering a state, and
+    /// exactly once per run rather than once per cycle. A
+    /// [`HookOutcome::Block`] here aborts the run before the coder runs (the
+    /// setup could not be established, so there is nothing to code against).
+    OnRunStart,
     /// A new coder cycle is about to begin (entering [`RunState::CoderRunning`]).
     OnCycleStart,
     /// Just before the coder agent runs.
@@ -72,6 +87,18 @@ pub enum HookPoint {
     OnConverged,
     /// Just before the converged commit is pushed (entering [`RunState::Pushed`]).
     BeforePush,
+    /// The run is ending -- fires **once**, after the convergence loop exits,
+    /// whatever its final state (converged, pushed, budget-exhausted, or
+    /// failed). The teardown counterpart of [`HookPoint::OnRunStart`]: it tears
+    /// down whatever setup established (bring the `docker compose` stack down,
+    /// remove scratch state), so it runs like a `finally` -- on every exit
+    /// path, including failure, not only the happy one.
+    ///
+    /// Also **not** reachable via [`HookPoint::on_entering`] (it brackets the
+    /// whole run, not a state entry). A [`HookOutcome::Block`] here is
+    /// meaningless -- the run is already over -- so the run-end dispatch does
+    /// not abort on one; teardown is best-effort.
+    OnRunEnd,
 }
 
 impl HookPoint {
@@ -79,6 +106,7 @@ impl HookPoint {
     /// variant's string without accounting for anything that persisted it.
     pub fn as_str(self) -> &'static str {
         match self {
+            HookPoint::OnRunStart => "on_run_start",
             HookPoint::OnCycleStart => "on_cycle_start",
             HookPoint::BeforeCoder => "before_coder",
             HookPoint::AfterCoder => "after_coder",
@@ -90,6 +118,7 @@ impl HookPoint {
             HookPoint::OnCycleEnd => "on_cycle_end",
             HookPoint::OnConverged => "on_converged",
             HookPoint::BeforePush => "before_push",
+            HookPoint::OnRunEnd => "on_run_end",
         }
     }
 
@@ -98,6 +127,10 @@ impl HookPoint {
     /// dispatch hooks from the single `self.transition(...)` point (issue
     /// #55): every legal transition names the state it enters, and a subset
     /// of those states is a meaningful lifecycle milestone.
+    ///
+    /// [`HookPoint::OnRunStart`] and [`HookPoint::OnRunEnd`] are deliberately
+    /// absent from this mapping: they bracket the whole run rather than a state
+    /// entry, and fire from explicit dispatch at run start/end, not here.
     ///
     /// States with no lifecycle point of their own (`Pending`, `AwaitingCi`,
     /// `Done`, the `Max*Exceeded` exhaustion states, `Failed`) return `None`
@@ -137,6 +170,13 @@ pub struct HookContext<'a> {
     pub run_id: &'a str,
     /// The state the run is entering as this hook fires.
     pub state: RunState,
+    /// The run's repository working directory -- the checkout the run was
+    /// launched against (`RUNS.repo_path`). Always present: it is the natural
+    /// cwd for a run-level setup/teardown action ([`HookPoint::OnRunStart`] /
+    /// [`HookPoint::OnRunEnd`]), which operates on the repo as a whole (bring a
+    /// `docker compose` stack up, `git pull`) rather than on any one role's
+    /// [`HookContext::worktree`].
+    pub repo_path: &'a Path,
     /// The overall loop-iteration counter for the current cycle, when the
     /// firing point is inside a cycle (`None` for run-level points that carry
     /// no single cycle).
@@ -213,6 +253,7 @@ mod tests {
     #[test]
     fn hook_point_strings_are_unique_and_stable() {
         let points = [
+            HookPoint::OnRunStart,
             HookPoint::OnCycleStart,
             HookPoint::BeforeCoder,
             HookPoint::AfterCoder,
@@ -224,6 +265,7 @@ mod tests {
             HookPoint::OnCycleEnd,
             HookPoint::OnConverged,
             HookPoint::BeforePush,
+            HookPoint::OnRunEnd,
         ];
         let mut seen = std::collections::HashSet::new();
         for point in points {
