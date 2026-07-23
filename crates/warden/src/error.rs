@@ -223,6 +223,15 @@ pub enum WardenError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The repo's `.warden/hooks.toml` could not be read as a hook config --
+    /// malformed TOML, or an entry naming a `point` that is not a known
+    /// [`warden_core::HookPoint`]. Per code-standards.md ("no silent
+    /// fallback"), a present-but-broken hook config aborts rather than being
+    /// quietly ignored, so a typo never leaves a setup hook silently not
+    /// running.
+    #[error("invalid hook config {path}: {reason}")]
+    HookConfig { path: PathBuf, reason: String },
+
     #[error("run {run_id} exceeded its review cycle budget ({max_review_cycles} cycles) without converging")]
     MaxReviewCyclesExceeded {
         run_id: String,

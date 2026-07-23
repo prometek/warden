@@ -511,6 +511,7 @@ impl Orchestrator {
                     point,
                     run_id,
                     state: to,
+                    repo_path: Path::new(&run.repo_path),
                     cycle: None,
                     worktree: None,
                     commit: None,
@@ -529,5 +530,69 @@ impl Orchestrator {
             }
         }
         Ok(())
+    }
+
+    /// Dispatches the **run-level** lifecycle hooks
+    /// ([`HookPoint::OnRunStart`] / [`HookPoint::OnRunEnd`]) and returns their
+    /// aggregated outcome. These two points bracket a whole run rather than a
+    /// state entry, so they fire from explicit calls here -- not from the
+    /// `transition` seam, whose `HookPoint::on_entering` mapping deliberately
+    /// excludes them. `worktree`/`commit`/`diff` are absent by construction: a
+    /// setup/teardown action operates on [`HookContext::repo_path`] (the repo
+    /// as a whole), not on any one role's worktree. Empty registry -> a strict
+    /// no-op `Continue`, exactly like the transition seam.
+    ///
+    /// The caller decides how to consume the outcome: `OnRunStart` aborts the
+    /// run on a [`HookOutcome::Block`]; `OnRunEnd` is best-effort teardown and
+    /// ignores it (see [`Orchestrator::run_teardown`]).
+    pub(super) async fn dispatch_run_hooks(
+        &self,
+        run_id: &str,
+        repo_path: &Path,
+        state: RunState,
+        point: HookPoint,
+    ) -> Result<HookOutcome> {
+        if self.hooks.is_empty() {
+            return Ok(HookOutcome::Continue);
+        }
+        let ctx = HookContext {
+            point,
+            run_id,
+            state,
+            repo_path,
+            cycle: None,
+            worktree: None,
+            commit: None,
+            diff: None,
+        };
+        self.hooks.run_hooks(point, &ctx).await
+    }
+
+    /// Fires [`HookPoint::OnRunEnd`] teardown, best-effort. Runs like a
+    /// `finally`: on every exit path of [`Orchestrator::run_convergence_loop`],
+    /// including a failed one, whatever setup [`HookPoint::OnRunStart`]
+    /// established (a `docker compose` stack, scratch state) is torn down.
+    /// Deliberately swallows both a `Block` (meaningless once the run is over)
+    /// and an `Err` (a teardown that itself failed to run) into a `warn!`:
+    /// teardown must never mask the run's own final state.
+    pub(super) async fn run_teardown(&self, run_id: &str, repo_path: &Path, final_state: RunState) {
+        match self
+            .dispatch_run_hooks(run_id, repo_path, final_state, HookPoint::OnRunEnd)
+            .await
+        {
+            Ok(HookOutcome::Continue) => {}
+            Ok(other) => tracing::warn!(
+                run_id,
+                ?other,
+                "on_run_end teardown hook returned a non-Continue outcome; ignoring \
+                 (the run is already over, teardown is best-effort)"
+            ),
+            Err(err) => tracing::warn!(
+                run_id,
+                error = %err,
+                "on_run_end teardown hook failed to run; ignoring (teardown must not \
+                 mask the run's final state)"
+            ),
+        }
     }
 }

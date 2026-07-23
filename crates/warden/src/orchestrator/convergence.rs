@@ -107,6 +107,38 @@ impl Orchestrator {
             callback(&run_id);
         }
 
+        // Run-level setup hooks: fire once, before the coder, while the run is
+        // still `Pending`. This is where deterministic environment prep runs
+        // (`docker compose up -d`, `git fetch`/pull, dependency install)
+        // instead of being spent as agent tokens. A `Block` means the
+        // environment could not be established -- there is nothing to code
+        // against -- so the run fails here, before any agent spawns. Teardown
+        // still runs (finally semantics): whatever a partial setup left behind
+        // gets a chance to be cleaned up.
+        if let HookOutcome::Block { reason } = self
+            .dispatch_run_hooks(
+                &run_id,
+                &config.repo_path,
+                RunState::Pending,
+                HookPoint::OnRunStart,
+            )
+            .await?
+        {
+            tracing::warn!(
+                run_id,
+                reason,
+                "on_run_start hook blocked the run; failing before the coder runs"
+            );
+            self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
+                .await;
+            self.transition(&run_id, RunState::Failed).await?;
+            self.publish_event(RunEvent::RunFinished {
+                final_state: RunState::Failed.as_str().to_string(),
+            })
+            .await?;
+            return Ok((run_id, RunState::Failed));
+        }
+
         // Write-ahead: the run is about to launch the coder, so record the
         // intent to do so before actually spawning anything (ADR-0004).
         self.transition(&run_id, RunState::CoderRunning).await?;
@@ -462,6 +494,13 @@ impl Orchestrator {
             }
         };
 
+        // Run-level teardown: the `finally` counterpart of the `on_run_start`
+        // setup above. Fires on every non-erroring exit of the loop, whatever
+        // the final state (converged, pushed, budget-exhausted, failed), so a
+        // `docker compose down` / scratch cleanup always gets a chance to run.
+        self.run_teardown(&run_id, &config.repo_path, final_state)
+            .await;
+
         self.publish_event(RunEvent::RunFinished {
             final_state: final_state.as_str().to_string(),
         })
@@ -594,6 +633,233 @@ mod tests {
                 run_id: run_id.clone(),
             }],
             "hook fires once, on entering CoderRunning, with the matching context"
+        );
+    }
+
+    /// The run-level points bracket a whole run: `OnRunStart` fires once
+    /// before the coder (while still `Pending`), `OnRunEnd` once after the
+    /// loop exits (with the final state) -- both from the explicit run-start/
+    /// run-end dispatch, not the `transition` seam. Proven end to end through a
+    /// converging `run_convergence_loop`.
+    #[tokio::test]
+    async fn run_start_and_run_end_hooks_bracket_a_converging_run() {
+        use crate::hook::Hook;
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+
+        struct BracketHook {
+            points: Vec<HookPoint>,
+            seen: Arc<Mutex<Vec<(HookPoint, RunState)>>>,
+        }
+
+        #[async_trait]
+        impl Hook for BracketHook {
+            fn points(&self) -> &[HookPoint] {
+                &self.points
+            }
+
+            async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
+                self.seen.lock().unwrap().push((ctx.point, ctx.state));
+                Ok(HookOutcome::Continue)
+            }
+        }
+
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(BracketHook {
+            points: vec![HookPoint::OnRunStart, HookPoint::OnRunEnd],
+            seen: seen.clone(),
+        }));
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "bracket a run with run-level hooks".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeRunner::new(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            *seen,
+            vec![
+                (HookPoint::OnRunStart, RunState::Pending),
+                (HookPoint::OnRunEnd, RunState::Converged),
+            ],
+            "setup fires before the coder (still Pending), teardown after the run converged"
+        );
+    }
+
+    /// A blocking `OnRunStart` hook fails the run *before the coder ever
+    /// runs*: the setup could not be established, so there is nothing to code
+    /// against. The teardown (`OnRunEnd`) still fires -- `finally` semantics,
+    /// so a partial setup gets cleaned up even on this abort path.
+    #[tokio::test]
+    async fn on_run_start_block_fails_the_run_before_the_coder() {
+        use crate::hook::Hook;
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetupHook {
+            points: Vec<HookPoint>,
+            teardown_ran: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Hook for SetupHook {
+            fn points(&self) -> &[HookPoint] {
+                &self.points
+            }
+
+            async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
+                match ctx.point {
+                    HookPoint::OnRunStart => Ok(HookOutcome::Block {
+                        reason: "docker compose up failed".to_string(),
+                    }),
+                    HookPoint::OnRunEnd => {
+                        self.teardown_ran.store(true, Ordering::SeqCst);
+                        Ok(HookOutcome::Continue)
+                    }
+                    other => {
+                        unreachable!("SetupHook only registered on run-level points: {other:?}")
+                    }
+                }
+            }
+        }
+
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let teardown_ran = Arc::new(AtomicBool::new(false));
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(SetupHook {
+            points: vec![HookPoint::OnRunStart, HookPoint::OnRunEnd],
+            teardown_ran: teardown_ran.clone(),
+        }));
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "a setup hook that cannot establish the environment".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeRunner::new(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::Failed,
+            "a blocked setup hook fails the run"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed, "the failure is persisted");
+
+        // The coder never ran: no cycle was ever opened.
+        let (cycles,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cycles WHERE run_id = ?")
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cycles, 0,
+            "no cycle opens when setup blocks -- the coder never runs"
+        );
+
+        assert!(
+            teardown_ran.load(Ordering::SeqCst),
+            "teardown still fires on the abort path (finally semantics)"
+        );
+    }
+
+    /// End to end: a repo's `.warden/hooks.toml` (loaded exactly as
+    /// `crate::main` does, via `hook_config::load_repo_hooks`) actually runs
+    /// its `on_run_start` command against the repo before the coder, through
+    /// the real `run_convergence_loop`. Proves the whole concrete-hook path --
+    /// declarative config -> registry -> dispatch -> `CommandHook` -> sandbox
+    /// -- not just the fake-hook seam the other tests use.
+    #[tokio::test]
+    async fn a_repo_hooks_file_runs_its_setup_command_before_the_coder() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let warden_dir = repo.path().join(".warden");
+        std::fs::create_dir_all(&warden_dir).unwrap();
+        std::fs::write(
+            warden_dir.join("hooks.toml"),
+            r#"
+            [[hooks]]
+            point = "on_run_start"
+            run = "echo hi > setup-ran.txt"
+            "#,
+        )
+        .unwrap();
+
+        let hooks = crate::hook_config::load_repo_hooks(
+            repo.path(),
+            Arc::new(warden_sandbox::LocalSandbox::new()),
+        )
+        .unwrap();
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(hooks);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "a repo hook prepares the environment".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeRunner::new(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        assert!(
+            repo.path().join("setup-ran.txt").exists(),
+            "the on_run_start hook command ran against the repo before the coder"
         );
     }
 

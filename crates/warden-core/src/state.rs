@@ -98,7 +98,10 @@ impl RunState {
 
     fn allowed_next_states(self) -> &'static [RunState] {
         match self {
-            RunState::Pending => &[RunState::CoderRunning],
+            // `Failed`: a run whose `on_run_start` setup hook blocked (the
+            // environment could not be established) fails before the coder
+            // ever runs, straight from `Pending`.
+            RunState::Pending => &[RunState::CoderRunning, RunState::Failed],
             RunState::CoderRunning => &[RunState::Reviewing, RunState::Failed],
             // Issue #43: `Testing` is reached only once this cycle's review
             // is clean (Phase A gate, issue #41) -- `Converged` is therefore
@@ -171,9 +174,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pending_can_only_move_to_coder_running() {
+    fn pending_can_move_to_coder_running_or_fail() {
         assert!(RunState::Pending
             .validate_transition(RunState::CoderRunning)
+            .is_ok());
+        // A blocked `on_run_start` setup hook fails the run straight from
+        // `Pending`, before the coder runs.
+        assert!(RunState::Pending
+            .validate_transition(RunState::Failed)
             .is_ok());
         assert!(RunState::Pending
             .validate_transition(RunState::Converged)
