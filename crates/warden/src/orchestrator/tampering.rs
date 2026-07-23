@@ -444,6 +444,27 @@ mod tests {
         dir.join("probe").exists()
     }
 
+    /// A coder commit that writes its poison under a *differently-cased*
+    /// `.warden/agents/` must still block convergence on a filesystem that
+    /// folds case when `agent_def::read_raw_definition` opens the literal,
+    /// canonical `.warden/agents/coder.md` path -- macOS's default APFS
+    /// (case-insensitive, case-preserving), verified directly. Skipped (not
+    /// failed) when the test filesystem doesn't fold case at all: on a
+    /// genuinely case-sensitive filesystem `.warden/Agents/coder.md` is an
+    /// inert, unrelated directory that `resolve_agent_definition` would
+    /// never read either, so there is nothing here for the detector to
+    /// (correctly) catch -- see `filesystem_folds_case`'s own docs.
+    ///
+    /// Issue #30 review (LOW): `#[cfg_attr(.., ignore)]` makes the skip
+    /// visible in `cargo test`'s own output (`... ignored`) on a
+    /// non-macOS/non-case-folding CI runner, rather than a silent `...
+    /// ok` that ran nothing -- the runtime check right below still covers
+    /// the case a macOS volume is itself configured case-sensitive.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "reproduces a case-folding filesystem attack; only macOS's default APFS \
+                  (case-insensitive) folds case the way this test needs"
+    )]
     #[tokio::test]
     async fn a_coder_diff_naming_the_agents_dir_with_a_capitalized_letter_still_blocks() {
         let repo = init_test_repo();
@@ -518,6 +539,15 @@ mod tests {
         );
     }
 
+    /// The other capitalization the review flagged by name -- see
+    /// [`a_coder_diff_naming_the_agents_dir_with_a_capitalized_letter_still_blocks`]'s
+    /// own docs for the full rationale, including why this is skipped
+    /// rather than failed on a filesystem that doesn't fold case.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "reproduces a case-folding filesystem attack; only macOS's default APFS \
+                  (case-insensitive) folds case the way this test needs"
+    )]
     #[tokio::test]
     async fn a_coder_diff_naming_the_agents_dir_fully_uppercase_still_blocks() {
         let repo = init_test_repo();
@@ -587,6 +617,19 @@ mod tests {
         );
     }
 
+    /// Issue #30's own named bypass 1/2: `.warden/agentſ/coder.md` (U+017F,
+    /// Latin small letter long s) is already lowercase, so the *old*
+    /// detector's `str::to_lowercase` comparison was a no-op and missed it
+    /// entirely -- while APFS's Unicode-normalizing case folding maps
+    /// U+017F onto plain `s`, so `agent_def::read_raw_definition` opening
+    /// the literal, canonical `.warden/agents/coder.md` path reads the
+    /// poisoned file anyway. Skipped (not failed) when this filesystem
+    /// doesn't perform that fold.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "reproduces a Unicode case-folding filesystem attack; only macOS's default \
+                  APFS folds U+017F onto plain 's' the way this test needs"
+    )]
     #[tokio::test]
     async fn a_coder_diff_writing_the_definition_under_a_unicode_confusable_directory_name_still_blocks(
     ) {
