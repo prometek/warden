@@ -7,6 +7,26 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #70 : découpage de `orchestrator.rs` en sous-modules
+
+- **Refactor mécanique à comportement strictement identique** (aucun changement
+  fonctionnel, ni d'API publique, ni d'assertion de test). Le module
+  `crates/warden/src/orchestrator.rs` (~10 300 lignes) est éclaté en un répertoire
+  `crates/warden/src/orchestrator/` : `mod.rs` (façade — doc de module, déclarations
+  `mod`, ré-exports `pub use` préservant la surface externe, struct `Orchestrator` +
+  types partagés + méthodes utilitaires) et sous-modules par responsabilité —
+  `config` (`RunConfig`/`GateConfig`/`UntrustedRepoAgentDefinition`), `convergence`
+  (`run_convergence_loop`), `gate_tail` (tail push/PR/CI post-`Converged`, ADR-0011),
+  `agents` (`run_coder`/`run_review`/`run_test`/`run_finding_agent`), `agent_run`
+  (seam sous-processus sandboxé), `evidence_capture`, `tampering` (détection de
+  poisoning de définition d'agent inter-run, issue #30), `diff` (lectures HEAD/diff
+  bornées), `recovery` (reprise après crash) et `test_support` (fixtures de test
+  partagées). Les tests inline `#[cfg(test)]` suivent leur code dans chaque
+  sous-module.
+- **Commentaires condensés** : les doc-comments multi-paragraphes narrant le
+  « pourquoi » historique sont ramenés à l'intention/le contrat porté par le code ;
+  le détail vit dans les ADR/docs (source de vérité), sans duplication inline.
+
 ### Added — `CommandHook` + config déclarative `.warden/hooks.toml`
 
 - **`.warden/hooks.toml`** (`warden::hook_config`) : format déclaratif qui
