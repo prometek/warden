@@ -8,6 +8,7 @@ pub mod error;
 pub mod event_bus;
 pub mod evidence;
 pub mod gate_trigger;
+pub(crate) mod git_util;
 pub mod hook;
 pub mod hook_config;
 pub mod orchestrator;

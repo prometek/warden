@@ -22,6 +22,7 @@ use warden_core::{
 
 use crate::db::EvidenceWithCycle;
 use crate::error::{EvidenceError, Result, WardenError, WorktreeError};
+use crate::git_util::NO_HOST_HOOKS;
 use crate::process::{self, AgentCommand};
 use crate::worktree::WorktreeManager;
 
@@ -480,9 +481,15 @@ pub async fn commit_evidence_into_repo(
 }
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH): this helper runs `git add`
+    // *and* `git commit` (pre-commit/commit-msg/post-commit) *and*
+    // `update-ref` (reference-transaction) against `cwd` -- always the
+    // evidence worktree or `main_repo_path`, both sharing the base repo's
+    // common `.git`/hooks. See `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
+        .args(NO_HOST_HOOKS)
         .args(args)
         .output()
         .await?;
@@ -499,9 +506,12 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
 }
 
 async fn git_head_commit(cwd: &Path) -> Result<String> {
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+    // `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
+        .args(NO_HOST_HOOKS)
         .args(["rev-parse", "HEAD"])
         .output()
         .await?;
@@ -925,6 +935,74 @@ mod tests {
         assert!(
             !repo.path().join(".warden").exists(),
             "evidence must never land inside the main repo's own working tree"
+        );
+    }
+
+    /// Issue #49 review, HIGH: `run_git` (used here for `git add`/`git
+    /// commit`) must never let a planted `pre-commit` hook run -- under
+    /// `--isolation docker`, `repo_path`'s `.git` (shared by the evidence
+    /// worktree this function commits into) is bind-mounted read-write into
+    /// the container, so an agent could otherwise plant one and have it run
+    /// here, on the host, the next time a run converges with evidence
+    /// captured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_evidence_into_repo_disables_a_planted_pre_commit_hook() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let worktree_manager =
+            WorktreeManager::new(repo.path(), warden_home.path().join("worktrees")).unwrap();
+        let base_commit = head_commit(repo.path());
+        let run_id = "run-hook-evidence";
+
+        let marker = repo.path().join("pre-commit-ran");
+        let hooks_dir = repo.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("pre-commit");
+        std::fs::write(
+            &hook_path,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+
+        let scratch_dir = warden_home.path().join("evidence").join(run_id).join("1");
+        tokio::fs::create_dir_all(&scratch_dir).await.unwrap();
+        tokio::fs::write(scratch_dir.join("screenshot.png"), b"fake-png-bytes")
+            .await
+            .unwrap();
+        let evidence = vec![EvidenceWithCycle {
+            cycle_number: 1,
+            evidence: Evidence {
+                id: "evidence-1".to_string(),
+                cycle_id: "cycle-1".to_string(),
+                finding_id: None,
+                evidence_type: EvidenceType::Image,
+                file_path: ".warden/evidence/1/screenshot.png".to_string(),
+                description: "Playwright capture".to_string(),
+                captured_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        }];
+
+        commit_evidence_into_repo(
+            &worktree_manager,
+            repo.path(),
+            warden_home.path(),
+            run_id,
+            &base_commit,
+            &evidence,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "a pre-commit hook planted in repo_path must never run when warden itself commits \
+             captured evidence"
         );
     }
 }

@@ -43,6 +43,20 @@ pub enum SandboxError {
     /// runtime condition to paper over.
     #[error("unknown sandbox id {id}")]
     UnknownSandbox { id: SandboxId },
+
+    /// A [`crate::docker::DockerSandbox`]-specific precondition or
+    /// configuration failure that has no natural `Spawn`/`Wait`/`Cancelled`/
+    /// `StdinWrite` counterpart: a host path required for a bind mount that
+    /// cannot be resolved (canonicalized), the one host path this backend
+    /// requires for auth (`~/.claude`) not existing at all, or `docker rm -f`
+    /// itself failing for a reason other than "already gone" during
+    /// [`crate::Sandbox::destroy`]. Never used for a `docker` invocation's
+    /// own outcome -- a non-zero exit from whatever ran *inside* the
+    /// container (including the daemon being unreachable, surfaced through
+    /// `docker run`'s own stderr/exit code) is a normal
+    /// [`crate::ExecutionResult`], not this variant.
+    #[error("docker sandbox misconfigured: {reason}")]
+    DockerUnavailable { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, SandboxError>;
