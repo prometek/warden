@@ -7,6 +7,31 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #72 : mode batch multi-intentions pour `warden run`
+
+- **`--intent` devient répétable**, et un nouveau flag `--intents-file <PATH>` lit une
+  intention par ligne non vide (une ligne commençant par `#` est un commentaire, ignorée).
+  Les entrées du fichier s'exécutent d'abord, dans l'ordre du fichier, suivies des
+  `--intent` répétés, dans l'ordre donné sur la ligne de commande. Au moins une intention
+  doit résulter de la combinaison des deux (sinon erreur explicite dès la frontière CLI,
+  qui nomme le fichier en cause si un `--intents-file` vide a été fourni).
+- **Une seule intention résultante reprend exactement le chemin mono-intention existant**,
+  in-process, inchangé. Deux intentions ou plus basculent en **mode batch** : chaque
+  intention tourne **séquentiellement**, comme un sous-processus enfant `warden run
+  --intent <x>` du même binaire — process neuf, `run_id` neuf, worktrees neufs — sans
+  aucun état en mémoire partagé entre intentions par construction. Le nettoyage
+  (`orchestrator::recover_crashed_runs`, agents orphelins tués, worktrees nettoyés) est
+  garanti à la sortie propre de chaque enfant, et appliqué au redémarrage suivant sinon.
+- **Politique d'échec** : par défaut, le batch continue après une intention non convergée
+  (budget de cycles épuisé ou run `Failed`) et passe à la suivante sur une base saine.
+  `--fail-fast` (sans effet pour une intention unique) arrête le batch à la première
+  intention non convergée et marque toutes les suivantes `Skipped`.
+- **Ctrl-C** : l'intention en cours va jusqu'à son terme, les intentions restantes sont
+  marquées `Skipped`, et le résumé du batch s'affiche quand même.
+- **Rapport final** : une ligne de statut par intention plus un total `batch summary:
+  X/N intent(s) converged`. Code de sortie non nul si au moins une intention n'a pas
+  convergé.
+
 ### Changed — Issue #70 : découpage de `orchestrator.rs` en sous-modules
 
 - **Refactor mécanique à comportement strictement identique** (aucun changement
