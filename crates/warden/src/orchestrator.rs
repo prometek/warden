@@ -3751,7 +3751,9 @@ mod tests {
                         self.teardown_ran.store(true, Ordering::SeqCst);
                         Ok(HookOutcome::Continue)
                     }
-                    other => unreachable!("SetupHook only registered on run-level points: {other:?}"),
+                    other => {
+                        unreachable!("SetupHook only registered on run-level points: {other:?}")
+                    }
                 }
             }
         }
@@ -3803,7 +3805,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(cycles, 0, "no cycle opens when setup blocks -- the coder never runs");
+        assert_eq!(
+            cycles, 0,
+            "no cycle opens when setup blocks -- the coder never runs"
+        );
 
         assert!(
             teardown_ran.load(Ordering::SeqCst),

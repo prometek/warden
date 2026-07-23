@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use warden_sandbox::{Command, ExecuteOptions, Sandbox, SandboxSpec};
 use warden_core::{HookContext, HookOutcome, HookPoint};
+use warden_sandbox::{Command, ExecuteOptions, Sandbox, SandboxSpec};
 
 use crate::error::Result;
 
@@ -510,8 +510,14 @@ mod tests {
             .unwrap()
         {
             HookOutcome::Block { reason } => {
-                assert!(reason.contains("exited 3"), "reason names the exit code: {reason}");
-                assert!(reason.contains("boom"), "reason carries the stderr tail: {reason}");
+                assert!(
+                    reason.contains("exited 3"),
+                    "reason names the exit code: {reason}"
+                );
+                assert!(
+                    reason.contains("boom"),
+                    "reason carries the stderr tail: {reason}"
+                );
             }
             other => panic!("expected Block, got {other:?}"),
         }
