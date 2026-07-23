@@ -14,7 +14,7 @@ use warden::db;
 use warden::gate_trigger;
 use warden::hook_config::load_repo_hooks;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
-use warden::tool_adapter::{ClaudeAdapter, ToolAdapter};
+use warden::tool_adapter::{ClaudeAdapter, CodexAdapter, MistralAdapter, ToolAdapter};
 use warden_core::AgentRole;
 use warden_sandbox::{LocalSandbox, Sandbox};
 
@@ -244,15 +244,17 @@ fn isolation_as_str(isolation: Isolation) -> &'static str {
 /// exists only to override it.
 const DEFAULT_DOCKER_IMAGE: &str = "warden-agent:latest";
 
-/// The closed set of `--tool` values this build understands (issue #24):
-/// each variant owns exactly one [`ToolAdapter`] impl, resolved at compile
-/// time -- not a config-declared registry, mirroring
-/// `warden_core::AgentRole`/`RunState` string parsing. `claude` is the only
-/// variant today; `aider` and others are meant to gain their own variant +
-/// adapter later, never by adding a runtime lookup table.
+/// The closed set of `--tool` values this build understands (issue #24,
+/// extended to `codex`/`mistral` by issue #71): each variant owns exactly
+/// one [`ToolAdapter`] impl, resolved at compile time -- not a
+/// config-declared registry, mirroring `warden_core::AgentRole`/`RunState`
+/// string parsing. Other CLIs are meant to gain their own variant + adapter
+/// later, never by adding a runtime lookup table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolName {
     Claude,
+    Codex,
+    Mistral,
 }
 
 /// clap `value_parser` for `--tool`: validated against the closed set above
@@ -261,7 +263,11 @@ enum ToolName {
 fn parse_tool(raw: &str) -> Result<ToolName, String> {
     match raw {
         "claude" => Ok(ToolName::Claude),
-        other => Err(format!("unknown --tool {other:?} (supported: \"claude\")")),
+        "codex" => Ok(ToolName::Codex),
+        "mistral" => Ok(ToolName::Mistral),
+        other => Err(format!(
+            "unknown --tool {other:?} (supported: \"claude\", \"codex\", \"mistral\")"
+        )),
     }
 }
 
@@ -352,10 +358,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // One arm today (`ToolName::Claude`); a future adapter gets its
-            // own arm here rather than a runtime lookup, so the concrete
-            // `R: ToolAdapter` `run_convergence_loop` needs stays resolved
-            // at compile time (see `ToolName`'s own docs).
+            // Three arms today (`ToolName::{Claude,Codex,Mistral}`, issue
+            // #71); a future adapter gets its own arm here rather than a
+            // runtime lookup, so the concrete `R: ToolAdapter`
+            // `run_convergence_loop` needs stays resolved at compile time
+            // (see `ToolName`'s own docs).
             match tool {
                 ToolName::Claude => {
                     // Issue #72: a single intent is the pre-existing,
@@ -444,6 +451,42 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                     }
+                }
+                ToolName::Codex => {
+                    run(
+                        repo,
+                        intent,
+                        branch,
+                        max_review_cycles,
+                        max_test_cycles,
+                        warden_home,
+                        CodexAdapter,
+                        TrustRepoAgents(trust_repo_agents),
+                        evidence_tool,
+                        evidence_store_in_repo,
+                        gate,
+                        tui_launch,
+                        isolation_config,
+                    )
+                    .await
+                }
+                ToolName::Mistral => {
+                    run(
+                        repo,
+                        intent,
+                        branch,
+                        max_review_cycles,
+                        max_test_cycles,
+                        warden_home,
+                        MistralAdapter,
+                        TrustRepoAgents(trust_repo_agents),
+                        evidence_tool,
+                        evidence_store_in_repo,
+                        gate,
+                        tui_launch,
+                        isolation_config,
+                    )
+                    .await
                 }
             }
         }
@@ -1503,5 +1546,29 @@ mod tests {
             resolve_tui_binary(None),
             PathBuf::from(format!("warden-tui{}", std::env::consts::EXE_SUFFIX))
         );
+    }
+
+    /// Issue #71: `--tool` accepts `codex`/`mistral` alongside `claude`,
+    /// each resolving to its own closed-set variant (see `ToolName`'s own
+    /// docs) -- the CLI-level equivalent of `e2e_an_unknown_tool_is_a_clean_
+    /// cli_error_naming_the_value` in `tests/cli.rs`, but for the parser
+    /// itself rather than the whole binary.
+    #[test]
+    fn parse_tool_accepts_claude_codex_and_mistral() {
+        assert_eq!(parse_tool("claude"), Ok(ToolName::Claude));
+        assert_eq!(parse_tool("codex"), Ok(ToolName::Codex));
+        assert_eq!(parse_tool("mistral"), Ok(ToolName::Mistral));
+    }
+
+    /// The unknown-value error message must name every supported value, not
+    /// just `claude` (issue #71 acceptance criterion) -- so a user who
+    /// mistypes `--tool` sees the full closed set to choose from.
+    #[test]
+    fn parse_tool_rejects_an_unknown_value_and_lists_every_supported_one() {
+        let error = parse_tool("aider").unwrap_err();
+        assert!(error.contains("aider"), "{error:?}");
+        assert!(error.contains("claude"), "{error:?}");
+        assert!(error.contains("codex"), "{error:?}");
+        assert!(error.contains("mistral"), "{error:?}");
     }
 }

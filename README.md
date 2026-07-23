@@ -250,8 +250,10 @@ Flags de `warden run` :
   trois rôles de ce run (issue #24) : l'invocation CLI réelle, l'allowlist d'environnement,
   la traduction de la sortie de l'outil en findings, et le prompt/`tools` par défaut de
   chaque rôle en l'absence de définition (voir "Définir un agent" ci-dessous). Ensemble
-  fermé résolu à la compilation ; seul `claude` existe aujourd'hui. Global au run — pas de
-  sélection par rôle (`--coder-tool`…, hors périmètre). Remplace les flags
+  fermé résolu à la compilation ; `claude`, `codex` et `mistral` existent aujourd'hui
+  (issue #71 pour les deux derniers — voir "Prérequis par CLI (`--tool`)" ci-dessous pour ce
+  que chacun suppose comme binaire installé/authentifié). Global au run — pas de sélection
+  par rôle (`--coder-tool`…, hors périmètre). Remplace les flags
   `--coder-agent`/`--reviewer-agent`/`--tester-agent` et le schéma de définition
   warden-natif qu'ils sélectionnaient (ADR-0013, amendée par l'issue #24) — voir
   `CHANGELOG.md` pour la note de migration.
@@ -485,6 +487,36 @@ la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML i
 > chemin relatif au worktree du rôle). Le risque « le coder committe un script que le
 > reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
 > donc plus aux adaptateurs intégrés.
+
+### Prérequis par CLI (`--tool`)
+
+Chaque adaptateur délègue entièrement l'authentification au binaire CLI qu'il invoque
+(ADR-0005 : Warden ne détient et ne transmet jamais de clé API lui-même) — le binaire doit
+donc être **installé** et **déjà authentifié** (session/token stockés sur disque par le CLI
+lui-même) avant `warden run --tool <name>`. Un binaire absent ou non authentifié échoue à
+l'exécution avec l'erreur propre du CLI sous-jacent (`ProcessError::Spawn`, ou le refus
+d'authentification du CLI lui-même) — Warden ne tente aucun diagnostic préalable (pas de
+sous-commande `warden doctor` à ce jour).
+
+- **`claude`** (`warden::tool_adapter::ClaudeAdapter`) — binaire `claude` (Claude Code) sur
+  `PATH`, authentifié via `claude login` (ou une session déjà active). `HOME`/`USER` sont
+  transmis à l'agent pour qu'il retrouve sa propre configuration/session (voir "Sécurité"
+  dans `docs/Architecture.md`, §10 et ADR-0006 amendée) — vérifié directement contre le CLI
+  réel (voir la doc de `CLAUDE_ENV_ALLOWLIST`).
+- **`codex`** (`warden::tool_adapter::CodexAdapter`, issue #71) — binaire `codex` (OpenAI
+  Codex CLI) sur `PATH`, authentifié via sa propre commande de login CLI. `HOME` est
+  transmis pour qu'il retrouve sa propre configuration/session. **Non vérifié contre une
+  installation réelle** (environnement de développement sans ce binaire ni accès réseau
+  au moment de l'écriture de cet adaptateur) — invocation et format de sortie construits à
+  partir de la documentation publiée du CLI, avec dégradation propre documentée dans
+  `warden::tool_adapter::CodexAdapter` si un détail s'avère inexact (échec typé plutôt que
+  findings fabriqués, `None`/« n/a » plutôt qu'un total de tokens inventé).
+- **`mistral`** (`warden::tool_adapter::MistralAdapter`, issue #71) — binaire `mistral` sur
+  `PATH`. **Maturité/existence de ce CLI non confirmées** au moment de l'écriture de cet
+  adaptateur (voir sa propre doc) : l'invocation modélisée ici est la forme minimale la plus
+  défendable (`--system <prompt> [--model <model>]`), sans format de sortie structuré
+  supposé — la sortie brute entière est traitée comme la réponse finale, et l'usage de
+  tokens (issue #53) est toujours « n/a » pour cet adaptateur.
 
 ### Protocole d'entrée des agents (stdin)
 
