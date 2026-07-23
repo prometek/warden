@@ -3,6 +3,7 @@
 
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -10,8 +11,10 @@ use tokio_util::sync::CancellationToken;
 use warden::agent_def::resolve_agent_definition;
 use warden::db;
 use warden::gate_trigger;
+use warden::hook_config::load_repo_hooks;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
 use warden::tool_adapter::{ClaudeAdapter, ToolAdapter};
+use warden_sandbox::{LocalSandbox, Sandbox};
 use warden_core::AgentRole;
 
 #[derive(Parser)]
@@ -557,7 +560,23 @@ async fn run<R: ToolAdapter>(
     // docs) -- lowercase hex and hyphens only, never containing shell
     // metacharacters -- so, unlike `attach_warden_home_quoted` above, it
     // does not need its own `shlex::try_quote` pass.
-    let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
+    // One sandbox backend, shared between the orchestrator (which runs the
+    // agents through it) and the lifecycle hooks (which run their commands
+    // through it): a single construction-time choice covers both, so a future
+    // `--isolation docker` (#49) reaches agents and hooks alike.
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
+
+    // Concrete lifecycle hooks, loaded from the repo's `.warden/hooks.toml`
+    // (absent -> empty registry, dispatch stays a no-op). See
+    // `warden::hook_config` for the trust model: a repo's hook commands are
+    // honoured by default, consistent with its `.warden/agents/coder.md`.
+    let hooks = load_repo_hooks(&config.repo_path, Arc::clone(&sandbox))
+        .context("failed to load .warden/hooks.toml")?;
+
+    let orchestrator = Orchestrator::new(pool)
+        .with_sandbox(Arc::clone(&sandbox))
+        .with_hooks(hooks)
+        .on_run_started(move |run_id| {
         print_run_started_hint(run_id, &attach_warden_home_quoted);
 
         // Issue #32: `--tui` spawns `warden-tui attach` as a separate

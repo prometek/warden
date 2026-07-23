@@ -122,6 +122,48 @@ impl HookPoint {
         }
     }
 
+    /// Parses the stable string form ([`HookPoint::as_str`]) back into a
+    /// point -- the inverse used when loading a declarative hook config
+    /// (`.warden/hooks.toml`, where a hook names its point as `"on_run_start"`
+    /// etc.). Returns `None` for an unknown string so the caller can raise a
+    /// config error that lists the valid names, rather than this panicking.
+    pub fn parse(s: &str) -> Option<HookPoint> {
+        Some(match s {
+            "on_run_start" => HookPoint::OnRunStart,
+            "on_cycle_start" => HookPoint::OnCycleStart,
+            "before_coder" => HookPoint::BeforeCoder,
+            "after_coder" => HookPoint::AfterCoder,
+            "on_commit" => HookPoint::OnCommit,
+            "before_review" => HookPoint::BeforeReview,
+            "after_review" => HookPoint::AfterReview,
+            "before_test" => HookPoint::BeforeTest,
+            "after_test" => HookPoint::AfterTest,
+            "on_cycle_end" => HookPoint::OnCycleEnd,
+            "on_converged" => HookPoint::OnConverged,
+            "before_push" => HookPoint::BeforePush,
+            "on_run_end" => HookPoint::OnRunEnd,
+            _ => return None,
+        })
+    }
+
+    /// Every point, in declaration order -- for config validation error
+    /// messages (listing the valid `point` names) and exhaustiveness tests.
+    pub const ALL: [HookPoint; 13] = [
+        HookPoint::OnRunStart,
+        HookPoint::OnCycleStart,
+        HookPoint::BeforeCoder,
+        HookPoint::AfterCoder,
+        HookPoint::OnCommit,
+        HookPoint::BeforeReview,
+        HookPoint::AfterReview,
+        HookPoint::BeforeTest,
+        HookPoint::AfterTest,
+        HookPoint::OnCycleEnd,
+        HookPoint::OnConverged,
+        HookPoint::BeforePush,
+        HookPoint::OnRunEnd,
+    ];
+
     /// The hook point that firing *on entering* `state` corresponds to, if
     /// any. This is the mapping the orchestrator's transition seam uses to
     /// dispatch hooks from the single `self.transition(...)` point (issue
@@ -252,25 +294,23 @@ mod tests {
 
     #[test]
     fn hook_point_strings_are_unique_and_stable() {
-        let points = [
-            HookPoint::OnRunStart,
-            HookPoint::OnCycleStart,
-            HookPoint::BeforeCoder,
-            HookPoint::AfterCoder,
-            HookPoint::OnCommit,
-            HookPoint::BeforeReview,
-            HookPoint::AfterReview,
-            HookPoint::BeforeTest,
-            HookPoint::AfterTest,
-            HookPoint::OnCycleEnd,
-            HookPoint::OnConverged,
-            HookPoint::BeforePush,
-            HookPoint::OnRunEnd,
-        ];
         let mut seen = std::collections::HashSet::new();
-        for point in points {
+        for point in HookPoint::ALL {
             assert!(seen.insert(point.as_str()), "duplicate: {}", point.as_str());
         }
-        assert_eq!(seen.len(), points.len());
+        assert_eq!(seen.len(), HookPoint::ALL.len());
+    }
+
+    #[test]
+    fn as_str_and_parse_round_trip_for_every_point() {
+        for point in HookPoint::ALL {
+            assert_eq!(
+                HookPoint::parse(point.as_str()),
+                Some(point),
+                "{} must parse back to itself",
+                point.as_str()
+            );
+        }
+        assert_eq!(HookPoint::parse("not_a_point"), None);
     }
 }
