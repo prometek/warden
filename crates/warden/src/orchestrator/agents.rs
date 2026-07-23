@@ -371,42 +371,84 @@ impl Orchestrator {
             )
             .await?;
 
-        // Agent stdout is untrusted input: a parse failure becomes a
-        // blocking finding describing the problem, never a run-ending
-        // panic (code-standards.md: "Ne jamais faire confiance à la sortie
-        // d'un agent CLI"). `runner.extract_findings` is this run's
-        // `--tool` adapter's own translation from its CLI's raw output into
-        // findings NDJSON (issue #24 point 1, third bullet) -- the user no
-        // longer writes that translation as a wrapper script.
-        //
-        // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
-        // necessarily an *honest* one -- `extract_findings` only checks that
-        // every finding's `source` is some known value, not that it's the
-        // one this role is entitled to claim. `validate_finding_sources_for_role`
-        // closes that gap (a forged `source: "warden"`, or a tester
-        // mislabelling its own failure as `source: "reviewer"` to slip past
-        // `tester_succeeded` below) with the exact same "reject the whole
-        // batch, describe why, never silently drop/relabel" treatment as an
-        // unparsable-output failure -- see that function's own docs for the
-        // full rationale.
-        let findings = match runner
-            .extract_findings(&outcome.stdout)
-            .and_then(|findings| {
-                warden_core::validate_finding_sources_for_role(&findings, role)?;
-                Ok(findings)
-            }) {
-            Ok(findings) => findings,
-            Err(parse_error) => {
-                tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable or misattributed output");
-                vec![Finding {
-                    source: role_to_finding_source(role),
-                    severity: warden_core::Severity::Blocking,
-                    file: None,
-                    description: format!(
-                        "{role:?} produced unparsable or misattributed output: {parse_error}"
-                    ),
-                    action: Some("fix the agent's output format/finding sources".to_string()),
-                }]
+        // Issue #71 review (HIGH): a reviewer/tester that exited non-zero
+        // must never have its stdout trusted at all -- checked *before*
+        // `extract_findings` is ever called, independent of whatever that
+        // adapter's own mapping does with a blank/malformed buffer.
+        // Mirrors the coder path's own non-zero-exit check above (M2), but
+        // a blocking finding rather than failing the whole run: a
+        // crashed/misbehaving reviewer or tester is exactly the kind of
+        // problem a reboucle back to the coder can plausibly recover from
+        // (a transient invocation failure, a flaky sandbox, ...), unlike a
+        // coder that never produced a commit worth reviewing at all. This
+        // closes a fail-open some adapters could otherwise incidentally
+        // reopen: `MistralAdapter::extract_findings` (see its own docs)
+        // trusts a blank buffer as "no findings" precisely *because* this
+        // check has already confirmed the process exited cleanly --
+        // without it, a `mistral` reviewer that crashed and printed
+        // nothing would read as a clean, converging pass.
+        let findings = if outcome.exit_code != 0 {
+            tracing::warn!(
+                run_id,
+                cycle_id,
+                ?role,
+                exit_code = outcome.exit_code,
+                stderr = %outcome.stderr,
+                "agent exited non-zero; not trusting its stdout"
+            );
+            vec![Finding {
+                source: role_to_finding_source(role),
+                severity: warden_core::Severity::Blocking,
+                file: None,
+                description: format!(
+                    "{role:?} exited with status {} instead of 0 (stderr: {})",
+                    outcome.exit_code,
+                    truncate_for_error(&outcome.stderr)
+                ),
+                action: Some(
+                    "investigate why the agent process exited non-zero and fix it".to_string(),
+                ),
+            }]
+        } else {
+            // Agent stdout is untrusted input: a parse failure becomes a
+            // blocking finding describing the problem, never a run-ending
+            // panic (code-standards.md: "Ne jamais faire confiance à la
+            // sortie d'un agent CLI"). `runner.extract_findings` is this
+            // run's `--tool` adapter's own translation from its CLI's raw
+            // output into findings NDJSON (issue #24 point 1, third
+            // bullet) -- the user no longer writes that translation as a
+            // wrapper script.
+            //
+            // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
+            // necessarily an *honest* one -- `extract_findings` only checks
+            // that every finding's `source` is some known value, not that
+            // it's the one this role is entitled to claim.
+            // `validate_finding_sources_for_role` closes that gap (a forged
+            // `source: "warden"`, or a tester mislabelling its own failure
+            // as `source: "reviewer"` to slip past `tester_succeeded`
+            // below) with the exact same "reject the whole batch, describe
+            // why, never silently drop/relabel" treatment as an
+            // unparsable-output failure -- see that function's own docs
+            // for the full rationale.
+            match runner
+                .extract_findings(&outcome.stdout)
+                .and_then(|findings| {
+                    warden_core::validate_finding_sources_for_role(&findings, role)?;
+                    Ok(findings)
+                }) {
+                Ok(findings) => findings,
+                Err(parse_error) => {
+                    tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable or misattributed output");
+                    vec![Finding {
+                        source: role_to_finding_source(role),
+                        severity: warden_core::Severity::Blocking,
+                        file: None,
+                        description: format!(
+                            "{role:?} produced unparsable or misattributed output: {parse_error}"
+                        ),
+                        action: Some("fix the agent's output format/finding sources".to_string()),
+                    }]
+                }
             }
         };
 
@@ -1082,6 +1124,103 @@ mod tests {
         assert!(
             !tester_succeeded(&findings),
             "Minor 2: a tester that mislabels its own failure must still be seen as failed by \
+                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+        );
+    }
+
+    /// Issue #71 review (HIGH), tester side: the exit-code guard added to
+    /// `run_finding_agent` closes the fail-open "for every `--tool` adapter
+    /// at once, not just mistral" (see this fix's own commit message) --
+    /// this repo's only other regression coverage for that guard
+    /// (`e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges`,
+    /// `crates/warden/tests/cli.rs`) drives it exclusively through the
+    /// **reviewer** role. Since `run_review`/`run_test` share the exact same
+    /// `run_finding_agent` body, the guard is structurally the same code
+    /// path for both -- but that's an implementation detail a future
+    /// refactor could break without any test failing today. This exercises
+    /// the **tester** side directly, through `run_test` (the same entry
+    /// point `Orchestrator::run_convergence_loop` itself calls), with a
+    /// tester that exits non-zero and prints nothing to stdout: it must
+    /// come back as a synthesized blocking `Tester` finding naming the exit
+    /// status, never as "zero findings" (which `tester_succeeded` would
+    /// otherwise read as a passing test suite and wrongly trigger evidence
+    /// capture for).
+    #[tokio::test]
+    async fn a_tester_that_exits_nonzero_with_no_output_synthesizes_a_blocking_finding_not_a_silent_pass(
+    ) {
+        let (repo, warden_home, _db_dir, pool, worktree_manager) =
+            finding_agent_test_fixture().await;
+
+        db::insert_run(
+            &pool,
+            "tester-crash-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "tester-crash-cycle", "tester-crash-run", 1)
+            .await
+            .unwrap();
+
+        let crashing_tester = AgentCommand::new("sh", ["-c", "printf 'boom' >&2; exit 7"]);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "intent".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(crashing_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
+        let orchestrator = Orchestrator::new(pool.clone());
+
+        let findings = orchestrator
+            .run_test(
+                &FakeCommandAdapter,
+                TestInvocation {
+                    run_id: "tester-crash-run",
+                    cycle_id: "tester-crash-cycle",
+                    cycle_number: 1,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "a crashing tester must synthesize exactly one blocking finding, not be silently \
+                 read as zero findings: {findings:?}"
+        );
+        assert_eq!(findings[0].source, warden_core::FindingSource::Tester);
+        assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
+        assert!(
+            findings[0].description.contains("exited with status 7"),
+            "the synthesized finding should name the actual exit status: {}",
+            findings[0].description
+        );
+        assert!(
+            !tester_succeeded(&findings),
+            "a tester that crashed non-zero must never be read as a passing test suite by \
                  tester_succeeded, the gate that decides whether to trigger evidence capture"
         );
     }
