@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Pre-commit hook (issue #69) — fast local safety net, mirrors the start of
+# CI (.github/workflows/ci.yml) without running the test suite (tests are
+# CI-only, by design, so this stays fast). Runs, in order:
+#   1. cargo fmt --check
+#   2. cargo clippy -- -D warnings
+#   3. gitleaks (scans the staged diff for secrets, if installed)
+#
+# Activate with:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+echo "==> pre-commit: cargo fmt --check"
+if ! cargo fmt --all --check; then
+  echo "error: cargo fmt found unformatted code. Run 'cargo fmt --all' and re-stage." >&2
+  exit 1
+fi
+
+echo "==> pre-commit: cargo clippy -- -D warnings"
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+  echo "error: cargo clippy reported warnings/errors. Fix them before committing." >&2
+  exit 1
+fi
+
+echo "==> pre-commit: gitleaks (staged diff)"
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --verbose; then
+    echo "error: gitleaks detected a potential secret in the staged diff. Fix or allowlist it in .gitleaks.toml." >&2
+    exit 1
+  fi
+else
+  echo "warning: gitleaks not installed, skipping secret scan (see README dev setup). Install with 'brew install gitleaks'." >&2
+fi
+
+echo "==> pre-commit: all checks passed"

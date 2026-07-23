@@ -1,0 +1,69 @@
+# cargo-deny configuration — supply-chain checks (issue #69).
+#
+# Run locally with `cargo deny check` (requires `cargo install cargo-deny` or
+# `brew install cargo-deny`). Wired into CI as a dedicated job — see
+# .github/workflows/ci.yml.
+#
+# Kept deliberately conservative: allow-list only the permissive licenses
+# actually present in the dependency tree (verified via `cargo deny list`),
+# and only ignore advisories/yanked crates that have no safe upgrade
+# available upstream today. Re-run `cargo deny check` after every
+# `cargo update` and prune the `ignore` list once a fix lands upstream.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+[advisories]
+ignore = [
+    # paste is unmaintained (crates.io author archived the repo). Pulled in
+    # transitively via ratatui-image -> image -> exr -> pulp; no direct
+    # dependency and no safe upgrade path today. Re-check on ratatui-image
+    # bumps.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained transitive dep (ratatui-image -> image -> exr -> pulp -> paste), no safe upgrade available" },
+    # spin 0.9.8 was yanked upstream after publication. Pulled in
+    # transitively via flume -> sqlx-sqlite; not a direct dependency.
+    { crate = "spin@0.9.8", reason = "yanked transitive dep (flume -> sqlx-sqlite), no direct control; monitor sqlx bumps" },
+]
+
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+# Permissive licenses actually present in the dependency tree (verified with
+# `cargo deny list` against the workspace lockfile). Extend this list only
+# after checking a new dependency's license is compatible with the project's
+# MIT license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "NCSA",
+]
+confidence-threshold = 0.8
+
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+multiple-versions = "warn"
+# Default upstream value ("allow"): workspace crates reference each other via
+# path dependencies with no version requirement, which cargo-deny also
+# classifies as "wildcard" — that's expected/safe for in-workspace path deps
+# (pinned to the exact local source, not floating), not a supply-chain risk.
+wildcards = "allow"
+deny = []
+
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,9 @@
+# Pins the exact Rust toolchain for reproducible builds (issue #69).
+# CI (`.github/workflows/ci.yml`) installs `stable` via dtolnay/rust-toolchain;
+# this file pins that same channel to a concrete version so local builds and
+# CI stay in lockstep instead of drifting silently as `stable` moves forward.
+# Bump deliberately (new commit) when upgrading, not implicitly.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "default"

@@ -136,13 +136,11 @@
 
 - **Conventional Commits** : `type(scope?): description`. Types : `feat`, `fix`, `chore`, `refactor`, `docs`, `test`, `perf`, `build`, `ci`, `style`, `revert`. Scope recommandé (`feat(gated):`, `fix(tui):`, `feat(core):`). Impératif présent, minuscule, pas de point final. Breaking : `!` ou footer `BREAKING CHANGE:`.
 - Branche principale `main`. Branches de travail `feat/...`, `fix/...`, `chore/...`. Pas de commit direct sur `main` — tout passe par PR titrée en Conventional Commit.
-- **Pre-commit** (`.pre-commit-config.yaml` committé, `pre-commit install` documenté dans le README). Filet rapide (secondes), sous-ensemble de la CI :
-  - `cargo fmt` (auto-fix + re-stage).
-  - `cargo clippy` (auto-fix sur règles corrigeables, bloquant sur le reste).
-  - Détection de secrets (`gitleaks`) — bloquant.
-  - Conventional commits (hook `commit-msg`) — bloquant.
-  - `check-toml` / `check-yaml` / `check-added-large-files` (limite ~500 KB).
-  - Exclus (restent en CI) : type check, tests, build.
+- **Pre-commit** (issue #69) — hooks shell versionnés dans `.githooks/`, activés via `git config core.hooksPath .githooks` (natif git, zéro dépendance externe — pas de framework `pre-commit`). Filet rapide (secondes), sous-ensemble de la CI :
+  - `cargo fmt --all --check` — bloquant (pas d'auto-fix silencieux : `cargo fmt --all` puis re-stage manuel).
+  - `cargo clippy --all-targets --all-features -- -D warnings` — bloquant.
+  - Détection de secrets (`gitleaks protect --staged`, si le binaire est installé — sinon avertissement, jamais un blocage silencieux masqué) — bloquant.
+  - Exclus (restent en CI uniquement, jamais dans les hooks) : tests, build release.
 - `--no-verify` toléré en cas exceptionnel (WIP branche perso, debug CI), jamais sur `main` ni PR prête à merger.
 - **GitHub Actions** — déclenché sur PR et push `main`, toutes étapes bloquantes :
   - `cargo clippy -- -D warnings`.

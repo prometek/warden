@@ -1,0 +1,14 @@
+# Explicit rustfmt config (issue #69) — stable-only options (verified against
+# the pinned stable toolchain, rust-toolchain.toml), values chosen to match
+# rustfmt's own stable defaults so this is a no-op on already-formatted code.
+# Versioned so `cargo fmt` behaves identically locally and in CI regardless
+# of the rustfmt version's own defaults changing over time.
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true
+remove_nested_parens = true

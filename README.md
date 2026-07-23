@@ -135,6 +135,45 @@ requête ou migration doit régénérer le cache du crate concerné (`cargo sqlx
 exécuté depuis ce crate) et le committer avec le code — voir `code-standards.md` ("SQLite &
 sqlx").
 
+### Setup dev — hooks, lint, supply-chain (issue #69)
+
+Le dépôt versionne sa config qualité (`rust-toolchain.toml`, `rustfmt.toml`,
+`clippy.toml`, `deny.toml`) et des hooks git locaux dans `.githooks/` — rien de
+cela n'est actif tant que vous n'avez pas exécuté, une fois par clone :
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Le hook `pre-commit` ainsi activé exécute, sur chaque commit et **avant** que la CI ne
+tourne : `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D
+warnings`, puis un scan `gitleaks` du diff staged. Volontairement rapide (secondes) — les
+tests restent réservés à la CI (`.github/workflows/ci.yml`, issue #38), jamais aux hooks
+locaux. `--no-verify` reste toléré en cas exceptionnel (branche perso en WIP), jamais sur
+`main` ni sur une PR prête à merger.
+
+Outils à installer localement (non requis par `cargo build`/`cargo test`, mais requis pour
+que le hook et les checks de supply-chain ci-dessous fonctionnent) :
+
+```sh
+# Détection de secrets, utilisé par le hook pre-commit et par la CI
+brew install gitleaks        # ou: voir https://github.com/gitleaks/gitleaks#installing
+
+# Audit licences/advisories RustSec/bans de dépendances (deny.toml)
+brew install cargo-deny      # ou: cargo install cargo-deny
+```
+
+`rust-toolchain.toml` pin la version exacte du toolchain (canal stable + composants
+`rustfmt`/`clippy`) : `rustup` bascule automatiquement dessus dès que vous êtes dans le
+dépôt, aucune action manuelle requise si `rustup` est déjà votre gestionnaire de toolchain.
+
+Vérifier la config supply-chain (licences autorisées, advisories RustSec ignorées avec
+justification, sources de dépendances) :
+
+```sh
+cargo deny check
+```
+
 ### Installer depuis une release prébuilt (issue #39)
 
 Alternative à la compilation depuis les sources : chaque tag `vX.Y.Z` poussé déclenche
