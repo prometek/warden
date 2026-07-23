@@ -1,0 +1,6 @@
+# clippy project config (issue #69). Deliberately conservative: only pins the
+# MSRV so clippy doesn't suggest APIs newer than the toolchain this project
+# builds with (rust-toolchain.toml). No lint thresholds are tightened here —
+# that would need a dedicated cleanup pass (out of scope for this ticket, see
+# issue #69's "non inclus").
+msrv = "1.95.0"

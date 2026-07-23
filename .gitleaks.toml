@@ -1,0 +1,16 @@
+# gitleaks config (issue #69) — extends the built-in default ruleset
+# (https://github.com/gitleaks/gitleaks/blob/master/config/gitleaks.toml)
+# rather than replacing it. Used by both the pre-commit hook (staged diff)
+# and CI (PR diff scan). Keep this file to real, confirmed false positives
+# only — do not use it to silence genuine findings.
+title = "warden gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project-wide allowlist"
+paths = [
+  # Committed sqlx offline query caches — generated hashes, not secrets.
+  '''(^|.*/)\.sqlx/.*''',
+]
