@@ -3,6 +3,7 @@
 
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -10,9 +11,11 @@ use tokio_util::sync::CancellationToken;
 use warden::agent_def::resolve_agent_definition;
 use warden::db;
 use warden::gate_trigger;
+use warden::hook_config::load_repo_hooks;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
 use warden::tool_adapter::{ClaudeAdapter, ToolAdapter};
 use warden_core::AgentRole;
+use warden_sandbox::{LocalSandbox, Sandbox};
 
 #[derive(Parser)]
 #[command(
@@ -147,8 +150,58 @@ enum Commands {
         /// back to a `PATH` lookup. Ignored unless `--tui` is also set.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         tui_bin: Option<PathBuf>,
+
+        /// Selects the [`warden_sandbox::Sandbox`] backend every agent
+        /// invocation in this run goes through (issue #49, ADR-0015/
+        /// ADR-0019): `worktree` (default) is `warden_sandbox::LocalSandbox`
+        /// -- unchanged from every `warden run` before this flag existed,
+        /// the agent's own process runs directly on this host. `docker` is
+        /// `warden_sandbox::DockerSandbox` -- each invocation runs inside a
+        /// container instead, with the role's own worktree and the base
+        /// repo's `.git` bind-mounted read-write, `~/.claude` bind-mounted
+        /// read-only for auth, and nothing else of the host reachable (see
+        /// `warden_sandbox::docker`'s own docs for the exact guarantees and
+        /// the accepted v1 limits: no egress filtering yet).
+        #[arg(long, default_value = "worktree", value_parser = parse_isolation)]
+        isolation: Isolation,
+
+        /// Overrides the image `--isolation docker` runs every agent
+        /// invocation in. Ignored unless `--isolation docker` is also set;
+        /// see `crates/warden-sandbox/docker/README.md` for how to build the
+        /// reference image this defaults to.
+        #[arg(long, default_value = DEFAULT_DOCKER_IMAGE)]
+        isolation_image: String,
     },
 }
+
+/// The closed set of `--isolation` values this build understands (issue
+/// #49): mirrors [`ToolName`]/[`parse_tool`]'s own closed-set pattern.
+/// `Worktree` selects `warden_sandbox::LocalSandbox` (the default, unchanged
+/// behaviour); `Docker` selects `warden_sandbox::DockerSandbox`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Isolation {
+    Worktree,
+    Docker,
+}
+
+/// clap `value_parser` for `--isolation`: validated against the closed set
+/// above at the CLI boundary (code-standards.md: "valider toute entrée
+/// externe... à la frontière"), mirroring `parse_tool`.
+fn parse_isolation(raw: &str) -> Result<Isolation, String> {
+    match raw {
+        "worktree" => Ok(Isolation::Worktree),
+        "docker" => Ok(Isolation::Docker),
+        other => Err(format!(
+            "unknown --isolation {other:?} (supported: \"worktree\", \"docker\")"
+        )),
+    }
+}
+
+/// Default image `--isolation docker` runs every agent invocation in --
+/// built from `crates/warden-sandbox/docker/Dockerfile` (issue #49). No
+/// separate `--isolation-image` is required for the common case; the flag
+/// exists only to override it.
+const DEFAULT_DOCKER_IMAGE: &str = "warden-agent:latest";
 
 /// The closed set of `--tool` values this build understands (issue #24):
 /// each variant owns exactly one [`ToolAdapter`] impl, resolved at compile
@@ -169,6 +222,14 @@ fn parse_tool(raw: &str) -> Result<ToolName, String> {
         "claude" => Ok(ToolName::Claude),
         other => Err(format!("unknown --tool {other:?} (supported: \"claude\")")),
     }
+}
+
+/// Issue #49: `--isolation`/`--isolation-image` bundled into one config,
+/// resolved once here (not inside `run`), the same shape `GateConfig`/
+/// `TuiLaunchConfig` above already use for their own flag pairs.
+struct IsolationConfig {
+    isolation: Isolation,
+    image: String,
 }
 
 /// A newtype around `--trust-repo-agents`'s `bool` (issue #26 review, LOW):
@@ -206,6 +267,8 @@ async fn main() -> anyhow::Result<()> {
             gate_inactivity_timeout_secs,
             tui,
             tui_bin,
+            isolation,
+            isolation_image,
         } => {
             // Issue #15/ADR-0011: the post-Converged tail only runs when
             // both paths it needs are configured; omitting either preserves
@@ -228,6 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 tui_bin: resolve_tui_binary(tui_bin),
             });
 
+            // Issue #49: bundled the same way as `gate`/`tui_launch` above.
+            let isolation_config = IsolationConfig {
+                isolation,
+                image: isolation_image,
+            };
+
             // One arm today (`ToolName::Claude`); a future adapter gets its
             // own arm here rather than a runtime lookup, so the concrete
             // `R: ToolAdapter` `run_convergence_loop` needs stays resolved
@@ -247,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
                         evidence_store_in_repo,
                         gate,
                         tui_launch,
+                        isolation_config,
                     )
                     .await
                 }
@@ -304,6 +374,7 @@ async fn run<R: ToolAdapter>(
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
     tui_launch: Option<TuiLaunchConfig>,
+    isolation_config: IsolationConfig,
 ) -> anyhow::Result<()> {
     // Issue #26 review: `Option::unwrap_or` (the previous form here)
     // evaluates its argument eagerly, so `default_warden_home()?` used to
@@ -524,6 +595,31 @@ async fn run<R: ToolAdapter>(
         untrusted_repo_agent_definitions,
     };
 
+    // Issue #49: `--isolation` selects the `Sandbox` backend every agent
+    // invocation in this run goes through. `Isolation::Worktree` is
+    // `Orchestrator::new`'s own default (`LocalSandbox`) and needs no
+    // override; `Isolation::Docker` builds a `DockerSandbox` bound to this
+    // run's own base repo (`config.repo_path`, not any role's own worktree --
+    // that arrives per-invocation via `SandboxSpec::cwd`, exactly like
+    // `LocalSandbox`) and the host's `~/.claude` (resolved here, not inside
+    // `warden_sandbox`, so a missing `HOME` is this same "pass
+    // `--warden-home` explicitly"-style error `default_warden_home` already
+    // uses, not a sandbox-layer one).
+    let sandbox: Option<std::sync::Arc<dyn warden_sandbox::Sandbox>> =
+        match isolation_config.isolation {
+            Isolation::Worktree => None,
+            Isolation::Docker => {
+                let claude_config_dir = default_claude_config_dir()?;
+                Some(std::sync::Arc::new(warden_sandbox::DockerSandbox::new(
+                    warden_sandbox::DockerConfig {
+                        image: isolation_config.image,
+                        repo_path: config.repo_path.clone(),
+                        claude_config_dir,
+                    },
+                )))
+            }
+        };
+
     let cancel_on_tui_exit = cancel.clone();
 
     // Issue #32 review (HIGH): holds the `JoinHandle` for the task that
@@ -557,53 +653,74 @@ async fn run<R: ToolAdapter>(
     // docs) -- lowercase hex and hyphens only, never containing shell
     // metacharacters -- so, unlike `attach_warden_home_quoted` above, it
     // does not need its own `shlex::try_quote` pass.
-    let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
-        print_run_started_hint(run_id, &attach_warden_home_quoted);
+    // Issue #49's agent-isolation sandbox: `None` => the orchestrator's own
+    // default `LocalSandbox` (unchanged `--isolation worktree` behaviour);
+    // `Some` => the `DockerSandbox` that `--isolation docker` selected above.
+    let mut orchestrator = Orchestrator::new(pool);
+    if let Some(sandbox) = sandbox {
+        orchestrator = orchestrator.with_sandbox(sandbox);
+    }
 
-        // Issue #32: `--tui` spawns `warden-tui attach` as a separate
-        // process (ADR-0008), in the foreground on this launch terminal,
-        // once the run_id it needs actually exists. `Command::spawn` (used
-        // by `spawn_tui_attach`) is itself synchronous/non-blocking -- it
-        // only issues the `fork`/`exec` syscalls and returns -- so calling
-        // it directly here does not violate `on_run_started`'s "must not
-        // block" contract.
-        if let Some(tui_launch) = &tui_launch {
-            match warden::process::spawn_tui_attach(
-                &tui_launch.tui_bin,
-                run_id,
-                &attach_warden_home,
-            ) {
-                Ok(child) => {
-                    let cancel_on_tui_exit = cancel_on_tui_exit.clone();
-                    let handle = tokio::spawn(async move {
-                        cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
-                    });
-                    *tui_watcher_setter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        tui_bin = %tui_launch.tui_bin.display(),
-                        "failed to spawn warden-tui for --tui; aborting the run"
-                    );
-                    // Issue #32 review (MEDIUM): abort immediately, right
-                    // here, rather than only once the convergence loop below
-                    // eventually returns -- the coder's very first
-                    // invocation hasn't even started yet at this point
-                    // (`on_run_started` fires before any per-cycle work,
-                    // see its own docs), so cancelling now stops the run
-                    // from doing any real work at all instead of running an
-                    // entire (headless) cycle it will just fail after.
-                    *tui_spawn_error_setter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                    cancel_on_tui_exit.cancel();
+    // Lifecycle hooks run on the HOST, never inside an agent's isolation
+    // container: they are the operator's own infra prep (`docker compose up`,
+    // `git pull`) against the repo as a whole, so they always go through a
+    // LocalSandbox regardless of `--isolation`. Absent `.warden/hooks.toml` =>
+    // empty registry (dispatch stays a no-op). See `warden::hook_config` for
+    // the trust model: a repo's hook commands are honoured by default,
+    // consistent with its `.warden/agents/coder.md`.
+    let hook_sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
+    let hooks = load_repo_hooks(&config.repo_path, hook_sandbox)
+        .context("failed to load .warden/hooks.toml")?;
+
+    let orchestrator = orchestrator
+        .with_hooks(hooks)
+        .on_run_started(move |run_id| {
+            print_run_started_hint(run_id, &attach_warden_home_quoted);
+
+            // Issue #32: `--tui` spawns `warden-tui attach` as a separate
+            // process (ADR-0008), in the foreground on this launch terminal,
+            // once the run_id it needs actually exists. `Command::spawn` (used
+            // by `spawn_tui_attach`) is itself synchronous/non-blocking -- it
+            // only issues the `fork`/`exec` syscalls and returns -- so calling
+            // it directly here does not violate `on_run_started`'s "must not
+            // block" contract.
+            if let Some(tui_launch) = &tui_launch {
+                match warden::process::spawn_tui_attach(
+                    &tui_launch.tui_bin,
+                    run_id,
+                    &attach_warden_home,
+                ) {
+                    Ok(child) => {
+                        let cancel_on_tui_exit = cancel_on_tui_exit.clone();
+                        let handle = tokio::spawn(async move {
+                            cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
+                        });
+                        *tui_watcher_setter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            tui_bin = %tui_launch.tui_bin.display(),
+                            "failed to spawn warden-tui for --tui; aborting the run"
+                        );
+                        // Issue #32 review (MEDIUM): abort immediately, right
+                        // here, rather than only once the convergence loop below
+                        // eventually returns -- the coder's very first
+                        // invocation hasn't even started yet at this point
+                        // (`on_run_started` fires before any per-cycle work,
+                        // see its own docs), so cancelling now stops the run
+                        // from doing any real work at all instead of running an
+                        // entire (headless) cycle it will just fail after.
+                        *tui_spawn_error_setter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        cancel_on_tui_exit.cancel();
+                    }
                 }
             }
-        }
-    });
+        });
     let convergence_result = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await;
@@ -794,6 +911,21 @@ fn default_warden_home() -> anyhow::Result<PathBuf> {
         bail!("HOME is empty; pass --warden-home explicitly");
     }
     Ok(PathBuf::from(home).join(".warden"))
+}
+
+/// Resolves the host's Claude Code login/config directory (issue #49,
+/// `--isolation docker`) -- `~/.claude`, the one host path `DockerSandbox`
+/// bind-mounts read-only for auth (see `warden_sandbox::docker`'s own docs).
+/// Same "fail clearly, no silent fallback" shape as `default_warden_home`:
+/// a missing/empty `HOME` is this run's own configuration error, not
+/// something `--isolation docker` can proceed without.
+fn default_claude_config_dir() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .context("HOME is not set; cannot resolve ~/.claude for --isolation docker")?;
+    if home.trim().is_empty() {
+        bail!("HOME is empty; cannot resolve ~/.claude for --isolation docker");
+    }
+    Ok(PathBuf::from(home).join(".claude"))
 }
 
 fn init_tracing(verbosity: u8) {

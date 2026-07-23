@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 use tempfile::TempDir;
 use warden_core::{AgentRole, FindingSource, RunState};
@@ -1003,6 +1004,273 @@ fn e2e_omitting_tool_entirely_is_a_clean_cli_error() {
     .assert()
     .failure()
     .stderr(contains("--tool"));
+}
+
+/// Issue #49: `--isolation` is validated against a closed, compiled-in set
+/// at the CLI boundary (code-standards.md: "valider toute entrée externe...
+/// à la frontière"), the exact same pattern `--tool` already uses -- an
+/// unsupported value is a clean parse error naming what was given, never
+/// silently defaulted to `worktree`.
+#[test]
+fn e2e_an_unknown_isolation_is_a_clean_cli_error_naming_the_value() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+        "--isolation",
+        "firecracker",
+    ])
+    .assert()
+    .failure()
+    .stderr(contains("firecracker"));
+}
+
+/// Issue #49: `--isolation` defaults to `worktree` when omitted entirely --
+/// unlike `--tool` (which has no default, issue #24), omitting `--isolation`
+/// must not itself fail arg parsing; it is exercised indirectly by every
+/// other `e2e_*` test in this file that never passes `--isolation` at all
+/// and still runs a real (non-docker) convergence loop successfully.
+#[test]
+fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.args([
+        "run",
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--intent",
+        "irrelevant",
+        "--warden-home",
+        warden_home.path().to_str().unwrap(),
+        "--tool",
+        "claude",
+    ])
+    .assert()
+    .failure()
+    // Fails downstream (no fake `claude` on `PATH`), never on arg parsing --
+    // proven by never seeing clap's own "--isolation" complaint.
+    .stderr(contains("--isolation").not());
+}
+
+/// Cheapest daemon-reachability probe available (mirrors
+/// `warden_sandbox::docker`'s own test-only `docker_daemon_available`) --
+/// auto-skips the behavioural test below rather than failing the whole
+/// suite on a machine without Docker installed/running.
+#[cfg(unix)]
+fn docker_daemon_available() -> bool {
+    SyncCommand::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Resolves the docker endpoint this test's own (real) environment actually
+/// uses, so it can be forwarded explicitly to `warden_command()`'s hermetic
+/// `HOME` below. Docker's own CLI resolves its context (and therefore which
+/// socket to dial) from `$HOME/.docker/config.json` when `$DOCKER_HOST` is
+/// unset -- many real setups (Docker Desktop's `desktop-linux` context, in
+/// particular) point at a non-default socket path under the real `$HOME`,
+/// not the standard `/var/run/docker.sock`. Overriding `HOME` for a hermetic
+/// run (this file's own established, load-bearing convention -- see
+/// `warden_command`'s own docs) would otherwise make every `docker` child
+/// process `warden` spawns dial the wrong (or a nonexistent) socket, even
+/// though this test's own preceding `docker_daemon_available`/`docker build`
+/// calls -- which inherit the real environment untouched -- succeed just
+/// fine. Explicit `$DOCKER_HOST` bypasses context resolution entirely,
+/// working regardless of the current machine's docker context setup.
+#[cfg(unix)]
+fn docker_host_for_current_context() -> Option<String> {
+    if let Ok(explicit) = std::env::var("DOCKER_HOST") {
+        if !explicit.is_empty() {
+            return Some(explicit);
+        }
+    }
+    let output = SyncCommand::new("docker")
+        .args([
+            "context",
+            "inspect",
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let host = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Issue #49 acceptance criterion 1, closing a real coverage gap: every
+/// other `--isolation docker` test in this file (above) only exercises the
+/// CLI *parse* half (`--isolation docker` is accepted / rejected as a
+/// string) -- none of them actually drive a `warden run --isolation docker`
+/// invocation through to a real container. This one does: it builds a
+/// throwaway image whose `claude` is a fake script that (a) hard-fails
+/// unless `/.dockerenv` exists, so the run can only converge if the coder
+/// invocation genuinely executed inside a container, and (b) is the *only*
+/// `claude` anywhere reachable -- deliberately not placed on this test's own
+/// host `PATH` -- so if `--isolation docker` were silently ignored (falling
+/// back to `LocalSandbox`, which resolves `claude` via the host `PATH` this
+/// process inherits), the run would fail to spawn it at all rather than
+/// quietly succeeding on the host. The coder additionally drops a proof file
+/// directly into the base repo's *common* `.git` directory (bind-mounted
+/// read-write, and, unlike the role's own ephemeral worktree, never cleaned
+/// up after the run) -- read back from the host afterwards as positive
+/// evidence a container actually ran, not just an absence-of-failure
+/// argument.
+#[cfg(unix)]
+#[test]
+fn e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container() {
+    if !docker_daemon_available() {
+        eprintln!("skipping: no docker daemon reachable");
+        return;
+    }
+
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, hermetic_home) = warden_command();
+    if let Some(docker_host) = docker_host_for_current_context() {
+        cmd.env("DOCKER_HOST", docker_host);
+    }
+
+    // `--isolation docker` resolves `~/.claude` from `HOME` (see
+    // `default_claude_config_dir`) -- `warden_command()`'s own hermetic
+    // `HOME` needs that directory to actually exist for `DockerSandbox` to
+    // canonicalize it, exactly like `init_repo_with_worktree_and_claude_dir`
+    // in `warden-sandbox`'s own tests.
+    let claude_dir = hermetic_home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join(".credentials.json"), "{}").unwrap();
+
+    // Build a throwaway image: plain `alpine` (already used by
+    // `warden-sandbox`'s own docker tests) plus `git` and the fake `claude`
+    // script below. Tagged with a fresh uuid so parallel test runs (and
+    // repeated local runs) never collide on the same tag.
+    let image_tag = format!("warden-cli-test-{}", uuid::Uuid::new_v4());
+    let build_dir = TempDir::new().unwrap();
+    std::fs::write(
+        build_dir.path().join("Dockerfile"),
+        "FROM alpine:latest\n\
+         RUN apk add --no-cache git\n\
+         COPY claude /usr/local/bin/claude\n\
+         RUN chmod +x /usr/local/bin/claude\n",
+    )
+    .unwrap();
+    std::fs::write(
+        build_dir.path().join("claude"),
+        r#"#!/bin/sh
+set -e
+stdin_content=$(cat)
+
+if [ ! -f /.dockerenv ]; then
+    echo "fake claude: not running inside a container" >&2
+    exit 1
+fi
+
+if echo "$stdin_content" | grep -q '"role":"coder"'; then
+    git_common_dir=$(git rev-parse --git-common-dir)
+    hostname > "$git_common_dir/WARDEN_DOCKER_ISOLATION_PROOF"
+    echo containerized > proof.txt
+    git add proof.txt
+    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle (containerized)"
+fi
+
+printf '{"type":"result","subtype":"success","is_error":false,"result":""}\n'
+"#,
+    )
+    .unwrap();
+
+    let build_status = SyncCommand::new("docker")
+        .args(["build", "-q", "-t", &image_tag])
+        .arg(build_dir.path())
+        .status()
+        .expect("spawn docker build");
+    assert!(
+        build_status.success(),
+        "failed to build the throwaway test image {image_tag}"
+    );
+
+    // Deliberately no fake `claude` placed on this test's own `PATH` -- see
+    // this test's own docs on why that absence is itself part of the
+    // assertion.
+    let assert = cmd
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "run the coder inside a real docker container",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+            "--isolation",
+            "docker",
+            "--isolation-image",
+            &image_tag,
+        ])
+        .assert();
+
+    let output = assert.get_output().clone();
+    let _ = SyncCommand::new("docker")
+        .args(["rmi", "-f", &image_tag])
+        .status();
+
+    assert!(
+        output.status.success(),
+        "warden run --isolation docker did not exit successfully: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("finished: Converged"),
+        "expected a converged run, got stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let proof_path = repo
+        .path()
+        .join(".git")
+        .join("WARDEN_DOCKER_ISOLATION_PROOF");
+    let container_hostname = std::fs::read_to_string(&proof_path).unwrap_or_else(|error| {
+        panic!(
+            "expected {} (proof the coder ran inside a container) to exist after a converged \
+             --isolation docker run: {error}",
+            proof_path.display()
+        )
+    });
+    let host_hostname = SyncCommand::new("hostname")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert_ne!(
+        container_hostname.trim(),
+        host_hostname.trim(),
+        "the proof file's hostname must be the *container's* own (Docker sets it to the \
+         container id by default), not this host's -- got {container_hostname:?} on a host \
+         named {host_hostname:?}"
+    );
 }
 
 /// Issue #24 point 4: the flags this issue removes (`--coder-agent`/

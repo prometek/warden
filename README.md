@@ -97,18 +97,24 @@ transmet `HOME`/`USER` à l'agent — un agent qui tourne **normalement** a donc
 d'atteindre la clé SSH réelle de l'utilisateur et `~/.config/gh`, et de pousser directement
 vers `origin` en contournant `warden-gated` entièrement, sous le même déploiement même-UID.
 Documenté sans l'euphémiser dans `docs/Architecture.md` (ADR-0006, amendement issue #24 ;
-§10). Isolation réelle côté agent — pas seulement côté gate — trackée par l'issue #28.
+§10). Isolation réelle côté agent — pas seulement côté gate — livrée par l'issue #49 :
+`warden run --isolation docker` (voir "Flags de `warden run`" ci-dessous) fait tourner
+l'agent dans un conteneur qui ne peut atteindre ni la clé SSH réelle de l'utilisateur, ni
+`~/.config/gh`, ni pousser vers `origin`. Reste optionnel — `--isolation worktree` (défaut)
+garde le comportement même-hôte décrit ci-dessus.
 
 ## Structure du dépôt
 
 - `crates/warden-core/` — logique pure (state machine des runs, interprétation des
   findings), 100 % testable sans I/O.
 - `crates/warden-sandbox/` — seam d'isolation de l'environnement d'exécution (issue
-  #50) : trait `Sandbox` (`create`/`execute`/`destroy`) + `LocalSandbox`, le backend
-  par défaut, en parité stricte avec l'isolation process que `warden` appliquait
-  auparavant à la main (`env_clear()`, `cwd`, `kill_on_drop`). Dont dépend
-  `crates/warden/` (jamais `warden-core`, dans aucun sens) — prêt pour un futur
-  backend conteneur (`DockerSandbox`, issue #49) sans retoucher les points d'appel.
+  #50) : trait `Sandbox` (`create`/`execute`/`destroy`) + deux backends. `LocalSandbox`
+  (défaut, `--isolation worktree`), en parité stricte avec l'isolation process que
+  `warden` appliquait auparavant à la main (`env_clear()`, `cwd`, `kill_on_drop`).
+  `DockerSandbox` (`--isolation docker`, issue #49/ADR-0015/ADR-0019) exécute chaque
+  invocation dans un conteneur `docker run --rm` séparé — voir "Flags de `warden run`"
+  ci-dessous et `crates/warden-sandbox/docker/README.md` pour l'image de référence et les
+  garanties exactes. Dont dépend `crates/warden/` (jamais `warden-core`, dans aucun sens).
 - `crates/warden/` — binaire orchestrateur (`[[bin]] warden`) : CLI, gestion des
   worktrees git, spawn des agents via la seam `warden-sandbox`, persistance SQLite
   (`sqlx`), boucle de convergence.
@@ -295,6 +301,25 @@ Flags de `warden run` :
 - `--tui-bin <PATH>` — surcharge le binaire `warden-tui` lancé par `--tui` (ignoré sans
   `--tui`). Par défaut, cherche `warden-tui` à côté du binaire `warden` en cours
   d'exécution, avec repli sur une résolution via `PATH`.
+- `--isolation <worktree|docker>` (défaut `worktree`, issue #49/ADR-0015/ADR-0019) —
+  sélectionne le backend `warden-sandbox` utilisé pour **chaque** invocation d'agent de ce
+  run. `worktree` est `LocalSandbox` : comportement inchangé, l'agent tourne directement sur
+  cet hôte. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
+  `docker run --rm` séparé, avec seulement le worktree du rôle et le `.git` du dépôt de base
+  montés en lecture-écriture (pour que git fonctionne), et `~/.claude` de l'hôte monté en
+  **lecture seule** comme unique source d'authentification — rien d'autre de l'hôte n'est
+  jamais atteignable (pas de `~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`). `git push origin`
+  échoue par construction (aucun credential monté, ferme l'issue #28) et les secrets réels de
+  l'hôte sont inatteignables par chemin absolu (ferme l'issue #25). Nécessite Docker
+  installé et démarré (Docker Desktop sur macOS, le démon Docker sur Linux) et l'image de
+  référence déjà construite — voir `crates/warden-sandbox/docker/README.md`. Limite acceptée
+  pour cette version : pas de filtrage d'egress (le conteneur garde un accès réseau normal
+  vers l'API Anthropic ; voir ADR-0019). Reste optionnel — `worktree` demeure le
+  comportement par défaut de tout `warden run`.
+- `--isolation-image <name>` (défaut `warden-agent:latest`, ignoré sans `--isolation
+  docker`) — surcharge l'image que `--isolation docker` exécute pour chaque invocation.
+  Voir `crates/warden-sandbox/docker/README.md` pour construire l'image de référence sous
+  ce tag exact.
 
 ### Preuve d'exécution (Evidence)
 
