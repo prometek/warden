@@ -1128,6 +1128,103 @@ mod tests {
         );
     }
 
+    /// Issue #71 review (HIGH), tester side: the exit-code guard added to
+    /// `run_finding_agent` closes the fail-open "for every `--tool` adapter
+    /// at once, not just mistral" (see this fix's own commit message) --
+    /// this repo's only other regression coverage for that guard
+    /// (`e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges`,
+    /// `crates/warden/tests/cli.rs`) drives it exclusively through the
+    /// **reviewer** role. Since `run_review`/`run_test` share the exact same
+    /// `run_finding_agent` body, the guard is structurally the same code
+    /// path for both -- but that's an implementation detail a future
+    /// refactor could break without any test failing today. This exercises
+    /// the **tester** side directly, through `run_test` (the same entry
+    /// point `Orchestrator::run_convergence_loop` itself calls), with a
+    /// tester that exits non-zero and prints nothing to stdout: it must
+    /// come back as a synthesized blocking `Tester` finding naming the exit
+    /// status, never as "zero findings" (which `tester_succeeded` would
+    /// otherwise read as a passing test suite and wrongly trigger evidence
+    /// capture for).
+    #[tokio::test]
+    async fn a_tester_that_exits_nonzero_with_no_output_synthesizes_a_blocking_finding_not_a_silent_pass(
+    ) {
+        let (repo, warden_home, _db_dir, pool, worktree_manager) =
+            finding_agent_test_fixture().await;
+
+        db::insert_run(
+            &pool,
+            "tester-crash-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "tester-crash-cycle", "tester-crash-run", 1)
+            .await
+            .unwrap();
+
+        let crashing_tester = AgentCommand::new("sh", ["-c", "printf 'boom' >&2; exit 7"]);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "intent".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            reviewer_agent: definition(always_passing_tester()),
+            tester_agent: definition(crashing_tester),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+        let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
+        let orchestrator = Orchestrator::new(pool.clone());
+
+        let findings = orchestrator
+            .run_test(
+                &FakeCommandAdapter,
+                TestInvocation {
+                    run_id: "tester-crash-run",
+                    cycle_id: "tester-crash-cycle",
+                    cycle_number: 1,
+                    agent: &agents.tester,
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: "HEAD",
+                    diff: "",
+                    prior_findings: &[],
+                    config: &config,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "a crashing tester must synthesize exactly one blocking finding, not be silently \
+                 read as zero findings: {findings:?}"
+        );
+        assert_eq!(findings[0].source, warden_core::FindingSource::Tester);
+        assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
+        assert!(
+            findings[0].description.contains("exited with status 7"),
+            "the synthesized finding should name the actual exit status: {}",
+            findings[0].description
+        );
+        assert!(
+            !tester_succeeded(&findings),
+            "a tester that crashed non-zero must never be read as a passing test suite by \
+                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+        );
+    }
+
     /// The legitimate control: a reviewer emitting its own, correct source
     /// must pass through completely unchanged -- proving the validation
     /// added above rejects only a genuine mismatch, not every finding.
