@@ -623,6 +623,21 @@ any other text in your final answer.";
 /// fixtures matching the schema documented here, not a real captured
 /// transcript (see this module's own test docs).
 ///
+/// **Known risk called out explicitly**: the relative *ordering* of event
+/// types within one `--json` transcript is itself unverified -- in
+/// particular, whether a `token_count` event can ever appear *after* the
+/// terminal `task_complete` event, or whether more than one `task_complete`/
+/// `error` event could ever appear in one transcript. `extract_findings` and
+/// `extract_usage` are both written defensively against that uncertainty
+/// (see their own docs): `extract_findings` scans backwards for the first
+/// `task_complete`/`error` event rather than hard-requiring it to be the
+/// stream's literal last line, and `extract_usage` already scanned the whole
+/// buffer rather than assuming a fixed position. If the real protocol turns
+/// out to interleave events completely differently than modelled here, the
+/// worst case is still the same graceful degradation this section already
+/// promises -- a typed parse error or "n/a", never a wrong answer presented
+/// as a right one.
+///
 /// # Invocation shape
 ///
 /// `codex exec --json --ask-for-approval never [--sandbox <mode>] [--model
@@ -690,7 +705,17 @@ impl ToolAdapter for CodexAdapter {
         // The positional `PROMPT` argument: `codex exec`'s only channel for
         // a system prompt (see this struct's own docs) -- pushed last, after
         // every flag, matching the CLI's documented `[OPTIONS] [PROMPT]`
-        // argument order.
+        // argument order. A defensive `--` end-of-options separator goes
+        // immediately before it: a `system_prompt` that happens to start
+        // with `-` (a markdown definition's body is arbitrary user text,
+        // not validated against this) would otherwise risk being parsed as
+        // a flag by codex's own arg parser rather than the positional
+        // prompt. This convention is universal across `clap`-based CLIs
+        // (and getopt-style parsers generally); not independently verified
+        // against this exact CLI (see this struct's own docs on what has/
+        // hasn't been), but safe to include unconditionally even if codex
+        // turns out not to need it.
+        args.push("--".to_string());
         args.push(definition.system_prompt.clone());
         Ok(AgentCommand::new("codex", args))
     }
@@ -700,48 +725,64 @@ impl ToolAdapter for CodexAdapter {
     }
 
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
-        // Same "last non-blank line carries the terminal envelope" contract
-        // `ClaudeAdapter::extract_findings` relies on for its own streamed
-        // output -- see this struct's own docs for why `codex exec --json`
-        // is modelled the same way (a `task_complete` event as the stream's
-        // last line).
-        let last_line = stdout
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .ok_or_else(|| {
-                warden_core::CoreError::MalformedAgentOutput(
-                    "codex produced no output at all (expected at least a final \
-                     `task_complete` event)"
-                        .to_string(),
-                )
-            })?;
-        let event: CodexEvent = serde_json::from_str(last_line).map_err(|error| {
-            warden_core::CoreError::MalformedAgentOutput(format!(
-                "codex's final output line is not the expected JSON event envelope: {error}"
-            ))
-        })?;
-        match event.msg {
-            CodexEventMsg::TaskComplete {
-                last_agent_message: Some(text),
-            } => warden_core::parse_findings(&text),
-            CodexEventMsg::TaskComplete {
-                last_agent_message: None,
-            } => Err(warden_core::CoreError::MalformedAgentOutput(
+        /// The two event kinds `extract_findings` actually terminates on --
+        /// scanned for below rather than assumed to be the stream's literal
+        /// last line, see this method's own docs on why.
+        enum Terminal {
+            Complete(Option<String>),
+            Failed(String),
+        }
+
+        if stdout.trim().is_empty() {
+            return Err(warden_core::CoreError::MalformedAgentOutput(
+                "codex produced no output at all (expected at least a final `task_complete` \
+                 event)"
+                    .to_string(),
+            ));
+        }
+
+        // Scans backwards for the first `task_complete`/`error` event rather
+        // than hard-requiring it to be the stream's literal last line
+        // (`ClaudeAdapter::extract_findings`'s own "last non-blank line"
+        // contract does not carry over unchanged here) -- this adapter's
+        // modeled event ordering is itself unverified (see `CodexAdapter`'s
+        // own "known risk called out explicitly" docs), so a trailing
+        // `token_count` (or any other/unrecognized event) after the
+        // terminal one must not make an otherwise well-formed transcript
+        // look malformed. Every line that isn't parsable JSON, or parses to
+        // some other event type, is simply skipped while scanning, not
+        // itself an error -- `codex`'s own protocol is expected to
+        // interleave several such lines (`agent_message`, `token_count`,
+        // ...) before its terminal event either way.
+        let terminal = stdout.lines().rev().find_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let event: CodexEvent = serde_json::from_str(line).ok()?;
+            match event.msg {
+                CodexEventMsg::TaskComplete { last_agent_message } => {
+                    Some(Terminal::Complete(last_agent_message))
+                }
+                CodexEventMsg::Error { message } => Some(Terminal::Failed(message)),
+                CodexEventMsg::AgentMessage { .. }
+                | CodexEventMsg::TokenCount { .. }
+                | CodexEventMsg::Other => None,
+            }
+        });
+
+        match terminal {
+            Some(Terminal::Complete(Some(text))) => warden_core::parse_findings(&text),
+            Some(Terminal::Complete(None)) => Err(warden_core::CoreError::MalformedAgentOutput(
                 "codex reported task_complete with no last_agent_message (the agent likely did \
                  not complete normally)"
                     .to_string(),
             )),
-            CodexEventMsg::Error { message } => Err(warden_core::CoreError::MalformedAgentOutput(
+            Some(Terminal::Failed(message)) => Err(warden_core::CoreError::MalformedAgentOutput(
                 format!("codex reported an error: {message}"),
             )),
-            CodexEventMsg::AgentMessage { .. } | CodexEventMsg::TokenCount { .. } => {
-                Err(warden_core::CoreError::MalformedAgentOutput(
-                    "codex's final output line is not a `task_complete` event".to_string(),
-                ))
-            }
-            CodexEventMsg::Other => Err(warden_core::CoreError::MalformedAgentOutput(
-                "codex's final output line is an unrecognized event type".to_string(),
+            None => Err(warden_core::CoreError::MalformedAgentOutput(
+                "codex's output contains no `task_complete`/`error` event".to_string(),
             )),
         }
     }
@@ -894,6 +935,29 @@ enum CodexEventMsg {
 ///   independent: if the real `mistral` CLI's argv turns out to differ from
 ///   what [`build_command`](MistralAdapter::build_command) assumes below,
 ///   only that method needs to change -- this findings contract does not.
+///   A **blank** buffer (nothing printed at all) is *not* treated as an
+///   error here, unlike `ClaudeAdapter`/`CodexAdapter`: both of those CLIs
+///   always emit a structural envelope, so a zero-byte stdout there is real
+///   evidence something crashed silently before that envelope was ever
+///   printed, distinct from that envelope's own payload being empty.
+///   `mistral`, as modelled, has no envelope at all -- and every default
+///   reviewer/tester prompt this codebase ships
+///   (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`, shared across every
+///   adapter) explicitly instructs the agent to answer with **zero NDJSON
+///   lines** when it has nothing to flag ("no findings at all means no
+///   lines"). For an envelope-less CLI that is indistinguishable from a
+///   literally blank stdout, so treating blank as an error here would make
+///   this adapter's own "zero `.md`" default prompts never able to reach a
+///   clean state at all. Blank stdout therefore parses to zero findings,
+///   matching `warden_core::parse_findings`'s own established "no non-blank
+///   lines" convention (see that function's own docs). **Known, accepted
+///   limitation**: this adapter has no structural way to tell that apart
+///   from `mistral` crashing silently before printing anything at all
+///   (`code-standards.md`'s "never trust agent output" bites hardest here,
+///   for exactly the reason this whole adapter is the conservative one) --
+///   a real deployment relying on this adapter for a role that must never
+///   silently pass should treat a silent `mistral` invocation as a residual
+///   risk this adapter cannot close on its own, unlike `claude`/`codex`.
 ///
 /// # Invocation shape
 ///
@@ -932,17 +996,15 @@ impl ToolAdapter for MistralAdapter {
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
         // No envelope to unwrap (see this adapter's own docs) -- the whole
         // trimmed buffer is the agent's final answer, handed straight to
-        // `warden_core::parse_findings` exactly like `ClaudeAdapter`'s
-        // original single-line `--output-format json` mode did before
-        // `stream-json` introduced an envelope (see `ClaudeAdapter`'s own
-        // docs on that history).
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            return Err(warden_core::CoreError::MalformedAgentOutput(
-                "mistral produced no output at all".to_string(),
-            ));
-        }
-        warden_core::parse_findings(trimmed)
+        // `warden_core::parse_findings`, which already treats a blank
+        // buffer as zero findings rather than an error. Deliberately *not*
+        // special-cased into an error here the way
+        // `ClaudeAdapter`/`CodexAdapter` treat a genuinely empty stdout --
+        // see this adapter's own docs ("Known, accepted limitation") for
+        // why a blank buffer is this adapter's expected shape for "nothing
+        // to report" rather than evidence of a crash, and the residual risk
+        // that entails.
+        warden_core::parse_findings(stdout.trim())
     }
 
     fn default_prompt(&self, role: AgentRole) -> &'static str {
@@ -1374,9 +1436,22 @@ mod tests {
                 "--json",
                 "--ask-for-approval",
                 "never",
+                "--",
                 "be an agent"
             ]
         );
+    }
+
+    /// The `--` end-of-options separator (defensive against a system prompt
+    /// starting with `-`, see `CodexAdapter::build_command`'s own docs) must
+    /// sit immediately before the positional prompt, not merely somewhere in
+    /// argv.
+    #[test]
+    fn codex_build_command_places_the_end_of_options_separator_right_before_the_prompt() {
+        let command = CodexAdapter.build_command(&definition(None, None)).unwrap();
+        let prompt_index = command.args.len() - 1;
+        assert_eq!(command.args[prompt_index], "be an agent");
+        assert_eq!(command.args[prompt_index - 1], "--");
     }
 
     #[test]
@@ -1653,22 +1728,24 @@ mod tests {
         assert_eq!(findings[0].description, "flaky test");
     }
 
+    /// Unlike `ClaudeAdapter`/`CodexAdapter` (both of which treat a
+    /// genuinely empty stdout as an error -- their own envelopes always
+    /// carry at least *something*), a blank buffer is this adapter's
+    /// expected shape for "nothing to report" (see `MistralAdapter`'s own
+    /// docs, "Known, accepted limitation") -- exactly what a reviewer/tester
+    /// following the shared default NDJSON prompts is instructed to answer
+    /// with when it has nothing to flag.
     #[test]
-    fn mistral_extract_findings_treats_blank_only_output_as_no_findings_error() {
-        let error = MistralAdapter.extract_findings("   \n\n").unwrap_err();
-        assert!(matches!(
-            error,
-            warden_core::CoreError::MalformedAgentOutput(_)
-        ));
+    fn mistral_extract_findings_treats_blank_only_output_as_no_findings() {
+        assert_eq!(
+            MistralAdapter.extract_findings("   \n\n").unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
-    fn mistral_extract_findings_rejects_completely_empty_output() {
-        let error = MistralAdapter.extract_findings("").unwrap_err();
-        assert!(matches!(
-            error,
-            warden_core::CoreError::MalformedAgentOutput(_)
-        ));
+    fn mistral_extract_findings_treats_completely_empty_output_as_no_findings() {
+        assert_eq!(MistralAdapter.extract_findings("").unwrap(), Vec::new());
     }
 
     #[test]

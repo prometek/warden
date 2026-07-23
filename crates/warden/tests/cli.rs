@@ -151,6 +151,78 @@ printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' 
     write_fake_tool(dir, "claude", &script);
 }
 
+/// Issue #71: same technique as [`write_fake_claude`] (this module's own
+/// "fake `claude` harness" docs apply equally here), standing in for the
+/// real `codex` binary in `codex exec --json` mode
+/// (`CodexAdapter::build_command`). Emits the JSONL event stream
+/// `CodexAdapter::extract_findings`/`extract_usage`/`parse_progress_line`
+/// expect (see `tool_adapter.rs`'s own docs on this not being verified
+/// against a live install) -- an `agent_message`, a `token_count`, then a
+/// terminal `task_complete` whose `last_agent_message` carries the role's
+/// own final-answer text, written to `$WARDEN_RESULT_FILE` exactly like
+/// `write_fake_claude`'s own fragments.
+#[cfg(unix)]
+fn write_fake_codex(dir: &Path, coder_body: &str, reviewer_body: &str, tester_body: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+stdin_file=$(mktemp)
+cat > "$stdin_file"
+WARDEN_RESULT_FILE=$(mktemp)
+export WARDEN_RESULT_FILE
+: > "$WARDEN_RESULT_FILE"
+
+if grep -q '"role":"coder"' "$stdin_file"; then
+{coder_body}
+elif grep -q '"role":"reviewer"' "$stdin_file"; then
+{reviewer_body}
+else
+{tester_body}
+fi
+
+result=$(cat "$WARDEN_RESULT_FILE")
+rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
+escaped=$(printf '%s' "$result" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
+printf '{{"msg":{{"type":"agent_message","message":"working"}}}}\n'
+printf '{{"msg":{{"type":"token_count","input_tokens":11,"output_tokens":22}}}}\n'
+printf '{{"msg":{{"type":"task_complete","last_agent_message":%s}}}}\n' "$escaped"
+"#
+    );
+    write_fake_tool(dir, "codex", &script);
+}
+
+/// Issue #71: same technique as [`write_fake_claude`], standing in for the
+/// real `mistral` binary (`MistralAdapter::build_command`). No envelope to
+/// unwrap (see `MistralAdapter`'s own docs) -- the role's final-answer text
+/// written to `$WARDEN_RESULT_FILE` is printed to stdout verbatim, exactly
+/// the "whole trimmed stdout is the final answer" contract
+/// `MistralAdapter::extract_findings` implements.
+#[cfg(unix)]
+fn write_fake_mistral(dir: &Path, coder_body: &str, reviewer_body: &str, tester_body: &str) {
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+stdin_file=$(mktemp)
+cat > "$stdin_file"
+WARDEN_RESULT_FILE=$(mktemp)
+export WARDEN_RESULT_FILE
+: > "$WARDEN_RESULT_FILE"
+
+if grep -q '"role":"coder"' "$stdin_file"; then
+{coder_body}
+elif grep -q '"role":"reviewer"' "$stdin_file"; then
+{reviewer_body}
+else
+{tester_body}
+fi
+
+cat "$WARDEN_RESULT_FILE"
+rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
+"#
+    );
+    write_fake_tool(dir, "mistral", &script);
+}
+
 /// A coder that flips `status.txt` between "broken" and "fixed" each time it
 /// runs, paired with [`STATUS_GATED_REVIEWER_BODY`] -- deterministically
 /// exercises exactly one reboucle before converging, without depending on a
@@ -845,6 +917,151 @@ async fn e2e_zero_md_run_uses_the_adapters_defaults_and_converges() {
         .assert()
         .success()
         .stdout(contains("finished: Converged"));
+}
+
+/// Issue #71: hermetic e2e proving the `codex` wiring end to end -- `main.rs`
+/// dispatch (`--tool codex`) -> `CodexAdapter::build_command` -> the real
+/// convergence loop -> `CodexAdapter::extract_findings`/`extract_usage` --
+/// the same level of test this repo already has for `claude`
+/// (`write_fake_claude`/`e2e_zero_md_run_uses_the_adapters_defaults_and_converges`
+/// above), applied to the fake `codex` JSONL event stream
+/// (`write_fake_codex`, this module's own docs). The reviewer's one `info`
+/// finding is non-blocking (it must not itself trigger a reboucle), so a
+/// single cycle both converges and proves findings/usage were actually
+/// extracted from the modeled event stream, not merely that the run didn't
+/// crash.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_via_codex_converges_and_extracts_findings_and_usage() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let reviewer_body = r#"
+printf '%s\n' '{"source":"reviewer","severity":"info","description":"codex reviewer saw the diff"}' > "$WARDEN_RESULT_FILE"
+"#;
+    write_fake_codex(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        reviewer_body,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "add a note via codex",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "codex",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    let (cycle_id,): (String,) = sqlx::query_as("SELECT id FROM cycles WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let findings = warden::db::list_findings_for_cycle(&pool, &cycle_id)
+        .await
+        .unwrap();
+    assert_eq!(findings.len(), 1, "expected the reviewer's one finding");
+    assert_eq!(findings[0].source, FindingSource::Reviewer);
+    assert_eq!(findings[0].description, "codex reviewer saw the diff");
+
+    let usage = warden::db::get_run_token_usage(&pool, &run_id)
+        .await
+        .unwrap()
+        .expect("codex's modeled token_count events must be extracted, not \"n/a\"");
+    assert!(usage.input_tokens > 0);
+    assert!(usage.output_tokens > 0);
+}
+
+/// Issue #71: hermetic e2e proving the `mistral` wiring end to end -- same
+/// level of test as
+/// `e2e_run_via_codex_converges_and_extracts_findings_and_usage` above, but
+/// through the fake `mistral` binary (`write_fake_mistral`, this module's
+/// own docs), which prints NDJSON findings directly on stdout with no
+/// envelope at all (`MistralAdapter::extract_findings`'s own contract).
+/// `extract_usage` always returns `None` for this adapter (see
+/// `MistralAdapter`'s own docs), so this test asserts "n/a" rather than any
+/// token figure.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_via_mistral_converges_and_extracts_findings() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let tester_body = r#"
+printf '%s\n' '{"source":"tester","severity":"info","description":"mistral tester ran the suite"}' > "$WARDEN_RESULT_FILE"
+"#;
+    write_fake_mistral(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        tester_body,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "add a note via mistral",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "mistral",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    let (cycle_id,): (String,) = sqlx::query_as("SELECT id FROM cycles WHERE run_id = ?")
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let findings = warden::db::list_findings_for_cycle(&pool, &cycle_id)
+        .await
+        .unwrap();
+    assert_eq!(findings.len(), 1, "expected the tester's one finding");
+    assert_eq!(findings[0].source, FindingSource::Tester);
+    assert_eq!(findings[0].description, "mistral tester ran the suite");
+
+    assert_eq!(
+        warden::db::get_run_token_usage(&pool, &run_id)
+            .await
+            .unwrap(),
+        None,
+        "MistralAdapter never reports usage -- must persist as \"n/a\", not a fabricated figure"
+    );
 }
 
 /// M2 (issue #20 review), unaffected by issue #24: a coder that exits

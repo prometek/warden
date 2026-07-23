@@ -12,23 +12,38 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - **`warden::tool_adapter::CodexAdapter`** (`--tool codex`) — enveloppe le CLI OpenAI Codex
   (`codex exec --json --ask-for-approval never`), avec `--sandbox <mode>` dérivé de
   `tools:` (`workspace-write` pour coder/tester, `read-only` pour reviewer, par défaut) et
-  `--model` depuis `model:`. Findings extraits du dernier événement `task_complete`
-  (`last_agent_message`), progression en direct (issue #33) depuis les événements
-  `agent_message`, usage de tokens (issue #53) depuis l'événement `token_count` le plus
-  récent du flux. **Non vérifié contre une installation réelle** (pas de binaire ni d'accès
-  réseau disponibles à l'écriture) — invocation et schéma JSON construits à partir de la
-  documentation publiée du CLI, avec dégradation propre documentée dans le module si un
-  détail s'avère inexact.
+  `--model` depuis `model:`. Un séparateur `--` précède le prompt positionnel (défensif
+  contre un `system_prompt` commençant par `-`). Findings extraits en remontant le flux à
+  la recherche du premier événement `task_complete`/`error` (pas seulement la dernière
+  ligne — l'ordre exact des événements `codex` n'étant pas vérifié en direct, un
+  `token_count` traînant après `task_complete` ne doit pas faire échouer l'extraction),
+  progression en direct (issue #33) depuis les événements `agent_message`, usage de tokens
+  (issue #53) depuis l'événement `token_count` le plus récent du flux. **Non vérifié contre
+  une installation réelle** (pas de binaire ni d'accès réseau disponibles à l'écriture) —
+  invocation et schéma JSON construits à partir de la documentation publiée du CLI, avec
+  dégradation propre documentée dans le module (risque d'ordonnancement des événements
+  explicitement documenté) si un détail s'avère inexact.
 - **`warden::tool_adapter::MistralAdapter`** (`--tool mistral`) — enveloppe minimale et
   volontairement conservatrice (`mistral --system <prompt> [--model <model>]`) : la
   maturité/existence même de ce CLI sont incertaines (ticket #71), donc aucun format de
   sortie structuré n'est supposé — la sortie brute entière est traitée comme la réponse
-  finale (findings), et l'usage de tokens est toujours `None` (« n/a »).
+  finale (findings), et l'usage de tokens est toujours `None` (« n/a »). Une sortie vide
+  est traitée comme « aucun finding » (pas une erreur) : les prompts par défaut partagés
+  demandent explicitement zéro ligne NDJSON quand il n'y a rien à signaler, ce qui pour ce
+  CLI sans enveloppe se traduit par un stdout littéralement vide — limitation documentée
+  dans le module (aucun moyen structurel de distinguer ce cas d'un crash silencieux pour ce
+  CLI précis, contrairement à `claude`/`codex`).
 - **`--tool`** accepte désormais `claude`/`codex`/`mistral` ; un nom inconnu liste les trois
   dans son message d'erreur (`crates/warden/src/main.rs`, `ToolName`/`parse_tool`).
 - Tests unitaires par adaptateur (`build_command`, `extract_findings`, `extract_usage`,
   `default_prompt`/`default_tools`, `parse_progress_line`) sur des sorties fabriquées,
   même style que ceux de `ClaudeAdapter`.
+- **Tests e2e hermétiques** (`crates/warden/tests/cli.rs`) : un faux binaire `codex`
+  (émettant `agent_message`/`token_count`/`task_complete`) et un faux binaire `mistral`
+  (NDJSON brut sur stdout), même technique que `write_fake_claude` — chacun piloté via
+  `warden run --tool <name>` réel, vérifiant convergence + findings extraits (+ usage de
+  tokens pour `codex`) de bout en bout (dispatch `main.rs` → `build_command` →
+  orchestrateur → `extract_findings`/`extract_usage`).
 - Doc : nouvelle section « Prérequis par CLI (`--tool`) » dans `README.md` (binaire
   installé + authentifié par le CLI lui-même, ADR-0005 inchangée — Warden ne détient
   aucune clé).
