@@ -317,6 +317,13 @@ async fn main() -> anyhow::Result<()> {
             // Issue #72: `--intents-file` entries run first (file order),
             // followed by any repeated `--intent` flags, in the order given.
             let mut intents = Vec::new();
+            // Issue #72 review, LOW 2: tracked separately from `intents`
+            // itself so the final "no intent provided" error (below) can
+            // name the file specifically when it's the reason the combined
+            // list is empty -- e.g. an all-comment/blank `--intents-file`
+            // with no `--intent` flags at all reads very differently from
+            // "you forgot both flags entirely".
+            let mut empty_intents_file: Option<&PathBuf> = None;
             if let Some(intents_file_path) = &intents_file {
                 let file_intents = warden::batch::read_intents_file(intents_file_path)
                     .with_context(|| {
@@ -325,13 +332,24 @@ async fn main() -> anyhow::Result<()> {
                             intents_file_path.display()
                         )
                     })?;
+                if file_intents.is_empty() {
+                    empty_intents_file = Some(intents_file_path);
+                }
                 intents.extend(file_intents);
             }
             intents.extend(intent);
             if intents.is_empty() {
-                bail!(
-                    "no intent provided: pass --intent (repeatable) and/or --intents-file <path>"
-                );
+                match empty_intents_file {
+                    Some(path) => bail!(
+                        "--intents-file {} contained no intents (every line was blank or a \
+                         comment); pass --intent (repeatable) and/or a non-empty --intents-file",
+                        path.display()
+                    ),
+                    None => bail!(
+                        "no intent provided: pass --intent (repeatable) and/or --intents-file \
+                         <path>"
+                    ),
+                }
             }
 
             // One arm today (`ToolName::Claude`); a future adapter gets its
@@ -880,6 +898,20 @@ async fn run<R: ToolAdapter>(
     // reproduced against the real binary with plain `warden run | head -1`
     // -- see `print_stdout_line_or_log`'s own docs.
     print_stdout_line_or_log(&format!("run {run_id} finished: {final_state:?}"));
+    // Issue #72 review, MEDIUM 1: a second, dedicated machine-readable line,
+    // deliberately keyed off `RunState::as_str()` -- warden-core's own
+    // documented, migration-guarded stable string form (`state.rs`'s own
+    // docs: "Never change existing variants' strings without a migration")
+    // -- rather than `RunState`'s `Debug` output above, which carries no
+    // such guarantee. `warden::batch`'s success classification for a batch
+    // child (`warden::batch::parse_outcome_line`/`is_converged_state`) is
+    // based on *this* line, never the human-readable `"finished: ..."` one,
+    // so a cosmetic `Debug` reformat can never silently misclassify a
+    // batch's outcome. Printed unconditionally (every run, not only a batch
+    // child) rather than only under `--intent`/batch mode, so this is one
+    // single, always-present contract instead of a conditional one a caller
+    // would need to know to opt into.
+    print_stdout_line_or_log(&format!("run {run_id} outcome: {}", final_state.as_str()));
 
     Ok(())
 }
@@ -890,11 +922,23 @@ async fn run<R: ToolAdapter>(
 /// isolation this issue defaults to: a brand new OS process gets a brand new
 /// `Orchestrator`, a brand new `run_id`, and its own
 /// `<warden_home>/worktrees/<run_id>/` tree, so there is no in-memory state
-/// to carry over between intents by construction -- and this crate's own
-/// existing, unchanged agent-subprocess/worktree teardown (exercised by
-/// every single-intent run already) guarantees agents are killed and
-/// worktrees are gone once that child's own convergence loop returns, before
-/// the next intent's child is ever spawned.
+/// to carry over between intents by construction.
+///
+/// **Teardown (issue #72 review, MEDIUM 2): guaranteed on a clean child
+/// exit, best-effort otherwise.** When a child's own convergence loop
+/// returns normally (converged, exhausted its budget, or a handled failure),
+/// this crate's existing, unchanged agent-subprocess (`kill_on_drop`) and
+/// worktree teardown already guarantees its agents are gone and its
+/// worktree is removed before this fn ever spawns the next intent's child --
+/// exactly like any single-intent run. A child that instead dies uncleanly
+/// (`SIGKILL`/OOM/abort) never runs that teardown at all (no `Drop` ever
+/// fires) and can leave an orphaned agent process and/or worktree behind;
+/// this fn does not detect that case itself, but reclaims it the same way
+/// every `warden run` startup already does for exactly this scenario --
+/// see the `orchestrator::recover_crashed_runs` call below, run once after
+/// every intent (not left to the *next* intent's own incidental startup
+/// call, which would never fire at all for the batch's last intent, or one
+/// stopped at via `fail_fast`/cancellation).
 ///
 /// Every flag here mirrors the one `--intent`/`--intents-file`/`--fail-fast`
 /// case of [`Commands::Run`] (this fn's own caller is the only place that
@@ -907,10 +951,14 @@ async fn run<R: ToolAdapter>(
 /// subprocess failed outright) does not stop the batch -- the next intent
 /// still gets its own clean-slate child -- unless `fail_fast` is set, in
 /// which case every intent after the first non-converged one is recorded as
-/// `Skipped` without ever being attempted. Once every intent has either run
-/// or been skipped, the batch summary is printed and this returns `Err` iff
-/// at least one intent did not converge (issue #72: "final report listing
-/// each intent's result").
+/// `Skipped` without ever being attempted. A Ctrl-C during the batch (issue
+/// #72 review, LOW 1) is handled the same way: the in-flight child is left
+/// to finish (it gets the same signal, in the same foreground process
+/// group, and cancels itself exactly like a plain `warden run` would), then
+/// every intent after it is recorded `Skipped` rather than started. Once
+/// every intent has either run or been skipped, the batch summary is
+/// printed and this returns `Err` iff at least one intent did not converge
+/// (issue #72: "final report listing each intent's result").
 #[allow(clippy::too_many_arguments)]
 async fn run_batch(
     repo: PathBuf,
@@ -945,6 +993,36 @@ async fn run_batch(
     let current_exe = std::env::current_exe().context(
         "failed to resolve the path to the running warden binary (needed to spawn batch children)",
     )?;
+
+    // Issue #72 review, MEDIUM 2: opened once here (not per intent) so the
+    // crash-recovery call after each intent below reuses the same pool --
+    // this is the exact same `<warden_home>/state.db` every batch child
+    // opens for itself, so this parent process reads/writes nothing a
+    // concurrently-running child wouldn't already expect another `warden`
+    // process to touch (ADR-0004's SQLite is already multi-writer-safe via
+    // WAL, and no child is alive when this call runs -- it only runs
+    // between children, once each has already exited).
+    let pool = warden::db::connect(&warden_home.join("state.db"))
+        .await
+        .context("failed to open Warden's SQLite database for batch crash recovery")?;
+
+    // Issue #72 review, LOW 1: without this, an unhandled Ctrl-C would kill
+    // this process outright (default `SIGINT` disposition), abandoning the
+    // loop below without ever printing the batch summary -- even though the
+    // in-flight child (same foreground process group) already receives and
+    // handles that same signal itself, exactly like a plain `warden run`
+    // would. This only arms a flag; it never touches the in-flight child.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled_setter = cancelled.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::warn!(
+                "received Ctrl-C during batch mode; finishing the in-flight intent, then \
+                 skipping the rest and printing the summary"
+            );
+            cancelled_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
 
     let repo_str = path_arg(&repo, "--repo")?;
     let warden_home_str = path_arg(&warden_home, "--warden-home")?;
@@ -987,17 +1065,20 @@ async fn run_batch(
     let total = intents.len();
     let mut reports: Vec<warden::batch::IntentReport> = Vec::with_capacity(total);
     let mut stop_remaining = false;
+    let mut skip_reason = String::new();
 
     for (index, intent) in intents.iter().enumerate() {
         if stop_remaining {
             print_stdout_line_or_log(&format!(
-                "batch: skipping intent {}/{total} (--fail-fast): {intent:?}",
+                "batch: skipping intent {}/{total} ({skip_reason}): {intent:?}",
                 index + 1
             ));
             reports.push(warden::batch::IntentReport {
                 intent: intent.clone(),
                 run_id: None,
-                status: warden::batch::IntentStatus::Skipped,
+                status: warden::batch::IntentStatus::Skipped {
+                    reason: skip_reason.clone(),
+                },
             });
             continue;
         }
@@ -1010,8 +1091,37 @@ async fn run_batch(
         let child_args = warden::batch::build_single_intent_args(&single_intent_args, intent);
         let report = run_one_batch_intent(&current_exe, &child_args, intent).await?;
 
-        if !report.status.is_success() && fail_fast {
+        // Issue #72 review, MEDIUM 2: reclaims this intent's own orphaned
+        // agent process(es)/worktree if its child crashed uncleanly --
+        // best-effort, exactly like every `warden run` startup already does
+        // (see this fn's own docs above). Run unconditionally, whether the
+        // intent converged or not: a converging child already tore down
+        // after itself, so this is a cheap no-op for it.
+        match orchestrator::recover_crashed_runs(&pool).await {
+            Ok(recovered) => {
+                for recovered_run_id in &recovered {
+                    tracing::warn!(
+                        run_id = recovered_run_id,
+                        "batch: run recovered as Failed after its child intent exited (crash \
+                         recovery)"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "batch: crash recovery after an intent's child failed"
+                );
+            }
+        }
+
+        if let Some(reason) = warden::batch::stop_reason(
+            report.status.is_success(),
+            fail_fast,
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
             stop_remaining = true;
+            skip_reason = reason;
         }
         reports.push(report);
     }
@@ -1048,9 +1158,19 @@ fn path_arg<'a>(path: &'a Path, flag_name: &str) -> anyhow::Result<&'a str> {
 /// Runs one batch intent's child (issue #72): spawns `current_exe` with
 /// `child_args`, relays its stdout live (through the same
 /// [`print_stdout_line_or_log`] every other run output goes through) while
-/// parsing it for the `"run <id> started"`/`"run <id> finished: <State>"`
-/// lines [`run`] itself always prints, then classifies the outcome once the
-/// child exits.
+/// parsing it for the `"run <id> started"`, `"run <id> finished: <Debug>"`,
+/// and `"run <id> outcome: <as_str()>"` lines [`run`] itself always prints,
+/// then classifies the outcome once the child exits.
+///
+/// Issue #72 review, MEDIUM 1: classification (converged or not) is decided
+/// **only** from the `"... outcome: ..."` line -- `RunState::as_str()`'s
+/// stable, migration-guarded string form -- never from the human-readable
+/// `"... finished: <Debug>"` line, which carries no such stability
+/// guarantee. The `Debug` text is still captured, purely to give
+/// [`warden::batch::summarize`] a nicer label than the `snake_case` stable
+/// form; a child that (for whatever reason) prints one line but not the
+/// other is treated as untrustworthy either way (see the final `match`
+/// below) -- this batch never classifies an intent from a partial read.
 ///
 /// Returns `Err` only for an infrastructure failure this batch cannot
 /// meaningfully continue past (the child failed to even spawn, or waiting on
@@ -1083,7 +1203,11 @@ async fn run_one_batch_intent(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut run_id: Option<String> = None;
-    let mut finished: Option<(String, String)> = None;
+    // Display-only (issue #72 review, MEDIUM 1): the human-readable
+    // `RunState` `Debug` text, used purely for `summarize`'s label.
+    let mut finished_display: Option<(String, String)> = None;
+    // The classification source of truth: `RunState::as_str()`'s stable form.
+    let mut outcome: Option<(String, String)> = None;
 
     while let Some(line) = lines
         .next_line()
@@ -1096,8 +1220,11 @@ async fn run_one_batch_intent(
                 run_id = Some(started_id.to_string());
             }
         }
-        if let Some((finished_id, final_state)) = warden::batch::parse_finished_line(&line) {
-            finished = Some((finished_id.to_string(), final_state.to_string()));
+        if let Some((finished_id, debug_state)) = warden::batch::parse_finished_line(&line) {
+            finished_display = Some((finished_id.to_string(), debug_state.to_string()));
+        }
+        if let Some((outcome_id, stable_state)) = warden::batch::parse_outcome_line(&line) {
+            outcome = Some((outcome_id.to_string(), stable_state.to_string()));
         }
     }
 
@@ -1109,23 +1236,29 @@ async fn run_one_batch_intent(
     if !status.success() {
         return Ok(warden::batch::IntentReport {
             intent: intent.to_string(),
-            run_id: run_id.or_else(|| finished.as_ref().map(|(id, _)| id.clone())),
+            run_id: run_id.or_else(|| outcome.as_ref().map(|(id, _)| id.clone())),
             status: warden::batch::IntentStatus::SubprocessError {
                 reason: format!("warden run exited with status {status}"),
             },
         });
     }
 
-    match finished {
-        Some((finished_run_id, final_state)) => {
-            let status = if warden::batch::is_converged_state(&final_state) {
+    match outcome {
+        Some((outcome_run_id, stable_state)) => {
+            // Prefers the `Debug`-form label for the report's own text when
+            // available (nicer to read), falling back to the stable form
+            // itself -- purely cosmetic, never the classification.
+            let final_state = finished_display
+                .map(|(_, debug_state)| debug_state)
+                .unwrap_or_else(|| stable_state.clone());
+            let status = if warden::batch::is_converged_state(&stable_state) {
                 warden::batch::IntentStatus::Converged { final_state }
             } else {
                 warden::batch::IntentStatus::NotConverged { final_state }
             };
             Ok(warden::batch::IntentReport {
                 intent: intent.to_string(),
-                run_id: Some(finished_run_id),
+                run_id: Some(outcome_run_id),
                 status,
             })
         }
@@ -1133,7 +1266,7 @@ async fn run_one_batch_intent(
             intent: intent.to_string(),
             run_id,
             status: warden::batch::IntentStatus::SubprocessError {
-                reason: "child exited successfully but printed no parseable \"finished:\" line"
+                reason: "child exited successfully but printed no parseable \"outcome:\" line"
                     .to_string(),
             },
         }),

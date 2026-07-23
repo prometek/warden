@@ -4426,3 +4426,37 @@ async fn e2e_run_without_any_intent_is_a_clean_cli_error() {
         .failure()
         .stderr(contains("no intent provided"));
 }
+
+/// Issue #72 review, LOW 2: an `--intents-file` that was actually supplied
+/// but contributed zero intents (every line blank or a comment) must name
+/// the file in the error -- the generic "no intent provided" message from
+/// [`e2e_run_without_any_intent_is_a_clean_cli_error`] reads as if no file
+/// was given at all, which is misleading when one very much was.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_with_an_all_comment_intents_file_names_the_file_in_the_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    let intents_file = warden_home.path().join("empty-intents.txt");
+    std::fs::write(&intents_file, "# nothing but comments\n\n   \n").unwrap();
+
+    warden_command()
+        .0
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intents-file",
+            intents_file.to_str().unwrap(),
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("contained no intents"))
+        .stderr(contains(intents_file.to_str().unwrap().to_string()));
+}

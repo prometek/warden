@@ -152,23 +152,40 @@ pub fn parse_started_line(line: &str) -> Option<&str> {
 /// Parses a `warden run` child's final `"run <id> finished: <State>"` stdout
 /// line (see `main.rs::run`'s own final `print_stdout_line_or_log` call),
 /// returning `(run_id, final_state)`. `final_state` is `RunState`'s `Debug`
-/// form (e.g. `"Converged"`, `"MaxReviewCyclesExceeded"`), never re-parsed
-/// into an actual `RunState` here -- this module only needs to tell success
-/// apart from every other outcome ([`is_converged_state`]), not the full
-/// state machine.
+/// form (e.g. `"Converged"`, `"MaxReviewCyclesExceeded"`) -- **display only**
+/// (issue #72 review, MEDIUM 1): `Debug`'s exact spelling carries no
+/// stability guarantee, so this batch never classifies an intent's success
+/// from it. Only used to give [`summarize`] a nicer label than
+/// [`parse_outcome_line`]'s `snake_case` stable form; the run_id captured
+/// here is likewise never the sole source of truth for a report's `run_id`
+/// (`main.rs::run_one_batch_intent` prefers [`parse_outcome_line`]'s copy).
 pub fn parse_finished_line(line: &str) -> Option<(&str, &str)> {
     line.strip_prefix("run ")?.split_once(" finished: ")
 }
 
-/// Whether `final_state` (a `RunState` `Debug` string, see
-/// [`parse_finished_line`]) counts as this intent having actually converged.
-/// `Done` (the post-gate terminal state, ADR-0011) counts alongside
-/// `Converged` (the no-gate terminal state) -- both mean the run's own goal
-/// was reached, just with or without the post-`Converged` push/PR/CI tail
-/// configured. Every other value (`MaxReviewCyclesExceeded`,
-/// `MaxTestCyclesExceeded`, `Failed`, or anything else) is not a success.
+/// Parses a `warden run` child's `"run <id> outcome: <state>"` stdout line
+/// (see `main.rs::run`'s own final `print_stdout_line_or_log` call, printed
+/// right after the `"... finished: ..."` line [`parse_finished_line`]
+/// parses), returning `(run_id, final_state)`. `final_state` here is
+/// `warden_core::RunState::as_str()`'s stable, migration-guarded string form
+/// (e.g. `"converged"`, `"max_review_cycles_exceeded"`) -- issue #72 review,
+/// MEDIUM 1: this is the line [`is_converged_state`] classification is
+/// actually based on, deliberately never `RunState`'s `Debug` output (see
+/// [`parse_finished_line`]'s own docs on why that's display-only here).
+pub fn parse_outcome_line(line: &str) -> Option<(&str, &str)> {
+    line.strip_prefix("run ")?.split_once(" outcome: ")
+}
+
+/// Whether `final_state` (a `RunState::as_str()` string, see
+/// [`parse_outcome_line`]) counts as this intent having actually converged.
+/// `"done"` (the post-gate terminal state, ADR-0011) counts alongside
+/// `"converged"` (the no-gate terminal state) -- both mean the run's own
+/// goal was reached, just with or without the post-`Converged` push/PR/CI
+/// tail configured. Every other value (`"max_review_cycles_exceeded"`,
+/// `"max_test_cycles_exceeded"`, `"failed"`, or anything else) is not a
+/// success.
 pub fn is_converged_state(final_state: &str) -> bool {
-    matches!(final_state, "Converged" | "Done")
+    matches!(final_state, "converged" | "done")
 }
 
 /// Outcome of one intent's isolated child run, once known.
@@ -181,13 +198,14 @@ pub enum IntentStatus {
     /// `Failed`/other) -- not a crash, just "didn't converge".
     NotConverged { final_state: String },
     /// The child either exited non-zero, or exited zero but never printed a
-    /// parseable `"... finished: ..."` line at all (a bug, or a crash after
+    /// parseable `"... outcome: ..."` line at all (a bug, or a crash after
     /// that print but before flush -- either way, this batch run cannot
     /// trust that intent's outcome).
     SubprocessError { reason: String },
-    /// Never attempted: batch stopped at an earlier failing intent under
-    /// `--fail-fast`.
-    Skipped,
+    /// Never attempted: batch stopped before reaching this intent, either
+    /// because an earlier intent failed under `--fail-fast`, or the batch was
+    /// cancelled (Ctrl-C, issue #72 review, LOW 1). `reason` names which.
+    Skipped { reason: String },
 }
 
 impl IntentStatus {
@@ -230,9 +248,7 @@ pub fn summarize(reports: &[IntentReport]) -> String {
             IntentStatus::SubprocessError { reason } => {
                 format!("FAILED -- {reason} (run {run_id})")
             }
-            IntentStatus::Skipped => {
-                "SKIPPED -- earlier intent failed under --fail-fast".to_string()
-            }
+            IntentStatus::Skipped { reason } => format!("SKIPPED -- {reason}"),
         };
         lines.push(format!(
             "  [{}/{}] {:?}: {outcome}",
@@ -249,6 +265,29 @@ pub fn summarize(reports: &[IntentReport]) -> String {
 /// skipped, crashed, or simply exhausted its budget.
 pub fn batch_failed(reports: &[IntentReport]) -> bool {
     reports.iter().any(|report| !report.status.is_success())
+}
+
+/// Decides whether `main.rs::run_batch`'s own loop should stop attempting
+/// further intents after the one that just finished, and why -- issue #72
+/// review, LOW 1. Kept as a pure decision, separate from the loop's own I/O
+/// (spawning children, reading Ctrl-C), so the two ways a batch can decide to
+/// stop early -- `--fail-fast` and a Ctrl-C cancellation -- and their
+/// interaction are unit-testable without a real subprocess or a real signal.
+///
+/// Cancellation always wins when both are true at once: the user asked to
+/// stop the whole batch outright, which is a more specific, more accurate
+/// reason than "the intent that just ran happened to fail under
+/// `--fail-fast`" -- and `intent_succeeded` is irrelevant once cancelled;
+/// even a *converged* intent still means "stop here", since there is no
+/// clean next intent to move on to once Ctrl-C has been requested.
+pub fn stop_reason(intent_succeeded: bool, fail_fast: bool, cancelled: bool) -> Option<String> {
+    if cancelled {
+        Some("batch was cancelled (Ctrl-C)".to_string())
+    } else if !intent_succeeded && fail_fast {
+        Some("earlier intent failed under --fail-fast".to_string())
+    } else {
+        None
+    }
 }
 
 /// Reads and parses `path` as an `--intents-file` (issue #72). Kept as a thin
@@ -394,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_finished_line_extracts_run_id_and_final_state() {
+    fn parse_finished_line_extracts_run_id_and_debug_final_state() {
         assert_eq!(
             parse_finished_line("run abc-123 finished: Converged"),
             Some(("abc-123", "Converged"))
@@ -406,13 +445,61 @@ mod tests {
         assert_eq!(parse_finished_line("attach: warden-tui attach ..."), None);
     }
 
+    /// Issue #72 review, MEDIUM 1: this is the line classification is
+    /// actually based on -- keyed off `RunState::as_str()`'s stable form,
+    /// never the `Debug` text [`parse_finished_line`] parses.
+    #[test]
+    fn parse_outcome_line_extracts_run_id_and_stable_final_state() {
+        assert_eq!(
+            parse_outcome_line("run abc-123 outcome: converged"),
+            Some(("abc-123", "converged"))
+        );
+        assert_eq!(
+            parse_outcome_line("run abc-123 outcome: max_review_cycles_exceeded"),
+            Some(("abc-123", "max_review_cycles_exceeded"))
+        );
+        assert_eq!(parse_outcome_line("run abc-123 finished: Converged"), None);
+        assert_eq!(parse_outcome_line("attach: warden-tui attach ..."), None);
+    }
+
     #[test]
     fn is_converged_state_accepts_converged_and_done_only() {
-        assert!(is_converged_state("Converged"));
-        assert!(is_converged_state("Done"));
-        assert!(!is_converged_state("MaxReviewCyclesExceeded"));
-        assert!(!is_converged_state("MaxTestCyclesExceeded"));
-        assert!(!is_converged_state("Failed"));
+        assert!(is_converged_state("converged"));
+        assert!(is_converged_state("done"));
+        assert!(!is_converged_state("max_review_cycles_exceeded"));
+        assert!(!is_converged_state("max_test_cycles_exceeded"));
+        assert!(!is_converged_state("failed"));
+    }
+
+    /// Issue #72 review, MEDIUM 1: pins `is_converged_state`'s two success
+    /// literals directly against `warden_core::RunState::as_str()`'s own
+    /// output -- the actual value `main.rs::run` sends over the `"outcome:
+    /// ..."` line. `state.rs`'s own `state_round_trips_through_its_string_form`
+    /// test only checks that `parse`/`as_str` stay mutually consistent, which
+    /// would keep passing even if `Converged`/`Done`'s literal string changed
+    /// (as long as both sides changed together) -- this test would catch that
+    /// too, since it asserts the exact literals this module's own
+    /// classification depends on. `Done` specifically (the post-gate success
+    /// state, ADR-0011) has no dedicated end-to-end `warden run` test in this
+    /// crate today (it requires a real bare gate repo + `warden-gated` +
+    /// simulated CI, exercised instead at the unit level in
+    /// `orchestrator::gate_tail`'s own tests) -- this at least locks down the
+    /// one literal a batch's classification of a gated run actually turns on.
+    #[test]
+    fn is_converged_state_matches_the_literal_stable_strings_run_state_as_str_produces() {
+        assert_eq!(warden_core::RunState::Converged.as_str(), "converged");
+        assert_eq!(warden_core::RunState::Done.as_str(), "done");
+        assert!(is_converged_state(
+            warden_core::RunState::Converged.as_str()
+        ));
+        assert!(is_converged_state(warden_core::RunState::Done.as_str()));
+        assert!(!is_converged_state(warden_core::RunState::Failed.as_str()));
+        assert!(!is_converged_state(
+            warden_core::RunState::MaxReviewCyclesExceeded.as_str()
+        ));
+        assert!(!is_converged_state(
+            warden_core::RunState::MaxTestCyclesExceeded.as_str()
+        ));
     }
 
     #[test]
@@ -448,6 +535,44 @@ mod tests {
         assert!(batch_failed(&one_failed));
     }
 
+    /// Issue #72 review, LOW 1: `stop_reason`'s full decision table, covering
+    /// `--fail-fast` and Ctrl-C cancellation both independently and
+    /// interacting -- this is the logic `main.rs::run_batch`'s own loop
+    /// delegates to, made unit-testable here without a real subprocess or
+    /// signal.
+    #[test]
+    fn stop_reason_covers_fail_fast_and_cancellation_and_their_interaction() {
+        assert_eq!(
+            stop_reason(true, false, false),
+            None,
+            "a converged intent with neither flag set never stops the batch"
+        );
+        assert_eq!(
+            stop_reason(false, false, false),
+            None,
+            "a non-converged intent without --fail-fast (the default) never stops the batch"
+        );
+        assert_eq!(
+            stop_reason(false, true, false),
+            Some("earlier intent failed under --fail-fast".to_string())
+        );
+        assert_eq!(
+            stop_reason(true, true, false),
+            None,
+            "--fail-fast only ever triggers on a non-converged intent"
+        );
+        assert_eq!(
+            stop_reason(true, false, true),
+            Some("batch was cancelled (Ctrl-C)".to_string()),
+            "cancellation stops the batch even after a converged intent"
+        );
+        assert_eq!(
+            stop_reason(false, true, true),
+            Some("batch was cancelled (Ctrl-C)".to_string()),
+            "cancellation's reason wins over --fail-fast's when both apply at once"
+        );
+    }
+
     #[test]
     fn summarize_lists_every_intent_with_its_outcome_and_a_tally() {
         let reports = vec![
@@ -468,7 +593,9 @@ mod tests {
             IntentReport {
                 intent: "third".to_string(),
                 run_id: None,
-                status: IntentStatus::Skipped,
+                status: IntentStatus::Skipped {
+                    reason: "earlier intent failed under --fail-fast".to_string(),
+                },
             },
         ];
 
