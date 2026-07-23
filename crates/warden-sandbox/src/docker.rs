@@ -499,6 +499,33 @@ fn build_docker_run_argv(
         format!("type=bind,source={claude_dir},target={container_home}/.claude,readonly"),
         "-e".to_string(),
         format!("HOME={container_home}"),
+        // Neutralise git's "dubious ownership" guard *inside the container*.
+        // The worktree and `.git` are bind-mounted from the host, where they
+        // are owned by the host user (uid != 0); the container runs git as
+        // root. Without this, every git command the agent runs in the mounted
+        // worktree aborts with `fatal: detected dubious ownership` (exit 128)
+        // -- reproducible only on Linux, since Docker Desktop for macOS remaps
+        // bind-mount ownership so the mismatch never surfaces there.
+        //
+        // `safe.directory=*` (rather than the exact mounted paths) is the
+        // correct scope here: a linked worktree makes git check ownership of
+        // three separate directories -- the worktree itself, its gitdir
+        // (`<repo>/.git/worktrees/<id>`, whose `<id>` is dynamic), and the
+        // common dir (`<repo>/.git`) -- and `safe.directory` matches by exact
+        // path or `*`, never by prefix, so no fixed set of entries covers the
+        // dynamic gitdir. The blanket form is safe because it applies only to
+        // this single-purpose, throwaway container's own process environment
+        // (via `GIT_CONFIG_*`, never a written file), never to the host git
+        // config, and it does not touch the credential isolation this backend
+        // exists for. Passed as env-based config so it cannot be overridden by
+        // an agent editing `.git/config`, exactly like the host-side
+        // `core.hooksPath=/dev/null` guard.
+        "-e".to_string(),
+        "GIT_CONFIG_COUNT=1".to_string(),
+        "-e".to_string(),
+        "GIT_CONFIG_KEY_0=safe.directory".to_string(),
+        "-e".to_string(),
+        "GIT_CONFIG_VALUE_0=*".to_string(),
     ];
     for (name, value) in forwarded_env {
         argv.push("-e".to_string());
@@ -643,6 +670,31 @@ mod tests {
         assert!(!joined.contains(".aws"));
         assert!(!joined.contains(".config/gh"));
         assert!(!joined.contains(".env"));
+    }
+
+    /// The mounted worktree/`.git` are host-owned (uid != 0) while the
+    /// container runs git as root; without `safe.directory` every in-container
+    /// git command aborts with `fatal: detected dubious ownership` (exit 128)
+    /// on Linux. Asserts the env-based `safe.directory=*` config is injected
+    /// (see [`build_docker_run_argv`]'s own docs on why `*` and why env, not a
+    /// written config file).
+    #[test]
+    fn argv_disables_gits_dubious_ownership_guard_via_env_config() {
+        let argv = build_docker_run_argv(
+            "warden-test",
+            "warden-agent:latest",
+            Path::new("/host/worktrees/coder"),
+            Path::new("/host/repo/.git"),
+            Path::new("/host/home/.claude"),
+            "/root",
+            &[],
+            "claude",
+            &[],
+        );
+
+        assert!(argv.contains(&"GIT_CONFIG_COUNT=1".to_string()));
+        assert!(argv.contains(&"GIT_CONFIG_KEY_0=safe.directory".to_string()));
+        assert!(argv.contains(&"GIT_CONFIG_VALUE_0=*".to_string()));
     }
 
     #[test]
