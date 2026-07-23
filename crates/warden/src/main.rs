@@ -271,6 +271,17 @@ fn parse_tool(raw: &str) -> Result<ToolName, String> {
     }
 }
 
+/// Reverses [`parse_tool`] (issue #72's batch mode): renders `tool` back into
+/// the exact `--tool` value a batch child subprocess needs to reproduce it,
+/// so a batch inherits the same adapter selection as a single-intent run.
+fn tool_as_str(tool: ToolName) -> &'static str {
+    match tool {
+        ToolName::Claude => "claude",
+        ToolName::Codex => "codex",
+        ToolName::Mistral => "mistral",
+    }
+}
+
 /// Issue #49: `--isolation`/`--isolation-image` bundled into one config,
 /// resolved once here (not inside `run`), the same shape `GateConfig`/
 /// `TuiLaunchConfig` above already use for their own flag pairs.
@@ -358,57 +369,55 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Three arms today (`ToolName::{Claude,Codex,Mistral}`, issue
-            // #71); a future adapter gets its own arm here rather than a
-            // runtime lookup, so the concrete `R: ToolAdapter`
-            // `run_convergence_loop` needs stays resolved at compile time
-            // (see `ToolName`'s own docs).
-            match tool {
-                ToolName::Claude => {
-                    // Issue #72: a single intent is the pre-existing,
-                    // unchanged mono-intent path -- built and awaited
-                    // in-process exactly as before this issue. Two or more
-                    // intents switch to `run_batch`, which never builds a
-                    // `RunConfig`/`Orchestrator` itself; each intent gets its
-                    // own `warden run` subprocess instead (see `run_batch`'s
-                    // own docs for why).
-                    if intents.len() == 1 {
-                        let intent = intents
-                            .into_iter()
-                            .next()
-                            .expect("checked intents.len() == 1 above");
+            // Issue #72: a single intent is the pre-existing, unchanged
+            // mono-intent path -- built and awaited in-process exactly as
+            // before this issue. Two or more intents switch to `run_batch`,
+            // which never builds a `RunConfig`/`Orchestrator` itself; each
+            // intent gets its own `warden run` subprocess instead (see
+            // `run_batch`'s own docs for why). The intent-count branch wraps
+            // the `--tool` dispatch (issue #71) so every adapter -- and the
+            // batch runner -- shares this same single-vs-batch decision.
+            if intents.len() == 1 {
+                let intent = intents
+                    .into_iter()
+                    .next()
+                    .expect("checked intents.len() == 1 above");
 
-                        // Issue #15/ADR-0011: the post-Converged tail only
-                        // runs when both paths it needs are configured;
-                        // omitting either preserves this crate's original
-                        // behaviour (stop at `Converged`).
-                        let gate = match (gate_bare_repo, gate_gated_bin) {
-                            (Some(bare_repo_path), Some(gated_bin)) => {
-                                Some(orchestrator::GateConfig {
-                                    bare_repo_path,
-                                    gated_bin,
-                                    repo_slug: gate_repo_slug,
-                                    poll_interval_secs: gate_poll_interval_secs,
-                                    inactivity_timeout_secs: gate_inactivity_timeout_secs,
-                                })
-                            }
-                            _ => None,
-                        };
+                // Issue #15/ADR-0011: the post-Converged tail only runs when
+                // both paths it needs are configured; omitting either
+                // preserves this crate's original behaviour (stop at
+                // `Converged`).
+                let gate = match (gate_bare_repo, gate_gated_bin) {
+                    (Some(bare_repo_path), Some(gated_bin)) => Some(orchestrator::GateConfig {
+                        bare_repo_path,
+                        gated_bin,
+                        repo_slug: gate_repo_slug,
+                        poll_interval_secs: gate_poll_interval_secs,
+                        inactivity_timeout_secs: gate_inactivity_timeout_secs,
+                    }),
+                    _ => None,
+                };
 
-                        // Issue #32: `--tui-bin` is only meaningful alongside
-                        // `--tui`; resolved once here (not inside `run`),
-                        // same shape as `gate` above.
-                        let tui_launch = tui.then(|| TuiLaunchConfig {
-                            tui_bin: resolve_tui_binary(tui_bin),
-                        });
+                // Issue #32: `--tui-bin` is only meaningful alongside `--tui`;
+                // resolved once here (not inside `run`), same shape as `gate`
+                // above.
+                let tui_launch = tui.then(|| TuiLaunchConfig {
+                    tui_bin: resolve_tui_binary(tui_bin),
+                });
 
-                        // Issue #49: bundled the same way as `gate`/
-                        // `tui_launch` above.
-                        let isolation_config = IsolationConfig {
-                            isolation,
-                            image: isolation_image,
-                        };
+                // Issue #49: bundled the same way as `gate`/`tui_launch` above.
+                let isolation_config = IsolationConfig {
+                    isolation,
+                    image: isolation_image,
+                };
 
+                // Three arms today (`ToolName::{Claude,Codex,Mistral}`, issue
+                // #71); a future adapter gets its own arm here rather than a
+                // runtime lookup, so the concrete `R: ToolAdapter`
+                // `run_convergence_loop` needs stays resolved at compile time
+                // (see `ToolName`'s own docs).
+                match tool {
+                    ToolName::Claude => {
                         run(
                             repo,
                             intent,
@@ -425,69 +434,69 @@ async fn main() -> anyhow::Result<()> {
                             isolation_config,
                         )
                         .await
-                    } else {
-                        run_batch(
+                    }
+                    ToolName::Codex => {
+                        run(
                             repo,
-                            intents,
-                            fail_fast,
+                            intent,
                             branch,
                             max_review_cycles,
                             max_test_cycles,
                             warden_home,
-                            verbose,
-                            trust_repo_agents,
+                            CodexAdapter,
+                            TrustRepoAgents(trust_repo_agents),
                             evidence_tool,
                             evidence_store_in_repo,
-                            gate_bare_repo,
-                            gate_gated_bin,
-                            gate_repo_slug,
-                            gate_poll_interval_secs,
-                            gate_inactivity_timeout_secs,
-                            tui,
-                            tui_bin,
-                            "claude",
-                            isolation_as_str(isolation),
-                            isolation_image,
+                            gate,
+                            tui_launch,
+                            isolation_config,
+                        )
+                        .await
+                    }
+                    ToolName::Mistral => {
+                        run(
+                            repo,
+                            intent,
+                            branch,
+                            max_review_cycles,
+                            max_test_cycles,
+                            warden_home,
+                            MistralAdapter,
+                            TrustRepoAgents(trust_repo_agents),
+                            evidence_tool,
+                            evidence_store_in_repo,
+                            gate,
+                            tui_launch,
+                            isolation_config,
                         )
                         .await
                     }
                 }
-                ToolName::Codex => {
-                    run(
-                        repo,
-                        intent,
-                        branch,
-                        max_review_cycles,
-                        max_test_cycles,
-                        warden_home,
-                        CodexAdapter,
-                        TrustRepoAgents(trust_repo_agents),
-                        evidence_tool,
-                        evidence_store_in_repo,
-                        gate,
-                        tui_launch,
-                        isolation_config,
-                    )
-                    .await
-                }
-                ToolName::Mistral => {
-                    run(
-                        repo,
-                        intent,
-                        branch,
-                        max_review_cycles,
-                        max_test_cycles,
-                        warden_home,
-                        MistralAdapter,
-                        TrustRepoAgents(trust_repo_agents),
-                        evidence_tool,
-                        evidence_store_in_repo,
-                        gate,
-                        tui_launch,
-                        isolation_config,
-                    )
-                    .await
-                }
+            } else {
+                run_batch(
+                    repo,
+                    intents,
+                    fail_fast,
+                    branch,
+                    max_review_cycles,
+                    max_test_cycles,
+                    warden_home,
+                    verbose,
+                    trust_repo_agents,
+                    evidence_tool,
+                    evidence_store_in_repo,
+                    gate_bare_repo,
+                    gate_gated_bin,
+                    gate_repo_slug,
+                    gate_poll_interval_secs,
+                    gate_inactivity_timeout_secs,
+                    tui,
+                    tui_bin,
+                    tool_as_str(tool),
+                    isolation_as_str(isolation),
+                    isolation_image,
+                )
+                .await
             }
         }
     }
