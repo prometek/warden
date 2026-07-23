@@ -371,42 +371,84 @@ impl Orchestrator {
             )
             .await?;
 
-        // Agent stdout is untrusted input: a parse failure becomes a
-        // blocking finding describing the problem, never a run-ending
-        // panic (code-standards.md: "Ne jamais faire confiance à la sortie
-        // d'un agent CLI"). `runner.extract_findings` is this run's
-        // `--tool` adapter's own translation from its CLI's raw output into
-        // findings NDJSON (issue #24 point 1, third bullet) -- the user no
-        // longer writes that translation as a wrapper script.
-        //
-        // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
-        // necessarily an *honest* one -- `extract_findings` only checks that
-        // every finding's `source` is some known value, not that it's the
-        // one this role is entitled to claim. `validate_finding_sources_for_role`
-        // closes that gap (a forged `source: "warden"`, or a tester
-        // mislabelling its own failure as `source: "reviewer"` to slip past
-        // `tester_succeeded` below) with the exact same "reject the whole
-        // batch, describe why, never silently drop/relabel" treatment as an
-        // unparsable-output failure -- see that function's own docs for the
-        // full rationale.
-        let findings = match runner
-            .extract_findings(&outcome.stdout)
-            .and_then(|findings| {
-                warden_core::validate_finding_sources_for_role(&findings, role)?;
-                Ok(findings)
-            }) {
-            Ok(findings) => findings,
-            Err(parse_error) => {
-                tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable or misattributed output");
-                vec![Finding {
-                    source: role_to_finding_source(role),
-                    severity: warden_core::Severity::Blocking,
-                    file: None,
-                    description: format!(
-                        "{role:?} produced unparsable or misattributed output: {parse_error}"
-                    ),
-                    action: Some("fix the agent's output format/finding sources".to_string()),
-                }]
+        // Issue #71 review (HIGH): a reviewer/tester that exited non-zero
+        // must never have its stdout trusted at all -- checked *before*
+        // `extract_findings` is ever called, independent of whatever that
+        // adapter's own mapping does with a blank/malformed buffer.
+        // Mirrors the coder path's own non-zero-exit check above (M2), but
+        // a blocking finding rather than failing the whole run: a
+        // crashed/misbehaving reviewer or tester is exactly the kind of
+        // problem a reboucle back to the coder can plausibly recover from
+        // (a transient invocation failure, a flaky sandbox, ...), unlike a
+        // coder that never produced a commit worth reviewing at all. This
+        // closes a fail-open some adapters could otherwise incidentally
+        // reopen: `MistralAdapter::extract_findings` (see its own docs)
+        // trusts a blank buffer as "no findings" precisely *because* this
+        // check has already confirmed the process exited cleanly --
+        // without it, a `mistral` reviewer that crashed and printed
+        // nothing would read as a clean, converging pass.
+        let findings = if outcome.exit_code != 0 {
+            tracing::warn!(
+                run_id,
+                cycle_id,
+                ?role,
+                exit_code = outcome.exit_code,
+                stderr = %outcome.stderr,
+                "agent exited non-zero; not trusting its stdout"
+            );
+            vec![Finding {
+                source: role_to_finding_source(role),
+                severity: warden_core::Severity::Blocking,
+                file: None,
+                description: format!(
+                    "{role:?} exited with status {} instead of 0 (stderr: {})",
+                    outcome.exit_code,
+                    truncate_for_error(&outcome.stderr)
+                ),
+                action: Some(
+                    "investigate why the agent process exited non-zero and fix it".to_string(),
+                ),
+            }]
+        } else {
+            // Agent stdout is untrusted input: a parse failure becomes a
+            // blocking finding describing the problem, never a run-ending
+            // panic (code-standards.md: "Ne jamais faire confiance à la
+            // sortie d'un agent CLI"). `runner.extract_findings` is this
+            // run's `--tool` adapter's own translation from its CLI's raw
+            // output into findings NDJSON (issue #24 point 1, third
+            // bullet) -- the user no longer writes that translation as a
+            // wrapper script.
+            //
+            // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
+            // necessarily an *honest* one -- `extract_findings` only checks
+            // that every finding's `source` is some known value, not that
+            // it's the one this role is entitled to claim.
+            // `validate_finding_sources_for_role` closes that gap (a forged
+            // `source: "warden"`, or a tester mislabelling its own failure
+            // as `source: "reviewer"` to slip past `tester_succeeded`
+            // below) with the exact same "reject the whole batch, describe
+            // why, never silently drop/relabel" treatment as an
+            // unparsable-output failure -- see that function's own docs
+            // for the full rationale.
+            match runner
+                .extract_findings(&outcome.stdout)
+                .and_then(|findings| {
+                    warden_core::validate_finding_sources_for_role(&findings, role)?;
+                    Ok(findings)
+                }) {
+                Ok(findings) => findings,
+                Err(parse_error) => {
+                    tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable or misattributed output");
+                    vec![Finding {
+                        source: role_to_finding_source(role),
+                        severity: warden_core::Severity::Blocking,
+                        file: None,
+                        description: format!(
+                            "{role:?} produced unparsable or misattributed output: {parse_error}"
+                        ),
+                        action: Some("fix the agent's output format/finding sources".to_string()),
+                    }]
+                }
             }
         };
 

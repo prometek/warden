@@ -950,14 +950,23 @@ enum CodexEventMsg {
 ///   this adapter's own "zero `.md`" default prompts never able to reach a
 ///   clean state at all. Blank stdout therefore parses to zero findings,
 ///   matching `warden_core::parse_findings`'s own established "no non-blank
-///   lines" convention (see that function's own docs). **Known, accepted
-///   limitation**: this adapter has no structural way to tell that apart
-///   from `mistral` crashing silently before printing anything at all
-///   (`code-standards.md`'s "never trust agent output" bites hardest here,
-///   for exactly the reason this whole adapter is the conservative one) --
-///   a real deployment relying on this adapter for a role that must never
-///   silently pass should treat a silent `mistral` invocation as a residual
-///   risk this adapter cannot close on its own, unlike `claude`/`codex`.
+///   lines" convention (see that function's own docs).
+///
+///   **This is only safe because [`extract_findings`](MistralAdapter::extract_findings)
+///   is never actually the thing distinguishing "clean pass" from "crashed
+///   silently"** (issue #71 review, HIGH): that job belongs to the
+///   orchestrator, one layer up (`warden::orchestrator::agents`'s own
+///   `run_finding_agent`), which checks this invocation's exit code
+///   *before* ever calling this method at all, and synthesizes a blocking
+///   finding of its own on anything non-zero -- mirroring the coder path's
+///   own non-zero-exit check, extended to reviewer/tester by that same
+///   review. This method is therefore only ever reached, for any adapter,
+///   once the process has already exited `0`; a blank buffer at that point
+///   is trusted as "no findings" precisely *because* a non-zero exit could
+///   never reach here to be misread as one. This adapter carries no such
+///   guard of its own (nor should it -- exit-code trust belongs to the one
+///   caller that spawned the process, not to a `stdout`-only translation
+///   layer that never sees the exit code at all).
 ///
 /// # Invocation shape
 ///
@@ -1000,10 +1009,11 @@ impl ToolAdapter for MistralAdapter {
         // buffer as zero findings rather than an error. Deliberately *not*
         // special-cased into an error here the way
         // `ClaudeAdapter`/`CodexAdapter` treat a genuinely empty stdout --
-        // see this adapter's own docs ("Known, accepted limitation") for
-        // why a blank buffer is this adapter's expected shape for "nothing
-        // to report" rather than evidence of a crash, and the residual risk
-        // that entails.
+        // see this adapter's own docs for why that's safe: this method is
+        // only ever called once the orchestrator has already confirmed a
+        // zero exit code, so a blank buffer reaching here is a legitimate
+        // "nothing to report", never a crash this method would otherwise
+        // have to guess about.
         warden_core::parse_findings(stdout.trim())
     }
 
@@ -1732,7 +1742,8 @@ mod tests {
     /// genuinely empty stdout as an error -- their own envelopes always
     /// carry at least *something*), a blank buffer is this adapter's
     /// expected shape for "nothing to report" (see `MistralAdapter`'s own
-    /// docs, "Known, accepted limitation") -- exactly what a reviewer/tester
+    /// docs on why this is only safe once the orchestrator has already
+    /// confirmed a zero exit code) -- exactly what a reviewer/tester
     /// following the shared default NDJSON prompts is instructed to answer
     /// with when it has nothing to flag.
     #[test]

@@ -1909,6 +1909,74 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
     assert_eq!(run.state, RunState::MaxReviewCyclesExceeded);
 }
 
+/// Issue #71 review, HIGH: a reviewer/tester that exits non-zero and prints
+/// nothing must never be read as "no findings, clean pass" -- proven here
+/// specifically through `mistral` (`MistralAdapter::extract_findings` treats
+/// a blank buffer as zero findings, see its own docs), the one adapter whose
+/// blank-stdout mapping could otherwise turn a silent crash into a false
+/// convergence. The fake reviewer below `exit 1`s immediately (under `set
+/// -e`, before `write_fake_mistral`'s own trailing `cat
+/// "$WARDEN_RESULT_FILE"` ever runs) -- exactly "crashed, printed nothing".
+/// If the orchestrator's own exit-code gate
+/// (`warden::orchestrator::agents::run_finding_agent`) were missing or
+/// removed, this would converge; asserting `MaxReviewCyclesExceeded`
+/// instead proves the non-zero exit was turned into a blocking finding
+/// before `extract_findings` (or its blank-is-fine mapping) ever got a say.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_mistral(bin_dir.path(), APPEND_NOTES_CODER_BODY, "exit 1", NOOP_BODY);
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "reviewer crashes silently, must never converge",
+            "--max-review-cycles",
+            "2",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "mistral",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: MaxReviewCyclesExceeded"));
+
+    let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(run.state, RunState::MaxReviewCyclesExceeded);
+
+    // Not just "didn't converge" -- the cycle's finding must actually be the
+    // synthesized non-zero-exit blocking finding, proving the exit-code
+    // gate (not some unrelated failure) is what fired.
+    let (cycle_id,): (String,) = sqlx::query_as("SELECT id FROM cycles WHERE run_id = ? LIMIT 1")
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let findings = warden::db::list_findings_for_cycle(&pool, &cycle_id)
+        .await
+        .unwrap();
+    assert!(
+        findings.iter().any(|f| f.source == FindingSource::Reviewer
+            && f.severity == warden_core::Severity::Blocking
+            && f.description.contains("exited with status")),
+        "expected a synthesized non-zero-exit blocking finding, got: {findings:?}"
+    );
+}
+
 /// A convention file naming a role Claude Code files also use (`tools`) must
 /// be passed to the real invocation -- covered at the unit level
 /// (`tool_adapter.rs`); this just proves the frontmatter actually reaches

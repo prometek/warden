@@ -30,9 +30,19 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   finale (findings), et l'usage de tokens est toujours `None` (« n/a »). Une sortie vide
   est traitée comme « aucun finding » (pas une erreur) : les prompts par défaut partagés
   demandent explicitement zéro ligne NDJSON quand il n'y a rien à signaler, ce qui pour ce
-  CLI sans enveloppe se traduit par un stdout littéralement vide — limitation documentée
-  dans le module (aucun moyen structurel de distinguer ce cas d'un crash silencieux pour ce
-  CLI précis, contrairement à `claude`/`codex`).
+  CLI sans enveloppe se traduit par un stdout littéralement vide. Ceci n'est sûr que parce
+  que l'orchestrateur a déjà vérifié un exit code nul avant d'appeler cette méthode (voir
+  ci-dessous) — ce n'est pas cet adaptateur qui distingue un pass propre d'un crash
+  silencieux.
+- **Revue de sécurité (HIGH)** : le chemin reviewer/tester
+  (`warden::orchestrator::agents::run_finding_agent`) ne vérifiait jamais l'exit code de
+  l'agent avant d'appeler `extract_findings` — seul le chemin coder le faisait. Combiné à
+  la sortie vide de `MistralAdapter` traitée comme « aucun finding », un reviewer/tester
+  `mistral` qui crashait en n'imprimant rien (exit non nul) convergeait silencieusement
+  comme un passage propre. Corrigé dans l'orchestrateur (pas dans l'adaptateur, qui reste
+  correct) : un exit non nul synthétise désormais un finding bloquant *avant* même
+  d'appeler `extract_findings`, quel que soit l'adaptateur — ferme la faille pour les
+  trois CLIs à la fois, pas seulement `mistral`.
 - **`--tool`** accepte désormais `claude`/`codex`/`mistral` ; un nom inconnu liste les trois
   dans son message d'erreur (`crates/warden/src/main.rs`, `ToolName`/`parse_tool`).
 - Tests unitaires par adaptateur (`build_command`, `extract_findings`, `extract_usage`,
@@ -43,7 +53,11 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   (NDJSON brut sur stdout), même technique que `write_fake_claude` — chacun piloté via
   `warden run --tool <name>` réel, vérifiant convergence + findings extraits (+ usage de
   tokens pour `codex`) de bout en bout (dispatch `main.rs` → `build_command` →
-  orchestrateur → `extract_findings`/`extract_usage`).
+  orchestrateur → `extract_findings`/`extract_usage`). Un troisième test hermétique pilote
+  un faux `mistral` reviewer qui sort en erreur sans rien imprimer, et vérifie que le run
+  n'atteint **jamais** `Converged` (`MaxReviewCyclesExceeded` à la place, avec un finding
+  bloquant synthétisé nommant l'exit code) — preuve directe que la faille ci-dessus est
+  fermée.
 - Doc : nouvelle section « Prérequis par CLI (`--tool`) » dans `README.md` (binaire
   installé + authentifié par le CLI lui-même, ADR-0005 inchangée — Warden ne détient
   aucune clé).
