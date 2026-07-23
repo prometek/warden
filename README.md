@@ -147,8 +147,10 @@ git config core.hooksPath .githooks
 
 Le hook `pre-commit` ainsi activé exécute, sur chaque commit et **avant** que la CI ne
 tourne : `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D
-warnings`, puis un scan `gitleaks` du diff staged. Volontairement rapide (secondes) — les
-tests restent réservés à la CI (`.github/workflows/ci.yml`, issue #38), jamais aux hooks
+warnings`, puis un scan `gitleaks` du diff staged. `clippy` lint tout le workspace : quelques
+secondes sur cache chaud, mais potentiellement quelques minutes à froid (premier run, après
+`cargo clean` ou changement de toolchain). Les tests, eux, restent réservés à la CI
+(`.github/workflows/ci.yml`, issue #38), jamais aux hooks
 locaux. `--no-verify` reste toléré en cas exceptionnel (branche perso en WIP), jamais sur
 `main` ni sur une PR prête à merger.
 
@@ -163,7 +165,7 @@ brew install gitleaks        # ou: voir https://github.com/gitleaks/gitleaks#ins
 brew install cargo-deny      # ou: cargo install cargo-deny
 ```
 
-`rust-toolchain.toml` pin la version exacte du toolchain (canal stable + composants
+`rust-toolchain.toml` pin la version exacte du toolchain (`1.95.0` + composants
 `rustfmt`/`clippy`) : `rustup` bascule automatiquement dessus dès que vous êtes dans le
 dépôt, aucune action manuelle requise si `rustup` est déjà votre gestionnaire de toolchain.
 

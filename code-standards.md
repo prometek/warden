@@ -136,7 +136,7 @@
 
 - **Conventional Commits** : `type(scope?): description`. Types : `feat`, `fix`, `chore`, `refactor`, `docs`, `test`, `perf`, `build`, `ci`, `style`, `revert`. Scope recommandé (`feat(gated):`, `fix(tui):`, `feat(core):`). Impératif présent, minuscule, pas de point final. Breaking : `!` ou footer `BREAKING CHANGE:`.
 - Branche principale `main`. Branches de travail `feat/...`, `fix/...`, `chore/...`. Pas de commit direct sur `main` — tout passe par PR titrée en Conventional Commit.
-- **Pre-commit** (issue #69) — hooks shell versionnés dans `.githooks/`, activés via `git config core.hooksPath .githooks` (natif git, zéro dépendance externe — pas de framework `pre-commit`). Filet rapide (secondes), sous-ensemble de la CI :
+- **Pre-commit** (issue #69) — hooks shell versionnés dans `.githooks/`, activés via `git config core.hooksPath .githooks` (natif git, zéro dépendance externe — pas de framework `pre-commit`). Sous-ensemble de la CI (secondes sur cache chaud, jusqu'à quelques minutes à froid car `clippy` lint tout le workspace) :
   - `cargo fmt --all --check` — bloquant (pas d'auto-fix silencieux : `cargo fmt --all` puis re-stage manuel).
   - `cargo clippy --all-targets --all-features -- -D warnings` — bloquant.
   - Détection de secrets (`gitleaks protect --staged`, si le binaire est installé — sinon avertissement, jamais un blocage silencieux masqué) — bloquant.
