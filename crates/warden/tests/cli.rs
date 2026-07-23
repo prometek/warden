@@ -4460,3 +4460,142 @@ async fn e2e_run_with_an_all_comment_intents_file_names_the_file_in_the_error() 
         .stderr(contains("contained no intents"))
         .stderr(contains(intents_file.to_str().unwrap().to_string()));
 }
+
+/// Issue #72 acceptance criterion: a Ctrl-C (`SIGINT`) during batch mode lets
+/// the in-flight intent's own child run to completion rather than killing
+/// it, then records every intent after it as `Skipped` (never even
+/// attempted) instead of continuing the batch -- the summary is still
+/// printed and the process still exits non-zero.
+///
+/// Driven against the real compiled binary via a raw [`SyncCommand`] (not
+/// `warden_command()`/`assert_cmd`, same reason as
+/// `e2e_run_survives_a_closed_stdout_without_panicking` above: this needs to
+/// observe -- and signal -- the batch parent while it is still running,
+/// which `assert_cmd::Command` does not expose). The first intent's coder
+/// fragment sleeps briefly (deterministically identified by a marker in its
+/// own intent text, checked against `$stdin_file`, exactly like
+/// `e2e_batch_continues_past_a_non_converged_intent_by_default`'s
+/// `BATCH_FORCE_FAIL_MARKER` above) so there is a real window, after its
+/// child has printed its own `"... started"` line but strictly before it
+/// converges, in which to send `SIGINT` to the *batch parent's* pid only
+/// (never the grandchild) -- proving the batch-level cancellation flag,
+/// not a killed child, is what stops the remaining intents.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_ctrl_c_lets_the_in_flight_intent_finish_then_skips_the_rest() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+
+    let coder_body_sleeps_only_for_the_marked_intent = r#"
+intent=$(python3 -c "import json; print(json.load(open('$stdin_file'))['intent'])")
+case "$intent" in
+    *SLOW_FIRST_INTENT*) sleep 2 ;;
+esac
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#;
+    write_fake_claude(
+        bin_dir.path(),
+        coder_body_sleeps_only_for_the_marked_intent,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let bin_path = env!("CARGO_BIN_EXE_warden");
+    let mut child = SyncCommand::new(bin_path)
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "first SLOW_FIRST_INTENT intent",
+            "--intent",
+            "second intent, must be skipped",
+            "--intent",
+            "third intent, must be skipped",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn warden");
+
+    let pid = child.id();
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    let child_stderr = child.stderr.take().expect("piped stderr");
+
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut stderr = child_stderr;
+        stderr.read_to_string(&mut buf).ok();
+        buf
+    });
+
+    // Reads stdout live (rather than waiting for the whole process to
+    // finish) so `SIGINT` can be sent while the first intent's own child is
+    // still running its 2s sleep -- well before it converges.
+    let stdout_lines: Vec<String> = {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(child_stdout);
+        let mut lines = Vec::new();
+        let mut sent_sigint = false;
+        for line in reader.lines() {
+            let line = line.expect("read batch stdout line");
+            let is_started_line = line.ends_with(" started");
+            lines.push(line);
+            if is_started_line && !sent_sigint {
+                let status = SyncCommand::new("kill")
+                    .args(["-INT", &pid.to_string()])
+                    .status()
+                    .expect("send SIGINT to the batch parent");
+                assert!(status.success(), "`kill -INT {pid}` must succeed");
+                sent_sigint = true;
+            }
+        }
+        lines
+    };
+
+    let status = child.wait().expect("wait for warden to exit");
+    let stderr_output = stderr_thread.join().expect("stderr thread");
+    let stdout = stdout_lines.join("\n");
+
+    assert!(
+        !status.success(),
+        "the batch must exit non-zero: two of its three intents were skipped rather than \
+         converged (stdout: {stdout:?}, stderr: {stderr_output:?})"
+    );
+
+    let finished = extract_all_finished_lines(&stdout);
+    assert_eq!(
+        finished.len(),
+        1,
+        "only the in-flight first intent should ever reach a \"finished:\" line; the second \
+         and third must never have been started: {stdout:?}"
+    );
+    assert_eq!(
+        finished[0].1, "Converged",
+        "the in-flight intent must be left to finish (and converge) rather than being killed \
+         outright: {stdout:?}"
+    );
+
+    assert!(
+        stdout.contains("batch summary: 1/3 intent(s) converged"),
+        "the batch summary must still be printed after a Ctrl-C cancellation: {stdout:?}"
+    );
+    let skipped_for_cancellation = stdout
+        .matches("SKIPPED -- batch was cancelled (Ctrl-C)")
+        .count();
+    assert_eq!(
+        skipped_for_cancellation, 2,
+        "both the second and third intents must be recorded as skipped due to cancellation, \
+         not attempted: {stdout:?}"
+    );
+}
