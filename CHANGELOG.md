@@ -7,63 +7,30 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
-### Added — Issue #71 : adaptateurs multi-CLI `codex` + `mistral`
+### Added — Issue #72 : mode batch multi-intentions pour `warden run`
 
-- **`warden::tool_adapter::CodexAdapter`** (`--tool codex`) — enveloppe le CLI OpenAI Codex
-  (`codex exec --json --ask-for-approval never`), avec `--sandbox <mode>` dérivé de
-  `tools:` (`workspace-write` pour coder/tester, `read-only` pour reviewer, par défaut) et
-  `--model` depuis `model:`. Un séparateur `--` précède le prompt positionnel (défensif
-  contre un `system_prompt` commençant par `-`). Findings extraits en remontant le flux à
-  la recherche du premier événement `task_complete`/`error` (pas seulement la dernière
-  ligne — l'ordre exact des événements `codex` n'étant pas vérifié en direct, un
-  `token_count` traînant après `task_complete` ne doit pas faire échouer l'extraction),
-  progression en direct (issue #33) depuis les événements `agent_message`, usage de tokens
-  (issue #53) depuis l'événement `token_count` le plus récent du flux. **Non vérifié contre
-  une installation réelle** (pas de binaire ni d'accès réseau disponibles à l'écriture) —
-  invocation et schéma JSON construits à partir de la documentation publiée du CLI, avec
-  dégradation propre documentée dans le module (risque d'ordonnancement des événements
-  explicitement documenté) si un détail s'avère inexact.
-- **`warden::tool_adapter::MistralAdapter`** (`--tool mistral`) — enveloppe minimale et
-  volontairement conservatrice (`mistral --system <prompt> [--model <model>]`) : la
-  maturité/existence même de ce CLI sont incertaines (ticket #71), donc aucun format de
-  sortie structuré n'est supposé — la sortie brute entière est traitée comme la réponse
-  finale (findings), et l'usage de tokens est toujours `None` (« n/a »). Une sortie vide
-  est traitée comme « aucun finding » (pas une erreur) : les prompts par défaut partagés
-  demandent explicitement zéro ligne NDJSON quand il n'y a rien à signaler, ce qui pour ce
-  CLI sans enveloppe se traduit par un stdout littéralement vide. Ceci n'est sûr que parce
-  que l'orchestrateur a déjà vérifié un exit code nul avant d'appeler cette méthode (voir
-  ci-dessous) — ce n'est pas cet adaptateur qui distingue un pass propre d'un crash
-  silencieux.
-- **Revue de sécurité (HIGH)** : le chemin reviewer/tester
-  (`warden::orchestrator::agents::run_finding_agent`) ne vérifiait jamais l'exit code de
-  l'agent avant d'appeler `extract_findings` — seul le chemin coder le faisait. Combiné à
-  la sortie vide de `MistralAdapter` traitée comme « aucun finding », un reviewer/tester
-  `mistral` qui crashait en n'imprimant rien (exit non nul) convergeait silencieusement
-  comme un passage propre. Corrigé dans l'orchestrateur (pas dans l'adaptateur, qui reste
-  correct) : un exit non nul synthétise désormais un finding bloquant *avant* même
-  d'appeler `extract_findings`, quel que soit l'adaptateur — ferme la faille pour les
-  trois CLIs à la fois, pas seulement `mistral`.
-- **`--tool`** accepte désormais `claude`/`codex`/`mistral` ; un nom inconnu liste les trois
-  dans son message d'erreur (`crates/warden/src/main.rs`, `ToolName`/`parse_tool`).
-- Tests unitaires par adaptateur (`build_command`, `extract_findings`, `extract_usage`,
-  `default_prompt`/`default_tools`, `parse_progress_line`) sur des sorties fabriquées,
-  même style que ceux de `ClaudeAdapter`.
-- **Tests e2e hermétiques** (`crates/warden/tests/cli.rs`) : un faux binaire `codex`
-  (émettant `agent_message`/`token_count`/`task_complete`) et un faux binaire `mistral`
-  (NDJSON brut sur stdout), même technique que `write_fake_claude` — chacun piloté via
-  `warden run --tool <name>` réel, vérifiant convergence + findings extraits (+ usage de
-  tokens pour `codex`) de bout en bout (dispatch `main.rs` → `build_command` →
-  orchestrateur → `extract_findings`/`extract_usage`). Un troisième test hermétique pilote
-  un faux `mistral` reviewer qui sort en erreur sans rien imprimer, et vérifie que le run
-  n'atteint **jamais** `Converged` (`MaxReviewCyclesExceeded` à la place, avec un finding
-  bloquant synthétisé nommant l'exit code) — preuve directe que la faille ci-dessus est
-  fermée.
-- Doc : nouvelle section « Prérequis par CLI (`--tool`) » dans `README.md` (binaire
-  installé + authentifié par le CLI lui-même, ADR-0005 inchangée — Warden ne détient
-  aucune clé).
-- Hors périmètre (inchangé) : sélection de l'adaptateur par rôle (`--coder-tool`…, `--tool`
-  reste global au run) et harmonisation des grants d'outils entre CLI (chaque adaptateur
-  garde ses propres défauts).
+- **`--intent` devient répétable**, et un nouveau flag `--intents-file <PATH>` lit une
+  intention par ligne non vide (une ligne commençant par `#` est un commentaire, ignorée).
+  Les entrées du fichier s'exécutent d'abord, dans l'ordre du fichier, suivies des
+  `--intent` répétés, dans l'ordre donné sur la ligne de commande. Au moins une intention
+  doit résulter de la combinaison des deux (sinon erreur explicite dès la frontière CLI,
+  qui nomme le fichier en cause si un `--intents-file` vide a été fourni).
+- **Une seule intention résultante reprend exactement le chemin mono-intention existant**,
+  in-process, inchangé. Deux intentions ou plus basculent en **mode batch** : chaque
+  intention tourne **séquentiellement**, comme un sous-processus enfant `warden run
+  --intent <x>` du même binaire — process neuf, `run_id` neuf, worktrees neufs — sans
+  aucun état en mémoire partagé entre intentions par construction. Le nettoyage
+  (`orchestrator::recover_crashed_runs`, agents orphelins tués, worktrees nettoyés) est
+  garanti à la sortie propre de chaque enfant, et appliqué au redémarrage suivant sinon.
+- **Politique d'échec** : par défaut, le batch continue après une intention non convergée
+  (budget de cycles épuisé ou run `Failed`) et passe à la suivante sur une base saine.
+  `--fail-fast` (sans effet pour une intention unique) arrête le batch à la première
+  intention non convergée et marque toutes les suivantes `Skipped`.
+- **Ctrl-C** : l'intention en cours va jusqu'à son terme, les intentions restantes sont
+  marquées `Skipped`, et le résumé du batch s'affiche quand même.
+- **Rapport final** : une ligne de statut par intention plus un total `batch summary:
+  X/N intent(s) converged`. Code de sortie non nul si au moins une intention n'a pas
+  convergé.
 
 ### Changed — Issue #70 : découpage de `orchestrator.rs` en sous-modules
 
