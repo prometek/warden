@@ -1,4 +1,5 @@
-//! The **sandbox seam** (issue #50, foundation for #49's `DockerSandbox`).
+//! The **sandbox seam** (issue #50) plus its second backend,
+//! [`DockerSandbox`] (issue #49).
 //!
 //! # Worktree vs. sandbox
 //!
@@ -8,10 +9,11 @@
 //!   dedicated `git worktree` per role/run, so a coder/reviewer/tester never
 //!   share a working directory.
 //! - The **sandbox** (this crate) isolates the *execution environment* an
-//!   agent's own process runs in: today, nothing more than the process
-//!   isolation `warden::process` already applied by hand
-//!   (`env_clear()`, `cwd`, `kill_on_drop`); tomorrow (#49), an actual
-//!   container.
+//!   agent's own process runs in: [`LocalSandbox`] applies nothing more than
+//!   the process isolation `warden::process` already applied by hand
+//!   (`env_clear()`, `cwd`, `kill_on_drop`); [`DockerSandbox`] runs it inside
+//!   an actual container instead (see that module's own docs for the exact
+//!   mount/network/auth shape).
 //!
 //! These compose, they do not replace one another -- a sandbox always runs
 //! *on top of* a worktree (its [`SandboxSpec::cwd`] names one), never
@@ -23,10 +25,11 @@
 //! (today: just a `cwd`); [`Sandbox::execute`] runs one [`Command`] inside
 //! that sandbox; [`Sandbox::destroy`] tears it down. This mirrors the
 //! lifecycle a container backend needs (`docker create` -> `docker exec` (any
-//! number of times) -> `docker rm`) while [`LocalSandbox`] -- the only
-//! implementation this issue ships -- keeps it a no-op beyond bookkeeping:
-//! "no container" is the whole point of Local, by design (see
-//! [`LocalSandbox`]'s own docs).
+//! number of times) -> `docker rm`), though [`DockerSandbox`] itself
+//! collapses `create`+`execute` into a single self-contained `docker run
+//! --rm` per invocation (see its own docs for why) -- [`LocalSandbox`] keeps
+//! `create`/`destroy` a no-op beyond bookkeeping: "no container" is the
+//! whole point of Local, by design (see [`LocalSandbox`]'s own docs).
 //!
 //! `execute` returns an [`Execution`] rather than an [`ExecutionResult`]
 //! directly: a caller (`warden::orchestrator::Orchestrator::run_agent`) needs
@@ -49,6 +52,8 @@
 //! `warden_core`'s. `warden-core` therefore has no path to ever depend on
 //! this crate, keeping it exactly as pure as before this issue.
 
+mod docker;
+mod drain;
 mod error;
 mod local;
 
@@ -59,21 +64,24 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+pub use docker::{DockerConfig, DockerSandbox};
 pub use error::{Result, SandboxError};
 pub use local::LocalSandbox;
 
 /// Opaque handle to one sandbox instance, scoped to a single
-/// [`Sandbox::create`]/[`Sandbox::destroy`] pair. Backend-specific
-/// (`LocalSandbox` mints a `uuid`; a future `DockerSandbox` would use the
-/// container id) -- a real caller only ever receives one back from
+/// [`Sandbox::create`]/[`Sandbox::destroy`] pair. Backend-specific --
+/// `LocalSandbox` mints a bare `uuid`; `DockerSandbox` mints a
+/// `warden-<uuid>` name and uses it *as* the `docker run --name` it passes
+/// (there is no separate `docker create` step to mint a daemon-assigned id
+/// from first) -- a real caller only ever receives one back from
 /// [`Sandbox::create`], never constructs one to pass in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SandboxId(String);
 
 impl SandboxId {
     /// Mints a fresh, random id -- what every [`LocalSandbox::create`] call
-    /// uses today; a future `DockerSandbox` would use the real container id
-    /// returned by the Docker daemon instead.
+    /// uses today; [`crate::docker::DockerSandbox::create`] uses
+    /// [`SandboxId::new`] instead (see this type's own docs on why).
     pub(crate) fn generate() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
@@ -86,9 +94,9 @@ impl SandboxId {
     /// other than [`LocalSandbox`]. Paired with [`Execution::new`] (issue #50
     /// review, MEDIUM A), this is what `warden::orchestrator`'s own
     /// `RecordingSandbox` test fake uses to implement [`Sandbox`] end to end
-    /// without reaching into anything private to this crate. A future
-    /// `DockerSandbox` (#49) uses this to wrap the container id the Docker
-    /// daemon hands back.
+    /// without reaching into anything private to this crate.
+    /// `DockerSandbox::create` (#49) uses this to mint its own
+    /// `warden-<uuid>` container name.
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }

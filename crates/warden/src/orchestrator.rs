@@ -74,6 +74,7 @@ use crate::error::{ProcessError, Result, WardenError, WorktreeError};
 use crate::event_bus::EventBus;
 use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
+use crate::git_util::NO_HOST_HOOKS;
 use crate::hook::HookRegistry;
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::tool_adapter::ToolAdapter;
@@ -2133,7 +2134,14 @@ fn map_sandbox_error(error: warden_sandbox::SandboxError) -> WardenError {
         // this one (an internal bug, never expected from a well-behaved
         // backend) -- wrapped via `WardenError`'s own `#[from]` instead of a
         // hand-rolled `reason: String` that would have discarded `#[source]`.
-        error @ SandboxError::UnknownSandbox { .. } => WardenError::Sandbox(error),
+        //
+        // Issue #49: `DockerUnavailable` has no `ProcessError` counterpart
+        // either -- a docker-specific configuration/precondition failure
+        // (a missing `~/.claude`, an unresolvable bind-mount path), not a
+        // spawn/wait/stdin-write/cancel shape `LocalSandbox` ever produces.
+        error @ (SandboxError::UnknownSandbox { .. } | SandboxError::DockerUnavailable { .. }) => {
+            WardenError::Sandbox(error)
+        }
     }
 }
 
@@ -2203,9 +2211,12 @@ fn role_to_finding_source(role: AgentRole) -> warden_core::FindingSource {
 }
 
 async fn read_head_commit(worktree_path: &Path) -> Result<String> {
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+    // `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(worktree_path)
+        .args(NO_HOST_HOOKS)
         .args(["rev-parse", "HEAD"])
         .output()
         .await?;
@@ -2295,9 +2306,12 @@ async fn read_diff(worktree_path: &Path, base: &str, target: &str) -> Result<Str
     use tokio::io::AsyncReadExt;
 
     let range = format!("{base}..{target}");
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
+    // `crate::git_util`'s own docs.
     let mut child = tokio::process::Command::new("git")
         .arg("-C")
         .arg(worktree_path)
+        .args(NO_HOST_HOOKS)
         .args(["-c", "color.ui=false"])
         .args([
             "diff",
@@ -2744,9 +2758,17 @@ async fn push_converged_commit_to_bare_repo(
     run_id: &str,
 ) -> Result<()> {
     let refspec = format!("{commit_sha}:{GATE_STAGING_REF_PREFIX}{run_id}");
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH): `git push` runs `pre-push`
+    // in the *pushing* repo (`repo_path`, `-C` above) -- under `--isolation
+    // docker`, `repo_path`'s `.git` is bind-mounted read-write into the
+    // container (`warden_sandbox::docker`'s own docs), so an agent could
+    // plant a `pre-push` hook there and have it run here, on the host, with
+    // full host credentials/network access. See `crate::git_util`'s own
+    // docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
+        .args(NO_HOST_HOOKS)
         .args(["push", "--force"])
         .arg(bare_repo_path)
         .arg(&refspec)
@@ -2809,6 +2831,11 @@ async fn wait_child_then_grace(gate_child: GateChild) {
 /// Never propagates: failing to reclaim it must not fail an otherwise-finished
 /// run, and a lingering ref is harmless until a later GC.
 async fn delete_gate_staging_ref(bare_repo_path: &Path, run_id: &str) {
+    // No `NO_HOST_HOOKS` needed here (issue #49 review, HIGH): unlike
+    // `repo_path` or a role's own worktree, `bare_repo_path` (the local gate
+    // repo) is never bind-mounted into any sandbox and no agent process ever
+    // writes to it -- there is no hook an agent could have planted in its
+    // `.git` in the first place. See `crate::git_util`'s own docs.
     let ref_name = format!("{GATE_STAGING_REF_PREFIX}{run_id}");
     let result = tokio::process::Command::new("git")
         .arg("-C")
@@ -2851,9 +2878,12 @@ async fn protect_cycle_commit(
     commit_sha: &str,
 ) -> Result<()> {
     let ref_name = format!("refs/warden/runs/{run_id}/cycle-{cycle_number}");
+    // `NO_HOST_HOOKS` (issue #49 review, HIGH): `update-ref` runs the
+    // `reference-transaction` hook -- see `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
+        .args(NO_HOST_HOOKS)
         .args(["update-ref", &ref_name, commit_sha])
         .output()
         .await?;
@@ -10142,6 +10172,130 @@ mod tests {
             calls.contains(&"destroy"),
             "expected `SandboxGuard::drop`'s backstop to destroy the sandbox created for a \
              future dropped mid-flight, got {calls:?}"
+        );
+    }
+
+    // ---- Issue #49 review, HIGH: host-side git hooks disabled -----------
+    //
+    // Under `--isolation docker`, the base repo's `.git` is bind-mounted
+    // read-write into the container (`warden_sandbox::docker`'s own docs),
+    // so a contained agent could plant a hook and have it run on the host
+    // the next time `warden` itself runs one of these git commands against
+    // that same repo. `NO_HOST_HOOKS` (`crate::git_util`) exists to make
+    // that impossible; these tests plant a hook that would prove it ran
+    // (touching a marker file) and assert it never does.
+
+    /// Plants an executable hook at `<repo_path>/.git/hooks/<name>` that
+    /// touches `marker` and exits successfully -- if `NO_HOST_HOOKS` were
+    /// ever missing from the invocation under test, `marker` would exist
+    /// afterwards.
+    #[cfg(unix)]
+    fn plant_marker_hook(repo_path: &Path, hook_name: &str, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks_dir = repo_path.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join(hook_name);
+        std::fs::write(
+            &hook_path,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    /// The exact vector the review flagged: `push_converged_commit_to_bare_repo`
+    /// runs `git push` against `repo_path` (`-C` above) once a run
+    /// converges -- `pre-push` runs in the *pushing* repo, so a hook planted
+    /// there (as an agent could, under `--isolation docker`'s rw `.git`
+    /// mount) must never fire when `warden` itself pushes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_to_bare_repo_disables_a_planted_pre_push_hook() {
+        let repo = init_test_repo();
+        let bare_repo = TempDir::new().unwrap();
+        let status = SyncCommand::new("git")
+            .current_dir(bare_repo.path())
+            .args(["init", "--bare", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let marker = repo.path().join("pre-push-ran");
+        plant_marker_hook(repo.path(), "pre-push", &marker);
+
+        let head = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        push_converged_commit_to_bare_repo(
+            repo.path(),
+            bare_repo.path(),
+            &commit_sha,
+            "run-hook-1",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "a pre-push hook planted in repo_path must never run when warden itself pushes \
+             to the bare gate repo"
+        );
+    }
+
+    /// `protect_cycle_commit` runs `update-ref` against `repo_path`, which
+    /// runs the `reference-transaction` hook -- a hook planted there must
+    /// never fire either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protect_cycle_commit_disables_a_planted_reference_transaction_hook() {
+        let repo = init_test_repo();
+        let marker = repo.path().join("reference-transaction-ran");
+        plant_marker_hook(repo.path(), "reference-transaction", &marker);
+
+        let head = SyncCommand::new("git")
+            .current_dir(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        protect_cycle_commit(repo.path(), "run-hook-2", 1, &commit_sha)
+            .await
+            .unwrap();
+
+        assert!(
+            !marker.exists(),
+            "a reference-transaction hook planted in repo_path must never run when warden \
+             itself protects a cycle commit via update-ref"
+        );
+    }
+
+    /// `WorktreeManager::create` runs `git worktree add`, a checkout --
+    /// `post-checkout` must never fire, since the hook lives in the main
+    /// repo's common `.git`, shared by every worktree an agent's own process
+    /// could otherwise have written to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_create_disables_a_planted_post_checkout_hook() {
+        let repo = init_test_repo();
+        let worktrees_root = TempDir::new().unwrap();
+        let marker = repo.path().join("post-checkout-ran");
+        plant_marker_hook(repo.path(), "post-checkout", &marker);
+
+        let manager = WorktreeManager::new(repo.path(), worktrees_root.path()).unwrap();
+        let _worktree = manager.create("run-hook-3", "coder", "HEAD").await.unwrap();
+
+        assert!(
+            !marker.exists(),
+            "a post-checkout hook planted in repo_path must never run when warden itself \
+             creates a role's worktree"
         );
     }
 }
