@@ -2,11 +2,12 @@
 //! lives in the `warden` library crate (`src/lib.rs` and friends).
 
 use std::io::{IsTerminal, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use warden::agent_def::resolve_agent_definition;
 use warden::db;
@@ -48,8 +49,38 @@ enum Commands {
         /// blank -- validated here rather than left to fail deep inside the
         /// first cycle (M2, issue #20 review), where
         /// `AgentInputMessage::for_coder` enforces the same rule.
-        #[arg(long, value_parser = parse_intent)]
-        intent: String,
+        ///
+        /// Issue #72: repeatable. A single `--intent` behaves exactly as
+        /// before (one run, driven in this same process -- unchanged mono-
+        /// intent mode). Two or more -- combined with any `--intents-file`
+        /// entries (see below) -- switch to batch mode: each intent runs to
+        /// completion sequentially, as its own fully isolated `warden run`
+        /// *subprocess* (fresh process, fresh run_id, fresh worktrees --
+        /// zero shared in-memory state between intents, the isolation this
+        /// issue defaults to). A non-converged intent does not stop the
+        /// batch unless `--fail-fast` is also given.
+        #[arg(long = "intent", value_parser = parse_intent)]
+        intent: Vec<String>,
+
+        /// Issue #72: a file with one intent per non-blank line (a leading
+        /// `#` marks a comment line, ignored). Combined with any repeated
+        /// `--intent` flags above: this file's entries run first, in file
+        /// order, followed by the `--intent` flags in the order given. At
+        /// least one intent must result from `--intent`/`--intents-file`
+        /// combined -- this run is rejected before anything starts
+        /// otherwise.
+        #[arg(long = "intents-file", value_parser = clap::value_parser!(PathBuf))]
+        intents_file: Option<PathBuf>,
+
+        /// Issue #72: only meaningful once two or more intents are in play
+        /// (batch mode) -- ignored for a single intent. Off (the default):
+        /// a non-converged intent (exhausted its own cycle budget, or its
+        /// subprocess itself failed) is recorded in the batch report and the
+        /// next intent still runs on its own clean slate. On: stops the
+        /// batch at the first non-converged intent instead, recording every
+        /// intent after it as `Skipped`.
+        #[arg(long)]
+        fail_fast: bool,
 
         /// Branch name recorded for this run (informational in Phase 1;
         /// no push happens until the git gate lands in Phase 3).
@@ -197,6 +228,16 @@ fn parse_isolation(raw: &str) -> Result<Isolation, String> {
     }
 }
 
+/// Reverses [`parse_isolation`] (issue #72's batch mode): renders `isolation`
+/// back into the exact `--isolation` value a batch child subprocess needs to
+/// reproduce it.
+fn isolation_as_str(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::Worktree => "worktree",
+        Isolation::Docker => "docker",
+    }
+}
+
 /// Default image `--isolation docker` runs every agent invocation in --
 /// built from `crates/warden-sandbox/docker/Dockerfile` (issue #49). No
 /// separate `--isolation-image` is required for the common case; the flag
@@ -247,11 +288,14 @@ struct TrustRepoAgents(bool);
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    let verbose = cli.verbose;
 
     match cli.command {
         Commands::Run {
             repo,
             intent,
+            intents_file,
+            fail_fast,
             branch,
             max_review_cycles,
             max_test_cycles,
@@ -270,32 +314,25 @@ async fn main() -> anyhow::Result<()> {
             isolation,
             isolation_image,
         } => {
-            // Issue #15/ADR-0011: the post-Converged tail only runs when
-            // both paths it needs are configured; omitting either preserves
-            // this crate's original behaviour (stop at `Converged`).
-            let gate = match (gate_bare_repo, gate_gated_bin) {
-                (Some(bare_repo_path), Some(gated_bin)) => Some(orchestrator::GateConfig {
-                    bare_repo_path,
-                    gated_bin,
-                    repo_slug: gate_repo_slug,
-                    poll_interval_secs: gate_poll_interval_secs,
-                    inactivity_timeout_secs: gate_inactivity_timeout_secs,
-                }),
-                _ => None,
-            };
-
-            // Issue #32: `--tui-bin` is only meaningful alongside `--tui`;
-            // resolved once here (not inside `run`), same shape as `gate`
-            // above.
-            let tui_launch = tui.then(|| TuiLaunchConfig {
-                tui_bin: resolve_tui_binary(tui_bin),
-            });
-
-            // Issue #49: bundled the same way as `gate`/`tui_launch` above.
-            let isolation_config = IsolationConfig {
-                isolation,
-                image: isolation_image,
-            };
+            // Issue #72: `--intents-file` entries run first (file order),
+            // followed by any repeated `--intent` flags, in the order given.
+            let mut intents = Vec::new();
+            if let Some(intents_file_path) = &intents_file {
+                let file_intents = warden::batch::read_intents_file(intents_file_path)
+                    .with_context(|| {
+                        format!(
+                            "failed to read --intents-file {}",
+                            intents_file_path.display()
+                        )
+                    })?;
+                intents.extend(file_intents);
+            }
+            intents.extend(intent);
+            if intents.is_empty() {
+                bail!(
+                    "no intent provided: pass --intent (repeatable) and/or --intents-file <path>"
+                );
+            }
 
             // One arm today (`ToolName::Claude`); a future adapter gets its
             // own arm here rather than a runtime lookup, so the concrete
@@ -303,22 +340,92 @@ async fn main() -> anyhow::Result<()> {
             // at compile time (see `ToolName`'s own docs).
             match tool {
                 ToolName::Claude => {
-                    run(
-                        repo,
-                        intent,
-                        branch,
-                        max_review_cycles,
-                        max_test_cycles,
-                        warden_home,
-                        ClaudeAdapter,
-                        TrustRepoAgents(trust_repo_agents),
-                        evidence_tool,
-                        evidence_store_in_repo,
-                        gate,
-                        tui_launch,
-                        isolation_config,
-                    )
-                    .await
+                    // Issue #72: a single intent is the pre-existing,
+                    // unchanged mono-intent path -- built and awaited
+                    // in-process exactly as before this issue. Two or more
+                    // intents switch to `run_batch`, which never builds a
+                    // `RunConfig`/`Orchestrator` itself; each intent gets its
+                    // own `warden run` subprocess instead (see `run_batch`'s
+                    // own docs for why).
+                    if intents.len() == 1 {
+                        let intent = intents
+                            .into_iter()
+                            .next()
+                            .expect("checked intents.len() == 1 above");
+
+                        // Issue #15/ADR-0011: the post-Converged tail only
+                        // runs when both paths it needs are configured;
+                        // omitting either preserves this crate's original
+                        // behaviour (stop at `Converged`).
+                        let gate = match (gate_bare_repo, gate_gated_bin) {
+                            (Some(bare_repo_path), Some(gated_bin)) => {
+                                Some(orchestrator::GateConfig {
+                                    bare_repo_path,
+                                    gated_bin,
+                                    repo_slug: gate_repo_slug,
+                                    poll_interval_secs: gate_poll_interval_secs,
+                                    inactivity_timeout_secs: gate_inactivity_timeout_secs,
+                                })
+                            }
+                            _ => None,
+                        };
+
+                        // Issue #32: `--tui-bin` is only meaningful alongside
+                        // `--tui`; resolved once here (not inside `run`),
+                        // same shape as `gate` above.
+                        let tui_launch = tui.then(|| TuiLaunchConfig {
+                            tui_bin: resolve_tui_binary(tui_bin),
+                        });
+
+                        // Issue #49: bundled the same way as `gate`/
+                        // `tui_launch` above.
+                        let isolation_config = IsolationConfig {
+                            isolation,
+                            image: isolation_image,
+                        };
+
+                        run(
+                            repo,
+                            intent,
+                            branch,
+                            max_review_cycles,
+                            max_test_cycles,
+                            warden_home,
+                            ClaudeAdapter,
+                            TrustRepoAgents(trust_repo_agents),
+                            evidence_tool,
+                            evidence_store_in_repo,
+                            gate,
+                            tui_launch,
+                            isolation_config,
+                        )
+                        .await
+                    } else {
+                        run_batch(
+                            repo,
+                            intents,
+                            fail_fast,
+                            branch,
+                            max_review_cycles,
+                            max_test_cycles,
+                            warden_home,
+                            verbose,
+                            trust_repo_agents,
+                            evidence_tool,
+                            evidence_store_in_repo,
+                            gate_bare_repo,
+                            gate_gated_bin,
+                            gate_repo_slug,
+                            gate_poll_interval_secs,
+                            gate_inactivity_timeout_secs,
+                            tui,
+                            tui_bin,
+                            "claude",
+                            isolation_as_str(isolation),
+                            isolation_image,
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -775,6 +882,262 @@ async fn run<R: ToolAdapter>(
     print_stdout_line_or_log(&format!("run {run_id} finished: {final_state:?}"));
 
     Ok(())
+}
+
+/// Issue #72's batch mode: runs `intents` sequentially, each as its own
+/// fresh `warden run --intent <intent>` **subprocess** of this same binary
+/// (`std::env::current_exe`), never in this process. This is the strong
+/// isolation this issue defaults to: a brand new OS process gets a brand new
+/// `Orchestrator`, a brand new `run_id`, and its own
+/// `<warden_home>/worktrees/<run_id>/` tree, so there is no in-memory state
+/// to carry over between intents by construction -- and this crate's own
+/// existing, unchanged agent-subprocess/worktree teardown (exercised by
+/// every single-intent run already) guarantees agents are killed and
+/// worktrees are gone once that child's own convergence loop returns, before
+/// the next intent's child is ever spawned.
+///
+/// Every flag here mirrors the one `--intent`/`--intents-file`/`--fail-fast`
+/// case of [`Commands::Run`] (this fn's own caller is the only place that
+/// destructures those three out before reaching here) -- forwarded to each
+/// child verbatim via [`warden::batch::build_single_intent_args`], so a
+/// batch child's own behaviour (gate tail, `--isolation docker`, evidence
+/// capture, ...) is identical to running that one intent directly.
+///
+/// A non-converged intent (exhausted its cycle budget, or its own
+/// subprocess failed outright) does not stop the batch -- the next intent
+/// still gets its own clean-slate child -- unless `fail_fast` is set, in
+/// which case every intent after the first non-converged one is recorded as
+/// `Skipped` without ever being attempted. Once every intent has either run
+/// or been skipped, the batch summary is printed and this returns `Err` iff
+/// at least one intent did not converge (issue #72: "final report listing
+/// each intent's result").
+#[allow(clippy::too_many_arguments)]
+async fn run_batch(
+    repo: PathBuf,
+    intents: Vec<String>,
+    fail_fast: bool,
+    branch: String,
+    max_review_cycles: u32,
+    max_test_cycles: u32,
+    warden_home: Option<PathBuf>,
+    verbose: u8,
+    trust_repo_agents: bool,
+    evidence_tool: Option<warden_core::EvidenceTool>,
+    evidence_store_in_repo: bool,
+    gate_bare_repo: Option<PathBuf>,
+    gate_gated_bin: Option<PathBuf>,
+    gate_repo_slug: Option<String>,
+    gate_poll_interval_secs: u64,
+    gate_inactivity_timeout_secs: u64,
+    tui: bool,
+    tui_bin: Option<PathBuf>,
+    tool: &str,
+    isolation: &str,
+    isolation_image: String,
+) -> anyhow::Result<()> {
+    // Resolved once here (not once per child), so every intent in this batch
+    // shares the exact same `--warden-home` regardless of which point in
+    // time `HOME` is read at -- same rationale as `run`'s own resolution.
+    let warden_home = match warden_home {
+        Some(warden_home) => warden_home,
+        None => default_warden_home()?,
+    };
+    let current_exe = std::env::current_exe().context(
+        "failed to resolve the path to the running warden binary (needed to spawn batch children)",
+    )?;
+
+    let repo_str = path_arg(&repo, "--repo")?;
+    let warden_home_str = path_arg(&warden_home, "--warden-home")?;
+    let gate_bare_repo_str = gate_bare_repo
+        .as_deref()
+        .map(|path| path_arg(path, "--gate-bare-repo"))
+        .transpose()?;
+    let gate_gated_bin_str = gate_gated_bin
+        .as_deref()
+        .map(|path| path_arg(path, "--gate-gated-bin"))
+        .transpose()?;
+    let tui_bin_str = tui_bin
+        .as_deref()
+        .map(|path| path_arg(path, "--tui-bin"))
+        .transpose()?;
+    let evidence_tool_str = evidence_tool.map(warden_core::EvidenceTool::as_str);
+
+    let single_intent_args = warden::batch::SingleIntentArgs {
+        repo: repo_str,
+        branch: &branch,
+        max_review_cycles,
+        max_test_cycles,
+        warden_home: warden_home_str,
+        tool,
+        trust_repo_agents,
+        evidence_tool: evidence_tool_str,
+        evidence_store_in_repo,
+        gate_bare_repo: gate_bare_repo_str,
+        gate_gated_bin: gate_gated_bin_str,
+        gate_repo_slug: gate_repo_slug.as_deref(),
+        gate_poll_interval_secs,
+        gate_inactivity_timeout_secs,
+        tui,
+        tui_bin: tui_bin_str,
+        isolation,
+        isolation_image: &isolation_image,
+        verbose,
+    };
+
+    let total = intents.len();
+    let mut reports: Vec<warden::batch::IntentReport> = Vec::with_capacity(total);
+    let mut stop_remaining = false;
+
+    for (index, intent) in intents.iter().enumerate() {
+        if stop_remaining {
+            print_stdout_line_or_log(&format!(
+                "batch: skipping intent {}/{total} (--fail-fast): {intent:?}",
+                index + 1
+            ));
+            reports.push(warden::batch::IntentReport {
+                intent: intent.clone(),
+                run_id: None,
+                status: warden::batch::IntentStatus::Skipped,
+            });
+            continue;
+        }
+
+        print_stdout_line_or_log(&format!(
+            "batch: starting intent {}/{total}: {intent:?}",
+            index + 1
+        ));
+
+        let child_args = warden::batch::build_single_intent_args(&single_intent_args, intent);
+        let report = run_one_batch_intent(&current_exe, &child_args, intent).await?;
+
+        if !report.status.is_success() && fail_fast {
+            stop_remaining = true;
+        }
+        reports.push(report);
+    }
+
+    print_stdout_line_or_log("");
+    print_stdout_line_or_log(&warden::batch::summarize(&reports));
+
+    if warden::batch::batch_failed(&reports) {
+        let converged = reports
+            .iter()
+            .filter(|report| report.status.is_success())
+            .count();
+        bail!("batch finished with {converged}/{total} intent(s) converged (see summary above)");
+    }
+
+    Ok(())
+}
+
+/// Converts a `Path` into the `&str` a batch child's argv needs (issue #72),
+/// naming `flag_name` in the error so a non-UTF-8 `--repo`/`--warden-home`/...
+/// fails clearly rather than being silently mangled via `Path::display()`
+/// (code-standards.md: "no silent fallback") -- the same shape
+/// `attach_warden_home_quoted` above already uses for the analogous
+/// `--warden-home` case.
+fn path_arg<'a>(path: &'a Path, flag_name: &str) -> anyhow::Result<&'a str> {
+    path.to_str().with_context(|| {
+        format!(
+            "{flag_name} ({}) is not valid UTF-8; cannot forward it to a batch child process",
+            path.display()
+        )
+    })
+}
+
+/// Runs one batch intent's child (issue #72): spawns `current_exe` with
+/// `child_args`, relays its stdout live (through the same
+/// [`print_stdout_line_or_log`] every other run output goes through) while
+/// parsing it for the `"run <id> started"`/`"run <id> finished: <State>"`
+/// lines [`run`] itself always prints, then classifies the outcome once the
+/// child exits.
+///
+/// Returns `Err` only for an infrastructure failure this batch cannot
+/// meaningfully continue past (the child failed to even spawn, or waiting on
+/// it failed) -- a *child* that ran and reported a non-converged outcome, or
+/// exited non-zero, is instead reported as a normal (non-`Err`)
+/// [`warden::batch::IntentStatus::SubprocessError`]/`NotConverged`, so the
+/// batch's own continue-by-default policy can act on it.
+async fn run_one_batch_intent(
+    current_exe: &Path,
+    child_args: &[String],
+    intent: &str,
+) -> anyhow::Result<warden::batch::IntentReport> {
+    let mut command = tokio::process::Command::new(current_exe);
+    command
+        .args(child_args)
+        .stdout(std::process::Stdio::piped());
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn batch child `{} {}`",
+            current_exe.display(),
+            child_args.join(" ")
+        )
+    })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("batch child stdout was not piped (internal bug)")?;
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut run_id: Option<String> = None;
+    let mut finished: Option<(String, String)> = None;
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read batch child stdout")?
+    {
+        print_stdout_line_or_log(&line);
+        if run_id.is_none() {
+            if let Some(started_id) = warden::batch::parse_started_line(&line) {
+                run_id = Some(started_id.to_string());
+            }
+        }
+        if let Some((finished_id, final_state)) = warden::batch::parse_finished_line(&line) {
+            finished = Some((finished_id.to_string(), final_state.to_string()));
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("failed to wait for batch child (intent {intent:?})"))?;
+
+    if !status.success() {
+        return Ok(warden::batch::IntentReport {
+            intent: intent.to_string(),
+            run_id: run_id.or_else(|| finished.as_ref().map(|(id, _)| id.clone())),
+            status: warden::batch::IntentStatus::SubprocessError {
+                reason: format!("warden run exited with status {status}"),
+            },
+        });
+    }
+
+    match finished {
+        Some((finished_run_id, final_state)) => {
+            let status = if warden::batch::is_converged_state(&final_state) {
+                warden::batch::IntentStatus::Converged { final_state }
+            } else {
+                warden::batch::IntentStatus::NotConverged { final_state }
+            };
+            Ok(warden::batch::IntentReport {
+                intent: intent.to_string(),
+                run_id: Some(finished_run_id),
+                status,
+            })
+        }
+        None => Ok(warden::batch::IntentReport {
+            intent: intent.to_string(),
+            run_id,
+            status: warden::batch::IntentStatus::SubprocessError {
+                reason: "child exited successfully but printed no parseable \"finished:\" line"
+                    .to_string(),
+            },
+        }),
+    }
 }
 
 /// Issue #32 decision ("la sortie de la TUI annule le run"): awaits the
