@@ -25,8 +25,9 @@
 //! itself once that wrapper existed.
 //!
 //! Issue #24's decision: **Warden ships opinionated, built-in adapters** for
-//! specific CLIs (`claude` first; `aider` and others are meant to gain their
-//! own [`ToolAdapter`] impl later, never a config-declared registry --
+//! specific CLIs (`claude` first; `codex` and `mistral` followed in issue
+//! #71; other CLIs are meant to gain their own [`ToolAdapter`] impl later,
+//! never a config-declared registry --
 //! `--tool <name>` selects one of a closed, compiled-in set, exactly like
 //! [`warden_core::RunState`]/`AgentRole` string parsing). Warden is no
 //! longer agent-agnostic at the *schema* level (a definition is Claude
@@ -596,6 +597,371 @@ exactly these fields: `source` (always the string \"tester\"), `severity` \
 the test suite failed; no findings at all means it passed. Do not include \
 any other text in your final answer.";
 
+/// The `codex` adapter (issue #71): Warden's second built-in [`ToolAdapter`],
+/// wrapping the OpenAI Codex CLI (the `codex` binary) in its non-interactive
+/// `codex exec` mode.
+///
+/// # Open question resolved pragmatically, not verified live (issue #71)
+///
+/// Unlike [`ClaudeAdapter`], whose every claim above is checked against a
+/// real, authenticated CLI, this adapter's invocation shape and JSON event
+/// schema were **not** verified against a live `codex` install -- this
+/// environment has neither the binary nor network access to install/run it.
+/// What follows is this adapter's author's best-effort, documented reading
+/// of OpenAI's own published Codex CLI ("codex-rs") behaviour at the time of
+/// writing (`codex exec`'s non-interactive mode, its experimental `--json`
+/// streamed-event output, and its `--sandbox`/`--ask-for-approval` execution
+/// policy flags), not a byte-for-byte captured transcript the way
+/// `ClaudeAdapter`'s own regression fixtures are. Should the real CLI's
+/// flags or event shape differ from what's modelled here, the failure mode
+/// is deliberately graceful rather than silent: `extract_findings` surfaces
+/// a named [`warden_core::CoreError::MalformedAgentOutput`] instead of
+/// fabricating findings, and `extract_usage` degrades to `None` ("n/a",
+/// issue #53) instead of a fabricated zero -- the exact two contracts
+/// [`ToolAdapter`]'s own docs already require of every adapter, live-verified
+/// or not. Tests below exercise this adapter's own parsing logic against
+/// fixtures matching the schema documented here, not a real captured
+/// transcript (see this module's own test docs).
+///
+/// # Invocation shape
+///
+/// `codex exec --json --ask-for-approval never [--sandbox <mode>] [--model
+/// <model>] <system_prompt>`, with the role's own `AgentInputMessage`
+/// context still fed on stdin exactly as for every other adapter (unchanged
+/// ADR-0012 channel, `Orchestrator::run_agent`). `codex exec`'s own
+/// positional `PROMPT` argument reads from stdin when omitted -- the same
+/// reason [`ClaudeAdapter`] is forced onto an argv flag for its system
+/// prompt rather than stdin (see that struct's own docs): stdin here already
+/// carries Warden's own JSON payload, so the system prompt has no channel
+/// left but argv, the ADR-0013/Q2 trade-off `ClaudeAdapter` already accepts,
+/// scoped to this adapter too.
+///
+/// - `--json`: the CLI's own experimental streamed-event output mode
+///   (this ticket's own research), the `codex` analogue of
+///   `claude --output-format stream-json` -- both an `extract_findings`
+///   source and a `parse_progress_line` source, same split as
+///   `ClaudeAdapter`.
+/// - `--ask-for-approval never`: unconditional, never driven by the
+///   definition -- a non-interactive subprocess with no human present to
+///   answer an approval prompt would otherwise hang forever. This is about
+///   *whether a human is asked*, not *what the agent may do*; that's
+///   `--sandbox`, below.
+/// - `--sandbox <mode>`: fed from `definition.tools` verbatim, the same
+///   "reinterpreted per adapter, passed through unvalidated" convention
+///   `definition.model` already uses (`AgentDefinition`'s own docs) --
+///   `tools:` in a markdown definition means "the comma-separated
+///   `--allowedTools` list" for `claude` and "one of `codex`'s own sandbox
+///   policy names (`read-only`/`workspace-write`/`danger-full-access`)" for
+///   `codex`; a value that isn't one of those is `codex`'s own error to
+///   report, not validated here -- see [`CodexAdapter::default_tools`].
+pub struct CodexAdapter;
+
+/// Env vars `codex` needs beyond `PATH` to find its own configuration and
+/// credentials -- ADR-0005: Warden delegates entirely to the CLI's own
+/// already-authenticated state (`codex login`), never handling API keys
+/// itself. Only `HOME` is forwarded: unlike `ClaudeAdapter`'s `USER`
+/// (empirically required for that CLI's keychain-based OAuth resolution on
+/// this platform, see that adapter's own docs), no equivalent requirement is
+/// known here -- this has not been verified against a live install (see this
+/// module's own docs on `CodexAdapter`), so nothing beyond the one variable
+/// this adapter is confident every config-file-based CLI needs is forwarded.
+/// Deliberately **not** an `OPENAI_API_KEY`-shaped variable: forwarding a raw
+/// API key would make Warden a holder of that secret, contradicting ADR-0005
+/// ("Warden holds no keys") -- this adapter relies on `codex`'s own
+/// already-authenticated on-disk session, exactly like `ClaudeAdapter`.
+const CODEX_ENV_ALLOWLIST: &[&str] = &["HOME"];
+
+impl ToolAdapter for CodexAdapter {
+    fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+        let mut args = vec![
+            "exec".to_string(),
+            "--json".to_string(),
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+        ];
+        if let Some(tools) = &definition.tools {
+            args.push("--sandbox".to_string());
+            args.push(tools.clone());
+        }
+        if let Some(model) = &definition.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        // The positional `PROMPT` argument: `codex exec`'s only channel for
+        // a system prompt (see this struct's own docs) -- pushed last, after
+        // every flag, matching the CLI's documented `[OPTIONS] [PROMPT]`
+        // argument order.
+        args.push(definition.system_prompt.clone());
+        Ok(AgentCommand::new("codex", args))
+    }
+
+    fn env_allowlist(&self) -> &'static [&'static str] {
+        CODEX_ENV_ALLOWLIST
+    }
+
+    fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+        // Same "last non-blank line carries the terminal envelope" contract
+        // `ClaudeAdapter::extract_findings` relies on for its own streamed
+        // output -- see this struct's own docs for why `codex exec --json`
+        // is modelled the same way (a `task_complete` event as the stream's
+        // last line).
+        let last_line = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .ok_or_else(|| {
+                warden_core::CoreError::MalformedAgentOutput(
+                    "codex produced no output at all (expected at least a final \
+                     `task_complete` event)"
+                        .to_string(),
+                )
+            })?;
+        let event: CodexEvent = serde_json::from_str(last_line).map_err(|error| {
+            warden_core::CoreError::MalformedAgentOutput(format!(
+                "codex's final output line is not the expected JSON event envelope: {error}"
+            ))
+        })?;
+        match event.msg {
+            CodexEventMsg::TaskComplete {
+                last_agent_message: Some(text),
+            } => warden_core::parse_findings(&text),
+            CodexEventMsg::TaskComplete {
+                last_agent_message: None,
+            } => Err(warden_core::CoreError::MalformedAgentOutput(
+                "codex reported task_complete with no last_agent_message (the agent likely did \
+                 not complete normally)"
+                    .to_string(),
+            )),
+            CodexEventMsg::Error { message } => Err(warden_core::CoreError::MalformedAgentOutput(
+                format!("codex reported an error: {message}"),
+            )),
+            CodexEventMsg::AgentMessage { .. } | CodexEventMsg::TokenCount { .. } => {
+                Err(warden_core::CoreError::MalformedAgentOutput(
+                    "codex's final output line is not a `task_complete` event".to_string(),
+                ))
+            }
+            CodexEventMsg::Other => Err(warden_core::CoreError::MalformedAgentOutput(
+                "codex's final output line is an unrecognized event type".to_string(),
+            )),
+        }
+    }
+
+    fn default_prompt(&self, role: AgentRole) -> &'static str {
+        match role {
+            AgentRole::Coder => DEFAULT_CODER_PROMPT,
+            AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT,
+            AgentRole::Tester => DEFAULT_TESTER_PROMPT,
+        }
+    }
+
+    fn default_tools(&self, role: AgentRole) -> Option<&'static str> {
+        Some(match role {
+            // Full read/write within the role's own worktree -- the default
+            // coder prompt asks it to implement the intent and commit
+            // locally, same capability `ClaudeAdapter`'s `Bash`/`Write`/`Edit`
+            // grant gives its own coder.
+            AgentRole::Coder => "workspace-write",
+            // Architecture.md §1: the reviewer raises findings, it never
+            // fixes them itself -- `read-only` is `codex`'s own sandbox
+            // policy closest to `ClaudeAdapter`'s deliberate omission of
+            // `Write`/`Edit` from the reviewer's grant.
+            AgentRole::Reviewer => "read-only",
+            // The default tester prompt asks it to both run the existing
+            // suite and add tests the diff lacks, same as
+            // `ClaudeAdapter::default_tools`'s tester grant.
+            AgentRole::Tester => "workspace-write",
+        })
+    }
+
+    fn parse_progress_line(&self, line: &str) -> Option<String> {
+        // Conservative on purpose (see this struct's own docs): only the one
+        // event variant this adapter's author is confident enough to model
+        // (`agent_message`, a complete assistant message) is translated into
+        // progress text. Every other event type this stream might carry
+        // (`task_complete`/`error`, already `extract_findings`'s concern; an
+        // unrecognized type; a malformed line) yields `None` rather than a
+        // guessed interpretation.
+        let event: CodexEvent = serde_json::from_str(line).ok()?;
+        match event.msg {
+            CodexEventMsg::AgentMessage { message } => {
+                Some(format!("message: {}", summarize_progress_text(&message)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Issue #53: unlike `ClaudeAdapter`, which reads usage off the exact
+    /// same terminal `result` line `extract_findings` unwraps, this adapter
+    /// models `codex`'s token usage as its own distinct streamed event
+    /// (`token_count`), not necessarily the stream's last line -- so this
+    /// scans every captured line, keeping the last `token_count` event seen
+    /// (a cumulative report superseding any earlier one), rather than only
+    /// the final line. No cache-token dimension is modelled: nothing in this
+    /// adapter's documented understanding of `codex`'s protocol (see this
+    /// struct's own docs) describes a prompt-caching figure distinct from
+    /// input/output tokens, so both cache fields are always `None` here --
+    /// never fabricated as `0` (same "n/a, not zero" contract
+    /// `ClaudeAdapter::extract_usage`'s own docs describe).
+    fn extract_usage(&self, stdout: &str) -> Option<TokenUsage> {
+        stdout.lines().rev().find_map(|line| {
+            let event: CodexEvent = serde_json::from_str(line).ok()?;
+            match event.msg {
+                CodexEventMsg::TokenCount {
+                    input_tokens,
+                    output_tokens,
+                } => Some(TokenUsage::new(input_tokens, output_tokens, None, None)),
+                _ => None,
+            }
+        })
+    }
+}
+
+/// One line of `codex exec --json` output, modelled from OpenAI's published
+/// Codex CLI event protocol as this adapter's author understood it -- **not
+/// independently verified against a live install** (see [`CodexAdapter`]'s
+/// own docs on why). Kept deliberately tolerant, the same convention
+/// `ClaudeStreamLine`/`ClaudeResultEnvelope` already use for a third party's
+/// own wire format: unknown top-level fields are ignored by serde's default
+/// behaviour, and an unrecognized `msg.type` parses into
+/// [`CodexEventMsg::Other`] (via `#[serde(other)]`) rather than failing the
+/// whole line.
+#[derive(Debug, serde::Deserialize)]
+struct CodexEvent {
+    msg: CodexEventMsg,
+}
+
+/// The `msg.type` payload of one [`CodexEvent`] -- see that struct's own
+/// docs on this not being a verified, stable wire contract.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CodexEventMsg {
+    /// A complete assistant message -- `parse_progress_line`'s only
+    /// recognized event (see [`CodexAdapter::parse_progress_line`]'s own
+    /// docs on why this adapter models no other progress-worthy event type).
+    AgentMessage { message: String },
+    /// The stream's terminal event -- `extract_findings`'s target, the
+    /// `codex` analogue of `claude`'s own `result` envelope.
+    /// `last_agent_message` absent (rather than defaulted to `""`) reports
+    /// the same "the agent likely did not complete normally" fact
+    /// `ClaudeResultEnvelope::result`'s own `Option` models.
+    TaskComplete {
+        #[serde(default)]
+        last_agent_message: Option<String>,
+    },
+    /// Issue #53's source for this adapter -- required, non-`Option` fields:
+    /// a `token_count` event missing either figure fails to deserialize
+    /// (caught by `extract_usage`'s `.ok()?`) rather than reporting a
+    /// fabricated `0` for the missing one.
+    TokenCount {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// A terminal failure this invocation reported on its own -- distinct
+    /// from a malformed line `extract_findings` itself can't parse at all.
+    Error { message: String },
+    /// Every event type this adapter doesn't specifically model (a future
+    /// addition to the CLI's own protocol, `task_started`,
+    /// `exec_command_begin`/`exec_command_end`, ...) -- tolerated, not
+    /// treated as this line failing to parse at all, same convention as
+    /// `ClaudeContentBlock::Other`.
+    #[serde(other)]
+    Other,
+}
+
+/// The `mistral` adapter (issue #71): Warden's third built-in
+/// [`ToolAdapter`], wrapping a `mistral` CLI in the most conservative shape
+/// defensible without a live install to verify against.
+///
+/// # Open question resolved conservatively, not guessed at (issue #71)
+///
+/// Issue #71 itself flags this CLI's maturity/existence as uncertain (`le
+/// chat`/`mistral` -- unlike `codex`, no single, widely-documented
+/// non-interactive automation mode could be identified with any confidence
+/// while writing this adapter). Per this ticket's own guidance ("prefer a
+/// design that degrades gracefully over guessing at a format that may not
+/// exist"), this adapter therefore assumes the least possible about the
+/// underlying CLI's own contract:
+///
+/// - No structured/streamed output format is assumed at all --
+///   [`extract_usage`](MistralAdapter::extract_usage) always returns `None`
+///   ("n/a", issue #53) and [`parse_progress_line`](ToolAdapter::parse_progress_line)
+///   is left at the trait's own default (`None` for every line -- issue #33's
+///   "legitimate to not implement progress at all", see
+///   [`ToolAdapter::parse_progress_line`]'s own docs).
+/// - [`extract_findings`](MistralAdapter::extract_findings) treats the
+///   **entire trimmed stdout** as the final answer text -- no envelope to
+///   unwrap at all, unlike `claude`/`codex`. This is invocation-shape-
+///   independent: if the real `mistral` CLI's argv turns out to differ from
+///   what [`build_command`](MistralAdapter::build_command) assumes below,
+///   only that method needs to change -- this findings contract does not.
+///
+/// # Invocation shape
+///
+/// `mistral --system <system_prompt> [--model <model>]` -- the minimal shape
+/// a plain prompt-in/answer-out CLI would expose, with the role's own
+/// `AgentInputMessage` context still fed on stdin exactly as for every other
+/// adapter (unchanged ADR-0012 channel). `definition.tools` is not consumed
+/// at all: no equivalent of `claude`'s `--allowedTools`/`codex`'s `--sandbox`
+/// is known for this CLI's surface -- see
+/// [`MistralAdapter::default_tools`].
+pub struct MistralAdapter;
+
+/// Env vars `mistral` needs beyond `PATH` -- ADR-0005: delegated entirely to
+/// the CLI's own already-authenticated state, never an API key Warden itself
+/// holds (same reasoning as [`CODEX_ENV_ALLOWLIST`]'s own docs). Only `HOME`
+/// is forwarded, on the same "every config-file-based CLI needs at least
+/// this" reasoning -- not verified against a live install, since this CLI's
+/// own configuration/credential storage location is itself unconfirmed (see
+/// this module's own docs on [`MistralAdapter`]).
+const MISTRAL_ENV_ALLOWLIST: &[&str] = &["HOME"];
+
+impl ToolAdapter for MistralAdapter {
+    fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+        let mut args = vec!["--system".to_string(), definition.system_prompt.clone()];
+        if let Some(model) = &definition.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        Ok(AgentCommand::new("mistral", args))
+    }
+
+    fn env_allowlist(&self) -> &'static [&'static str] {
+        MISTRAL_ENV_ALLOWLIST
+    }
+
+    fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+        // No envelope to unwrap (see this adapter's own docs) -- the whole
+        // trimmed buffer is the agent's final answer, handed straight to
+        // `warden_core::parse_findings` exactly like `ClaudeAdapter`'s
+        // original single-line `--output-format json` mode did before
+        // `stream-json` introduced an envelope (see `ClaudeAdapter`'s own
+        // docs on that history).
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return Err(warden_core::CoreError::MalformedAgentOutput(
+                "mistral produced no output at all".to_string(),
+            ));
+        }
+        warden_core::parse_findings(trimmed)
+    }
+
+    fn default_prompt(&self, role: AgentRole) -> &'static str {
+        match role {
+            AgentRole::Coder => DEFAULT_CODER_PROMPT,
+            AgentRole::Reviewer => DEFAULT_REVIEWER_PROMPT,
+            AgentRole::Tester => DEFAULT_TESTER_PROMPT,
+        }
+    }
+
+    fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+        // No known equivalent of `--allowedTools`/`--sandbox` for this CLI's
+        // surface (see this adapter's own docs) -- `None` is the legitimate
+        // answer `ToolAdapter::default_tools`'s own docs describe for a tool
+        // that needs no such grant, not an oversight.
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1352,362 @@ mod tests {
             let tools = ClaudeAdapter.default_tools(role).unwrap();
             assert!(tools.contains("Write"), "{role:?}: {tools:?}");
             assert!(tools.contains("Edit"), "{role:?}: {tools:?}");
+        }
+    }
+
+    // ===================================================================
+    // `CodexAdapter` (issue #71) -- fixtures below match the JSON event
+    // schema documented on `CodexEvent`/`CodexEventMsg`, this adapter's own
+    // best-effort reading of `codex exec --json`, not a real captured
+    // transcript (see `CodexAdapter`'s own docs on why no such transcript
+    // exists here).
+    // ===================================================================
+
+    #[test]
+    fn codex_build_command_always_execs_in_json_never_ask_mode_with_the_prompt_last() {
+        let command = CodexAdapter.build_command(&definition(None, None)).unwrap();
+        assert_eq!(command.program, "codex");
+        assert_eq!(
+            command.args,
+            vec![
+                "exec",
+                "--json",
+                "--ask-for-approval",
+                "never",
+                "be an agent"
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_build_command_appends_sandbox_when_the_definition_sets_tools() {
+        let command = CodexAdapter
+            .build_command(&definition(None, Some("workspace-write")))
+            .unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|w| w == ["--sandbox", "workspace-write"]));
+    }
+
+    #[test]
+    fn codex_build_command_appends_model_when_the_definition_sets_one() {
+        let command = CodexAdapter
+            .build_command(&definition(Some("o3"), None))
+            .unwrap();
+        assert!(command.args.windows(2).any(|w| w == ["--model", "o3"]));
+    }
+
+    #[test]
+    fn codex_build_command_places_the_system_prompt_as_the_trailing_positional_argument() {
+        let command = CodexAdapter
+            .build_command(&definition(Some("o3"), Some("read-only")))
+            .unwrap();
+        assert_eq!(command.args.last().unwrap(), "be an agent");
+    }
+
+    #[test]
+    fn codex_env_allowlist_is_exactly_home() {
+        assert_eq!(CodexAdapter.env_allowlist(), &["HOME"]);
+    }
+
+    #[test]
+    fn codex_extract_findings_unwraps_task_complete_and_parses_ndjson_findings() {
+        let stdout = concat!(
+            r#"{"msg":{"type":"agent_message","message":"looking into it"}}"#,
+            "\n",
+            r#"{"msg":{"type":"task_complete","last_agent_message":"{\"source\":\"reviewer\",\"severity\":\"blocking\",\"description\":\"bug\"}"}}"#,
+        );
+        let findings = CodexAdapter.extract_findings(stdout).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].description, "bug");
+    }
+
+    #[test]
+    fn codex_extract_findings_treats_an_empty_last_agent_message_as_no_findings() {
+        let stdout = r#"{"msg":{"type":"task_complete","last_agent_message":""}}"#;
+        assert_eq!(CodexAdapter.extract_findings(stdout).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn codex_extract_findings_rejects_a_task_complete_with_no_last_agent_message() {
+        let stdout = r#"{"msg":{"type":"task_complete"}}"#;
+        let error = CodexAdapter.extract_findings(stdout).unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn codex_extract_findings_surfaces_a_reported_error_event() {
+        let stdout = r#"{"msg":{"type":"error","message":"sandbox denied write"}}"#;
+        let error = match CodexAdapter.extract_findings(stdout).unwrap_err() {
+            warden_core::CoreError::MalformedAgentOutput(message) => message,
+            other => panic!("expected MalformedAgentOutput, got {other:?}"),
+        };
+        assert!(error.contains("sandbox denied write"));
+    }
+
+    #[test]
+    fn codex_extract_findings_rejects_output_that_is_not_the_event_envelope() {
+        let error = CodexAdapter
+            .extract_findings("not json at all")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn codex_extract_findings_rejects_completely_empty_output() {
+        let error = CodexAdapter.extract_findings("").unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn codex_extract_findings_finds_the_task_complete_event_as_the_last_line_of_a_transcript() {
+        let stdout = concat!(
+            r#"{"msg":{"type":"agent_message","message":"reading files"}}"#,
+            "\n",
+            r#"{"msg":{"type":"agent_message","message":"done reviewing"}}"#,
+            "\n",
+            r#"{"msg":{"type":"task_complete","last_agent_message":"{\"source\":\"reviewer\",\"severity\":\"blocking\",\"description\":\"bug\"}"}}"#,
+            "\n",
+        );
+        let findings = CodexAdapter.extract_findings(stdout).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].description, "bug");
+    }
+
+    #[test]
+    fn codex_parse_progress_line_extracts_an_agent_message_event() {
+        let line =
+            r#"{"msg":{"type":"agent_message","message":"Looking at the failing test now."}}"#;
+        let progress = CodexAdapter.parse_progress_line(line).unwrap();
+        assert_eq!(progress, "message: Looking at the failing test now.");
+    }
+
+    #[test]
+    fn codex_parse_progress_line_ignores_non_agent_message_event_types() {
+        for line in [
+            r#"{"msg":{"type":"task_complete","last_agent_message":""}}"#,
+            r#"{"msg":{"type":"token_count","input_tokens":1,"output_tokens":1}}"#,
+            r#"{"msg":{"type":"error","message":"boom"}}"#,
+            r#"{"msg":{"type":"exec_command_begin","command":"ls"}}"#,
+        ] {
+            assert_eq!(CodexAdapter.parse_progress_line(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn codex_parse_progress_line_returns_none_for_unparsable_lines() {
+        assert_eq!(CodexAdapter.parse_progress_line("not json at all"), None);
+        assert_eq!(CodexAdapter.parse_progress_line(""), None);
+    }
+
+    #[test]
+    fn codex_extract_usage_reads_input_and_output_tokens_from_a_token_count_event() {
+        let stdout = r#"{"msg":{"type":"token_count","input_tokens":120,"output_tokens":45}}"#;
+        let usage = CodexAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cache_read_tokens, None);
+        assert_eq!(usage.cache_creation_tokens, None);
+    }
+
+    #[test]
+    fn codex_extract_usage_finds_a_token_count_event_anywhere_in_the_transcript_not_just_the_last_line(
+    ) {
+        let stdout = concat!(
+            r#"{"msg":{"type":"agent_message","message":"working"}}"#,
+            "\n",
+            r#"{"msg":{"type":"token_count","input_tokens":7,"output_tokens":2}}"#,
+            "\n",
+            r#"{"msg":{"type":"task_complete","last_agent_message":""}}"#,
+            "\n",
+        );
+        let usage = CodexAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn codex_extract_usage_keeps_the_last_token_count_event_when_several_are_reported() {
+        let stdout = concat!(
+            r#"{"msg":{"type":"token_count","input_tokens":7,"output_tokens":2}}"#,
+            "\n",
+            r#"{"msg":{"type":"token_count","input_tokens":20,"output_tokens":9}}"#,
+            "\n",
+        );
+        let usage = CodexAdapter.extract_usage(stdout).unwrap();
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 9);
+    }
+
+    #[test]
+    fn codex_extract_usage_returns_none_when_no_token_count_event_is_present() {
+        let stdout = r#"{"msg":{"type":"task_complete","last_agent_message":"done"}}"#;
+        assert_eq!(CodexAdapter.extract_usage(stdout), None);
+    }
+
+    #[test]
+    fn codex_extract_usage_returns_none_for_output_that_is_not_the_event_envelope() {
+        assert_eq!(CodexAdapter.extract_usage("not json at all"), None);
+    }
+
+    #[test]
+    fn codex_extract_usage_returns_none_for_completely_empty_output() {
+        assert_eq!(CodexAdapter.extract_usage(""), None);
+    }
+
+    #[test]
+    fn every_role_has_a_non_blank_codex_default_prompt() {
+        for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
+            assert!(!CodexAdapter.default_prompt(role).trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn every_role_has_a_non_blank_codex_default_tools_grant() {
+        for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
+            let tools = CodexAdapter
+                .default_tools(role)
+                .expect("every role must have a default sandbox grant");
+            assert!(!tools.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_codex_reviewer_default_sandbox_is_read_only() {
+        assert_eq!(
+            CodexAdapter.default_tools(AgentRole::Reviewer).unwrap(),
+            "read-only"
+        );
+    }
+
+    #[test]
+    fn the_codex_coder_and_tester_default_sandbox_is_workspace_write() {
+        for role in [AgentRole::Coder, AgentRole::Tester] {
+            assert_eq!(
+                CodexAdapter.default_tools(role).unwrap(),
+                "workspace-write",
+                "{role:?}"
+            );
+        }
+    }
+
+    // ===================================================================
+    // `MistralAdapter` (issue #71) -- no structured output format is
+    // assumed at all (see `MistralAdapter`'s own docs); these fixtures
+    // exercise the "whole trimmed stdout is the final answer" contract that
+    // choice implies, independent of any particular CLI wire format.
+    // ===================================================================
+
+    #[test]
+    fn mistral_build_command_passes_the_system_prompt_via_the_system_flag() {
+        let command = MistralAdapter
+            .build_command(&definition(None, None))
+            .unwrap();
+        assert_eq!(command.program, "mistral");
+        assert_eq!(command.args, vec!["--system", "be an agent"]);
+    }
+
+    #[test]
+    fn mistral_build_command_appends_model_when_the_definition_sets_one() {
+        let command = MistralAdapter
+            .build_command(&definition(Some("mistral-large"), None))
+            .unwrap();
+        assert!(command
+            .args
+            .windows(2)
+            .any(|w| w == ["--model", "mistral-large"]));
+    }
+
+    #[test]
+    fn mistral_build_command_ignores_a_tools_grant_the_definition_sets() {
+        // No known equivalent of `--allowedTools`/`--sandbox` for this CLI
+        // (see `MistralAdapter`'s own docs) -- `tools` must not leak into
+        // argv as some unrecognized flag.
+        let command = MistralAdapter
+            .build_command(&definition(None, Some("Read, Write, Edit, Bash")))
+            .unwrap();
+        assert_eq!(command.args, vec!["--system", "be an agent"]);
+    }
+
+    #[test]
+    fn mistral_env_allowlist_is_exactly_home() {
+        assert_eq!(MistralAdapter.env_allowlist(), &["HOME"]);
+    }
+
+    #[test]
+    fn mistral_extract_findings_treats_the_whole_trimmed_stdout_as_ndjson_findings() {
+        let stdout =
+            "{\"source\":\"tester\",\"severity\":\"warning\",\"description\":\"flaky test\"}\n";
+        let findings = MistralAdapter.extract_findings(stdout).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].description, "flaky test");
+    }
+
+    #[test]
+    fn mistral_extract_findings_treats_blank_only_output_as_no_findings_error() {
+        let error = MistralAdapter.extract_findings("   \n\n").unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn mistral_extract_findings_rejects_completely_empty_output() {
+        let error = MistralAdapter.extract_findings("").unwrap_err();
+        assert!(matches!(
+            error,
+            warden_core::CoreError::MalformedAgentOutput(_)
+        ));
+    }
+
+    #[test]
+    fn mistral_extract_findings_propagates_the_parse_error_for_malformed_findings() {
+        assert!(MistralAdapter.extract_findings("not ndjson").is_err());
+    }
+
+    #[test]
+    fn mistral_extract_usage_always_returns_none() {
+        // No structured usage-reporting format is known for this CLI (see
+        // `MistralAdapter`'s own docs) -- "n/a" (`None`) regardless of
+        // input, never a fabricated zero.
+        assert_eq!(MistralAdapter.extract_usage("anything at all"), None);
+        assert_eq!(MistralAdapter.extract_usage(""), None);
+    }
+
+    #[test]
+    fn mistral_parse_progress_line_uses_the_trait_default_of_none() {
+        // No override (see `MistralAdapter`'s own docs): every line
+        // degrades to the pre-issue-#33 silence, the trait's own
+        // legitimate default.
+        assert_eq!(MistralAdapter.parse_progress_line("anything at all"), None);
+    }
+
+    #[test]
+    fn every_role_has_a_non_blank_mistral_default_prompt() {
+        for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
+            assert!(!MistralAdapter.default_prompt(role).trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn every_role_has_no_mistral_default_tools_grant() {
+        // Legitimate `None` (see `MistralAdapter::default_tools`'s own
+        // docs), not an oversight -- pinned explicitly so a future change
+        // that starts returning `Some` here is a deliberate decision, not a
+        // silent one.
+        for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
+            assert_eq!(MistralAdapter.default_tools(role), None, "{role:?}");
         }
     }
 }
