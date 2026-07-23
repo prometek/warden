@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use warden_core::{HookContext, HookOutcome, HookPoint};
+use warden_sandbox::{Command, ExecuteOptions, Sandbox, SandboxSpec};
 
 use crate::error::Result;
 
@@ -57,6 +58,17 @@ pub trait Hook: Send + Sync {
 #[derive(Default)]
 pub struct HookRegistry {
     hooks: Vec<Arc<dyn Hook>>,
+}
+
+impl std::fmt::Debug for HookRegistry {
+    /// A `dyn Hook` is not `Debug` (and need not be); a registry's only
+    /// externally interesting property is how many hooks it holds, which is
+    /// enough for a test's `unwrap_err` message or a `tracing` field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookRegistry")
+            .field("hooks", &self.hooks.len())
+            .finish()
+    }
 }
 
 impl HookRegistry {
@@ -113,12 +125,152 @@ impl HookRegistry {
     }
 }
 
+/// A [`Hook`] that runs one shell command through the [`Sandbox`], at the
+/// [`HookPoint`]s it is bound to. This is the concrete hook a declarative
+/// entry in `.warden/hooks.toml` compiles down to -- the deterministic
+/// environment prep (`docker compose up -d`, `git fetch`/pull, dependency
+/// install) that Warden runs itself rather than spending as agent tokens.
+///
+/// The command runs against [`HookContext::repo_path`] (the run's repository,
+/// the natural cwd for a run-level setup/teardown action), via `sh -c "<run>"`
+/// so a full shell line -- pipes, `&&`, env expansion -- works as written.
+///
+/// # Environment
+///
+/// Unlike an *agent* invocation -- which the sandbox runs with a cleared
+/// environment plus a narrow adapter allowlist, so a coder never inherits the
+/// operator's shell -- a `CommandHook` forwards the operator's **full**
+/// environment. These are the operator's own trusted infra commands, and they
+/// must behave exactly as they would in the operator's shell: `docker` needs
+/// `DOCKER_HOST`, `git pull` over SSH needs `SSH_AUTH_SOCK`, everything needs
+/// `HOME`. `LocalSandbox` provides no isolation from this host regardless (it
+/// is the same OS user), so forwarding the full environment changes nothing
+/// about the trust boundary -- it only makes the commands work.
+///
+/// # Failure
+///
+/// A non-zero exit is a [`HookOutcome::Block`] when `block_on_failure` is set
+/// (a setup step that failed means the environment is not ready -- there is
+/// nothing to run against), otherwise a logged `Continue`. An error actually
+/// *running* the command (the sandbox failed to spawn) propagates as `Err`,
+/// per the [`Hook::run`] contract.
+pub struct CommandHook {
+    points: Vec<HookPoint>,
+    /// The raw shell line, kept for log/block messages.
+    run: String,
+    block_on_failure: bool,
+    sandbox: Arc<dyn Sandbox>,
+}
+
+impl CommandHook {
+    /// Binds `run` (a shell line) to `points`, executed through `sandbox`.
+    /// `block_on_failure` decides whether a non-zero exit blocks the run.
+    pub fn new(
+        points: Vec<HookPoint>,
+        run: impl Into<String>,
+        block_on_failure: bool,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
+        Self {
+            points,
+            run: run.into(),
+            block_on_failure,
+            sandbox,
+        }
+    }
+
+    /// The operator's full environment, as an allowlist of variable *names*
+    /// (the sandbox resolves the values). See this type's own docs on why a
+    /// hook forwards everything where an agent forwards almost nothing.
+    fn full_env_allowlist() -> Vec<String> {
+        std::env::vars().map(|(name, _)| name).collect()
+    }
+}
+
+#[async_trait]
+impl Hook for CommandHook {
+    fn points(&self) -> &[HookPoint] {
+        &self.points
+    }
+
+    async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        let id = self
+            .sandbox
+            .create(SandboxSpec {
+                cwd: ctx.repo_path.to_path_buf(),
+            })
+            .await?;
+
+        // The sandbox is always destroyed, on the error path as on the success
+        // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
+        // structural -- kept explicit and simpler here since there is no long
+        // streaming await to be dropped mid-flight). `execute` borrows `id`
+        // until the returned `Execution` is consumed by `wait`; collapsing both
+        // into one owned `Result<ExecutionResult>` here ends that borrow before
+        // `id` is moved into `destroy`.
+        let exec = self
+            .sandbox
+            .execute(
+                &id,
+                Command {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), self.run.clone()],
+                    env_allowlist: Self::full_env_allowlist(),
+                    stdin: None,
+                },
+                ExecuteOptions::default(),
+            )
+            .await;
+        let waited = match exec {
+            Ok(execution) => execution.wait().await,
+            Err(err) => Err(err),
+        };
+        let _ = self.sandbox.destroy(id.clone()).await;
+        let output = waited?;
+
+        if output.exit_code == 0 {
+            return Ok(HookOutcome::Continue);
+        }
+
+        // A trimmed stderr tail makes the reason actionable without dumping a
+        // whole build log into the event/log line.
+        let stderr_tail: String = output.stderr.trim_end().chars().rev().take(500).collect();
+        let stderr_tail: String = stderr_tail.chars().rev().collect();
+        let reason = format!(
+            "hook command `{}` at {} exited {}{}",
+            self.run,
+            ctx.point.as_str(),
+            output.exit_code,
+            if stderr_tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr_tail}")
+            }
+        );
+
+        if self.block_on_failure {
+            Ok(HookOutcome::Block { reason })
+        } else {
+            tracing::warn!(
+                run_id = ctx.run_id,
+                point = ctx.point.as_str(),
+                exit_code = output.exit_code,
+                command = %self.run,
+                "hook command failed but block_on_failure is false; continuing"
+            );
+            Ok(HookOutcome::Continue)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use tempfile::TempDir;
     use warden_core::{Finding, FindingSource, RunState, Severity};
+    use warden_sandbox::LocalSandbox;
 
     use super::*;
 
@@ -311,6 +463,91 @@ mod tests {
                 .await
                 .unwrap(),
             HookOutcome::EmitFindings(vec![blocking_finding("a"), blocking_finding("b")])
+        );
+    }
+
+    /// A `HookContext` whose `repo_path` is a real directory, for the
+    /// [`CommandHook`] tests that actually run a command against it.
+    fn ctx_in<'a>(point: HookPoint, repo_path: &'a Path) -> HookContext<'a> {
+        HookContext {
+            point,
+            run_id: "run-1",
+            state: RunState::Pending,
+            repo_path,
+            cycle: None,
+            worktree: None,
+            commit: None,
+            diff: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn command_hook_continues_on_a_zero_exit() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let hook = CommandHook::new(vec![HookPoint::OnRunStart], "exit 0", true, sandbox);
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            hook.run(&ctx_in(HookPoint::OnRunStart, dir.path()))
+                .await
+                .unwrap(),
+            HookOutcome::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn command_hook_blocks_on_a_non_zero_exit_when_block_on_failure() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunStart],
+            "echo boom >&2; exit 3",
+            true,
+            sandbox,
+        );
+        let dir = TempDir::new().unwrap();
+        match hook
+            .run(&ctx_in(HookPoint::OnRunStart, dir.path()))
+            .await
+            .unwrap()
+        {
+            HookOutcome::Block { reason } => {
+                assert!(
+                    reason.contains("exited 3"),
+                    "reason names the exit code: {reason}"
+                );
+                assert!(
+                    reason.contains("boom"),
+                    "reason carries the stderr tail: {reason}"
+                );
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_hook_continues_on_failure_when_not_block_on_failure() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let hook = CommandHook::new(vec![HookPoint::OnRunEnd], "exit 1", false, sandbox);
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            hook.run(&ctx_in(HookPoint::OnRunEnd, dir.path()))
+                .await
+                .unwrap(),
+            HookOutcome::Continue,
+            "a non-blocking hook's failure is logged, not a Block"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_hook_runs_in_the_repo_path_cwd() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let hook = CommandHook::new(vec![HookPoint::OnRunStart], "touch ran.txt", true, sandbox);
+        let dir = TempDir::new().unwrap();
+        hook.run(&ctx_in(HookPoint::OnRunStart, dir.path()))
+            .await
+            .unwrap();
+        assert!(
+            dir.path().join("ran.txt").exists(),
+            "the command runs with repo_path as its cwd"
         );
     }
 }

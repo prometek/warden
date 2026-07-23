@@ -7,6 +7,38 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — `CommandHook` + config déclarative `.warden/hooks.toml`
+
+- **`.warden/hooks.toml`** (`warden::hook_config`) : format déclaratif qui
+  décrit les hooks d'un dépôt — un `[[hooks]]` par entrée, avec `point`
+  (nom stable du `HookPoint`), `run` (ligne shell) et `block_on_failure`
+  (défaut `true`). Chargé par `load_repo_hooks`, compilé en `CommandHook`s
+  enregistrés **dans l'ordre du fichier** (ordre d'enregistrement = ordre
+  d'exécution). C'est là que la préparation d'environnement (`docker compose
+  up -d`, `git fetch`/pull, install de deps) devient réellement configurable
+  sans recompiler.
+- **`warden::hook::CommandHook`** : hook concret qui exécute une ligne shell
+  (`sh -c`) via le `Sandbox`, contre `HookContext::repo_path`. Exit 0 →
+  `Continue` ; exit ≠0 → `Block` si `block_on_failure`, sinon `Continue` +
+  `warn!`. Un échec de *spawn* (pas d'exit) propage en `Err`. Contrairement à
+  une invocation d'agent, un `CommandHook` transmet l'environnement **complet**
+  de l'opérateur : ce sont ses commandes d'infra de confiance, elles doivent se
+  comporter comme dans son shell (`docker` a besoin de `DOCKER_HOST`, `git
+  pull` en SSH de `SSH_AUTH_SOCK`…).
+- **Modèle de confiance** : `.warden/hooks.toml` du dépôt est honoré **par
+  défaut**, sans flag d'opt-in — cohérent avec `.warden/agents/coder.md`, déjà
+  trusted par défaut (#26). Un dépôt dont on n'a pas lu le `hooks.toml` en
+  exécutera les commandes, comme un `Makefile` ou un `postinstall` npm.
+  Documenté explicitement dans `hook_config`.
+- **Pas de fallback silencieux** : un `hooks.toml` présent mais cassé (TOML
+  invalide, ou `point` inconnu) est une `WardenError::HookConfig` dure qui
+  liste les noms de points valides — jamais ignoré en douce. Un fichier
+  **absent** = registry vide (dispatch no-op).
+- **Câblage** (`main`) : un seul backend `Sandbox` partagé entre
+  l'orchestrateur (agents) et les hooks (commandes) — un choix à la
+  construction couvre les deux, prêt pour `--isolation docker` (#49).
+- Dépendance : `toml = "0.8"`.
+
 ### Added — Hooks run-level `OnRunStart` / `OnRunEnd` (suite de #55)
 
 - **Deux points de cycle de vie qui encadrent le run entier** (`warden-core`) :

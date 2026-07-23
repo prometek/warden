@@ -25,6 +25,7 @@ sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runti
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "io-util", "time", "sync", "signal"] }
+toml = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

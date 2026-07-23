@@ -3816,6 +3816,65 @@ mod tests {
         );
     }
 
+    /// End to end: a repo's `.warden/hooks.toml` (loaded exactly as
+    /// `crate::main` does, via `hook_config::load_repo_hooks`) actually runs
+    /// its `on_run_start` command against the repo before the coder, through
+    /// the real `run_convergence_loop`. Proves the whole concrete-hook path --
+    /// declarative config -> registry -> dispatch -> `CommandHook` -> sandbox
+    /// -- not just the fake-hook seam the other tests use.
+    #[tokio::test]
+    async fn a_repo_hooks_file_runs_its_setup_command_before_the_coder() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let warden_dir = repo.path().join(".warden");
+        std::fs::create_dir_all(&warden_dir).unwrap();
+        std::fs::write(
+            warden_dir.join("hooks.toml"),
+            r#"
+            [[hooks]]
+            point = "on_run_start"
+            run = "echo hi > setup-ran.txt"
+            "#,
+        )
+        .unwrap();
+
+        let hooks = crate::hook_config::load_repo_hooks(
+            repo.path(),
+            Arc::new(warden_sandbox::LocalSandbox::new()),
+        )
+        .unwrap();
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(hooks);
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "a repo hook prepares the environment".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeRunner::new(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        assert!(
+            repo.path().join("setup-ran.txt").exists(),
+            "the on_run_start hook command ran against the repo before the coder"
+        );
+    }
+
     /// Issue #26: `run_convergence_loop` publishes one persisted
     /// `RunEvent::UntrustedAgentDefinitionUsed` per entry in
     /// `RunConfig::untrusted_repo_agent_definitions`, right after

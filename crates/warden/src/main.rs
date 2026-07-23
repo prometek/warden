@@ -3,6 +3,7 @@
 
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
@@ -10,9 +11,11 @@ use tokio_util::sync::CancellationToken;
 use warden::agent_def::resolve_agent_definition;
 use warden::db;
 use warden::gate_trigger;
+use warden::hook_config::load_repo_hooks;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
 use warden::tool_adapter::{ClaudeAdapter, ToolAdapter};
 use warden_core::AgentRole;
+use warden_sandbox::{LocalSandbox, Sandbox};
 
 #[derive(Parser)]
 #[command(
@@ -557,53 +560,69 @@ async fn run<R: ToolAdapter>(
     // docs) -- lowercase hex and hyphens only, never containing shell
     // metacharacters -- so, unlike `attach_warden_home_quoted` above, it
     // does not need its own `shlex::try_quote` pass.
-    let orchestrator = Orchestrator::new(pool).on_run_started(move |run_id| {
-        print_run_started_hint(run_id, &attach_warden_home_quoted);
+    // One sandbox backend, shared between the orchestrator (which runs the
+    // agents through it) and the lifecycle hooks (which run their commands
+    // through it): a single construction-time choice covers both, so a future
+    // `--isolation docker` (#49) reaches agents and hooks alike.
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
 
-        // Issue #32: `--tui` spawns `warden-tui attach` as a separate
-        // process (ADR-0008), in the foreground on this launch terminal,
-        // once the run_id it needs actually exists. `Command::spawn` (used
-        // by `spawn_tui_attach`) is itself synchronous/non-blocking -- it
-        // only issues the `fork`/`exec` syscalls and returns -- so calling
-        // it directly here does not violate `on_run_started`'s "must not
-        // block" contract.
-        if let Some(tui_launch) = &tui_launch {
-            match warden::process::spawn_tui_attach(
-                &tui_launch.tui_bin,
-                run_id,
-                &attach_warden_home,
-            ) {
-                Ok(child) => {
-                    let cancel_on_tui_exit = cancel_on_tui_exit.clone();
-                    let handle = tokio::spawn(async move {
-                        cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
-                    });
-                    *tui_watcher_setter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        tui_bin = %tui_launch.tui_bin.display(),
-                        "failed to spawn warden-tui for --tui; aborting the run"
-                    );
-                    // Issue #32 review (MEDIUM): abort immediately, right
-                    // here, rather than only once the convergence loop below
-                    // eventually returns -- the coder's very first
-                    // invocation hasn't even started yet at this point
-                    // (`on_run_started` fires before any per-cycle work,
-                    // see its own docs), so cancelling now stops the run
-                    // from doing any real work at all instead of running an
-                    // entire (headless) cycle it will just fail after.
-                    *tui_spawn_error_setter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                    cancel_on_tui_exit.cancel();
+    // Concrete lifecycle hooks, loaded from the repo's `.warden/hooks.toml`
+    // (absent -> empty registry, dispatch stays a no-op). See
+    // `warden::hook_config` for the trust model: a repo's hook commands are
+    // honoured by default, consistent with its `.warden/agents/coder.md`.
+    let hooks = load_repo_hooks(&config.repo_path, Arc::clone(&sandbox))
+        .context("failed to load .warden/hooks.toml")?;
+
+    let orchestrator = Orchestrator::new(pool)
+        .with_sandbox(Arc::clone(&sandbox))
+        .with_hooks(hooks)
+        .on_run_started(move |run_id| {
+            print_run_started_hint(run_id, &attach_warden_home_quoted);
+
+            // Issue #32: `--tui` spawns `warden-tui attach` as a separate
+            // process (ADR-0008), in the foreground on this launch terminal,
+            // once the run_id it needs actually exists. `Command::spawn` (used
+            // by `spawn_tui_attach`) is itself synchronous/non-blocking -- it
+            // only issues the `fork`/`exec` syscalls and returns -- so calling
+            // it directly here does not violate `on_run_started`'s "must not
+            // block" contract.
+            if let Some(tui_launch) = &tui_launch {
+                match warden::process::spawn_tui_attach(
+                    &tui_launch.tui_bin,
+                    run_id,
+                    &attach_warden_home,
+                ) {
+                    Ok(child) => {
+                        let cancel_on_tui_exit = cancel_on_tui_exit.clone();
+                        let handle = tokio::spawn(async move {
+                            cancel_run_when_tui_exits(child, cancel_on_tui_exit).await;
+                        });
+                        *tui_watcher_setter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            tui_bin = %tui_launch.tui_bin.display(),
+                            "failed to spawn warden-tui for --tui; aborting the run"
+                        );
+                        // Issue #32 review (MEDIUM): abort immediately, right
+                        // here, rather than only once the convergence loop below
+                        // eventually returns -- the coder's very first
+                        // invocation hasn't even started yet at this point
+                        // (`on_run_started` fires before any per-cycle work,
+                        // see its own docs), so cancelling now stops the run
+                        // from doing any real work at all instead of running an
+                        // entire (headless) cycle it will just fail after.
+                        *tui_spawn_error_setter
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        cancel_on_tui_exit.cancel();
+                    }
                 }
             }
-        }
-    });
+        });
     let convergence_result = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await;
