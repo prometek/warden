@@ -12,9 +12,12 @@
 //!   - role: reviewer
 //!     agent: code-reviewer
 //!     gate: loop-until-clean
+//!     budget: review
 //!   - role: tester
 //!     agent: test-runner
 //!     gate: loop-until-clean
+//!     budget: test
+//!     evidence: true
 //! ```
 //!
 //! [`Workflow::builtin_default`] is exactly this shape -- what a run uses
@@ -124,6 +127,59 @@ impl Gate {
     }
 }
 
+/// Which run-level cycle budget a gated step's blocking findings are
+/// charged against, and how (issue #73 review, finding F3). Before this,
+/// the budget rule followed a step's *position* (`workflow.steps[1]` always
+/// got `max_review_cycles`, `steps[2]` always got `max_test_cycles`) -- but
+/// steps can now be reordered, so a swapped built-in pair would silently
+/// apply the wrong rule to each. This is [`WorkflowStep`]'s own declared
+/// property instead: whichever step claims [`StepBudget::Review`] gets the
+/// review rule, wherever it sits in the pipeline.
+///
+/// `None` only ever applies to `steps[0]` (the producer, which has no gate
+/// and so nothing to charge a budget against) -- every other step always
+/// carries `Some` (defaulted to [`StepBudget::Extra`] when
+/// `workflow.yaml` omits the key, see [`Workflow::parse_yaml`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepBudget {
+    /// `max_review_cycles` -- charged only when *this* step's own
+    /// evaluation is blocking (decision #37 Q1's imputation rule): a cycle
+    /// whose first pass over the work is clean never advances this
+    /// counter, however many cycles a *different* step's own blocking
+    /// finding costs.
+    Review,
+    /// `max_test_cycles` -- charged unconditionally, once per invocation
+    /// (this step runs, and its counter advances, every time the pipeline
+    /// reaches it).
+    Test,
+    /// `max_extra_step_cycles` -- the single budget shared by every step
+    /// that isn't `Review` or `Test`, charged once per cycle the first time
+    /// any such step is entered (never once per individual extra step).
+    Extra,
+}
+
+impl StepBudget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepBudget::Review => "review",
+            StepBudget::Test => "test",
+            StepBudget::Extra => "extra",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "review" => Ok(StepBudget::Review),
+            "test" => Ok(StepBudget::Test),
+            "extra" => Ok(StepBudget::Extra),
+            other => Err(CoreError::InvalidWorkflow(format!(
+                "unknown budget {other:?} (expected \"review\", \"test\", \"extra\", or omit the \
+                 key for \"extra\")"
+            ))),
+        }
+    }
+}
+
 /// One step of a [`Workflow`]: a [`Role`] resolved to an `agent` (a name
 /// `warden::agent_def` resolves onto a markdown agent definition, ADR-0013 --
 /// e.g. `.claude/agents/<agent>.md` for a role beyond the built-in three),
@@ -138,6 +194,17 @@ pub struct WorkflowStep {
     /// simply prefer a differently-named agent file for a role.
     pub agent: String,
     pub gate: Gate,
+    /// See [`StepBudget`]'s own docs -- `None` only for `steps[0]`.
+    pub budget: Option<StepBudget>,
+    /// Issue #73 review, finding F2: whether this step's successful,
+    /// clean run triggers ADR-0009 evidence capture. Before this, capture
+    /// fired whenever `role.as_str() == "tester"` -- a custom workflow that
+    /// renamed its test step lost evidence capture silently. Declared here
+    /// instead, so the property is explicit in `workflow.yaml` (or in
+    /// [`Workflow::builtin_default`]'s literal) rather than inferred from a
+    /// name. Only one step may set this per workflow (see
+    /// [`Workflow::parse_yaml`]).
+    pub captures_evidence: bool,
 }
 
 /// A user-definable pipeline (issue #73): an ordered, non-empty list of
@@ -156,12 +223,17 @@ pub struct Workflow {
 /// Wire shape of one `workflow.yaml` step -- `gate` absent means "plain
 /// pass-through" (never "reject", never "assume loop-until-clean": an
 /// omitted key and a wrong one must not be conflated, see [`Gate::parse`]).
+/// `budget` absent means [`StepBudget::Extra`] (see [`Workflow::parse_yaml`]);
+/// `evidence` absent means `false`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowStepWire {
     role: String,
     agent: String,
     gate: Option<String>,
+    budget: Option<String>,
+    #[serde(default)]
+    evidence: bool,
 }
 
 /// Wire shape of `.warden/workflow.yaml` itself.
@@ -213,16 +285,22 @@ impl Workflow {
                     role: Role::new("coder").expect("literal role name is never blank"),
                     agent: "coder".to_string(),
                     gate: Gate::PassThrough,
+                    budget: None,
+                    captures_evidence: false,
                 },
                 WorkflowStep {
                     role: Role::new("reviewer").expect("literal role name is never blank"),
                     agent: "code-reviewer".to_string(),
                     gate: Gate::LoopUntilClean,
+                    budget: Some(StepBudget::Review),
+                    captures_evidence: false,
                 },
                 WorkflowStep {
                     role: Role::new("tester").expect("literal role name is never blank"),
                     agent: "test-runner".to_string(),
                     gate: Gate::LoopUntilClean,
+                    budget: Some(StepBudget::Test),
+                    captures_evidence: true,
                 },
             ],
         }
@@ -254,8 +332,27 @@ impl Workflow {
 
         let mut steps = Vec::with_capacity(wire.steps.len());
         let mut seen_roles = std::collections::HashSet::new();
+        // Issue #73 review F3: at most one step may claim each of `Review`/
+        // `Test` -- two steps sharing the same budget counter would silently
+        // conflate two independent cycle counts. `Extra` is deliberately
+        // exempt: it's the *shared* bucket every non-review/test step already
+        // pools into.
+        let mut review_budget_step: Option<usize> = None;
+        let mut test_budget_step: Option<usize> = None;
+        // Issue #73 review F2: at most one step may capture evidence -- ADR-
+        // 0009's evidence is one artifact per converged run, not per step.
+        let mut evidence_capture_step: Option<usize> = None;
         for (index, step) in wire.steps.into_iter().enumerate() {
             reject_path_like_value(index, "role", &step.role)?;
+            if crate::convergence::FindingSource::RESERVED_ROLE_NAMES.contains(&step.role.as_str())
+            {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "step {index}: role {:?} is reserved (findings from a \"ci\" or \"warden\" \
+                     step could never be told apart from `FindingSource::Ci`/`FindingSource::Warden`, \
+                     which are not role findings) -- pick a different role name",
+                    step.role
+                )));
+            }
             let role = Role::new(step.role)
                 .map_err(|error| CoreError::InvalidWorkflow(format!("step {index}: {error}")))?;
             if step.agent.trim().is_empty() {
@@ -285,10 +382,60 @@ impl Workflow {
                      pipeline"
                 )));
             }
+
+            let budget = if index == 0 {
+                if step.budget.is_some() {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "the first step (role {role:?}) is the pipeline's producer and has no \
+                         cycle budget of its own -- remove its \"budget\" key"
+                    )));
+                }
+                None
+            } else {
+                let budget = match &step.budget {
+                    Some(raw_budget) => StepBudget::parse(raw_budget).map_err(|_| {
+                        CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): unknown budget {raw_budget:?} \
+                             (expected \"review\", \"test\", \"extra\", or omit the key for \
+                             \"extra\")"
+                        ))
+                    })?,
+                    None => StepBudget::Extra,
+                };
+                let duplicate_of = match budget {
+                    StepBudget::Review => &mut review_budget_step,
+                    StepBudget::Test => &mut test_budget_step,
+                    // `Extra` is the shared bucket -- no single-claimant
+                    // invariant applies, so there's nothing to check.
+                    StepBudget::Extra => &mut None,
+                };
+                if let Some(prior_index) = *duplicate_of {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}) claims budget \"{}\", already claimed by \
+                         step {prior_index} -- only one step may claim each of \"review\"/\"test\"",
+                        budget.as_str()
+                    )));
+                }
+                *duplicate_of = Some(index);
+                Some(budget)
+            };
+
+            if step.evidence {
+                if let Some(prior_index) = evidence_capture_step {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}) sets \"evidence: true\", already set by \
+                         step {prior_index} -- only one step may capture evidence"
+                    )));
+                }
+                evidence_capture_step = Some(index);
+            }
+
             steps.push(WorkflowStep {
                 role,
                 agent: step.agent,
                 gate,
+                budget,
+                captures_evidence: step.evidence,
             });
         }
 
@@ -327,9 +474,12 @@ steps:
   - role: reviewer
     agent: code-reviewer
     gate: loop-until-clean
+    budget: review
   - role: tester
     agent: test-runner
     gate: loop-until-clean
+    budget: test
+    evidence: true
 "#;
 
     #[test]
@@ -346,10 +496,16 @@ steps:
         assert_eq!(workflow.steps.len(), 3);
         assert_eq!(workflow.steps[0].role.as_str(), "coder");
         assert_eq!(workflow.steps[0].gate, Gate::PassThrough);
+        assert_eq!(workflow.steps[0].budget, None);
+        assert!(!workflow.steps[0].captures_evidence);
         assert_eq!(workflow.steps[1].role.as_str(), "reviewer");
         assert_eq!(workflow.steps[1].gate, Gate::LoopUntilClean);
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Review));
+        assert!(!workflow.steps[1].captures_evidence);
         assert_eq!(workflow.steps[2].role.as_str(), "tester");
         assert_eq!(workflow.steps[2].gate, Gate::LoopUntilClean);
+        assert_eq!(workflow.steps[2].budget, Some(StepBudget::Test));
+        assert!(workflow.steps[2].captures_evidence);
     }
 
     #[test]
@@ -521,6 +677,23 @@ steps:
         assert!(Workflow::parse_yaml(yaml).is_ok());
     }
 
+    /// Review F1: `role: warden`/`role: ci` would break the finding
+    /// round-trip (`FindingSource::Warden`/`Ci` vs `FindingSource::Role`),
+    /// so both reserved words must be rejected at parse time, not left to
+    /// fail obscurely at run time via `validate_finding_sources_for_role`.
+    #[test]
+    fn rejects_a_reserved_role_name() {
+        for reserved in crate::convergence::FindingSource::RESERVED_ROLE_NAMES {
+            let yaml = format!(
+                "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: {reserved}\n    \
+                 agent: {reserved}\n    gate: loop-until-clean\n"
+            );
+            let error = Workflow::parse_yaml(&yaml).unwrap_err();
+            assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+    }
+
     #[test]
     fn rejects_a_duplicate_role() {
         let yaml = r#"
@@ -585,5 +758,121 @@ steps:
     fn producer_role_is_always_the_first_step() {
         let workflow = Workflow::builtin_default();
         assert_eq!(workflow.producer_role().as_str(), "coder");
+    }
+
+    /// Issue #73 review, F3: a gated step that omits `budget` altogether
+    /// falls into the shared "extra" bucket -- exactly the pre-fix behaviour
+    /// for any step beyond the built-in reviewer/tester pair.
+    #[test]
+    fn a_gated_step_with_no_budget_key_defaults_to_extra() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Extra));
+    }
+
+    /// The producer has no gate and no budget of its own -- declaring one
+    /// is rejected exactly like declaring a gate on it already was.
+    #[test]
+    fn rejects_a_budget_declared_on_the_first_step() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    budget: extra\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_budget() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
+                     agent: reviewer\n    gate: loop-until-clean\n    budget: whenever\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("unknown budget"), "{error}");
+    }
+
+    /// Issue #73 review, F3: two steps can't both claim `review` (or both
+    /// claim `test`) -- the counter each backs is a single run-level value,
+    /// so a second claimant would silently share it with the first.
+    #[test]
+    fn rejects_two_steps_claiming_the_same_review_or_test_budget() {
+        for budget in ["review", "test"] {
+            let yaml = format!(
+                "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: one\n    agent: \
+                 one\n    gate: loop-until-clean\n    budget: {budget}\n  - role: two\n    \
+                 agent: two\n    gate: loop-until-clean\n    budget: {budget}\n"
+            );
+            let error = Workflow::parse_yaml(&yaml).unwrap_err();
+            assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+            assert!(error.to_string().contains("already claimed"), "{error}");
+        }
+    }
+
+    /// Unlike `review`/`test`, `extra` is the shared bucket every non-
+    /// review/test step already pools into -- multiple steps claiming it
+    /// (or omitting `budget` altogether) is completely legal.
+    #[test]
+    fn multiple_steps_may_share_the_extra_budget() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    agent: one
+    gate: loop-until-clean
+    budget: extra
+  - role: two
+    agent: two
+    gate: loop-until-clean
+    budget: extra
+"#;
+        assert!(Workflow::parse_yaml(yaml).is_ok());
+    }
+
+    /// Issue #73 review, F2: evidence capture is a declared per-step
+    /// property, not inferred from a role literally named `"tester"` --
+    /// a custom step can opt in by name.
+    #[test]
+    fn a_step_can_declare_itself_as_the_evidence_capturing_step() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: qa
+    agent: qa
+    gate: loop-until-clean
+    evidence: true
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert!(workflow.steps[1].captures_evidence);
+    }
+
+    #[test]
+    fn rejects_two_steps_both_declaring_evidence_capture() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    agent: one
+    gate: loop-until-clean
+    evidence: true
+  - role: two
+    agent: two
+    gate: loop-until-clean
+    evidence: true
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("already set"), "{error}");
     }
 }

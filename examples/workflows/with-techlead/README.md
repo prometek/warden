@@ -50,7 +50,14 @@ expected, not a silently skipped step.
 
 ## Cycle budget
 
-`workflow.yaml`'s first two gated steps (positions 1 and 2 -- the reviewer
-and tester in this example) are bound by `--max-review-cycles`/
-`--max-test-cycles` respectively; any step beyond those two shares a single
-budget, controlled by `--max-cycles` (default 5).
+Which step is bound by `--max-review-cycles`/`--max-test-cycles` follows
+each step's own declared `budget: review`/`budget: test` in `workflow.yaml`
+-- never its position, so reordering the reviewer/tester never flips the
+rule between them (see this example's own `workflow.yaml`: the reviewer
+declares `budget: review`, the tester declares `budget: test`). Any step
+declaring `budget: extra` (or omitting the key, like `techlead` here)
+shares a single budget instead, controlled by `--max-cycles` (default 5).
+
+Similarly, `evidence: true` (set on the tester step here) declares which
+step's clean run triggers ADR-0009 evidence capture -- also a declared
+property, not inferred from a role literally named `"tester"`.

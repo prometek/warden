@@ -42,6 +42,17 @@ pub enum FindingSource {
 }
 
 impl FindingSource {
+    /// Words no workflow role may claim (`Workflow::parse_yaml`'s review
+    /// finding F1: a step named `role: warden` or `role: ci` would parse a
+    /// finding it raises as [`FindingSource::Warden`]/[`FindingSource::Ci`]
+    /// instead of [`FindingSource::Role`], breaking
+    /// `validate_finding_sources_for_role`'s round-trip for that step every
+    /// cycle). Kept as the single source of truth here, next to [`Self::parse`]
+    /// which is the other place that must agree with it, so
+    /// `crate::workflow::Workflow::parse_yaml` never re-lists these words
+    /// itself.
+    pub const RESERVED_ROLE_NAMES: &'static [&'static str] = &["ci", "warden"];
+
     /// Convenience constructor for a role-sourced finding -- `FindingSource::role("techlead")`
     /// reads more directly at call sites than `FindingSource::Role("techlead".to_string())`.
     pub fn role(name: impl Into<String>) -> Self {

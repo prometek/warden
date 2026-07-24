@@ -30,13 +30,16 @@ fn truncate_for_error(stderr: &str) -> String {
 }
 
 /// "The cycle's e2e test succeeded" (ADR-0009: evidence is captured "après
-/// le succès du test e2e"), inferred as "the tester itself raised no
-/// blocking finding" -- there's no separate pass/fail signal in the
-/// findings protocol, so absence of a blocking `Tester`-sourced finding is
-/// the only available proxy.
-fn tester_succeeded(findings: &[Finding]) -> bool {
+/// le succès du test e2e"), inferred as "the evidence-capturing step itself
+/// raised no blocking finding" -- there's no separate pass/fail signal in
+/// the findings protocol, so absence of a blocking finding sourced from
+/// `role` is the only available proxy. Generalized off `role` (issue #73
+/// review, finding F2) rather than hardcoding `FindingSource::role("tester")`,
+/// since the step this now watches is whichever one declared
+/// `captures_evidence: true`, not necessarily one named `"tester"`.
+fn step_succeeded(role: &Role, findings: &[Finding]) -> bool {
     !findings.iter().any(|finding| {
-        finding.source == warden_core::FindingSource::role("tester")
+        finding.source == warden_core::FindingSource::role(role.as_str())
             && finding.severity == warden_core::Severity::Blocking
     })
 }
@@ -208,24 +211,23 @@ impl Orchestrator {
     /// validated against its own open [`Role`] -- no role name ever
     /// branches this function's own behaviour.
     ///
-    /// **Two narrow, documented exceptions, both positional/functional
-    /// rather than role-name checks:**
-    /// - `scope` may only be [`warden_core::ReviewScope::Correctif`] for
-    ///   `invocation.step_index == 1` (the first gated step) -- decision
-    ///   #37 Q2's scoped-re-review optimization is a pipeline mechanic tied
-    ///   to *position*, not to a role named `"reviewer"`; `run_convergence_loop`
-    ///   is the only caller that ever sets it, and this is a defensive
-    ///   re-check against a future caller doing so incorrectly, mirroring
-    ///   this crate's existing "constructor invariant == defensive re-check"
-    ///   convention.
-    /// - Evidence capture (ADR-0009) still fires only when this step's own
-    ///   role is literally named `"tester"` -- a distinct, pre-existing
-    ///   feature (issue #7) this trio-unification pass does not redesign:
-    ///   evidence capture is fundamentally about recording *the step that
-    ///   ran the project's own test suite*, which has no purely positional
-    ///   or structural definition the way "the producer is `steps[0]`"
-    ///   does. Documented here as a known, narrow, out-of-scope special
-    ///   case rather than silently left unexplained.
+    /// **One narrow, documented exception, positional/functional rather
+    /// than a role-name check:** `scope` may only be
+    /// [`warden_core::ReviewScope::Correctif`] for `invocation.step_index
+    /// == 1` (the first gated step) -- decision #37 Q2's scoped-re-review
+    /// optimization is a pipeline mechanic tied to *position*, not to a role
+    /// named `"reviewer"`; `run_convergence_loop` is the only caller that
+    /// ever sets it, and this is a defensive re-check against a future
+    /// caller doing so incorrectly, mirroring this crate's existing
+    /// "constructor invariant == defensive re-check" convention.
+    ///
+    /// Evidence capture (ADR-0009, issue #7) no longer keys on a literal
+    /// role name either (issue #73 review, finding F2): it fires whenever
+    /// `invocation.captures_evidence` is set, a property `run_convergence_loop`
+    /// reads straight off this step's own `workflow.yaml` declaration
+    /// (`WorkflowStep::captures_evidence`) -- `true` for the built-in
+    /// default's tester step (`Workflow::builtin_default`), for strict
+    /// retro-compat, and opt-in for any custom workflow's own step.
     pub(super) async fn run_gated_step<R: ToolAdapter>(
         &self,
         runner: &R,
@@ -244,6 +246,7 @@ impl Orchestrator {
             diff,
             prior_findings,
             scope,
+            captures_evidence,
             config,
             cancel,
         } = invocation;
@@ -343,7 +346,7 @@ impl Orchestrator {
             // it's the one this role is entitled to claim.
             // `validate_finding_sources_for_role` closes that gap (a forged
             // `source: "warden"`, or a step mislabelling its own failure as
-            // a sibling step's own source to slip past `tester_succeeded`
+            // a sibling step's own source to slip past `step_succeeded`
             // below) with the exact same "reject the whole batch, describe
             // why, never silently drop/relabel" treatment as an
             // unparsable-output failure -- see that function's own docs
@@ -371,11 +374,11 @@ impl Orchestrator {
         };
 
         // ADR-0009 (issue #7): capture evidence right after a *successful*
-        // tester run, still inside its worktree -- which is about to be
-        // removed below, so this must happen before that, not after. See
-        // this function's own docs on why this one check stays keyed on the
-        // literal role name `"tester"`.
-        if role.as_str() == "tester" && tester_succeeded(&findings) {
+        // run of this step, still inside its worktree -- which is about to
+        // be removed below, so this must happen before that, not after.
+        // Gated on the step's own declared `captures_evidence` (issue #73
+        // review, finding F2), never on a literal role name.
+        if captures_evidence && step_succeeded(role, &findings) {
             self.capture_evidence_for_cycle(EvidenceCapture {
                 run_id,
                 cycle_id,
@@ -526,6 +529,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -550,6 +554,7 @@ mod tests {
                         diff: "",
                         prior_findings: &[],
                         scope: warden_core::ReviewScope::Full,
+                        captures_evidence: true,
                         config: &config,
                         cancel: CancellationToken::new(),
                     },
@@ -668,6 +673,7 @@ mod tests {
                     diff: "diff --git a/x b/x\n+fixed the unwrap\n",
                     prior_findings: std::slice::from_ref(&originating_finding),
                     scope: warden_core::ReviewScope::Correctif,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -754,6 +760,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Correctif,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -863,6 +870,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -885,6 +893,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -991,6 +1000,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1013,13 +1023,13 @@ mod tests {
     }
 
     /// The sharper, non-hypothetical case the review called out by name
-    /// (closing Minor 2, `tester_succeeded` trusting an agent-controlled
+    /// (closing Minor 2, `step_succeeded` trusting an agent-controlled
     /// `source`): a tester that mislabels its own failure as
     /// `source: "reviewer"` must not have that failure hidden from
-    /// `tester_succeeded` -- the gate `run_gated_step` uses to decide
+    /// `step_succeeded` -- the gate `run_gated_step` uses to decide
     /// whether to trigger evidence capture. Before the fix, a forged
     /// `source: "reviewer"` finding from the tester would sail through
-    /// `extract_findings` unchanged, and `tester_succeeded` (which only ever
+    /// `extract_findings` unchanged, and `step_succeeded` (which only ever
     /// looks for a `FindingSource::role("tester")` blocking finding) would report
     /// "succeeded" -- triggering evidence capture for a cycle whose e2e test
     /// actually failed.
@@ -1092,6 +1102,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1108,9 +1119,9 @@ mod tests {
         );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
         assert!(
-            !tester_succeeded(&findings),
+            !step_succeeded(&tester_role, &findings),
             "Minor 2: a tester that mislabels its own failure must still be seen as failed by \
-                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+                 step_succeeded, the gate that decides whether to trigger evidence capture"
         );
     }
 
@@ -1127,7 +1138,7 @@ mod tests {
     /// the **tester** side directly, with a tester that exits non-zero and
     /// prints nothing to stdout: it must come back as a synthesized blocking
     /// `Tester` finding naming the exit status, never as "zero findings"
-    /// (which `tester_succeeded` would otherwise read as a passing test
+    /// (which `step_succeeded` would otherwise read as a passing test
     /// suite and wrongly trigger evidence capture for).
     #[tokio::test]
     async fn a_tester_that_exits_nonzero_with_no_output_synthesizes_a_blocking_finding_not_a_silent_pass(
@@ -1192,6 +1203,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1216,9 +1228,9 @@ mod tests {
             findings[0].description
         );
         assert!(
-            !tester_succeeded(&findings),
+            !step_succeeded(&tester_role, &findings),
             "a tester that crashed non-zero must never be read as a passing test suite by \
-                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+                 step_succeeded, the gate that decides whether to trigger evidence capture"
         );
     }
 
@@ -1293,6 +1305,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },

@@ -45,4 +45,4 @@ pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use state::{AgentRole, RunState};
 pub use token_usage::TokenUsage;
-pub use workflow::{Gate, Role, Workflow, WorkflowStep};
+pub use workflow::{Gate, Role, StepBudget, Workflow, WorkflowStep};

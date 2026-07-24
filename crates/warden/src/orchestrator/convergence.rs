@@ -306,35 +306,65 @@ impl Orchestrator {
             // every gated step (`workflow.steps[1..]`) -- the built-in
             // reviewer/tester and any custom step (e.g. `techlead`) are
             // driven through the exact same `run_gated_step` call, never
-            // branched on role name. Only two things still vary by
+            // branched on role name. Only one thing still varies by
             // **position**, not by name (the "genuine invariant" issue #73
             // asks to keep, generalized off step semantics rather than role
-            // names):
-            // - `step_index == 1` (the first gated step) is the only one
-            //   ever offered `ReviewScope::Correctif` (decision #37 Q2 was
-            //   never really "the reviewer specifically", just "whichever
-            //   step reviews the cycle's full body of work first, before
-            //   later steps see it") -- gated on the run's own
-            //   `has_reviewed_once`, exactly like before.
-            // - Which cycle-budget flag charges this step's own counter:
-            //   `step_index == 1` uses `max_review_cycles` (charged only
-            //   when this step's own evaluation is blocking, decision #37
-            //   Q1); `step_index == 2` uses `max_test_cycles` (charged
-            //   unconditionally, once per invocation); any `step_index >= 3`
-            //   shares `max_extra_step_cycles` (charged once per cycle for
-            //   the whole remaining chain, the first time it's entered).
-            //   Every legal `workflow.yaml` still has its first two gated
-            //   steps at exactly these positions even after reordering
-            //   elsewhere in the pipeline, so this stays meaningful for any
-            //   workflow this engine can run.
+            // names): `step_index == 1` (the first gated step) is the only
+            // one ever offered `ReviewScope::Correctif` (decision #37 Q2 was
+            // never really "the reviewer specifically", just "whichever
+            // step reviews the cycle's full body of work first, before
+            // later steps see it") -- gated on the run's own
+            // `has_reviewed_once`, exactly like before.
+            //
+            // Which cycle-budget flag charges a step's own counter is *not*
+            // positional (issue #73 review, finding F3: reordering the
+            // built-in pair used to invert the budget rule) -- it follows
+            // each step's own declared `WorkflowStep::budget` instead:
+            // [`warden_core::StepBudget::Review`] charges `max_review_cycles`
+            // (only when this step's own evaluation is blocking, decision
+            // #37 Q1); [`warden_core::StepBudget::Test`] charges
+            // `max_test_cycles` (unconditionally, once per invocation);
+            // [`warden_core::StepBudget::Extra`] shares `max_extra_step_cycles`
+            // (charged once per cycle for the whole remaining chain, the
+            // first time any such step is entered -- tracked below by
+            // `entered_extra_budget_this_cycle`). `Workflow::builtin_default`
+            // declares its reviewer/tester steps' budgets explicitly
+            // (`Review`/`Test`), so this is byte-for-byte the same rule the
+            // pre-review code applied by position.
             let mut next_state = if total_steps <= 1 {
-                // Degenerate one-step workflow (producer only, no gates at
-                // all) -- `RunState::CoderRunning`'s own transition table
-                // allows converging directly from here.
-                RunState::Converged
+                // Issue #73 review, finding F4: a degenerate one-step
+                // workflow (producer only, no gates at all) has no later
+                // gated step to catch a blocking finding the producer itself
+                // already raised this cycle (a definition-tampering finding,
+                // `FindingSource::Warden`, folded into `findings` above) --
+                // unconditionally converging here would silently let it
+                // through. Reused via `decide_next_state_for_step` at
+                // `step_index == 0` (structurally `workflow.is_last_step(0)`
+                // whenever `total_steps == 1`) rather than a bespoke check,
+                // so a single-step workflow follows the exact same
+                // "blocking Warden/role-sourced finding" rule every other
+                // step already does. The producer has no budget of its own
+                // (`WorkflowStep::budget` is `None` for `steps[0]`), so a
+                // reboucle here shares the same `max_extra_step_cycles`
+                // bucket any other budget-less step would.
+                extra_step_cycle_number += 1;
+                db::set_run_current_extra_step_cycle(&self.pool, &run_id, extra_step_cycle_number)
+                    .await?;
+                decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    0,
+                    extra_step_cycle_number,
+                    config.max_extra_step_cycles,
+                )
             } else {
                 RunState::RunningStep(1)
             };
+            // Reset once per cycle -- `Some(StepBudget::Extra)` is charged
+            // (the counter advanced) at most once per cycle, the first time
+            // any extra-budgeted step is entered, never once per individual
+            // extra step (see the loop's own docs above).
+            let mut entered_extra_budget_this_cycle = false;
             while let RunState::RunningStep(step_index) = next_state {
                 let step = &config.workflow.steps[step_index as usize];
                 let step_agent = &agents.steps[step_index as usize];
@@ -347,11 +377,14 @@ impl Orchestrator {
 
                 self.transition(&run_id, RunState::RunningStep(step_index))
                     .await?;
-                if step_index == 3 {
+                if step.budget == Some(warden_core::StepBudget::Extra)
+                    && !entered_extra_budget_this_cycle
+                {
                     // First entry into the shared extra-step budget this
                     // cycle -- charged once for the whole remaining chain,
                     // never once per extra step (see the loop's own docs
                     // above).
+                    entered_extra_budget_this_cycle = true;
                     extra_step_cycle_number += 1;
                     db::set_run_current_extra_step_cycle(
                         &self.pool,
@@ -377,6 +410,7 @@ impl Orchestrator {
                             diff: &producer_result.diff,
                             prior_findings: &prior_findings,
                             scope,
+                            captures_evidence: step.captures_evidence,
                             config: &config,
                             cancel: cancel.clone(),
                         },
@@ -407,8 +441,11 @@ impl Orchestrator {
                             || finding.source == warden_core::FindingSource::Warden)
                 });
 
-                let (current_cycle, max_cycles) = match step_index {
-                    1 => {
+                // Issue #73 review, finding F3: which counter/rule applies
+                // follows this step's own declared `budget`, not its
+                // position -- see the loop's own docs above.
+                let (current_cycle, max_cycles) = match step.budget {
+                    Some(warden_core::StepBudget::Review) => {
                         // Issue #43 code review (MEDIUM): the review
                         // budget's own counter only advances when this
                         // cycle's reboucle is actually charged to the
@@ -425,13 +462,20 @@ impl Orchestrator {
                             .await?;
                         (review_cycle_number, config.max_review_cycles)
                     }
-                    2 => {
+                    Some(warden_core::StepBudget::Test) => {
                         test_cycle_number += 1;
                         db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number)
                             .await?;
                         (test_cycle_number, config.max_test_cycles)
                     }
-                    _ => (extra_step_cycle_number, config.max_extra_step_cycles),
+                    Some(warden_core::StepBudget::Extra) => {
+                        (extra_step_cycle_number, config.max_extra_step_cycles)
+                    }
+                    None => unreachable!(
+                        "workflow steps at index >= 1 always carry Some(budget) -- \
+                         Workflow::parse_yaml's own invariant, only steps[0] (never reached by \
+                         this loop) has none"
+                    ),
                 };
 
                 next_state = decide_next_state_for_step(
@@ -2199,6 +2243,108 @@ mod tests {
                  clean never charges the review budget at all, so the counter never leaves 0"
         );
         assert_eq!(run.current_test_cycle, 3, "the test budget is what ran out");
+    }
+
+    /// Issue #73 review, finding F3: before this, `step_index == 1` always
+    /// meant "review budget" and `step_index == 2` always meant "test
+    /// budget" -- reordering the built-in pair inverted the rule. This
+    /// pins a workflow with the two swapped (a `Test`-budgeted step at
+    /// `step_index == 1`, a `Review`-budgeted step at `step_index == 2`):
+    /// the counters must still follow each step's own declared `budget`,
+    /// not its slot.
+    #[tokio::test]
+    async fn cycle_budgets_follow_a_steps_declared_budget_not_its_position() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        // At `step_index == 1` (the slot the pre-fix code always charged to
+        // `max_review_cycles`) but declares `budget: test` -- always raises
+        // its own blocking finding, so the run never converges and the
+        // *test* budget (charged unconditionally, once per invocation) is
+        // what exhausts first.
+        let always_blocking_qa = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"qa","severity":"blocking","description":"never happy"}'"#,
+            ],
+        );
+        // At `step_index == 2` (the slot the pre-fix code always charged to
+        // `max_test_cycles`) but declares `budget: review`, and this step
+        // never even runs (the swapped `qa` step ahead of it always
+        // reboucles first) -- its own counter must stay at 0.
+        let never_reached_sign_off = AgentCommand::new("sh", ["-c", "true"]);
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: swapped
+steps:
+  - role: coder
+    agent: coder
+  - role: qa
+    agent: qa
+    gate: loop-until-clean
+    budget: test
+  - role: sign-off
+    agent: sign-off
+    gate: loop-until-clean
+    budget: review
+"#,
+        )
+        .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 2,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_blocking_qa),
+                definition(never_reached_sign_off),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(1),
+            "the step at index 1 (\"qa\", declared budget \"test\") is what never clears"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_test_cycle, 2,
+            "the \"qa\" step's own declared budget (\"test\") is what exhausted, even though \
+                 it sits at step_index 1 -- the slot the pre-fix code always charged to \
+                 max_review_cycles instead"
+        );
+        assert_eq!(
+            run.current_review_cycle, 0,
+            "\"sign-off\" (declared budget \"review\") never even ran -- the \"qa\" step ahead \
+                 of it always reboucles first -- so the review counter must stay untouched"
+        );
     }
 
     /// The converse of

@@ -211,6 +211,20 @@ mod tests {
         db::list_findings_for_cycle(pool, &cycle_id).await.unwrap()
     }
 
+    /// Same convention as [`findings_for_the_only_cycle`], for a
+    /// multi-cycle test run -- the most recently started cycle's own
+    /// findings.
+    async fn findings_for_the_last_cycle(pool: &SqlitePool, run_id: &str) -> Vec<Finding> {
+        let (cycle_id,): (String,) = sqlx::query_as(
+            "SELECT id FROM cycles WHERE run_id = ? ORDER BY cycle_number DESC LIMIT 1",
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        db::list_findings_for_cycle(pool, &cycle_id).await.unwrap()
+    }
+
     /// A coder commit that adds a file under `.warden/agents/` must block
     /// convergence: `max_review_cycles: 1` makes a blocking (`Warden`-sourced,
     /// so review-phase per decision #37 Q1) finding at cycle 1 land straight
@@ -282,6 +296,86 @@ mod tests {
                 .contains(".warden/agents/reviewer.md"),
             "the finding must name the offending path: {}",
             tampering_finding.description
+        );
+    }
+
+    /// Issue #73 review, finding F4: a **single-step** workflow (the
+    /// producer only, no gated step at all) used to jump straight to
+    /// `Converged` unconditionally, even when the producer's own cycle
+    /// raised a blocking `Warden`-sourced tampering finding -- there was no
+    /// later gated step left to catch it. This pins that a degenerate
+    /// one-step pipeline still refuses to converge over a poisoned
+    /// `.warden/agents/` diff, reboucling back to the producer (and
+    /// eventually exhausting `max_extra_step_cycles`, the only budget a
+    /// producer-only pipeline has) exactly like a multi-step workflow's own
+    /// gated step would.
+    #[tokio::test]
+    async fn a_single_step_workflow_still_blocks_convergence_on_a_tampering_finding() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let always_poisoning_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                    mkdir -p .warden/agents
+                    echo "poisoned at $(date +%s%N)" > .warden/agents/reviewer.md
+                    git add .warden/agents/reviewer.md
+                    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                    "#,
+            ],
+        );
+
+        let single_step_workflow = warden_core::Workflow::parse_yaml(
+            "name: producer-only\nsteps:\n  - role: coder\n    agent: coder\n",
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "sneak in a reviewer.md change with no gated step to catch it".to_string(),
+            max_review_cycles: 1,
+            max_test_cycles: 1,
+            workflow: single_step_workflow,
+            max_extra_step_cycles: 2,
+            step_agents: vec![definition(always_poisoning_coder)],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(0),
+            "a single-step workflow must never reach Converged while the producer's own cycle \
+                 keeps raising a blocking tampering finding"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_extra_step_cycle, 2,
+            "a producer-only pipeline has no review/test budget of its own -- it shares the \
+                 same max_extra_step_cycles bucket any other budget-less step would"
+        );
+
+        let findings = findings_for_the_last_cycle(&pool, &run_id).await;
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.source == warden_core::FindingSource::Warden),
+            "the last cycle must still carry the tampering finding that kept it from \
+                 converging: {findings:?}"
         );
     }
 

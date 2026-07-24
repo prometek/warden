@@ -459,20 +459,33 @@ steps:
   - role: reviewer
     agent: code-reviewer
     gate: loop-until-clean
+    budget: review
   - role: tester
     agent: test-runner
     gate: loop-until-clean
+    budget: test
+    evidence: true
   - role: techlead
     agent: techlead
     gate: loop-until-clean
 ```
 
 - `role` — nom ouvert (pas une énumération fermée) : identifie l'étape et la source des
-  findings qu'elle lève (`FindingSource::role(...)`).
+  findings qu'elle lève (`FindingSource::role(...)`). `ci` et `warden` sont réservés
+  (ce sont les autres `FindingSource` non liées à un rôle) et rejetés au parsing.
 - `agent` — nom résolu vers `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013)
   pour tout rôle au-delà des trois rôles intégrés.
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
   (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
+- `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :
+  `review` (`--max-review-cycles`, compté seulement quand cette étape elle-même bloque),
+  `test` (`--max-test-cycles`, compté à chaque invocation), ou `extra` (`--max-cycles`,
+  budget partagé — c'est la valeur par défaut si la clé est omise). Suit la déclaration de
+  l'étape, jamais sa position : réordonner le pipeline n'inverse jamais la règle de
+  budget. `review`/`test` ne peuvent être revendiqués que par une seule étape chacun.
+- `evidence` — optionnel, `true`/`false` (défaut `false`) : déclare que cette étape
+  déclenche la capture de preuve ADR-0009 sur un cycle propre. Une seule étape peut le
+  déclarer par workflow.
 
 **Rétro-compatibilité stricte** : sans `.warden/workflow.yaml`, le comportement est
 identique à celui d'avant l'issue #73 — le pipeline intégré (`--max-review-cycles`/
@@ -488,15 +501,17 @@ position — mais rien n'empêche d'insérer une étape personnalisée (ex. `tec
 *entre* le reviewer et le tester plutôt qu'après les deux, ou de réordonner
 davantage. La seule règle structurelle imposée : la première étape est le
 producteur du pipeline (elle crée le commit/diff que les étapes suivantes
-examinent) et ne doit pas déclarer de `gate`.
+examinent) et ne doit pas déclarer de `gate` (ni de `budget`).
 
-Les deux premières étapes gatées (positions 1 et 2 — reviewer et tester dans
-l'exemple par défaut) sont bornées par `--max-review-cycles`/`--max-test-cycles` ;
-toute étape au-delà partage un unique budget, contrôlé par `--max-cycles` (défaut
-5). Tout rôle autre que `coder`/`reviewer`/`tester` est résolu depuis
-`.claude/agents/<agent>.md` (convention Claude Code, ADR-0013), sans prompt par
-défaut : un fichier manquant est une erreur claire nommant le rôle et le chemin
-attendu, jamais une étape silencieusement ignorée.
+Quelle étape gatée est bornée par `--max-review-cycles`/`--max-test-cycles` suit sa
+propre déclaration `budget: review`/`budget: test` — jamais sa position dans le
+pipeline (réordonner le reviewer/tester ne bascule plus la règle de l'un vers
+l'autre). Toute étape déclarant `budget: extra` (ou omettant la clé) partage un
+unique budget, contrôlé par `--max-cycles` (défaut 5). Tout rôle autre que
+`coder`/`reviewer`/`tester` est résolu depuis `.claude/agents/<agent>.md`
+(convention Claude Code, ADR-0013), sans prompt par défaut : un fichier manquant
+est une erreur claire nommant le rôle et le chemin attendu, jamais une étape
+silencieusement ignorée.
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
 `workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.

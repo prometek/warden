@@ -28,11 +28,19 @@
 //! does, going through that same scoped re-review gate before it is ever
 //! handed the correctif's commit again.
 //!
-//! Per-step budgets: `max_review_cycles`/`max_test_cycles` (config.rs) back
-//! `workflow.steps[1]`/`steps[2]` specifically (positional, decision #37 Q1
-//! -- a blocking finding is charged to whichever step raised it); any step
-//! beyond those two shares `max_extra_step_cycles`, one shared budget for
-//! the whole remaining chain. [`warden_core::decide_next_state_for_step`]
+//! Per-step budgets follow each step's own declared
+//! [`warden_core::WorkflowStep::budget`] (issue #73 review, finding F3 --
+//! before this fix, `workflow.steps[1]`/`steps[2]` were hardcoded to
+//! `max_review_cycles`/`max_test_cycles`, which inverted the rule the moment
+//! the built-in pair was reordered): [`warden_core::StepBudget::Review`]/
+//! [`warden_core::StepBudget::Test`] back `max_review_cycles`/`max_test_cycles`
+//! (decision #37 Q1 -- a blocking finding is charged to whichever step
+//! raised it, wherever it sits); every other step shares
+//! [`warden_core::StepBudget::Extra`] (`max_extra_step_cycles`), one budget
+//! for the whole remaining chain. Evidence capture (ADR-0009, issue #7) is
+//! likewise a step's own declared property now
+//! ([`warden_core::WorkflowStep::captures_evidence`], finding F2), not a
+//! literal role-name check. [`warden_core::decide_next_state_for_step`]
 //! decides the next [`RunState`] for any step, at any position, uniformly.
 //! Each step gets its own worktree synced onto the producer's commit (see
 //! [`crate::worktree::WorktreeManager::create`]), keyed by role, and its own
@@ -144,7 +152,19 @@ impl ResolvedAgents {
     /// Maps every step's definition up-front, before the loop spawns
     /// anything: a definition the adapter cannot honour must fail the run at
     /// its start, not several cycles in when that step first happens to run.
+    ///
+    /// Issue #73 review (F5): `run_convergence_loop`'s per-cycle loop indexes
+    /// `self.steps` and `config.workflow.steps` in lockstep, by position,
+    /// with no further bounds check at each access -- so the one-time
+    /// length check below is what turns a would-be out-of-bounds panic deep
+    /// into a run into a fail-fast, typed error before the run even starts.
     fn resolve<R: ToolAdapter>(runner: &R, config: &RunConfig) -> Result<Self> {
+        if config.step_agents.len() != config.workflow.steps.len() {
+            return Err(WardenError::MismatchedStepAgentCount {
+                workflow_steps: config.workflow.steps.len(),
+                step_agents: config.step_agents.len(),
+            });
+        }
         let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
             Ok(ResolvedAgent {
                 command: runner.build_command(definition)?,
@@ -266,12 +286,18 @@ struct GatedStepInvocation<'a> {
     /// [`Orchestrator::run_gated_step`]'s own docs for the defensive
     /// re-check this struct's `step_index` backs.
     scope: warden_core::ReviewScope,
-    /// Only consulted when this step is functionally "the tester" (evidence
-    /// capture, `evidence_tool`/`evidence_store_in_repo`/`warden_home`) --
-    /// carried through here rather than threading four separate fields. See
-    /// [`Orchestrator::run_gated_step`]'s own docs on this one remaining,
-    /// deliberately out-of-scope role-name check (ADR-0009 is a distinct
-    /// feature from this issue's execution-path unification).
+    /// This step's own declared [`warden_core::WorkflowStep::captures_evidence`]
+    /// (issue #73 review, finding F2) -- whether a clean run of *this* step
+    /// triggers ADR-0009 evidence capture. Before this, `run_gated_step`
+    /// checked `role.as_str() == "tester"` directly; a custom workflow that
+    /// renamed its test step lost evidence capture silently. Now it's the
+    /// step's own declared property, carried in from `config.workflow.steps
+    /// [step_index]` by the caller, so `run_gated_step` itself never
+    /// consults a role name at all.
+    captures_evidence: bool,
+    /// Consulted only when `captures_evidence` is set (evidence capture's
+    /// own config: `evidence_tool`/`evidence_store_in_repo`/`warden_home`) --
+    /// carried through here rather than threading three separate fields.
     config: &'a RunConfig,
     cancel: CancellationToken,
 }

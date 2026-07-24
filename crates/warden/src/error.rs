@@ -380,6 +380,22 @@ pub enum WardenError {
     /// number.
     #[error("token count {value} for column `{column}` does not fit in the column's numeric type")]
     TokenCountOverflow { column: &'static str, value: u64 },
+
+    /// Issue #73 review (F5): [`crate::orchestrator::run_convergence_loop`]
+    /// indexes `RunConfig::step_agents` and `RunConfig::workflow`'s own
+    /// steps in lockstep, by position -- a caller that ever builds a
+    /// `RunConfig` with the two out of sync (a bug in `main.rs`'s
+    /// resolution loop, or a future caller) must fail fast, here, with a
+    /// clear count mismatch, rather than let the loop panic mid-run on an
+    /// out-of-bounds index into whichever list ran out first.
+    #[error(
+        "workflow declares {workflow_steps} step(s) but {step_agents} agent definition(s) were \
+         resolved for it -- every workflow step must have exactly one resolved agent"
+    )]
+    MismatchedStepAgentCount {
+        workflow_steps: usize,
+        step_agents: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;

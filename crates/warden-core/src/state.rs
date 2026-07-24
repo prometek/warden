@@ -135,13 +135,31 @@ impl RunState {
             RunState::Pending => vec![RunState::CoderRunning, RunState::Failed],
             RunState::CoderRunning => {
                 // A workflow whose only step is the producer itself (no
-                // gates at all) converges directly -- there is nothing left
-                // to gate on. Every workflow this codebase ships with has at
-                // least one gated step, but this keeps the machine correct
-                // for the degenerate one-step case too, rather than an
-                // unreachable panic.
+                // gates at all) converges directly when its cycle raised no
+                // blocking finding -- there is no later gated step to gate
+                // on. Every workflow this codebase ships with has at least
+                // one gated step, but this keeps the machine correct for the
+                // degenerate one-step case too, rather than an unreachable
+                // panic.
+                //
+                // Issue #73 review, finding F4: a blocking finding the
+                // producer's own cycle raises (`FindingSource::Warden`, the
+                // agent-definition-tampering check -- there is no per-role
+                // gated finding at index 0, since the producer's own role
+                // never gates) must still be able to reboucle
+                // (`CoderRunning`, a self-loop: the very next cycle's
+                // producer run) or exhaust its budget
+                // (`StepCyclesExceeded(0)`) instead of the run being forced
+                // straight to `Converged` regardless. Without this, the
+                // orchestrator's own convergence loop would have nowhere
+                // legal to transition a blocking single-step cycle to.
                 if total_steps <= 1 {
-                    vec![RunState::Converged, RunState::Failed]
+                    vec![
+                        RunState::Converged,
+                        RunState::CoderRunning,
+                        RunState::StepCyclesExceeded(0),
+                        RunState::Failed,
+                    ]
                 } else {
                     vec![RunState::RunningStep(1), RunState::Failed]
                 }
@@ -286,6 +304,33 @@ mod tests {
             .is_ok());
         assert!(RunState::CoderRunning
             .validate_transition(RunState::RunningStep(1), 1)
+            .is_err());
+    }
+
+    /// Issue #73 review, finding F4: a single-step workflow's producer
+    /// cycle can also reboucle (a blocking finding, budget not yet
+    /// exhausted) or exhaust its budget (`StepCyclesExceeded(0)`) -- it is
+    /// not forced straight to `Converged` regardless of what the cycle
+    /// raised.
+    #[test]
+    fn coder_running_with_a_single_step_workflow_can_also_reboucle_or_exhaust_its_budget() {
+        assert!(RunState::CoderRunning
+            .validate_transition(RunState::CoderRunning, 1)
+            .is_ok());
+        assert!(RunState::CoderRunning
+            .validate_transition(RunState::StepCyclesExceeded(0), 1)
+            .is_ok());
+        assert!(RunState::CoderRunning
+            .validate_transition(RunState::Failed, 1)
+            .is_ok());
+        // A multi-step workflow's producer never reboucles/exhausts a
+        // budget directly from `CoderRunning` -- that's the first *gated*
+        // step's own job.
+        assert!(RunState::CoderRunning
+            .validate_transition(RunState::CoderRunning, DEFAULT_TOTAL_STEPS)
+            .is_err());
+        assert!(RunState::CoderRunning
+            .validate_transition(RunState::StepCyclesExceeded(0), DEFAULT_TOTAL_STEPS)
             .is_err());
     }
 
