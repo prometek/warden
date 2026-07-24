@@ -28,25 +28,29 @@ Then run `warden` exactly as usual (`warden run --repo your-repo --intent
 (no `.warden/workflow.yaml` at all), a run uses the built-in default
 pipeline unchanged.
 
-## Current engine limitation
+## Ordering is not restricted
 
-The convergence loop's built-in `coder`/`reviewer`/`tester` steps still run
-through their existing, hardened resolution path
-(`warden::agent_def::resolve_agent_definition`) -- a custom
-`workflow.yaml` may only **append** steps after them, never reorder,
-replace, or omit them. The first three steps of `workflow.yaml` must always
-be exactly `coder`, `reviewer`, `tester` in that order; `warden` rejects
-anything else with a clear error at startup.
+Every workflow step -- built-in or custom -- runs through the exact same
+execution path (worktree, subprocess spawn, findings validation, crash
+recovery). A step literally named `coder`/`reviewer`/`tester` still
+resolves through the existing, hardened, role-asymmetric path
+(`warden::agent_def::resolve_agent_definition`) -- that trust model is
+inherent to what those three names *mean*, not to their position -- but
+nothing stops you from inserting `techlead` *between* the reviewer and the
+tester instead of after both, or reordering the pipeline further. The only
+structural rule `warden` enforces is that the first step is the pipeline's
+producer (it creates the commit/diff every later step reviews) and must not
+declare a `gate`.
 
-Every step beyond those three (like `techlead` here) is resolved from
-`.claude/agents/<agent>.md` -- Claude Code's own subagent file convention
-(ADR-0013) -- with no adapter default to fall back to: a missing file is a
-hard, actionable error naming the role and the exact path expected, not a
-silently skipped step.
+Any role other than `coder`/`reviewer`/`tester` (like `techlead` here) is
+resolved from `.claude/agents/<agent>.md` -- Claude Code's own subagent file
+convention (ADR-0013) -- with no adapter default to fall back to: a missing
+file is a hard, actionable error naming the role and the exact path
+expected, not a silently skipped step.
 
 ## Cycle budget
 
-Any step beyond the built-in pair shares a single cycle budget, controlled
-by `--max-cycles` (default 5) -- distinct from `--max-review-cycles`/
-`--max-test-cycles`, which still bound the built-in reviewer/tester pair
-only.
+`workflow.yaml`'s first two gated steps (positions 1 and 2 -- the reviewer
+and tester in this example) are bound by `--max-review-cycles`/
+`--max-test-cycles` respectively; any step beyond those two shares a single
+budget, controlled by `--max-cycles` (default 5).

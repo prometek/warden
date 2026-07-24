@@ -478,14 +478,25 @@ steps:
 identique à celui d'avant l'issue #73 — le pipeline intégré (`--max-review-cycles`/
 `--max-test-cycles`) n'est pas affecté.
 
-**Limite actuelle du moteur** : les trois premières étapes doivent être exactement
-`coder`, `reviewer`, `tester` dans cet ordre — la boucle de convergence ne fait
-qu'**ajouter** des étapes après ce pipeline intégré (qui garde sa propre résolution
-d'agent, ADR-0018), jamais les réordonner, remplacer, ni omettre. Toute étape
-au-delà partage un unique budget de cycles, contrôlé par `--max-cycles` (défaut 5),
-distinct de `--max-review-cycles`/`--max-test-cycles`. Ces étapes personnalisées
-n'ont pour l'instant ni suivi de tokens par rôle, ni récupération de worktree après
-crash (limites de portée v1, voir ADR-0020).
+**Aucune restriction d'ordre.** Chaque étape — intégrée ou personnalisée — passe par
+exactement le même chemin d'exécution (worktree, sous-processus, validation des
+findings, `agent_processes`, suivi des tokens, récupération après crash). Un rôle
+littéralement nommé `coder`/`reviewer`/`tester` est toujours résolu via le chemin
+existant, renforcé et asymétrique en confiance (`resolve_agent_definition`) — ce
+modèle de confiance est inhérent à ce que ces trois noms *signifient*, pas à leur
+position — mais rien n'empêche d'insérer une étape personnalisée (ex. `techlead`)
+*entre* le reviewer et le tester plutôt qu'après les deux, ou de réordonner
+davantage. La seule règle structurelle imposée : la première étape est le
+producteur du pipeline (elle crée le commit/diff que les étapes suivantes
+examinent) et ne doit pas déclarer de `gate`.
+
+Les deux premières étapes gatées (positions 1 et 2 — reviewer et tester dans
+l'exemple par défaut) sont bornées par `--max-review-cycles`/`--max-test-cycles` ;
+toute étape au-delà partage un unique budget, contrôlé par `--max-cycles` (défaut
+5). Tout rôle autre que `coder`/`reviewer`/`tester` est résolu depuis
+`.claude/agents/<agent>.md` (convention Claude Code, ADR-0013), sans prompt par
+défaut : un fichier manquant est une erreur claire nommant le rôle et le chemin
+attendu, jamais une étape silencieusement ignorée.
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
 `workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.
