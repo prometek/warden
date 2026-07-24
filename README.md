@@ -237,6 +237,15 @@ Flags de `warden run` :
 - `--intent <TEXT>` — description de la tâche transmise à l'agent coder sur son `stdin`
   (voir "Protocole d'entrée des agents (stdin)" ci-dessous, ADR-0012). Doit être non vide
   (espaces exclus) — validé dès la frontière CLI plutôt qu'en profondeur du premier cycle.
+  **Répétable depuis l'issue #72** (voir "Mode batch (plusieurs intentions)" ci-dessous) :
+  une seule occurrence garde exactement le comportement mono-intention décrit ici ; deux
+  occurrences ou plus (ou une combinaison avec `--intents-file`) basculent en mode batch.
+- `--intents-file <PATH>` (issue #72) — fichier listant une intention par ligne non vide ;
+  une ligne commençant par `#` est un commentaire, ignorée. Voir "Mode batch (plusieurs
+  intentions)" ci-dessous.
+- `--fail-fast` (issue #72, défaut désactivé, sans effet hors mode batch) — arrête le
+  batch à la première intention non convergée au lieu de continuer sur la suivante. Voir
+  "Mode batch (plusieurs intentions)" ci-dessous.
 - `--tool <name>` (**requis**) — sélectionne l'adaptateur d'outil intégré qui pilote les
   trois rôles de ce run (issue #24) : l'invocation CLI réelle, l'allowlist d'environnement,
   la traduction de la sortie de l'outil en findings, et le prompt/`tools` par défaut de
@@ -327,6 +336,45 @@ Flags de `warden run` :
   docker`) — surcharge l'image que `--isolation docker` exécute pour chaque invocation.
   Voir `crates/warden-sandbox/docker/README.md` pour construire l'image de référence sous
   ce tag exact.
+
+### Mode batch (plusieurs intentions, issue #72)
+
+`--intent` est répétable, et `--intents-file <PATH>` lit une intention par ligne non vide
+d'un fichier (une ligne `#...` est un commentaire, ignorée) :
+
+```sh
+warden run \
+  --repo /chemin/vers/mon-projet \
+  --intents-file taches.txt \
+  --intent "Une intention supplémentaire donnée en ligne de commande" \
+  --tool claude
+```
+
+Les entrées de `--intents-file` s'exécutent d'abord, dans l'ordre du fichier, suivies des
+`--intent` répétés, dans l'ordre donné. Au moins une intention doit résulter de cette
+combinaison, sinon `warden` s'arrête avec une erreur explicite (qui nomme le fichier en
+cause si un `--intents-file` fourni ne contenait aucune intention).
+
+Une seule intention résultante reprend **exactement** le comportement mono-intention
+inchangé (chemin in-process décrit dans tout le reste de cette section). Deux intentions
+ou plus basculent en **mode batch** : chaque intention est traitée **séquentiellement**,
+comme un sous-processus enfant `warden run --intent <x>` de ce même binaire — process,
+`run_id` et worktrees neufs à chaque intention, sans aucun état en mémoire partagé d'une
+intention à l'autre. Le nettoyage entre deux intentions (agents orphelins tués, worktrees
+nettoyés — le même mécanisme de reprise après crash que "Disaster Recovery" dans
+`docs/Architecture.md`, §9) est garanti à la sortie propre de l'enfant, et rattrapé au
+redémarrage suivant sinon.
+
+Par défaut, une intention non convergée (budget de cycles épuisé, ou run `Failed`)
+n'arrête pas le batch : l'intention suivante démarre quand même, sur une base saine.
+`--fail-fast` change ce comportement : il arrête le batch à la première intention non
+convergée et marque toutes les intentions restantes `Skipped` sans les lancer. Un Ctrl-C
+laisse l'intention en cours aller jusqu'à son terme, marque les intentions restantes
+`Skipped`, puis affiche quand même le résumé du batch.
+
+En fin de batch, `warden` affiche une ligne de statut par intention puis un total
+`batch summary: X/N intent(s) converged` ; le code de sortie du processus est non nul si
+au moins une intention n'a pas convergé.
 
 ### Preuve d'exécution (Evidence)
 

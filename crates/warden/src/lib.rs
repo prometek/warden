@@ -2,6 +2,7 @@
 //! plus the coordination that drives `warden-core`'s pure state machine.
 
 pub mod agent_def;
+pub mod batch;
 pub mod ci_channel;
 pub mod db;
 pub mod error;

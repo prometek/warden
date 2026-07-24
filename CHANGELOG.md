@@ -10,98 +10,69 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 ### Added — Issue #73 / ADR-0020 : workflow personnalisable piloté par la donnée (`.warden/workflow.yaml`)
 
 - **`.warden/workflow.yaml`** (optionnel, pur YAML) : le pipeline coder → gate review → gate
-  test n'est plus câblé en dur — un repo peut désormais déclarer des étapes supplémentaires
-  après ce trio intégré, chacune liant un `role` (nom ouvert, plus l'enum fermé
-  `AgentRole` d'avant) à un `agent` résolu vers `.claude/agents/<agent>.md` (convention
-  ADR-0013), avec un `gate: loop-until-clean` optionnel (reboucle vers le coder sur un
-  finding bloquant, comme le reviewer/tester aujourd'hui) ou l'absence de `gate` (simple
+  test n'est plus câblé en dur. Un repo déclare une séquence ordonnée d'**étapes**, chacune
+  liant un `role` (nom ouvert, plus l'enum fermé `AgentRole` d'avant) à un `agent` résolu vers
+  `.claude/agents/<agent>.md` (convention ADR-0013), avec un `gate: loop-until-clean` optionnel
+  (reboucle vers le producteur sur un finding bloquant) ou l'absence de `gate` (simple
   pass-through). **Rétro-compatibilité stricte** : sans ce fichier, `Workflow::builtin_default()`
   reproduit exactement le pipeline d'avant l'issue #73 — pinné par un test core et un test
   e2e CLI dédiés.
-- **`--max-cycles <N>`** (nouveau flag `warden run`, défaut `5`) : budget de cycles partagé
-  par toute étape au-delà du trio intégré, distinct de `--max-review-cycles`/
-  `--max-test-cycles` qui continuent de ne borner que reviewer/tester.
+- **Trio intégré unifié en étapes ordinaires.** `coder`/`reviewer`/`tester` ne sont plus
+  privilégiés dans la boucle : toute étape, intégrée ou personnalisée, passe par le **même
+  chemin d'exécution** et le **même bookkeeping**. Les étapes peuvent être réordonnées,
+  insérées entre les intégrées, remplacées ou omises — plus aucune contrainte de position.
+  Le reviewer/tester conservent leur résolution d'agent role-asymétrique (ADR-0018, jugement
+  indépendant du travail du coder) sans que celle-ci ne branche la boucle ni n'impose un rang.
+- **Comportements liés à la déclaration, pas au nom/position** : `evidence: true` (capture
+  d'evidence, ADR-0009) et `budget: review|test|extra` (règle de comptage de cycle) sont
+  déclarés sur l'étape ; `Workflow::builtin_default()` les pose sur le trio, rétro-compat
+  exacte. Déclarer `budget`/`evidence` sur l'étape productrice (première) est rejeté.
 - Nouveau rôle démontré de bout en bout : **`techlead`** — voir
   `examples/workflows/with-techlead/` (`workflow.yaml` + `.claude/agents/techlead.md` +
   README d'utilisation).
+- **`--max-cycles <N>`** (nouveau flag `warden run`, défaut `5`) : budget de cycles pour les
+  étapes hors reviewer/tester, distinct de `--max-review-cycles`/`--max-test-cycles`.
 - `RunState` généralisé : `RunningStep(u32)`/`StepCyclesExceeded(u32)` remplacent les
   variantes spécifiques aux rôles (`Reviewing`/`Testing`/`MaxReviewCyclesExceeded`/
-  `MaxTestCyclesExceeded`), avec une migration DB (`0009_generic_workflow_state.sql`) qui
-  remappe sans perte tout état persisté d'un run antérieur. `FindingSource`/
-  `decide_next_state_for_step` généralisés en miroir : les findings d'un rôle personnalisé
-  s'agrègent dans la boucle de convergence exactement comme ceux du reviewer/tester
-  aujourd'hui.
+  `MaxTestCyclesExceeded`). Deux migrations DB : `0009_generic_workflow_state.sql` (remap sans
+  perte des états legacy) et `0010_generic_step_bookkeeping.sql` (colonnes worktree + tokens
+  jusqu'ici câblées par nom de rôle normalisées en tables génériques `(cycle, role)` — une
+  étape personnalisée a désormais son suivi de tokens et sa récupération de worktree après
+  crash, comme n'importe quel rôle intégré). `FindingSource`/`decide_next_state_for_step`
+  généralisés en miroir : les findings d'un rôle personnalisé s'agrègent dans la boucle
+  exactement comme ceux du reviewer/tester.
 - **Durcissement (revue)** : `Workflow::parse_yaml` rejette tout `role`/`agent` contenant un
-  séparateur de chemin (`/`, `\`) ou une composante `..`, avant que ces valeurs ne soient
-  jointes telles quelles à un chemin filesystem (`.claude/agents/<agent>.md`, répertoire de
-  worktree par rôle) — ferme un risque de traversée de chemin sur une valeur de
-  `workflow.yaml` non validée.
-- **Limite v1 connue, documentée dans le README et l'exemple** : le moteur n'autorise que
-  l'**ajout** d'étapes après le trio intégré `coder`/`reviewer`/`tester`, qui doit rester
-  en tête dans cet ordre exact — réordonnancement/remplacement/omission du trio rejetés
-  avec une erreur claire (réagencement complet reporté à une itération ultérieure). Les
-  étapes personnalisées n'ont pour l'instant ni suivi de tokens par rôle, ni récupération
-  de worktree après crash (colonnes dédiées encore câblées uniquement pour les trois rôles
-  intégrés) ; une étape reste toujours un agent (les types hook/policy restent hors
-  périmètre de cette livraison).
+  séparateur de chemin (`/`, `\`) ou une composante `..` (traversée de chemin sur une valeur
+  de `workflow.yaml` non validée), et tout `role` collision­nant avec une source de findings
+  réservée (`ci`, `warden`).
+- **Hors périmètre de cette livraison** (suivis dédiés) : étapes non-agent hook/policy (#79),
+  workflow non-linéaire / DAG (#80), gates étendus — re-review scopée + budgets par étape
+  configurables (#81).
 
-### Added — Issue #71 : adaptateurs multi-CLI `codex` + `mistral`
+### Added — Issue #72 : mode batch multi-intentions pour `warden run`
 
-- **`warden::tool_adapter::CodexAdapter`** (`--tool codex`) — enveloppe le CLI OpenAI Codex
-  (`codex exec --json --ask-for-approval never`), avec `--sandbox <mode>` dérivé de
-  `tools:` (`workspace-write` pour coder/tester, `read-only` pour reviewer, par défaut) et
-  `--model` depuis `model:`. Un séparateur `--` précède le prompt positionnel (défensif
-  contre un `system_prompt` commençant par `-`). Findings extraits en remontant le flux à
-  la recherche du premier événement `task_complete`/`error` (pas seulement la dernière
-  ligne — l'ordre exact des événements `codex` n'étant pas vérifié en direct, un
-  `token_count` traînant après `task_complete` ne doit pas faire échouer l'extraction),
-  progression en direct (issue #33) depuis les événements `agent_message`, usage de tokens
-  (issue #53) depuis l'événement `token_count` le plus récent du flux. **Non vérifié contre
-  une installation réelle** (pas de binaire ni d'accès réseau disponibles à l'écriture) —
-  invocation et schéma JSON construits à partir de la documentation publiée du CLI, avec
-  dégradation propre documentée dans le module (risque d'ordonnancement des événements
-  explicitement documenté) si un détail s'avère inexact.
-- **`warden::tool_adapter::MistralAdapter`** (`--tool mistral`) — enveloppe minimale et
-  volontairement conservatrice (`mistral --system <prompt> [--model <model>]`) : la
-  maturité/existence même de ce CLI sont incertaines (ticket #71), donc aucun format de
-  sortie structuré n'est supposé — la sortie brute entière est traitée comme la réponse
-  finale (findings), et l'usage de tokens est toujours `None` (« n/a »). Une sortie vide
-  est traitée comme « aucun finding » (pas une erreur) : les prompts par défaut partagés
-  demandent explicitement zéro ligne NDJSON quand il n'y a rien à signaler, ce qui pour ce
-  CLI sans enveloppe se traduit par un stdout littéralement vide. Ceci n'est sûr que parce
-  que l'orchestrateur a déjà vérifié un exit code nul avant d'appeler cette méthode (voir
-  ci-dessous) — ce n'est pas cet adaptateur qui distingue un pass propre d'un crash
-  silencieux.
-- **Revue de sécurité (HIGH)** : le chemin reviewer/tester
-  (`warden::orchestrator::agents::run_finding_agent`) ne vérifiait jamais l'exit code de
-  l'agent avant d'appeler `extract_findings` — seul le chemin coder le faisait. Combiné à
-  la sortie vide de `MistralAdapter` traitée comme « aucun finding », un reviewer/tester
-  `mistral` qui crashait en n'imprimant rien (exit non nul) convergeait silencieusement
-  comme un passage propre. Corrigé dans l'orchestrateur (pas dans l'adaptateur, qui reste
-  correct) : un exit non nul synthétise désormais un finding bloquant *avant* même
-  d'appeler `extract_findings`, quel que soit l'adaptateur — ferme la faille pour les
-  trois CLIs à la fois, pas seulement `mistral`.
-- **`--tool`** accepte désormais `claude`/`codex`/`mistral` ; un nom inconnu liste les trois
-  dans son message d'erreur (`crates/warden/src/main.rs`, `ToolName`/`parse_tool`).
-- Tests unitaires par adaptateur (`build_command`, `extract_findings`, `extract_usage`,
-  `default_prompt`/`default_tools`, `parse_progress_line`) sur des sorties fabriquées,
-  même style que ceux de `ClaudeAdapter`.
-- **Tests e2e hermétiques** (`crates/warden/tests/cli.rs`) : un faux binaire `codex`
-  (émettant `agent_message`/`token_count`/`task_complete`) et un faux binaire `mistral`
-  (NDJSON brut sur stdout), même technique que `write_fake_claude` — chacun piloté via
-  `warden run --tool <name>` réel, vérifiant convergence + findings extraits (+ usage de
-  tokens pour `codex`) de bout en bout (dispatch `main.rs` → `build_command` →
-  orchestrateur → `extract_findings`/`extract_usage`). Un troisième test hermétique pilote
-  un faux `mistral` reviewer qui sort en erreur sans rien imprimer, et vérifie que le run
-  n'atteint **jamais** `Converged` (`MaxReviewCyclesExceeded` à la place, avec un finding
-  bloquant synthétisé nommant l'exit code) — preuve directe que la faille ci-dessus est
-  fermée.
-- Doc : nouvelle section « Prérequis par CLI (`--tool`) » dans `README.md` (binaire
-  installé + authentifié par le CLI lui-même, ADR-0005 inchangée — Warden ne détient
-  aucune clé).
-- Hors périmètre (inchangé) : sélection de l'adaptateur par rôle (`--coder-tool`…, `--tool`
-  reste global au run) et harmonisation des grants d'outils entre CLI (chaque adaptateur
-  garde ses propres défauts).
+- **`--intent` devient répétable**, et un nouveau flag `--intents-file <PATH>` lit une
+  intention par ligne non vide (une ligne commençant par `#` est un commentaire, ignorée).
+  Les entrées du fichier s'exécutent d'abord, dans l'ordre du fichier, suivies des
+  `--intent` répétés, dans l'ordre donné sur la ligne de commande. Au moins une intention
+  doit résulter de la combinaison des deux (sinon erreur explicite dès la frontière CLI,
+  qui nomme le fichier en cause si un `--intents-file` vide a été fourni).
+- **Une seule intention résultante reprend exactement le chemin mono-intention existant**,
+  in-process, inchangé. Deux intentions ou plus basculent en **mode batch** : chaque
+  intention tourne **séquentiellement**, comme un sous-processus enfant `warden run
+  --intent <x>` du même binaire — process neuf, `run_id` neuf, worktrees neufs — sans
+  aucun état en mémoire partagé entre intentions par construction. Le nettoyage
+  (`orchestrator::recover_crashed_runs`, agents orphelins tués, worktrees nettoyés) est
+  garanti à la sortie propre de chaque enfant, et appliqué au redémarrage suivant sinon.
+- **Politique d'échec** : par défaut, le batch continue après une intention non convergée
+  (budget de cycles épuisé ou run `Failed`) et passe à la suivante sur une base saine.
+  `--fail-fast` (sans effet pour une intention unique) arrête le batch à la première
+  intention non convergée et marque toutes les suivantes `Skipped`.
+- **Ctrl-C** : l'intention en cours va jusqu'à son terme, les intentions restantes sont
+  marquées `Skipped`, et le résumé du batch s'affiche quand même.
+- **Rapport final** : une ligne de statut par intention plus un total `batch summary:
+  X/N intent(s) converged`. Code de sortie non nul si au moins une intention n'a pas
+  convergé.
 
 ### Changed — Issue #70 : découpage de `orchestrator.rs` en sous-modules
 

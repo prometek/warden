@@ -5079,3 +5079,474 @@ async fn e2e_a_custom_steps_worktree_and_process_are_reclaimed_by_crash_recovery
         "recovery must mark the custom step's orphaned agent_processes row ended"
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #72: multi-intent batch mode.
+// ---------------------------------------------------------------------
+
+/// Every `"run <id> finished: <State>"` line in `stdout`, in order -- the
+/// batch equivalent of [`extract_run_id`] (which only ever expects one).
+fn extract_all_finished_lines(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("run ")
+                .and_then(|rest| rest.split_once(" finished: "))
+                .map(|(id, state)| (id.to_string(), state.to_string()))
+        })
+        .collect()
+}
+
+/// Issue #72 acceptance criterion: "3 intents provided -> processed one
+/// after another, each to completion". Reuses the exact coder/reviewer/
+/// tester fixture the single-intent "converges cleanly" tests already use
+/// (`APPEND_NOTES_CODER_BODY`/`NOOP_BODY`/`NOOP_BODY`) -- proving batch mode
+/// converges each intent is the same claim those tests make, just repeated
+/// three times through one `warden run` invocation with three `--intent`
+/// flags instead of three separate invocations.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_three_intents_each_converge_as_their_own_isolated_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "batch intent one",
+            "--intent",
+            "batch intent two",
+            "--intent",
+            "batch intent three",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("batch summary: 3/3 intent(s) converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let finished = extract_all_finished_lines(&stdout);
+    assert_eq!(
+        finished.len(),
+        3,
+        "expected exactly 3 \"finished:\" lines, one per intent, got: {stdout:?}"
+    );
+    assert!(
+        finished.iter().all(|(_, state)| state == "Converged"),
+        "every intent must converge: {finished:?}"
+    );
+
+    // Issue #72: "between two intents ... no shared state" -- each of the 3
+    // intents got its own distinct run_id and its own `runs` row.
+    let mut run_ids: Vec<&str> = finished.iter().map(|(id, _)| id.as_str()).collect();
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    assert_eq!(
+        run_ids.len(),
+        3,
+        "expected 3 distinct run ids: {finished:?}"
+    );
+
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    for (run_id, _) in &finished {
+        let run = warden::db::get_run(&pool, run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Converged);
+    }
+}
+
+/// Issue #72 acceptance criterion: "a failing intent doesn't block the
+/// following ones (continue by default)". The reviewer here only ever
+/// blocks when the incoming payload's `intent` field carries a specific
+/// marker (checked against `$stdin_file`, exactly like
+/// `e2e_run_intent_never_leaks_into_the_coders_argv`'s existing use of
+/// `$stdin_file` for a reviewer/tester-observable marker) -- so exactly the
+/// middle of 3 intents is forced into `StepCyclesExceeded(1)` while the
+/// other two converge normally, proving the batch actually continued past
+/// it rather than stopping.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_continues_past_a_non_converged_intent_by_default() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // Issue #20 Scope B / A2 (ADR-0012): only the coder's own payload
+    // carries the run `intent` -- the reviewer/tester payload never does
+    // (`AgentInputMessage::for_finding_agent` has no `intent` field at all).
+    // So this coder fragment writes the intent it *did* receive into the
+    // file it commits, making it observable to the reviewer the only way a
+    // reviewer ever sees anything about a cycle: through the coder's own
+    // diff (also part of its own `$stdin_file` payload).
+    let coder_body_writes_its_own_intent_into_the_commit = r#"
+intent=$(python3 -c "import json; print(json.load(open('$stdin_file'))['intent'])")
+printf '%s\n' "$intent" >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#;
+    write_fake_claude(
+        bin_dir.path(),
+        coder_body_writes_its_own_intent_into_the_commit,
+        r#"if grep -q 'BATCH_FORCE_FAIL_MARKER' "$stdin_file"; then
+    printf '%s\n' '{"source":"reviewer","severity":"blocking","description":"forced failure"}' > "$WARDEN_RESULT_FILE"
+fi"#,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "first intent converges",
+            "--intent",
+            "second intent BATCH_FORCE_FAIL_MARKER never converges",
+            "--intent",
+            "third intent converges",
+            "--max-review-cycles",
+            "1",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stdout(contains("batch summary: 2/3 intent(s) converged"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let finished = extract_all_finished_lines(&stdout);
+    assert_eq!(
+        finished.len(),
+        3,
+        "all 3 intents must have run (continue-by-default), got: {stdout:?}"
+    );
+    assert_eq!(finished[0].1, "Converged");
+    // Issue #73: the reviewer step exhausting its budget is now the generic
+    // per-step `StepCyclesExceeded(1)` (step index 1 = reviewer), not the old
+    // phase-specific `MaxReviewCyclesExceeded`.
+    assert_eq!(finished[1].1, "StepCyclesExceeded(1)");
+    assert_eq!(finished[2].1, "Converged");
+}
+
+/// Issue #72 acceptance criterion: `--fail-fast` stops the batch at the
+/// first non-converged intent, recording every intent after it as
+/// `Skipped` -- never even attempted (no `"... started"`/`"... finished:
+/// ..."` line for it at all, and no `runs` row in SQLite).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_fail_fast_stops_at_the_first_non_converged_intent() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        r#"printf '%s\n' '{"source":"reviewer","severity":"blocking","description":"always blocking"}' > "$WARDEN_RESULT_FILE""#,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "never converges (always blocking reviewer)",
+            "--intent",
+            "would converge, but must be skipped",
+            "--max-review-cycles",
+            "1",
+            "--fail-fast",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stdout(contains(
+            "SKIPPED -- earlier intent failed under --fail-fast",
+        ));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let finished = extract_all_finished_lines(&stdout);
+    assert_eq!(
+        finished.len(),
+        1,
+        "the second intent must never have been attempted under --fail-fast: {stdout:?}"
+    );
+    assert_eq!(finished[0].1, "StepCyclesExceeded(1)");
+}
+
+/// Issue #72: `--intents-file` entries run first (file order), followed by
+/// any `--intent` flags, in the order given -- and the two sources combine
+/// rather than one overriding the other.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_combines_intents_file_entries_with_repeated_intent_flags() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let intents_file = warden_home.path().join("intents.txt");
+    std::fs::write(
+        &intents_file,
+        "# a comment, ignored\nfrom file: first\n\nfrom file: second\n",
+    )
+    .unwrap();
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intents-file",
+            intents_file.to_str().unwrap(),
+            "--intent",
+            "from flag: third",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("batch summary: 3/3 intent(s) converged"))
+        .stdout(contains("[1/3] \"from file: first\""))
+        .stdout(contains("[2/3] \"from file: second\""))
+        .stdout(contains("[3/3] \"from flag: third\""));
+}
+
+/// Issue #72: neither `--intent` nor `--intents-file` is required to be
+/// present individually (each alone would make the other pointless to
+/// support), but at least one intent must result from the two combined --
+/// rejected as a clean CLI error rather than starting a run with an empty
+/// intent.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_without_any_intent_is_a_clean_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    warden_command()
+        .0
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("no intent provided"));
+}
+
+/// Issue #72 review, LOW 2: an `--intents-file` that was actually supplied
+/// but contributed zero intents (every line blank or a comment) must name
+/// the file in the error -- the generic "no intent provided" message from
+/// [`e2e_run_without_any_intent_is_a_clean_cli_error`] reads as if no file
+/// was given at all, which is misleading when one very much was.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_run_with_an_all_comment_intents_file_names_the_file_in_the_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+
+    let intents_file = warden_home.path().join("empty-intents.txt");
+    std::fs::write(&intents_file, "# nothing but comments\n\n   \n").unwrap();
+
+    warden_command()
+        .0
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intents-file",
+            intents_file.to_str().unwrap(),
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("contained no intents"))
+        .stderr(contains(intents_file.to_str().unwrap().to_string()));
+}
+
+/// Issue #72 acceptance criterion: a Ctrl-C (`SIGINT`) during batch mode lets
+/// the in-flight intent's own child run to completion rather than killing
+/// it, then records every intent after it as `Skipped` (never even
+/// attempted) instead of continuing the batch -- the summary is still
+/// printed and the process still exits non-zero.
+///
+/// Driven against the real compiled binary via a raw [`SyncCommand`] (not
+/// `warden_command()`/`assert_cmd`, same reason as
+/// `e2e_run_survives_a_closed_stdout_without_panicking` above: this needs to
+/// observe -- and signal -- the batch parent while it is still running,
+/// which `assert_cmd::Command` does not expose). The first intent's coder
+/// fragment sleeps briefly (deterministically identified by a marker in its
+/// own intent text, checked against `$stdin_file`, exactly like
+/// `e2e_batch_continues_past_a_non_converged_intent_by_default`'s
+/// `BATCH_FORCE_FAIL_MARKER` above) so there is a real window, after its
+/// child has printed its own `"... started"` line but strictly before it
+/// converges, in which to send `SIGINT` to the *batch parent's* pid only
+/// (never the grandchild) -- proving the batch-level cancellation flag,
+/// not a killed child, is what stops the remaining intents.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_ctrl_c_lets_the_in_flight_intent_finish_then_skips_the_rest() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+
+    let coder_body_sleeps_only_for_the_marked_intent = r#"
+intent=$(python3 -c "import json; print(json.load(open('$stdin_file'))['intent'])")
+case "$intent" in
+    *SLOW_FIRST_INTENT*) sleep 2 ;;
+esac
+echo hello >> notes.txt
+git add notes.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+"#;
+    write_fake_claude(
+        bin_dir.path(),
+        coder_body_sleeps_only_for_the_marked_intent,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let bin_path = env!("CARGO_BIN_EXE_warden");
+    let mut child = SyncCommand::new(bin_path)
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "first SLOW_FIRST_INTENT intent",
+            "--intent",
+            "second intent, must be skipped",
+            "--intent",
+            "third intent, must be skipped",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn warden");
+
+    let pid = child.id();
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    let child_stderr = child.stderr.take().expect("piped stderr");
+
+    let stderr_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut stderr = child_stderr;
+        stderr.read_to_string(&mut buf).ok();
+        buf
+    });
+
+    // Reads stdout live (rather than waiting for the whole process to
+    // finish) so `SIGINT` can be sent while the first intent's own child is
+    // still running its 2s sleep -- well before it converges.
+    let stdout_lines: Vec<String> = {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(child_stdout);
+        let mut lines = Vec::new();
+        let mut sent_sigint = false;
+        for line in reader.lines() {
+            let line = line.expect("read batch stdout line");
+            let is_started_line = line.ends_with(" started");
+            lines.push(line);
+            if is_started_line && !sent_sigint {
+                let status = SyncCommand::new("kill")
+                    .args(["-INT", &pid.to_string()])
+                    .status()
+                    .expect("send SIGINT to the batch parent");
+                assert!(status.success(), "`kill -INT {pid}` must succeed");
+                sent_sigint = true;
+            }
+        }
+        lines
+    };
+
+    let status = child.wait().expect("wait for warden to exit");
+    let stderr_output = stderr_thread.join().expect("stderr thread");
+    let stdout = stdout_lines.join("\n");
+
+    assert!(
+        !status.success(),
+        "the batch must exit non-zero: two of its three intents were skipped rather than \
+         converged (stdout: {stdout:?}, stderr: {stderr_output:?})"
+    );
+
+    let finished = extract_all_finished_lines(&stdout);
+    assert_eq!(
+        finished.len(),
+        1,
+        "only the in-flight first intent should ever reach a \"finished:\" line; the second \
+         and third must never have been started: {stdout:?}"
+    );
+    assert_eq!(
+        finished[0].1, "Converged",
+        "the in-flight intent must be left to finish (and converge) rather than being killed \
+         outright: {stdout:?}"
+    );
+
+    assert!(
+        stdout.contains("batch summary: 1/3 intent(s) converged"),
+        "the batch summary must still be printed after a Ctrl-C cancellation: {stdout:?}"
+    );
+    let skipped_for_cancellation = stdout
+        .matches("SKIPPED -- batch was cancelled (Ctrl-C)")
+        .count();
+    assert_eq!(
+        skipped_for_cancellation, 2,
+        "both the second and third intents must be recorded as skipped due to cancellation, \
+         not attempted: {stdout:?}"
+    );
+}
