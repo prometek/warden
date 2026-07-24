@@ -268,6 +268,11 @@ Flags de `warden run` :
 - `--max-test-cycles <N>` — nombre maximum de passages du tester se soldant par un finding
   bloquant avant abandon (`RunState::MaxTestCyclesExceeded`, issue #43). Doit être ≥ 1.
   Défaut : `5`.
+- `--max-cycles <N>` (issue #73) — budget de cycles partagé par toute étape définie au-delà
+  du trio intégré coder/reviewer/tester dans `.warden/workflow.yaml` (`RunState::StepCyclesExceeded`).
+  Distinct de `--max-review-cycles`/`--max-test-cycles`, qui ne bornent que le trio intégré.
+  Sans étape personnalisée, ce flag n'a aucun effet. Doit être ≥ 1. Défaut : `5`. Voir
+  "Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73)" ci-dessous.
 - `--warden-home <PATH>` — répertoire d'état de Warden (base SQLite + worktrees).
   Défaut : `~/.warden`.
 - `--evidence-tool <playwright|asciinema>` — force l'outil de capture de preuve
@@ -440,7 +445,7 @@ la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML i
 > reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
 > donc plus aux adaptateurs intégrés.
 
-### Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73)
+### Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73/ADR-0020)
 
 Par défaut, un run suit le pipeline intégré coder -> gate review -> gate test — rien à
 faire, aucun fichier requis. Un `.warden/workflow.yaml` optionnel à la racine du repo sous
@@ -476,9 +481,11 @@ identique à celui d'avant l'issue #73 — le pipeline intégré (`--max-review-
 **Limite actuelle du moteur** : les trois premières étapes doivent être exactement
 `coder`, `reviewer`, `tester` dans cet ordre — la boucle de convergence ne fait
 qu'**ajouter** des étapes après ce pipeline intégré (qui garde sa propre résolution
-d'agent, ADR-0026), jamais les réordonner, remplacer, ni omettre. Toute étape
+d'agent, ADR-0018), jamais les réordonner, remplacer, ni omettre. Toute étape
 au-delà partage un unique budget de cycles, contrôlé par `--max-cycles` (défaut 5),
-distinct de `--max-review-cycles`/`--max-test-cycles`.
+distinct de `--max-review-cycles`/`--max-test-cycles`. Ces étapes personnalisées
+n'ont pour l'instant ni suivi de tokens par rôle, ni récupération de worktree après
+crash (limites de portée v1, voir ADR-0020).
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
 `workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.

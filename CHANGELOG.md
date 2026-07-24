@@ -7,6 +7,44 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #73 / ADR-0020 : workflow personnalisable piloté par la donnée (`.warden/workflow.yaml`)
+
+- **`.warden/workflow.yaml`** (optionnel, pur YAML) : le pipeline coder → gate review → gate
+  test n'est plus câblé en dur — un repo peut désormais déclarer des étapes supplémentaires
+  après ce trio intégré, chacune liant un `role` (nom ouvert, plus l'enum fermé
+  `AgentRole` d'avant) à un `agent` résolu vers `.claude/agents/<agent>.md` (convention
+  ADR-0013), avec un `gate: loop-until-clean` optionnel (reboucle vers le coder sur un
+  finding bloquant, comme le reviewer/tester aujourd'hui) ou l'absence de `gate` (simple
+  pass-through). **Rétro-compatibilité stricte** : sans ce fichier, `Workflow::builtin_default()`
+  reproduit exactement le pipeline d'avant l'issue #73 — pinné par un test core et un test
+  e2e CLI dédiés.
+- **`--max-cycles <N>`** (nouveau flag `warden run`, défaut `5`) : budget de cycles partagé
+  par toute étape au-delà du trio intégré, distinct de `--max-review-cycles`/
+  `--max-test-cycles` qui continuent de ne borner que reviewer/tester.
+- Nouveau rôle démontré de bout en bout : **`techlead`** — voir
+  `examples/workflows/with-techlead/` (`workflow.yaml` + `.claude/agents/techlead.md` +
+  README d'utilisation).
+- `RunState` généralisé : `RunningStep(u32)`/`StepCyclesExceeded(u32)` remplacent les
+  variantes spécifiques aux rôles (`Reviewing`/`Testing`/`MaxReviewCyclesExceeded`/
+  `MaxTestCyclesExceeded`), avec une migration DB (`0009_generic_workflow_state.sql`) qui
+  remappe sans perte tout état persisté d'un run antérieur. `FindingSource`/
+  `decide_next_state_for_step` généralisés en miroir : les findings d'un rôle personnalisé
+  s'agrègent dans la boucle de convergence exactement comme ceux du reviewer/tester
+  aujourd'hui.
+- **Durcissement (revue)** : `Workflow::parse_yaml` rejette tout `role`/`agent` contenant un
+  séparateur de chemin (`/`, `\`) ou une composante `..`, avant que ces valeurs ne soient
+  jointes telles quelles à un chemin filesystem (`.claude/agents/<agent>.md`, répertoire de
+  worktree par rôle) — ferme un risque de traversée de chemin sur une valeur de
+  `workflow.yaml` non validée.
+- **Limite v1 connue, documentée dans le README et l'exemple** : le moteur n'autorise que
+  l'**ajout** d'étapes après le trio intégré `coder`/`reviewer`/`tester`, qui doit rester
+  en tête dans cet ordre exact — réordonnancement/remplacement/omission du trio rejetés
+  avec une erreur claire (réagencement complet reporté à une itération ultérieure). Les
+  étapes personnalisées n'ont pour l'instant ni suivi de tokens par rôle, ni récupération
+  de worktree après crash (colonnes dédiées encore câblées uniquement pour les trois rôles
+  intégrés) ; une étape reste toujours un agent (les types hook/policy restent hors
+  périmètre de cette livraison).
+
 ### Added — Issue #71 : adaptateurs multi-CLI `codex` + `mistral`
 
 - **`warden::tool_adapter::CodexAdapter`** (`--tool codex`) — enveloppe le CLI OpenAI Codex
