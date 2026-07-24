@@ -383,6 +383,13 @@ impl Workflow {
                 )));
             }
 
+            if index == 0 && step.evidence {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "the first step (role {role:?}) is the pipeline's producer and cannot \
+                     capture evidence -- remove its \"evidence\" key"
+                )));
+            }
+
             let budget = if index == 0 {
                 if step.budget.is_some() {
                     return Err(CoreError::InvalidWorkflow(format!(
@@ -783,6 +790,19 @@ steps:
     #[test]
     fn rejects_a_budget_declared_on_the_first_step() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    budget: extra\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
+    }
+
+    /// Review follow-up (MEDIUM introduced by F2): the producer never runs
+    /// through `run_gated_step` (the only place `captures_evidence` is ever
+    /// consulted), so `evidence: true` on the first step used to parse fine
+    /// and silently capture nothing -- a silent misconfiguration, and
+    /// asymmetric with the sibling `budget`-on-producer rejection above.
+    #[test]
+    fn rejects_an_evidence_flag_declared_on_the_first_step() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    evidence: true\n";
         let error = Workflow::parse_yaml(yaml).unwrap_err();
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
         assert!(error.to_string().contains("producer"), "{error}");
