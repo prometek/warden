@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens\n        FROM cycle_token_usage WHERE cycle_id = ? AND role = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "input_tokens",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cycle_token_usage",
+            "name": "input_tokens"
+          }
+        }
+      },
+      {
+        "name": "output_tokens",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cycle_token_usage",
+            "name": "output_tokens"
+          }
+        }
+      },
+      {
+        "name": "cache_read_tokens",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cycle_token_usage",
+            "name": "cache_read_tokens"
+          }
+        }
+      },
+      {
+        "name": "cache_creation_tokens",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "cycle_token_usage",
+            "name": "cache_creation_tokens"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "3be40eb0f95ca09bb30b027ea668e677d0c98b737aaa40e4073cbdd0316cbefc"
+}

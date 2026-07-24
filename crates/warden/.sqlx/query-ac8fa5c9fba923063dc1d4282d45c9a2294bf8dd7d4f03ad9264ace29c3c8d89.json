@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM cycle_worktrees WHERE cycle_id = ? AND role = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ac8fa5c9fba923063dc1d4282d45c9a2294bf8dd7d4f03ad9264ace29c3c8d89"
+}

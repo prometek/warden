@@ -12,8 +12,8 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    AgentRole, EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState,
-    Severity, TokenUsage,
+    EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
+    TokenUsage,
 };
 
 use crate::error::{Result, WardenError};
@@ -642,11 +642,9 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
                 WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL
             )
             OR EXISTS (
-                SELECT 1 FROM cycles
+                SELECT 1 FROM cycle_worktrees
+                JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
                 WHERE cycles.run_id = runs.id
-                  AND (cycles.coder_worktree_path IS NOT NULL
-                       OR cycles.reviewer_worktree_path IS NOT NULL
-                       OR cycles.tester_worktree_path IS NOT NULL)
             )
           )
         "#
@@ -695,194 +693,97 @@ pub async fn set_cycle_commit_sha(
     Ok(())
 }
 
+/// Issue #73 follow-up (trio-unification): records/overwrites the worktree
+/// path for `role` on `cycle_id` -- generalized from three hardcoded
+/// `cycles.{coder,reviewer,tester}_worktree_path` columns to one row per
+/// (cycle, role) in `cycle_worktrees` (migrations/0010), open to any role a
+/// workflow declares. Every step, built-in or custom, calls this now -- see
+/// `warden::orchestrator::InvocationRole`'s removal: there is no longer a
+/// role for which this bookkeeping is skipped.
 pub async fn set_cycle_worktree_path(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     path: &str,
 ) -> Result<()> {
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                "UPDATE cycles SET coder_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                "UPDATE cycles SET reviewer_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                "UPDATE cycles SET tester_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        "INSERT INTO cycle_worktrees (cycle_id, role, worktree_path) VALUES (?, ?, ?) \
+         ON CONFLICT (cycle_id, role) DO UPDATE SET worktree_path = excluded.worktree_path",
+        cycle_id,
+        role,
+        path,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Nulls out the recorded worktree path for `role` on `cycle_id`, once crash
-/// recovery has actually removed that worktree from disk (issue #6). This is
-/// what lets [`list_failed_runs_with_pending_cleanup`] stop returning a run
-/// after its orphan cleanup succeeds — the run stays `Failed` forever (a
-/// terminal state), but the *recorded path* is the signal that tells a later
-/// recovery pass whether there is still anything left to reclaim for it.
+/// Removes the recorded worktree path row for `role` on `cycle_id`, once
+/// crash recovery has actually removed that worktree from disk (issue #6).
+/// This is what lets [`list_failed_runs_with_pending_cleanup`] stop
+/// returning a run after its orphan cleanup succeeds — the run stays
+/// `Failed` forever (a terminal state), but the *recorded row* is the
+/// signal that tells a later recovery pass whether there is still anything
+/// left to reclaim for it.
 pub async fn clear_cycle_worktree_path(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
 ) -> Result<()> {
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                "UPDATE cycles SET coder_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                "UPDATE cycles SET reviewer_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                "UPDATE cycles SET tester_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        "DELETE FROM cycle_worktrees WHERE cycle_id = ? AND role = ?",
+        cycle_id,
+        role,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Issue #53: accumulates one agent invocation's token usage onto `role`'s
-/// running total for this cycle -- the cycle-level half of the aggregation
-/// (see [`add_run_token_usage`]'s own docs for the run-level half and the
-/// shared "cache columns only advance when reported" rule both follow).
-/// Three near-identical arms rather than a dynamic column name, matching
-/// [`set_cycle_worktree_path`]'s own per-role match (code-standards.md: no
-/// SQL built by string concatenation).
+/// Issue #53 (generalized by the trio-unification follow-up, issue #73):
+/// accumulates one agent invocation's token usage onto `role`'s running
+/// total for this cycle -- the cycle-level half of the aggregation (see
+/// [`add_run_token_usage`]'s own docs for the run-level half and the shared
+/// "cache columns only advance when reported" rule both follow). One
+/// upserted row per (cycle, role) in `cycle_token_usage` (migrations/0010)
+/// rather than three hardcoded column groups -- open to any role.
 pub async fn add_cycle_role_token_usage(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     usage: &TokenUsage,
 ) -> Result<()> {
-    let input_tokens = checked_i64(usage.input_tokens, "cycles.<role>_input_tokens")?;
-    let output_tokens = checked_i64(usage.output_tokens, "cycles.<role>_output_tokens")?;
+    let input_tokens = checked_i64(usage.input_tokens, "cycle_token_usage.input_tokens")?;
+    let output_tokens = checked_i64(usage.output_tokens, "cycle_token_usage.output_tokens")?;
     let cache_read_tokens = usage
         .cache_read_tokens
-        .map(|value| checked_i64(value, "cycles.<role>_cache_read_tokens"))
+        .map(|value| checked_i64(value, "cycle_token_usage.cache_read_tokens"))
         .transpose()?;
     let cache_creation_tokens = usage
         .cache_creation_tokens
-        .map(|value| checked_i64(value, "cycles.<role>_cache_creation_tokens"))
+        .map(|value| checked_i64(value, "cycle_token_usage.cache_creation_tokens"))
         .transpose()?;
 
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    coder_input_tokens = COALESCE(coder_input_tokens, 0) + ?,
-                    coder_output_tokens = COALESCE(coder_output_tokens, 0) + ?,
-                    coder_cache_read_tokens = CASE WHEN ? IS NULL THEN coder_cache_read_tokens ELSE COALESCE(coder_cache_read_tokens, 0) + ? END,
-                    coder_cache_creation_tokens = CASE WHEN ? IS NULL THEN coder_cache_creation_tokens ELSE COALESCE(coder_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    reviewer_input_tokens = COALESCE(reviewer_input_tokens, 0) + ?,
-                    reviewer_output_tokens = COALESCE(reviewer_output_tokens, 0) + ?,
-                    reviewer_cache_read_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_read_tokens ELSE COALESCE(reviewer_cache_read_tokens, 0) + ? END,
-                    reviewer_cache_creation_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_creation_tokens ELSE COALESCE(reviewer_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    tester_input_tokens = COALESCE(tester_input_tokens, 0) + ?,
-                    tester_output_tokens = COALESCE(tester_output_tokens, 0) + ?,
-                    tester_cache_read_tokens = CASE WHEN ? IS NULL THEN tester_cache_read_tokens ELSE COALESCE(tester_cache_read_tokens, 0) + ? END,
-                    tester_cache_creation_tokens = CASE WHEN ? IS NULL THEN tester_cache_creation_tokens ELSE COALESCE(tester_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        r#"
+        INSERT INTO cycle_token_usage (cycle_id, role, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (cycle_id, role) DO UPDATE SET
+            input_tokens = COALESCE(cycle_token_usage.input_tokens, 0) + excluded.input_tokens,
+            output_tokens = COALESCE(cycle_token_usage.output_tokens, 0) + excluded.output_tokens,
+            cache_read_tokens = CASE WHEN excluded.cache_read_tokens IS NULL THEN cycle_token_usage.cache_read_tokens ELSE COALESCE(cycle_token_usage.cache_read_tokens, 0) + excluded.cache_read_tokens END,
+            cache_creation_tokens = CASE WHEN excluded.cache_creation_tokens IS NULL THEN cycle_token_usage.cache_creation_tokens ELSE COALESCE(cycle_token_usage.cache_creation_tokens, 0) + excluded.cache_creation_tokens END
+        "#,
+        cycle_id,
+        role,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
-}
-
-/// Raw shape of `cycles`' twelve per-role token-count columns (issue #53),
-/// read back once per [`get_cycle_role_token_usage`] call and then narrowed
-/// to the requested `role`'s four columns -- avoids three near-duplicate
-/// `SELECT`s (one per role) for what is, from the database's own point of
-/// view, a single row read.
-struct CycleTokenUsageRow {
-    coder_input_tokens: Option<i64>,
-    coder_output_tokens: Option<i64>,
-    coder_cache_read_tokens: Option<i64>,
-    coder_cache_creation_tokens: Option<i64>,
-    reviewer_input_tokens: Option<i64>,
-    reviewer_output_tokens: Option<i64>,
-    reviewer_cache_read_tokens: Option<i64>,
-    reviewer_cache_creation_tokens: Option<i64>,
-    tester_input_tokens: Option<i64>,
-    tester_output_tokens: Option<i64>,
-    tester_cache_read_tokens: Option<i64>,
-    tester_cache_creation_tokens: Option<i64>,
 }
 
 /// The running total accumulated by [`add_cycle_role_token_usage`] for
@@ -892,48 +793,26 @@ struct CycleTokenUsageRow {
 pub async fn get_cycle_role_token_usage(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
 ) -> Result<Option<TokenUsage>> {
-    let row = sqlx::query_as!(
-        CycleTokenUsageRow,
+    let row = sqlx::query!(
         r#"
-        SELECT coder_input_tokens, coder_output_tokens, coder_cache_read_tokens, coder_cache_creation_tokens,
-               reviewer_input_tokens, reviewer_output_tokens, reviewer_cache_read_tokens, reviewer_cache_creation_tokens,
-               tester_input_tokens, tester_output_tokens, tester_cache_read_tokens, tester_cache_creation_tokens
-        FROM cycles WHERE id = ?
+        SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+        FROM cycle_token_usage WHERE cycle_id = ? AND role = ?
         "#,
         cycle_id,
+        role,
     )
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) = match role {
-        AgentRole::Coder => (
-            row.coder_input_tokens,
-            row.coder_output_tokens,
-            row.coder_cache_read_tokens,
-            row.coder_cache_creation_tokens,
-        ),
-        AgentRole::Reviewer => (
-            row.reviewer_input_tokens,
-            row.reviewer_output_tokens,
-            row.reviewer_cache_read_tokens,
-            row.reviewer_cache_creation_tokens,
-        ),
-        AgentRole::Tester => (
-            row.tester_input_tokens,
-            row.tester_output_tokens,
-            row.tester_cache_read_tokens,
-            row.tester_cache_creation_tokens,
-        ),
-    };
     row_to_token_usage(
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_creation_tokens,
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read_tokens,
+        row.cache_creation_tokens,
     )
 }
 
@@ -945,34 +824,25 @@ pub async fn close_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The distinct, non-null worktree paths recorded across every cycle of
-/// `run_id` (`cycles.coder_worktree_path` / `reviewer_worktree_path` /
-/// `tester_worktree_path`). Used by crash recovery to find worktrees that
-/// may have been orphaned when the orchestrator that owned them died before
-/// it could call `Worktree::remove` (issue #6).
+/// The distinct worktree paths recorded across every cycle of `run_id`
+/// (`cycle_worktrees`, migrations/0010). Used by crash recovery to find
+/// worktrees that may have been orphaned when the orchestrator that owned
+/// them died before it could call `Worktree::remove` (issue #6) -- every
+/// role's, built-in or custom, since issue #73's trio-unification follow-up.
 pub async fn list_worktree_paths_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<String>> {
     let rows = sqlx::query!(
         r#"
-        SELECT coder_worktree_path, reviewer_worktree_path, tester_worktree_path
-        FROM cycles
-        WHERE run_id = ?
+        SELECT DISTINCT cycle_worktrees.worktree_path as "worktree_path!"
+        FROM cycle_worktrees
+        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
+        WHERE cycles.run_id = ?
         "#,
         run_id,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut paths: Vec<String> = rows
-        .into_iter()
-        .flat_map(|row| {
-            [
-                row.coder_worktree_path,
-                row.reviewer_worktree_path,
-                row.tester_worktree_path,
-            ]
-        })
-        .flatten()
-        .collect();
+    let mut paths: Vec<String> = rows.into_iter().map(|row| row.worktree_path).collect();
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -985,56 +855,41 @@ pub async fn list_worktree_paths_for_run(pool: &SqlitePool, run_id: &str) -> Res
 /// paths for simple removal and loses that association.
 pub struct CycleWorktreeEntry {
     pub cycle_id: String,
-    pub role: AgentRole,
+    pub role: String,
     pub path: String,
 }
 
-/// Every non-null worktree path recorded across `run_id`'s cycles, tagged
-/// with the cycle/role it came from. Used by crash recovery so a
-/// successfully removed worktree's path can be cleared afterwards
-/// (issue #6): without that, a `Failed` run would look like it still has
-/// orphaned worktrees forever, since the path column is otherwise never
-/// cleared once a cycle records it.
+/// Every worktree path recorded across `run_id`'s cycles, tagged with the
+/// cycle/role it came from. Used by crash recovery so a successfully
+/// removed worktree's path can be cleared afterwards (issue #6): without
+/// that, a `Failed` run would look like it still has orphaned worktrees
+/// forever, since the row is otherwise never cleared once a cycle records
+/// it. Every role's, built-in or custom (issue #73's trio-unification
+/// follow-up) -- no step's worktree leaks on crash anymore.
 pub async fn list_cycle_worktree_entries_for_run(
     pool: &SqlitePool,
     run_id: &str,
 ) -> Result<Vec<CycleWorktreeEntry>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id as "id!", coder_worktree_path, reviewer_worktree_path, tester_worktree_path
-        FROM cycles
-        WHERE run_id = ?
+        SELECT cycle_worktrees.cycle_id as "cycle_id!", cycle_worktrees.role as "role!", cycle_worktrees.worktree_path as "worktree_path!"
+        FROM cycle_worktrees
+        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
+        WHERE cycles.run_id = ?
         "#,
         run_id,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut entries = Vec::new();
-    for row in rows {
-        if let Some(path) = row.coder_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Coder,
-                path,
-            });
-        }
-        if let Some(path) = row.reviewer_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Reviewer,
-                path,
-            });
-        }
-        if let Some(path) = row.tester_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Tester,
-                path,
-            });
-        }
-    }
-    Ok(entries)
+    Ok(rows
+        .into_iter()
+        .map(|row| CycleWorktreeEntry {
+            cycle_id: row.cycle_id,
+            role: row.role,
+            path: row.worktree_path,
+        })
+        .collect())
 }
 
 pub async fn insert_finding(
@@ -1281,12 +1136,11 @@ pub async fn insert_agent_process(
     pool: &SqlitePool,
     id: &str,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     pid: u32,
     worktree_path: &str,
 ) -> Result<()> {
     let now = now_rfc3339();
-    let role = role.as_str();
     let pid_started_at_unix =
         crate::process::process_start_time(pid).unwrap_or(crate::process::UNKNOWN_START_TIME);
     let pid = i64::from(pid);
@@ -1396,7 +1250,6 @@ pub async fn list_open_agent_processes_for_run(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use warden_core::AgentRole;
 
     async fn test_pool() -> (TempDir, SqlitePool) {
         let dir = TempDir::new().unwrap();
@@ -1551,7 +1404,7 @@ mod tests {
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-1", "run-4", 1).await.unwrap();
-        set_cycle_worktree_path(&pool, "cycle-1", AgentRole::Coder, "/tmp/wt/coder")
+        set_cycle_worktree_path(&pool, "cycle-1", "coder", "/tmp/wt/coder")
             .await
             .unwrap();
 
@@ -1597,7 +1450,7 @@ mod tests {
             .await
             .unwrap();
 
-        let usage = get_cycle_role_token_usage(&pool, "cycle-usage-none", AgentRole::Coder)
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage-none", "coder")
             .await
             .unwrap();
         assert_eq!(
@@ -1629,7 +1482,7 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(100, 50, Some(10), None),
         )
         .await
@@ -1637,13 +1490,13 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(20, 10, None, Some(3)),
         )
         .await
         .unwrap();
 
-        let usage = get_cycle_role_token_usage(&pool, "cycle-usage", AgentRole::Coder)
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage", "coder")
             .await
             .unwrap()
             .unwrap();
@@ -1681,7 +1534,7 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage-roles",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(100, 50, None, None),
         )
         .await
@@ -1689,22 +1542,21 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage-roles",
-            AgentRole::Reviewer,
+            "reviewer",
             &TokenUsage::new(7, 3, None, None),
         )
         .await
         .unwrap();
 
-        let coder_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Coder)
+        let coder_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", "coder")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(coder_usage.input_tokens, 100);
 
-        let tester_usage =
-            get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Tester)
-                .await
-                .unwrap();
+        let tester_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", "tester")
+            .await
+            .unwrap();
         assert_eq!(
             tester_usage, None,
             "the tester never ran on this cycle -- must stay n/a"
@@ -1821,7 +1673,7 @@ mod tests {
         let result = add_cycle_role_token_usage(
             &pool,
             "cycle-usage-overflow",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(overflowing, 0, None, None),
         )
         .await;
@@ -1978,16 +1830,9 @@ mod tests {
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-5", "run-5", 1).await.unwrap();
-        insert_agent_process(
-            &pool,
-            "proc-1",
-            "cycle-5",
-            AgentRole::Coder,
-            424242,
-            "/tmp/wt/coder",
-        )
-        .await
-        .unwrap();
+        insert_agent_process(&pool, "proc-1", "cycle-5", "coder", 424242, "/tmp/wt/coder")
+            .await
+            .unwrap();
 
         let open = latest_open_agent_process_for_run(&pool, "run-5")
             .await
@@ -2017,7 +1862,7 @@ mod tests {
             &pool,
             "proc-reviewer",
             "cycle-6",
-            AgentRole::Reviewer,
+            "reviewer",
             111,
             "/tmp/wt/reviewer",
         )
@@ -2027,7 +1872,7 @@ mod tests {
             &pool,
             "proc-tester",
             "cycle-6",
-            AgentRole::Tester,
+            "tester",
             222,
             "/tmp/wt/tester",
         )
@@ -2038,7 +1883,7 @@ mod tests {
             &pool,
             "proc-coder",
             "cycle-6",
-            AgentRole::Coder,
+            "coder",
             333,
             "/tmp/wt/coder",
         )
@@ -2078,13 +1923,13 @@ mod tests {
         insert_cycle(&pool, "cycle-8a", "run-8", 1).await.unwrap();
         insert_cycle(&pool, "cycle-8b", "run-8", 2).await.unwrap();
 
-        set_cycle_worktree_path(&pool, "cycle-8a", AgentRole::Coder, "/tmp/wt/coder-1")
+        set_cycle_worktree_path(&pool, "cycle-8a", "coder", "/tmp/wt/coder-1")
             .await
             .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-8a", AgentRole::Reviewer, "/tmp/wt/reviewer-1")
+        set_cycle_worktree_path(&pool, "cycle-8a", "reviewer", "/tmp/wt/reviewer-1")
             .await
             .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-8b", AgentRole::Coder, "/tmp/wt/coder-2")
+        set_cycle_worktree_path(&pool, "cycle-8b", "coder", "/tmp/wt/coder-2")
             .await
             .unwrap();
         // Tester path left unset for both cycles — must not appear as a
@@ -2519,19 +2364,14 @@ mod tests {
         insert_cycle(&pool, "cycle-clear", "run-clear", 1)
             .await
             .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder, "/tmp/wt/coder")
+        set_cycle_worktree_path(&pool, "cycle-clear", "coder", "/tmp/wt/coder")
             .await
             .unwrap();
-        set_cycle_worktree_path(
-            &pool,
-            "cycle-clear",
-            AgentRole::Reviewer,
-            "/tmp/wt/reviewer",
-        )
-        .await
-        .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-clear", "reviewer", "/tmp/wt/reviewer")
+            .await
+            .unwrap();
 
-        clear_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder)
+        clear_cycle_worktree_path(&pool, "cycle-clear", "coder")
             .await
             .unwrap();
 
@@ -2539,7 +2379,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1, "only the reviewer path should remain");
-        assert_eq!(entries[0].role, AgentRole::Reviewer);
+        assert_eq!(entries[0].role, "reviewer");
         assert_eq!(entries[0].path, "/tmp/wt/reviewer");
     }
 
@@ -2596,7 +2436,7 @@ mod tests {
             &pool,
             "proc-open",
             "cycle-open-proc",
-            AgentRole::Coder,
+            "coder",
             999_999_998,
             "/tmp/wt",
         )
@@ -2630,14 +2470,9 @@ mod tests {
         insert_cycle(&pool, "cycle-recorded-wt", "run-recorded-wt", 1)
             .await
             .unwrap();
-        set_cycle_worktree_path(
-            &pool,
-            "cycle-recorded-wt",
-            AgentRole::Coder,
-            "/tmp/wt/coder",
-        )
-        .await
-        .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-recorded-wt", "coder", "/tmp/wt/coder")
+            .await
+            .unwrap();
         update_run_state(&pool, "run-recorded-wt", RunState::Failed)
             .await
             .unwrap();
@@ -2649,7 +2484,7 @@ mod tests {
         // Once the path is cleared (simulating a successful removal), the
         // run must stop being returned -- no separate "cleanup done" flag,
         // the recorded path itself is the signal.
-        clear_cycle_worktree_path(&pool, "cycle-recorded-wt", AgentRole::Coder)
+        clear_cycle_worktree_path(&pool, "cycle-recorded-wt", "coder")
             .await
             .unwrap();
         let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();

@@ -204,7 +204,7 @@ async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()
         match worktree::remove_orphan_worktree(main_repo_path, Path::new(&entry.path)).await {
             Ok(()) => {
                 if let Err(error) =
-                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, entry.role).await
+                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, &entry.role).await
                 {
                     tracing::error!(run_id = %run.id, cycle_id = %entry.cycle_id, %error, "failed to clear recorded worktree path after removing it");
                 }
@@ -318,7 +318,7 @@ mod tests {
             &pool,
             "crashed-process",
             "crashed-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             "/tmp/wt",
         )
@@ -360,7 +360,7 @@ mod tests {
             &pool,
             "live-process",
             "live-cycle",
-            AgentRole::Coder,
+            "coder",
             live_pid,
             "/tmp/wt",
         )
@@ -423,7 +423,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "orphan-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -441,7 +441,7 @@ mod tests {
             &pool,
             "orphan-recovery-process",
             "orphan-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             &worktree_path.display().to_string(),
         )
@@ -502,7 +502,7 @@ mod tests {
             &pool,
             "orphan-process-live",
             "orphan-process-cycle",
-            AgentRole::Tester,
+            "tester",
             live_pid,
             "/tmp/wt/tester",
         )
@@ -524,7 +524,7 @@ mod tests {
             &pool,
             "orphan-process-dead",
             "orphan-process-cycle",
-            AgentRole::Reviewer,
+            "reviewer",
             dead_pid,
             "/tmp/wt/reviewer",
         )
@@ -702,7 +702,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "crash-during-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -721,7 +721,7 @@ mod tests {
             &pool,
             "crash-during-recovery-process",
             "crash-during-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             pid,
             &worktree_path.display().to_string(),
         )
@@ -817,7 +817,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "idempotent-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -833,7 +833,7 @@ mod tests {
             &pool,
             "idempotent-recovery-process",
             "idempotent-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             &worktree_path.display().to_string(),
         )

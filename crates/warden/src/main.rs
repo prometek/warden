@@ -34,9 +34,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a full convergence loop (coder -> [review ∥ test] -> reboucle if
-    /// needed) against a repository. Reviewer and tester run in parallel,
-    /// each in its own worktree synced onto the coder's commit (ADR-0003).
+    /// Run a full convergence loop against a repository: a producer step
+    /// (the coder, by default) followed by a sequence of gated steps
+    /// (reviewer/tester by default; customizable via `.warden/workflow.yaml`,
+    /// issue #73), reboucling to the producer on a blocking finding. Each
+    /// step runs sequentially, in its own worktree synced onto the
+    /// producer's commit (ADR-0003).
     Run {
         /// Path to the user's existing repository. Never written to
         /// directly; only worktrees created under `--warden-home` are.
@@ -421,80 +424,36 @@ fn resolve_tui_binary(explicit: Option<PathBuf>) -> PathBuf {
 /// dotfile under the repo root.
 const WORKFLOW_FILE: &str = ".warden/workflow.yaml";
 
-/// Loads and validates this run's pipeline (issue #73): `.warden/workflow.yaml`
-/// if present, else `Workflow::builtin_default()` -- the latter is what
-/// makes a run with no workflow file reproduce the pre-issue-#73 pipeline
-/// exactly (strict retro-compat).
+/// Loads and validates this run's pipeline shape (issue #73):
+/// `.warden/workflow.yaml` if present, else `Workflow::builtin_default()` --
+/// the latter is what makes a run with no workflow file reproduce the
+/// pre-issue-#73 pipeline exactly (strict retro-compat). Resolving each
+/// step's own *agent* is a separate concern (`run`'s own step-resolution
+/// loop, right after this call) -- it needs the adapter/user-config-dir/
+/// trust-repo-agents context this function deliberately doesn't take, so
+/// this one only ever fails on the workflow file itself being missing/
+/// malformed.
 ///
-/// **Current engine limitation, enforced here (not a silent restriction):**
-/// the convergence loop's built-in coder/reviewer/tester steps still run
-/// through their own existing, hardened path (`agent_def::resolve_agent_definition`'s
-/// role-asymmetric trust model) -- a custom `workflow.yaml` may only
-/// *append* steps after them, never reorder, replace, or omit them. A
-/// workflow whose first three steps aren't exactly `coder`, `reviewer`,
-/// `tester` (in that order) is rejected with a clear error naming the
-/// mismatch, rather than silently running something the loop cannot
-/// actually execute.
-///
-/// Every step beyond those three is resolved via
-/// `agent_def::resolve_custom_step_agent_definition` (`.claude/agents/<agent>.md`,
-/// ADR-0013) -- an unresolvable agent for any such step fails the run here,
-/// before anything is spawned, naming the role and the exact path expected.
-async fn load_workflow(
-    repo: &std::path::Path,
-) -> anyhow::Result<(warden_core::Workflow, Vec<warden_core::AgentDefinition>)> {
+/// **Issue #73 (trio-unification follow-up)**: no ordering restriction --
+/// the built-in coder/reviewer/tester no longer need to appear first, or at
+/// all. `Workflow::parse_yaml`'s own validation (non-empty steps, the first
+/// step a plain pass-through, unique roles, no path-traversal-shaped
+/// role/agent names) is the only shape this function itself enforces.
+async fn load_workflow(repo: &std::path::Path) -> anyhow::Result<warden_core::Workflow> {
     let workflow_path = repo.join(WORKFLOW_FILE);
-    let workflow = match tokio::fs::read_to_string(&workflow_path).await {
+    match tokio::fs::read_to_string(&workflow_path).await {
         Ok(raw) => warden_core::Workflow::parse_yaml(&raw)
-            .with_context(|| format!("invalid workflow file at {}", workflow_path.display()))?,
+            .with_context(|| format!("invalid workflow file at {}", workflow_path.display())),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            warden_core::Workflow::builtin_default()
+            Ok(warden_core::Workflow::builtin_default())
         }
-        Err(source) => {
-            return Err(source).with_context(|| {
-                format!(
-                    "failed to read workflow file at {}",
-                    workflow_path.display()
-                )
-            })
-        }
-    };
-
-    let builtin_role_names: Vec<&str> = workflow
-        .steps
-        .iter()
-        .take(3)
-        .map(|step| step.role.as_str())
-        .collect();
-    if builtin_role_names != ["coder", "reviewer", "tester"] {
-        bail!(
-            "{}: the first three steps must be exactly \"coder\", \"reviewer\", \"tester\" (in \
-             that order) -- found {:?}. The current engine only supports appending custom steps \
-             after this built-in pipeline, not reordering, replacing, or omitting it.",
-            workflow_path.display(),
-            builtin_role_names
-        );
-    }
-
-    let mut extra_step_agents = Vec::with_capacity(workflow.steps.len().saturating_sub(3));
-    for step in workflow.steps.iter().skip(3) {
-        let definition = warden::agent_def::resolve_custom_step_agent_definition(
-            repo,
-            step.role.as_str(),
-            &step.agent,
-        )
-        .await
-        .with_context(|| {
+        Err(source) => Err(source).with_context(|| {
             format!(
-                "failed to resolve the agent for custom workflow role {:?} (agent {:?})",
-                step.role.as_str(),
-                step.agent
+                "failed to read workflow file at {}",
+                workflow_path.display()
             )
-        })?;
-        extra_step_agents.push(definition);
+        }),
     }
-
-    Ok((workflow, extra_step_agents))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,63 +577,113 @@ async fn run<R: ToolAdapter>(
     // `<warden_home>/worktrees/` -- a stale worktree from a crashed run --
     // must be degraded exactly like one resolving inside the repo itself.
     let user_config_agents_dir = warden::agent_def::default_user_config_agents_dir()?;
-    let (coder_agent, _coder_source) = resolve_agent_definition(
-        &repo,
-        AgentRole::Coder,
-        &adapter,
-        &user_config_agents_dir,
-        &warden_home,
-        trust_repo_agents.0,
-    )
-    .await?;
-    let (reviewer_agent, reviewer_source) = resolve_agent_definition(
-        &repo,
-        AgentRole::Reviewer,
-        &adapter,
-        &user_config_agents_dir,
-        &warden_home,
-        trust_repo_agents.0,
-    )
-    .await?;
-    let (tester_agent, tester_source) = resolve_agent_definition(
-        &repo,
-        AgentRole::Tester,
-        &adapter,
-        &user_config_agents_dir,
-        &warden_home,
-        trust_repo_agents.0,
-    )
-    .await?;
 
     // Issue #73: `.warden/workflow.yaml`, if present, defines this run's
     // pipeline; its absence reproduces the pre-issue-#73 pipeline exactly
     // (`Workflow::builtin_default`) -- the strict retro-compat requirement
-    // this whole feature is judged against.
-    let (workflow, extra_step_agents) = load_workflow(&repo).await?;
+    // this whole feature is judged against. Loaded before any agent is
+    // resolved, so a malformed workflow file fails fast.
+    let workflow = load_workflow(&repo).await?;
 
+    // Issue #73 (trio-unification follow-up): every step's agent is
+    // resolved here, uniformly, in `workflow.steps` order -- no ordering
+    // restriction on the workflow itself. A step literally named
+    // `"coder"`/`"reviewer"`/`"tester"` still goes through the existing,
+    // hardened, role-asymmetric resolution (`resolve_agent_definition`,
+    // ADR-0026/issue #26) -- that trust model is inherent to what those
+    // three names *mean* (independent judgement of the coder's own work),
+    // not an artifact of their position in the pipeline. Any other role
+    // goes through the simpler `resolve_custom_step_agent_definition`
+    // (`.claude/agents/<agent>.md`, ADR-0013). `step_agents` ends up a flat
+    // list the convergence loop indexes by position, never by name.
+    let mut step_agents = Vec::with_capacity(workflow.steps.len());
     // Issue #26: `resolve_agent_definition` already `tracing::warn!`ed the
     // moment it actually read a repo-sourced reviewer/tester definition
     // (before this run, or its Event Bus, even exist) -- this just collects
     // which role(s) that happened for, so `run_convergence_loop` can also
     // publish a persisted `RunEvent::UntrustedAgentDefinitionUsed` for each,
     // once the run's own event log exists to carry it.
-    let untrusted_repo_agent_definitions = [
-        (AgentRole::Reviewer, reviewer_source),
-        (AgentRole::Tester, tester_source),
-    ]
-    .into_iter()
-    .filter_map(|(role, source)| match source {
-        warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
-            path,
-            canonical_path,
-        } => Some(orchestrator::UntrustedRepoAgentDefinition {
-            role,
-            path,
-            canonical_path,
-        }),
-        _ => None,
-    })
-    .collect();
+    let mut untrusted_repo_agent_definitions = Vec::new();
+    for step in &workflow.steps {
+        let definition = match step.role.as_str() {
+            "coder" => {
+                let (definition, _source) = resolve_agent_definition(
+                    &repo,
+                    AgentRole::Coder,
+                    &adapter,
+                    &user_config_agents_dir,
+                    &warden_home,
+                    trust_repo_agents.0,
+                )
+                .await?;
+                definition
+            }
+            "reviewer" => {
+                let (definition, source) = resolve_agent_definition(
+                    &repo,
+                    AgentRole::Reviewer,
+                    &adapter,
+                    &user_config_agents_dir,
+                    &warden_home,
+                    trust_repo_agents.0,
+                )
+                .await?;
+                if let warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
+                    path,
+                    canonical_path,
+                } = source
+                {
+                    untrusted_repo_agent_definitions.push(
+                        orchestrator::UntrustedRepoAgentDefinition {
+                            role: AgentRole::Reviewer,
+                            path,
+                            canonical_path,
+                        },
+                    );
+                }
+                definition
+            }
+            "tester" => {
+                let (definition, source) = resolve_agent_definition(
+                    &repo,
+                    AgentRole::Tester,
+                    &adapter,
+                    &user_config_agents_dir,
+                    &warden_home,
+                    trust_repo_agents.0,
+                )
+                .await?;
+                if let warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
+                    path,
+                    canonical_path,
+                } = source
+                {
+                    untrusted_repo_agent_definitions.push(
+                        orchestrator::UntrustedRepoAgentDefinition {
+                            role: AgentRole::Tester,
+                            path,
+                            canonical_path,
+                        },
+                    );
+                }
+                definition
+            }
+            custom_role => warden::agent_def::resolve_custom_step_agent_definition(
+                &repo,
+                custom_role,
+                &step.agent,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve the agent for custom workflow role {custom_role:?} (agent \
+                     {:?})",
+                    step.agent
+                )
+            })?,
+        };
+        step_agents.push(definition);
+    }
 
     // Issue #31: resolved before `warden_home` moves into `config` below --
     // this is the resolved `warden_home` (not the raw `--warden-home` flag,
@@ -732,13 +741,10 @@ async fn run<R: ToolAdapter>(
         max_test_cycles,
         workflow,
         max_extra_step_cycles: max_cycles,
-        coder_agent,
-        reviewer_agent,
-        tester_agent,
+        step_agents,
         evidence_tool,
         evidence_store_in_repo,
         gate,
-        extra_step_agents,
         untrusted_repo_agent_definitions,
     };
 

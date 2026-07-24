@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO cycle_worktrees (cycle_id, role, worktree_path) VALUES (?, ?, ?) ON CONFLICT (cycle_id, role) DO UPDATE SET worktree_path = excluded.worktree_path",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "8e6eae5ddf6da562ba36cf25a8e7b8a2da0aaa362c19edd71ae4f5dc254aadf9"
+}

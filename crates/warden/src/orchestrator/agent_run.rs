@@ -1,6 +1,6 @@
-//! The sandboxed subprocess seam every coder/reviewer/tester invocation
-//! runs through: [`Orchestrator::run_agent`], its [`SandboxGuard`]
-//! create->destroy pairing (issue #50), and [`map_sandbox_error`].
+//! The sandboxed subprocess seam every workflow step's invocation runs
+//! through: [`Orchestrator::run_agent`], its [`SandboxGuard`] create->destroy
+//! pairing (issue #50), and [`map_sandbox_error`].
 
 use super::*;
 
@@ -33,15 +33,24 @@ impl Orchestrator {
     /// `repo_path` is the run's base repository; `run_worktrees_root` is
     /// this run's own `<warden_home>/worktrees/<run_id>`. Both are passed
     /// through to [`process::validate_agent_program`] (issue #26), the one
-    /// choke point every coder/reviewer/tester spawn goes through, so a
-    /// future `ToolAdapter` that names a repo-relative or in-worktree
-    /// `command.program` for the reviewer/tester is refused here, before the
+    /// choke point every workflow step's spawn goes through, so a future
+    /// `ToolAdapter` that names a repo-relative or in-worktree
+    /// `command.program` for a gated step is refused here, before the
     /// sandbox ever runs it.
+    ///
+    /// **Issue #73 (trio-unification follow-up)**: `role`/`is_producer`
+    /// replace the old `InvocationRole::Builtin`/`Custom` split -- every
+    /// step, built-in or custom, goes through this exact same body now,
+    /// including the `agent_processes` row and per-role token-usage
+    /// bookkeeping below (previously built-in-roles-only; see
+    /// [`recover_crashed_runs`](crate::orchestrator::recover_crashed_runs)'s
+    /// own docs on why no step's worktree leaks on crash anymore).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_agent<R: ToolAdapter>(
         &self,
         cycle_id: &str,
-        role: InvocationRole<'_>,
+        role: &Role,
+        is_producer: bool,
         runner: &R,
         command: &AgentCommand,
         env_allowlist: &[&str],
@@ -51,38 +60,14 @@ impl Orchestrator {
         stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
-        // Issue #73: `process::validate_agent_program`'s containment check is
-        // role-agnostic beyond "is this the coder" (the one role it never
-        // applies to at all) -- a custom step is never the coder, so it gets
-        // exactly the same containment check as the reviewer/tester, via the
-        // same non-coder branch. `AgentRole::Reviewer` is passed as the
-        // *check's own* role argument purely to select that non-coder
-        // branch -- it never reaches an error message: on the rare path
-        // where this check actually refuses a custom step's program, the
-        // `role` field of the resulting `ProcessError::UntrustedAgentProgram`
-        // is rewritten below to the step's real, owned role name before it
-        // ever surfaces.
-        let validate_role = match role {
-            InvocationRole::Builtin(role) => role,
-            InvocationRole::Custom(_) => AgentRole::Reviewer,
-        };
-        if let Err(mut error) = process::validate_agent_program(
-            validate_role,
+        process::validate_agent_program(
+            role.as_str(),
+            is_producer,
             &command.program,
             cwd,
             repo_path,
             run_worktrees_root,
-        ) {
-            if let InvocationRole::Custom(custom_role) = role {
-                if let ProcessError::UntrustedAgentProgram {
-                    role: role_field, ..
-                } = &mut error
-                {
-                    *role_field = custom_role.as_str().to_string();
-                }
-            }
-            return Err(error.into());
-        }
+        )?;
 
         let sandbox_id = self
             .sandbox
@@ -141,28 +126,23 @@ impl Orchestrator {
                 let pid = execution.pid.ok_or_else(|| ProcessError::MissingPid {
                     command: command.program.clone(),
                 })?;
-                // Issue #73: `agent_processes` (crash-recovery bookkeeping,
-                // issue #6) is keyed to the three built-in roles only -- see
-                // `InvocationRole`'s own docs on this deliberate scope limit.
-                // A custom step's process is still spawned and awaited
-                // identically below; it simply gets no `agent_processes` row,
-                // so a crash mid-invocation of a custom step is not detected
-                // by `recover_crashed_runs` the way a built-in role's is.
-                let process_id = if let InvocationRole::Builtin(builtin_role) = role {
-                    let process_id = Uuid::new_v4().to_string();
-                    db::insert_agent_process(
-                        &self.pool,
-                        &process_id,
-                        cycle_id,
-                        builtin_role,
-                        pid,
-                        &cwd.display().to_string(),
-                    )
-                    .await?;
-                    Some(process_id)
-                } else {
-                    None
-                };
+                // Issue #73 (trio-unification follow-up): every step,
+                // built-in or custom, gets an `agent_processes` row now --
+                // `agent_processes.role` was already a plain, unconstrained
+                // TEXT column (migrations/0001_initial.sql); only the
+                // orchestrator used to gate this on `InvocationRole::Builtin`.
+                // This is what lets `recover_crashed_runs` detect a crash
+                // mid-invocation of *any* step, not just the built-in three.
+                let process_id = Uuid::new_v4().to_string();
+                db::insert_agent_process(
+                    &self.pool,
+                    &process_id,
+                    cycle_id,
+                    role.as_str(),
+                    pid,
+                    &cwd.display().to_string(),
+                )
+                .await?;
                 self.publish_event(RunEvent::AgentStarted {
                     role: role.as_str().to_string(),
                 })
@@ -181,9 +161,7 @@ impl Orchestrator {
                     Ok(outcome) => outcome.exit_code,
                     Err(_) => -1,
                 };
-                if let Some(process_id) = &process_id {
-                    db::mark_agent_process_ended(&self.pool, process_id, exit_code_for_db).await?;
-                }
+                db::mark_agent_process_ended(&self.pool, &process_id, exit_code_for_db).await?;
 
                 // L1: log stderr on the success path too — previously only ever
                 // surfaced when findings-parsing failed, so a noisy-but-successful
@@ -202,15 +180,14 @@ impl Orchestrator {
                     // this never fails an otherwise-successful invocation.
                     let usage = runner.extract_usage(&outcome.stdout);
                     if let Some(usage) = &usage {
-                        // Issue #73: the per-cycle *per-role* breakdown is
-                        // built-in-roles-only (same `agent_processes` scope
-                        // limit as above); the *run-level* running total just
-                        // below still accumulates every role's usage,
-                        // built-in or custom.
-                        if let InvocationRole::Builtin(builtin_role) = role {
-                            db::add_cycle_role_token_usage(&self.pool, cycle_id, builtin_role, usage)
-                                .await?;
-                        }
+                        // Issue #73 (trio-unification follow-up): the
+                        // per-cycle *per-role* breakdown is recorded for
+                        // every step now, not just the built-in three (see
+                        // `cycle_token_usage`, migrations/0010) -- the
+                        // run-level running total just below always
+                        // accumulated every role's usage regardless.
+                        db::add_cycle_role_token_usage(&self.pool, cycle_id, role.as_str(), usage)
+                            .await?;
                         // Only reachable with a run in progress (see
                         // `publish_event`'s own docs on why a missing
                         // `run_context` is a silent no-op here too): a test that
@@ -598,10 +575,12 @@ mod tests {
         )
         .await;
 
+        let coder_role = Role::new("coder").unwrap();
         let outcome = orchestrator
             .run_agent(
                 "sandbox-seam-cycle",
-                InvocationRole::Builtin(AgentRole::Coder),
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "echo hi"]),
                 &[],
@@ -619,13 +598,14 @@ mod tests {
         assert_eq!(sandbox.calls(), vec!["create", "execute", "destroy"]);
     }
 
-    /// Issue #73 review (LOW cosmetic): `process::validate_agent_program`
-    /// refusing a **custom** workflow step's `command.program` (issue #73)
-    /// must name that step's own real role in the resulting
-    /// `ProcessError::UntrustedAgentProgram` -- not the `AgentRole::Reviewer`
-    /// stand-in `run_agent` passes to select the check's non-coder branch.
+    /// Issue #73 (trio-unification follow-up): every step -- built-in or
+    /// custom -- goes through the exact same `validate_agent_program` call
+    /// now, keyed on `role.as_str()` directly rather than an
+    /// `AgentRole::Reviewer` stand-in rewritten after the fact. A custom
+    /// step's containment-check failure names its own real role from the
+    /// start.
     #[tokio::test]
-    async fn a_custom_steps_containment_violation_names_its_own_real_role_not_the_stand_in() {
+    async fn a_custom_steps_containment_violation_names_its_own_real_role() {
         let worktree = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
         let run_worktrees_root = TempDir::new().unwrap();
@@ -643,14 +623,15 @@ mod tests {
 
         // Resolves inside `worktree` itself -- exactly the containment
         // violation `process::validate_agent_program` refuses for any
-        // non-coder role.
+        // non-producer step.
         let program_inside_worktree = worktree.path().join("evil.sh");
         let techlead_role = Role::new("techlead").unwrap();
 
         let error = orchestrator
             .run_agent(
                 "sandbox-seam-custom-role-cycle",
-                InvocationRole::Custom(&techlead_role),
+                &techlead_role,
+                false,
                 &FakeCommandAdapter,
                 &AgentCommand::new(
                     program_inside_worktree.to_str().unwrap(),
@@ -673,7 +654,7 @@ mod tests {
         );
         assert!(
             !rendered.contains("reviewer"),
-            "must not leak the AgentRole::Reviewer stand-in into the error: {rendered}"
+            "must never name an unrelated built-in role: {rendered}"
         );
     }
 
@@ -698,10 +679,12 @@ mod tests {
         )
         .await;
 
+        let coder_role = Role::new("coder").unwrap();
         let result = orchestrator
             .run_agent(
                 "sandbox-seam-failure-cycle",
-                InvocationRole::Builtin(AgentRole::Coder),
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "echo hi"]),
                 &[],
@@ -759,10 +742,12 @@ mod tests {
             cancel_clone.cancel();
         });
 
+        let coder_role = Role::new("coder").unwrap();
         let result = orchestrator
             .run_agent(
                 "sandbox-seam-cancel-cycle",
-                InvocationRole::Builtin(AgentRole::Coder),
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "sleep 30"]),
                 &[],
@@ -822,10 +807,12 @@ mod tests {
         let repo_path = repo.path().to_path_buf();
 
         let handle = tokio::spawn(async move {
+            let coder_role = Role::new("coder").unwrap();
             let _ = orchestrator_for_task
                 .run_agent(
                     "sandbox-seam-abort-cycle",
-                    InvocationRole::Builtin(AgentRole::Coder),
+                    &coder_role,
+                    true,
                     &FakeCommandAdapter,
                     &AgentCommand::new("sh", ["-c", "sleep 30"]),
                     &[],

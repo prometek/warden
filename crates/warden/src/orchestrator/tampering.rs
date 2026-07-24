@@ -248,13 +248,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -319,13 +320,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(ordinary_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(ordinary_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -402,13 +404,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(deleting_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(deleting_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -511,13 +514,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -597,13 +601,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -689,13 +694,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -768,13 +774,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -841,13 +848,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -922,13 +930,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -998,13 +1007,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(coder_with_uncommitted_junk),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(coder_with_uncommitted_junk),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1087,13 +1097,14 @@ mod tests {
             max_test_cycles: 1,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(modifying_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(modifying_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1179,13 +1190,14 @@ mod tests {
             max_test_cycles: 2,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(poison_once_then_fix_coder),
-            reviewer_agent: definition(status_gated_reviewer()),
-            tester_agent: definition(always_passing_tester()),
+            step_agents: vec![
+                definition(poison_once_then_fix_coder),
+                definition(status_gated_reviewer()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 

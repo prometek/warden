@@ -551,9 +551,11 @@ mod tests {
             max_test_cycles: 5,
             workflow: warden_core::Workflow::builtin_default(),
             max_extra_step_cycles: 5,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            tester_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: Some(GateConfig {
@@ -563,7 +565,6 @@ mod tests {
                 poll_interval_secs: 1,
                 inactivity_timeout_secs: 3600,
             }),
-            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         // Leaked deliberately: `warden_home`'s TempDir must outlive the

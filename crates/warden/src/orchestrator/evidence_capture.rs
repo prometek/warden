@@ -153,19 +153,16 @@ mod tests {
                 max_test_cycles: 3,
                 workflow: warden_core::Workflow::builtin_default(),
                 max_extra_step_cycles: 5,
-                coder_agent: definition(AgentCommand::new(
+                                step_agents: vec![definition(AgentCommand::new(
                     "sh",
                     [
                         "-c",
                         "echo hi >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle",
                     ],
-                )),
-                reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-                tester_agent: definition(always_passing_tester()),
+                )), definition(AgentCommand::new("sh", ["-c", "true"])), definition(always_passing_tester())],
                 evidence_tool: None,
                 evidence_store_in_repo: true,
                 gate: None,
-                extra_step_agents: Vec::new(),
                 untrusted_repo_agent_definitions: Vec::new(),
             };
 

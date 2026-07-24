@@ -39,7 +39,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
 use tempfile::TempDir;
-use warden_core::{AgentRole, FindingSource, RunState};
+use warden_core::{FindingSource, RunState};
 
 /// Sets up a throwaway git repo with a single commit, suitable as `--repo`.
 fn init_test_repo() -> TempDir {
@@ -2786,7 +2786,7 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
             &pool,
             "crashed-process",
             "crashed-cycle",
-            warden_core::AgentRole::Coder,
+            "coder",
             dead_pid,
             "/tmp/wt",
         )
@@ -3111,16 +3111,24 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
     );
 
     // Cross-check at the worktree-path level too: reviewer and tester must
-    // have been assigned distinct directories for this cycle.
-    let (reviewer_wt, tester_wt): (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT reviewer_worktree_path, tester_worktree_path FROM cycles WHERE id = ?",
-    )
-    .bind(&cycle_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let reviewer_wt = reviewer_wt.expect("reviewer worktree path recorded");
-    let tester_wt = tester_wt.expect("tester worktree path recorded");
+    // have been assigned distinct directories for this cycle. Issue #73
+    // (trio-unification follow-up): `cycle_worktrees` is the generalized,
+    // one-row-per-(cycle, role) table (migrations/0010) that replaced the
+    // old `cycles.reviewer_worktree_path`/`tester_worktree_path` columns.
+    let (reviewer_wt,): (String,) =
+        sqlx::query_as("SELECT worktree_path FROM cycle_worktrees WHERE cycle_id = ? AND role = ?")
+            .bind(&cycle_id)
+            .bind("reviewer")
+            .fetch_one(&pool)
+            .await
+            .expect("reviewer worktree path recorded");
+    let (tester_wt,): (String,) =
+        sqlx::query_as("SELECT worktree_path FROM cycle_worktrees WHERE cycle_id = ? AND role = ?")
+            .bind(&cycle_id)
+            .bind("tester")
+            .fetch_one(&pool)
+            .await
+            .expect("tester worktree path recorded");
     assert_ne!(
         reviewer_wt, tester_wt,
         "reviewer and tester must run in distinct worktree directories"
@@ -3190,7 +3198,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
         warden::db::set_cycle_worktree_path(
             &pool,
             "orphan-e2e-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -3216,7 +3224,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             &pool,
             "orphan-e2e-live-process",
             "orphan-e2e-cycle",
-            AgentRole::Reviewer,
+            "reviewer",
             orphan_pid,
             &worktree_path.display().to_string(),
         )
@@ -3237,7 +3245,7 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             &pool,
             "orphan-e2e-dead-process",
             "orphan-e2e-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             &worktree_path.display().to_string(),
         )
@@ -4774,4 +4782,300 @@ steps:
                 .unwrap()
                 .to_string(),
         ));
+}
+
+/// Issue #73 follow-up (trio-unification): removes the append-only
+/// restriction entirely. This workflow inserts a custom gated step
+/// (`techlead`) **between** the built-in reviewer and tester -- not
+/// appended after both -- proving the engine drives *any* legal ordering,
+/// not just "built-in trio first, custom steps after". Driven through the
+/// real CLI end to end: the run must actually reach and execute the
+/// mid-pipeline custom step (proven by its marker file existing) and still
+/// converge.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_custom_step_inserted_between_reviewer_and_tester_actually_runs() {
+    let repo = init_test_repo();
+    let yaml = r#"
+name: techlead-in-the-middle
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+"#;
+    write_workflow_yaml(repo.path(), yaml);
+    write_custom_step_agent_definition(
+        repo.path(),
+        "techlead",
+        "You are Warden's tech lead, running between the reviewer and the tester.",
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // techlead-ran marker: proves the mid-pipeline custom step actually
+    // executed as a real subprocess (not skipped, not silently reordered
+    // back to the end).
+    let techlead_marker = bin_dir.path().join("techlead-has-run");
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+stdin_file=$(mktemp)
+cat > "$stdin_file"
+WARDEN_RESULT_FILE=$(mktemp)
+export WARDEN_RESULT_FILE
+: > "$WARDEN_RESULT_FILE"
+
+if grep -q '"role":"coder"' "$stdin_file"; then
+{APPEND_NOTES_CODER_BODY}
+elif grep -q '"role":"reviewer"' "$stdin_file"; then
+{NOOP_BODY}
+elif grep -q '"role":"techlead"' "$stdin_file"; then
+    touch "{marker}"
+else
+{NOOP_BODY}
+fi
+
+result=$(cat "$WARDEN_RESULT_FILE")
+rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
+escaped=$(printf '%s' "$result" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
+printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' "$escaped"
+"#,
+        marker = techlead_marker.display()
+    );
+    write_fake_tool(bin_dir.path(), "claude", &script);
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "insert techlead between reviewer and tester",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    assert!(
+        techlead_marker.exists(),
+        "the mid-pipeline techlead step must actually have run as a real subprocess"
+    );
+
+    // The engine must have gone through RunningStep(1) (reviewer),
+    // RunningStep(2) (techlead, now second because it was inserted there),
+    // and RunningStep(3) (tester, pushed one position later by the
+    // insertion) -- confirms position-based step indexing tracks the
+    // user's own reordering, not a hardcoded assumption that index 2 is
+    // always the tester.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let entries = warden::db::list_cycle_worktree_entries_for_run(&pool, &run_id)
+        .await
+        .unwrap();
+    let roles_seen: Vec<String> = entries.into_iter().map(|entry| entry.role).collect();
+    for expected_role in ["coder", "reviewer", "techlead", "tester"] {
+        assert!(
+            roles_seen.iter().any(|role| role == expected_role),
+            "expected role {expected_role:?} to have its own worktree recorded, got: {roles_seen:?}"
+        );
+    }
+}
+
+/// Issue #73 follow-up (trio-unification), MEDIUM #2 closed: a **custom**
+/// workflow step's worktree and `agent_processes` row are now reclaimed by
+/// crash recovery exactly like a built-in role's always were -- generalized
+/// from `e2e_crash_restart_leaves_no_orphan_worktree_or_process`, which only
+/// ever exercised the built-in trio. Before this trio-unification pass, a
+/// custom role got no `agent_processes` row and no `cycle_worktrees` entry
+/// at all (see the removed `InvocationRole::Custom` scope limit), so a
+/// crash mid-invocation of a custom step silently leaked its worktree
+/// forever. Seeds a run "crashed" while a `techlead` step's own worktree and
+/// agent process were still live/recorded, then proves a completely
+/// unrelated `warden run` invocation's own startup recovery reclaims both.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_custom_steps_worktree_and_process_are_reclaimed_by_crash_recovery() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let db_path = warden_home.path().join("state.db");
+
+    let (worktree_path, mut orphan_child) = {
+        let pool = warden::db::connect(&db_path).await.unwrap();
+
+        let worktree_manager = warden::worktree::WorktreeManager::new(
+            repo.path(),
+            warden_home.path().join("worktrees"),
+        )
+        .unwrap();
+        // Simulates the crash itself: the `Worktree` guard is forgotten
+        // instead of dropped or explicitly removed -- exactly what a
+        // SIGKILL'd orchestrator would leave behind, here for a **custom**
+        // role rather than one of the built-in three.
+        let worktree = worktree_manager
+            .create("techlead-orphan-run", "techlead", "HEAD")
+            .await
+            .unwrap();
+        let worktree_path = worktree.path().to_path_buf();
+        std::mem::forget(worktree);
+        assert!(
+            worktree_path.exists(),
+            "precondition: the custom step's orphan worktree exists on disk"
+        );
+
+        warden::db::insert_run(
+            &pool,
+            "techlead-orphan-run",
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+            3,
+            4,
+            5,
+        )
+        .await
+        .unwrap();
+        // RunningStep(3): the techlead step, in a four-step workflow
+        // (coder, reviewer, tester, techlead) -- an intermediate state, so
+        // crash recovery's own `RunState::is_intermediate` picks it up.
+        warden::db::update_run_state(&pool, "techlead-orphan-run", RunState::RunningStep(3))
+            .await
+            .unwrap();
+        warden::db::insert_cycle(&pool, "techlead-orphan-cycle", "techlead-orphan-run", 1)
+            .await
+            .unwrap();
+        warden::db::set_cycle_worktree_path(
+            &pool,
+            "techlead-orphan-cycle",
+            "techlead",
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Same two-processes-per-cycle shape as
+        // `e2e_crash_restart_leaves_no_orphan_worktree_or_process` (see its
+        // own docs): recovery decides whether the *run* crashed from the
+        // *latest* recorded process (`latest_open_agent_process_for_run`),
+        // so a genuinely still-alive orphan alone would read as "still
+        // legitimately in progress". A later, already-dead row is what
+        // actually makes recovery mark the run `Failed` -- the live orphan
+        // is then reclaimed as a side effect of that.
+        let orphan_child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let orphan_pid = orphan_child.id().unwrap();
+        warden::db::insert_agent_process(
+            &pool,
+            "techlead-orphan-live-process",
+            "techlead-orphan-cycle",
+            "techlead",
+            orphan_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let mut dead_child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let dead_pid = dead_child.id().unwrap();
+        dead_child.wait().await.unwrap();
+        warden::db::insert_agent_process(
+            &pool,
+            "techlead-orphan-dead-process",
+            "techlead-orphan-cycle",
+            "techlead",
+            dead_pid,
+            &worktree_path.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        pool.close().await;
+        (worktree_path, orphan_child)
+    };
+
+    // Restart: a completely unrelated, trivial run against the same
+    // --warden-home. Startup crash recovery must run first regardless.
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "unrelated new run",
+            "--branch",
+            "main",
+            "--max-review-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    // Behavior 1: the run is recovered as Failed and the custom step's
+    // orphan worktree no longer exists on disk.
+    let pool = warden::db::connect(&db_path).await.unwrap();
+    let recovered = warden::db::get_run(&pool, "techlead-orphan-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, RunState::Failed);
+    assert!(
+        !worktree_path.exists(),
+        "no custom step's orphan worktree may persist after a crash+restart cycle"
+    );
+
+    // Behavior 2: the custom step's orphan agent process was actually
+    // terminated, not merely forgotten about.
+    let exit_status = orphan_child.wait().await.unwrap();
+    assert!(
+        !exit_status.success(),
+        "no custom step's orphan agent process may persist after a crash+restart cycle"
+    );
+    let open_processes =
+        warden::db::list_open_agent_processes_for_run(&pool, "techlead-orphan-run")
+            .await
+            .unwrap();
+    assert!(
+        open_processes.is_empty(),
+        "recovery must mark the custom step's orphaned agent_processes row ended"
+    );
 }

@@ -25,8 +25,8 @@ mod workflow;
 
 pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
-    build_finding_agent_input_json, parse_agent_input_message, AgentInputMessage, ReviewScope,
-    AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
+    build_finding_agent_input_json, build_producer_input_json, parse_agent_input_message,
+    AgentInputMessage, ReviewScope, AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
 };
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{

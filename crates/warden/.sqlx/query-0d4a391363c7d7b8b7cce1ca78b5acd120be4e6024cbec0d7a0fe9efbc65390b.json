@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT DISTINCT cycle_worktrees.worktree_path as \"worktree_path!\"\n        FROM cycle_worktrees\n        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id\n        WHERE cycles.run_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "worktree_path!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycle_worktrees",
+            "name": "worktree_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0d4a391363c7d7b8b7cce1ca78b5acd120be4e6024cbec0d7a0fe9efbc65390b"
+}
