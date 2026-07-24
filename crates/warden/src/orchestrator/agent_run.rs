@@ -55,25 +55,34 @@ impl Orchestrator {
         // role-agnostic beyond "is this the coder" (the one role it never
         // applies to at all) -- a custom step is never the coder, so it gets
         // exactly the same containment check as the reviewer/tester, via the
-        // same non-coder branch. `AgentRole::Reviewer` here is a label only
-        // (`ProcessError::UntrustedAgentProgram::role` is `&'static str`, so
-        // it can't carry an arbitrary custom role's owned name) -- on the
-        // rare path where this check actually refuses a custom step's
-        // program, the resulting error names "reviewer" rather than the real
-        // custom role. A narrow, documented cosmetic limitation: the
-        // *enforcement* is identical either way, only the label in that one
-        // error message is imprecise for a custom step.
+        // same non-coder branch. `AgentRole::Reviewer` is passed as the
+        // *check's own* role argument purely to select that non-coder
+        // branch -- it never reaches an error message: on the rare path
+        // where this check actually refuses a custom step's program, the
+        // `role` field of the resulting `ProcessError::UntrustedAgentProgram`
+        // is rewritten below to the step's real, owned role name before it
+        // ever surfaces.
         let validate_role = match role {
             InvocationRole::Builtin(role) => role,
             InvocationRole::Custom(_) => AgentRole::Reviewer,
         };
-        process::validate_agent_program(
+        if let Err(mut error) = process::validate_agent_program(
             validate_role,
             &command.program,
             cwd,
             repo_path,
             run_worktrees_root,
-        )?;
+        ) {
+            if let InvocationRole::Custom(custom_role) = role {
+                if let ProcessError::UntrustedAgentProgram {
+                    role: role_field, ..
+                } = &mut error
+                {
+                    *role_field = custom_role.as_str().to_string();
+                }
+            }
+            return Err(error.into());
+        }
 
         let sandbox_id = self
             .sandbox
@@ -608,6 +617,64 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.stdout.trim(), "hi");
         assert_eq!(sandbox.calls(), vec!["create", "execute", "destroy"]);
+    }
+
+    /// Issue #73 review (LOW cosmetic): `process::validate_agent_program`
+    /// refusing a **custom** workflow step's `command.program` (issue #73)
+    /// must name that step's own real role in the resulting
+    /// `ProcessError::UntrustedAgentProgram` -- not the `AgentRole::Reviewer`
+    /// stand-in `run_agent` passes to select the check's non-coder branch.
+    #[tokio::test]
+    async fn a_custom_steps_containment_violation_names_its_own_real_role_not_the_stand_in() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let run_worktrees_root = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let sandbox = Arc::new(RecordingSandbox::new(false));
+
+        let orchestrator = orchestrator_with_sandbox_and_cycle(
+            &pool,
+            sandbox as Arc<dyn Sandbox>,
+            "sandbox-seam-custom-role-run",
+            "sandbox-seam-custom-role-cycle",
+        )
+        .await;
+
+        // Resolves inside `worktree` itself -- exactly the containment
+        // violation `process::validate_agent_program` refuses for any
+        // non-coder role.
+        let program_inside_worktree = worktree.path().join("evil.sh");
+        let techlead_role = Role::new("techlead").unwrap();
+
+        let error = orchestrator
+            .run_agent(
+                "sandbox-seam-custom-role-cycle",
+                InvocationRole::Custom(&techlead_role),
+                &FakeCommandAdapter,
+                &AgentCommand::new(
+                    program_inside_worktree.to_str().unwrap(),
+                    Vec::<String>::new(),
+                ),
+                &[],
+                worktree.path(),
+                repo.path(),
+                run_worktrees_root.path(),
+                "{}".to_string(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("techlead"),
+            "expected the real custom role name in the error, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("reviewer"),
+            "must not leak the AgentRole::Reviewer stand-in into the error: {rendered}"
+        );
     }
 
     /// Issue #50 review, MEDIUM 1: a sandbox created for an invocation whose

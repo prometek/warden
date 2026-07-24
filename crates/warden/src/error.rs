@@ -91,7 +91,7 @@ pub enum ProcessError {
          coder control what an independent role executes"
     )]
     UntrustedAgentProgram {
-        role: &'static str,
+        role: String,
         program: String,
         reason: String,
     },

@@ -142,7 +142,7 @@ pub fn validate_agent_program(
     let candidate = Path::new(program);
     if !candidate.is_absolute() {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "relative path -- would resolve against {}, the role's own worktree (a \
@@ -154,7 +154,7 @@ pub fn validate_agent_program(
 
     let canonical_candidate = canonicalize_best_effort(candidate).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve its real location to verify it is outside the repo under \
@@ -164,7 +164,7 @@ pub fn validate_agent_program(
     })?;
     let canonical_worktree = canonicalize_best_effort(worktree_path).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve the role's own worktree ({}) to verify this program is outside \
@@ -175,7 +175,7 @@ pub fn validate_agent_program(
     })?;
     let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve the run's base repository ({}) to verify this program is \
@@ -187,7 +187,7 @@ pub fn validate_agent_program(
     let canonical_run_worktrees_root =
         canonicalize_best_effort(run_worktrees_root).map_err(|source| {
             ProcessError::UntrustedAgentProgram {
-                role: role.as_str(),
+                role: role.as_str().to_string(),
                 program: program.to_string(),
                 reason: format!(
                     "cannot resolve this run's own worktrees root ({}) to verify this program is \
@@ -199,7 +199,7 @@ pub fn validate_agent_program(
 
     if canonical_candidate.starts_with(&canonical_worktree) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside the role's own worktree ({}) -- a checkout of the repo the \
@@ -215,7 +215,7 @@ pub fn validate_agent_program(
     // ever covered the checked role's own worktree.
     if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
@@ -226,7 +226,7 @@ pub fn validate_agent_program(
     }
     if canonical_candidate.starts_with(&canonical_repo) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role.as_str().to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside the run's base repository ({}), which the coder can write to \

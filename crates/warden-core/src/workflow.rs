@@ -172,6 +172,28 @@ struct WorkflowWire {
     steps: Vec<WorkflowStepWire>,
 }
 
+/// Issue #73 review (LOW security, path traversal): a step's `role`/`agent`
+/// value ends up embedded, verbatim, in a filesystem path built by an I/O
+/// caller downstream -- `agent` in
+/// `warden::agent_def::resolve_custom_step_agent_definition`'s
+/// `.claude/agents/<agent>.md` join, `role` in
+/// `warden::worktree::WorktreeManager::create`'s per-role worktree
+/// directory name. Neither caller re-validates it (this is the one place
+/// every step is already validated), so a value containing a path
+/// separator (`/` or `\`) or a `..` component is rejected right here, at the
+/// boundary, rather than trusted through to those two path joins.
+fn reject_path_like_value(step_index: usize, field: &'static str, value: &str) -> Result<()> {
+    let has_separator = value.contains('/') || value.contains('\\');
+    let has_dotdot_component = value.split(['/', '\\']).any(|part| part == "..");
+    if has_separator || has_dotdot_component {
+        return Err(CoreError::InvalidWorkflow(format!(
+            "step {step_index}: {field} {value:?} must not contain a path separator (\"/\" or \
+             \"\\\") or a \"..\" component"
+        )));
+    }
+    Ok(())
+}
+
 impl Workflow {
     /// The pipeline every run drives when no `.warden/workflow.yaml` exists
     /// at all -- the exact shape `workflow.yaml`'s own doc-comment example
@@ -233,6 +255,7 @@ impl Workflow {
         let mut steps = Vec::with_capacity(wire.steps.len());
         let mut seen_roles = std::collections::HashSet::new();
         for (index, step) in wire.steps.into_iter().enumerate() {
+            reject_path_like_value(index, "role", &step.role)?;
             let role = Role::new(step.role)
                 .map_err(|error| CoreError::InvalidWorkflow(format!("step {index}: {error}")))?;
             if step.agent.trim().is_empty() {
@@ -240,6 +263,7 @@ impl Workflow {
                     "step {index} (role {role:?}): agent must not be blank"
                 )));
             }
+            reject_path_like_value(index, "agent", &step.agent)?;
             if !seen_roles.insert(role.as_str().to_string()) {
                 return Err(CoreError::InvalidWorkflow(format!(
                     "duplicate role {role:?} at step {index} -- every step must have a unique role"
@@ -409,6 +433,92 @@ steps:
             Workflow::parse_yaml(yaml),
             Err(CoreError::InvalidWorkflow(_))
         ));
+    }
+
+    /// Issue #73 review (LOW security): `agent` ends up joined verbatim into
+    /// `.claude/agents/<agent>.md` (`warden::agent_def::resolve_custom_step_agent_definition`)
+    /// -- a relative path-traversal component must never reach that join.
+    #[test]
+    fn rejects_an_agent_name_containing_a_path_traversal_component() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: ../../../etc/os-release
+    gate: loop-until-clean
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// An absolute path is rejected too -- it contains a leading `/`, caught
+    /// by the same separator check regardless of whether it also has a
+    /// `..` component.
+    #[test]
+    fn rejects_an_agent_name_that_is_an_absolute_path() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: /etc/passwd\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// A backslash-separated traversal must be rejected identically -- the
+    /// check must not only recognize the Unix separator.
+    #[test]
+    fn rejects_an_agent_name_containing_a_backslash_path_traversal_component() {
+        let yaml = r#"name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: "..\\..\\windows\\system32\\drivers\\etc\\hosts"
+    gate: loop-until-clean
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+    }
+
+    /// `role` is checked too -- it flows into
+    /// `warden::worktree::WorktreeManager::create`'s per-role worktree
+    /// directory name, a second path-building call site besides `agent`.
+    #[test]
+    fn rejects_a_role_name_containing_a_path_traversal_component() {
+        let yaml = "name: x\nsteps:\n  - role: ../coder\n    agent: coder\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// A bare `..` with no separator at all must still be rejected -- the
+    /// whole value, not just a `/../` pattern, is a traversal component.
+    #[test]
+    fn rejects_a_bare_dot_dot_agent_name_with_no_separator() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: \"..\"\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    /// The legitimate control: ordinary hyphenated names (used throughout
+    /// this module's own other tests) must never trip this check.
+    #[test]
+    fn accepts_ordinary_hyphenated_role_and_agent_names() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: techlead
+    agent: tech-lead-v2
+    gate: loop-until-clean
+"#;
+        assert!(Workflow::parse_yaml(yaml).is_ok());
     }
 
     #[test]
