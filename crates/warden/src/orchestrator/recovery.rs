@@ -59,7 +59,8 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
             continue;
         }
 
-        run.state.validate_transition(RunState::Failed)?;
+        run.state
+            .validate_transition(RunState::Failed, run.total_steps)?;
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
@@ -120,7 +121,8 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
                 run_id = %run.id,
                 "run stuck in AwaitingCi with no pr_number recorded; nothing to resume watching, marking Failed"
             );
-            run.state.validate_transition(RunState::Failed)?;
+            run.state
+                .validate_transition(RunState::Failed, run.total_steps)?;
             db::update_run_state(&pool, &run.id, RunState::Failed).await?;
             // Issue #15 review, L3: mirrors recover_crashed_runs's own
             // orphan reclaim for every other path that fails a run outright
@@ -283,9 +285,19 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "crashed-run", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "crashed-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::update_run_state(&pool, "crashed-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -328,7 +340,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3, 3)
+        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         db::update_run_state(&pool, "live-run", RunState::CoderRunning)
@@ -397,6 +409,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -461,10 +475,12 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
-        db::update_run_state(&pool, "orphan-process-run", RunState::Testing)
+        db::update_run_state(&pool, "orphan-process-run", RunState::RunningStep(2))
             .await
             .unwrap();
         db::insert_cycle(&pool, "orphan-process-cycle", "orphan-process-run", 1)
@@ -548,9 +564,19 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "pid-reuse-run", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "pid-reuse-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::update_run_state(&pool, "pid-reuse-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -660,6 +686,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -770,6 +798,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();

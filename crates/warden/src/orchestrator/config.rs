@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use warden_core::{AgentDefinition, AgentRole, EvidenceTool};
+use warden_core::{AgentDefinition, AgentRole, EvidenceTool, Workflow};
 
 /// Static configuration for a single run of the convergence loop.
 ///
@@ -26,17 +26,42 @@ pub struct RunConfig {
     pub branch: String,
     pub intent: String,
     /// Issue #43/ADR-0014: the coder<->reviewer round-trip budget
-    /// (`RunState::Reviewing`) -- a scoped re-review's own finding is charged
+    /// (`RunState::RunningStep(1)`) -- a scoped re-review's own finding is charged
     /// here even when a tester finding was what triggered the coder's
     /// correctif (decision #37 Q1).
     pub max_review_cycles: u32,
     /// Issue #43/ADR-0014: how many times the tester may actually run and
-    /// come back with a blocking finding (`RunState::Testing`) before the run
-    /// gives up as `MaxTestCyclesExceeded`.
+    /// come back with a blocking finding (`RunState::RunningStep(2)`) before
+    /// the run gives up as `RunState::StepCyclesExceeded(2)`.
     pub max_test_cycles: u32,
+    /// Issue #73: the run's pipeline -- `Workflow::builtin_default()` when
+    /// no `.warden/workflow.yaml` exists (strict retro-compat with the
+    /// pre-issue-#73 coder -> gate review -> gate test pipeline), or the
+    /// parsed/validated contents of that file otherwise. Resolved once by
+    /// the CLI, before this run's `runs` row is even written -- the same
+    /// "resolved once, at the base repo, before the coder ever runs" timing
+    /// `coder_agent`/`reviewer_agent`/`tester_agent` already follow.
+    pub workflow: Workflow,
+    /// Issue #73: the single shared cycle budget for any workflow step
+    /// beyond the built-in reviewer/tester pair (e.g. a custom `techlead`
+    /// step) -- the built-in pair keeps using `max_review_cycles`/
+    /// `max_test_cycles` above. Unused when `workflow` has no such extra
+    /// step (the built-in default workflow never does).
+    pub max_extra_step_cycles: u32,
     pub coder_agent: AgentDefinition,
     pub reviewer_agent: AgentDefinition,
     pub tester_agent: AgentDefinition,
+    /// Issue #73: one resolved [`AgentDefinition`] per `workflow.steps[3..]`
+    /// (any step beyond the built-in coder/reviewer/tester pipeline), in the
+    /// same order -- e.g. index `0` here is `workflow.steps[3]`'s own agent
+    /// (a `techlead`, in the shipped example). Empty when `workflow` has no
+    /// such extra step (the built-in default workflow never does). Resolved
+    /// via `warden::agent_def::resolve_custom_step_agent_definition`
+    /// (`.claude/agents/<agent>.md`, ADR-0013) -- a simpler, non-role-
+    /// asymmetric resolution than `coder_agent`/`reviewer_agent`/
+    /// `tester_agent`'s own hardened path (see that function's own docs on
+    /// this deliberate scope limit).
+    pub extra_step_agents: Vec<AgentDefinition>,
     /// Overrides automatic project-type detection for the Evidence Capture
     /// Adapter (`evidence.tool`, ADR-0009). `None` means "detect from the
     /// repo" (`warden_core::detect_project_type`).

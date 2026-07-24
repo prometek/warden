@@ -57,16 +57,25 @@ enum Commands {
         branch: String,
 
         /// Maximum number of coder<->reviewer round trips before giving up
-        /// (`RunState::MaxReviewCyclesExceeded`, issue #43/ADR-0014). Must be
+        /// (`RunState::StepCyclesExceeded(1)`, issue #43/ADR-0014). Must be
         /// at least 1 — a budget of 0 could never let the coder run at all.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_review_cycles: u32,
 
         /// Maximum number of times the tester may run and come back with a
-        /// blocking finding before giving up (`RunState::MaxTestCyclesExceeded`,
+        /// blocking finding before giving up (`RunState::StepCyclesExceeded(2)`,
         /// issue #43/ADR-0014). Must be at least 1.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_test_cycles: u32,
+
+        /// Issue #73: the single shared cycle budget for any workflow step
+        /// beyond the built-in reviewer/tester pair (`.warden/workflow.yaml`,
+        /// e.g. a custom `techlead` step) before giving up
+        /// (`RunState::StepCyclesExceeded`). Ignored when the run's workflow
+        /// has no such extra step (the built-in default workflow never
+        /// does). Must be at least 1.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+        max_cycles: u32,
 
         /// Warden's own state directory (SQLite db + worktrees). Defaults
         /// to `~/.warden`.
@@ -261,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
             branch,
             max_review_cycles,
             max_test_cycles,
+            max_cycles,
             warden_home,
             tool,
             trust_repo_agents,
@@ -316,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
                         branch,
                         max_review_cycles,
                         max_test_cycles,
+                        max_cycles,
                         warden_home,
                         ClaudeAdapter,
                         TrustRepoAgents(trust_repo_agents),
@@ -334,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
                         branch,
                         max_review_cycles,
                         max_test_cycles,
+                        max_cycles,
                         warden_home,
                         CodexAdapter,
                         TrustRepoAgents(trust_repo_agents),
@@ -352,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
                         branch,
                         max_review_cycles,
                         max_test_cycles,
+                        max_cycles,
                         warden_home,
                         MistralAdapter,
                         TrustRepoAgents(trust_repo_agents),
@@ -403,6 +416,87 @@ fn resolve_tui_binary(explicit: Option<PathBuf>) -> PathBuf {
     PathBuf::from(format!("warden-tui{}", std::env::consts::EXE_SUFFIX))
 }
 
+/// Relative path `.warden/workflow.yaml` resolves against a run's repo
+/// (issue #73) -- mirrors `agent_def::AGENTS_DIR`'s own convention of a
+/// dotfile under the repo root.
+const WORKFLOW_FILE: &str = ".warden/workflow.yaml";
+
+/// Loads and validates this run's pipeline (issue #73): `.warden/workflow.yaml`
+/// if present, else `Workflow::builtin_default()` -- the latter is what
+/// makes a run with no workflow file reproduce the pre-issue-#73 pipeline
+/// exactly (strict retro-compat).
+///
+/// **Current engine limitation, enforced here (not a silent restriction):**
+/// the convergence loop's built-in coder/reviewer/tester steps still run
+/// through their own existing, hardened path (`agent_def::resolve_agent_definition`'s
+/// role-asymmetric trust model) -- a custom `workflow.yaml` may only
+/// *append* steps after them, never reorder, replace, or omit them. A
+/// workflow whose first three steps aren't exactly `coder`, `reviewer`,
+/// `tester` (in that order) is rejected with a clear error naming the
+/// mismatch, rather than silently running something the loop cannot
+/// actually execute.
+///
+/// Every step beyond those three is resolved via
+/// `agent_def::resolve_custom_step_agent_definition` (`.claude/agents/<agent>.md`,
+/// ADR-0013) -- an unresolvable agent for any such step fails the run here,
+/// before anything is spawned, naming the role and the exact path expected.
+async fn load_workflow(
+    repo: &std::path::Path,
+) -> anyhow::Result<(warden_core::Workflow, Vec<warden_core::AgentDefinition>)> {
+    let workflow_path = repo.join(WORKFLOW_FILE);
+    let workflow = match tokio::fs::read_to_string(&workflow_path).await {
+        Ok(raw) => warden_core::Workflow::parse_yaml(&raw)
+            .with_context(|| format!("invalid workflow file at {}", workflow_path.display()))?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            warden_core::Workflow::builtin_default()
+        }
+        Err(source) => {
+            return Err(source).with_context(|| {
+                format!(
+                    "failed to read workflow file at {}",
+                    workflow_path.display()
+                )
+            })
+        }
+    };
+
+    let builtin_role_names: Vec<&str> = workflow
+        .steps
+        .iter()
+        .take(3)
+        .map(|step| step.role.as_str())
+        .collect();
+    if builtin_role_names != ["coder", "reviewer", "tester"] {
+        bail!(
+            "{}: the first three steps must be exactly \"coder\", \"reviewer\", \"tester\" (in \
+             that order) -- found {:?}. The current engine only supports appending custom steps \
+             after this built-in pipeline, not reordering, replacing, or omitting it.",
+            workflow_path.display(),
+            builtin_role_names
+        );
+    }
+
+    let mut extra_step_agents = Vec::with_capacity(workflow.steps.len().saturating_sub(3));
+    for step in workflow.steps.iter().skip(3) {
+        let definition = warden::agent_def::resolve_custom_step_agent_definition(
+            repo,
+            step.role.as_str(),
+            &step.agent,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resolve the agent for custom workflow role {:?} (agent {:?})",
+                step.role.as_str(),
+                step.agent
+            )
+        })?;
+        extra_step_agents.push(definition);
+    }
+
+    Ok((workflow, extra_step_agents))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run<R: ToolAdapter>(
     repo: PathBuf,
@@ -410,6 +504,7 @@ async fn run<R: ToolAdapter>(
     branch: String,
     max_review_cycles: u32,
     max_test_cycles: u32,
+    max_cycles: u32,
     warden_home: Option<PathBuf>,
     adapter: R,
     trust_repo_agents: TrustRepoAgents,
@@ -551,6 +646,12 @@ async fn run<R: ToolAdapter>(
     )
     .await?;
 
+    // Issue #73: `.warden/workflow.yaml`, if present, defines this run's
+    // pipeline; its absence reproduces the pre-issue-#73 pipeline exactly
+    // (`Workflow::builtin_default`) -- the strict retro-compat requirement
+    // this whole feature is judged against.
+    let (workflow, extra_step_agents) = load_workflow(&repo).await?;
+
     // Issue #26: `resolve_agent_definition` already `tracing::warn!`ed the
     // moment it actually read a repo-sourced reviewer/tester definition
     // (before this run, or its Event Bus, even exist) -- this just collects
@@ -629,12 +730,15 @@ async fn run<R: ToolAdapter>(
         intent,
         max_review_cycles,
         max_test_cycles,
+        workflow,
+        max_extra_step_cycles: max_cycles,
         coder_agent,
         reviewer_agent,
         tester_agent,
         evidence_tool,
         evidence_store_in_repo,
         gate,
+        extra_step_agents,
         untrusted_repo_agent_definitions,
     };
 

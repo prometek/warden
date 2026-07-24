@@ -68,6 +68,17 @@ pub enum CoreError {
     /// rigor as [`Self::MalformedAgentInput`].
     #[error("malformed agent definition: {0}")]
     MalformedAgentDefinition(String),
+
+    /// Issue #73: a `.warden/workflow.yaml` that isn't valid YAML, or whose
+    /// shape violates [`crate::workflow::Workflow`]'s own invariants (empty
+    /// `steps`, a blank `role`/`agent`, a duplicate `role`, an unknown
+    /// `gate`, or a first step that isn't a plain pass-through) -- validated
+    /// at the boundary with the same rigor as every other user-supplied file
+    /// this crate parses. The message names *what* is wrong; the caller
+    /// (`warden::agent_def`, which reads the file) is responsible for naming
+    /// *which file*.
+    #[error("invalid workflow: {0}")]
+    InvalidWorkflow(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

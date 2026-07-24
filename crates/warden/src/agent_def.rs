@@ -724,6 +724,65 @@ pub fn default_user_config_agents_dir() -> Result<PathBuf> {
     Ok(base.join("warden").join("agents"))
 }
 
+/// The directory a custom workflow step's `agent` name resolves against
+/// (issue #73) -- Claude Code's own `.claude/agents/` subagent convention
+/// (ADR-0013), read directly from the repo under review.
+pub(crate) const CUSTOM_STEP_AGENTS_DIR: &str = ".claude/agents";
+
+/// Resolves a **custom** workflow step's agent definition (issue #73) -- any
+/// role beyond the built-in coder/reviewer/tester pipeline (e.g. a
+/// `techlead` role in `.warden/workflow.yaml`). Reads
+/// `<repo>/.claude/agents/<agent>.md` and parses it with the exact same
+/// [`parse_agent_definition`] the built-in roles use (same schema, same
+/// validation rigor) -- but, deliberately, **none** of
+/// [`resolve_agent_definition`]'s role-asymmetric trust machinery: no
+/// user-config precedence, no `--trust-repo-agents` gate, no
+/// `AgentDefinitionSource` to report. That hardened model was built
+/// specifically for the reviewer/tester's own independence from the coder
+/// (see this module's "Security: role-asymmetric resolution" docs) and
+/// extending it correctly to an arbitrary, workflow-declared role is a
+/// larger security design this issue does not take on -- a real, documented
+/// scope limit: a custom step's definition is exactly as coder-writable as
+/// the coder's own convention file is today.
+///
+/// No adapter-default fallback either (unlike every built-in role): a
+/// custom role has no natural "default prompt" for `ToolAdapter` to supply
+/// (`ToolAdapter::default_prompt`/`default_tools` are keyed to the closed
+/// `AgentRole`), so a missing file is always a hard,
+/// [`AgentDefinitionError::CustomStepAgentNotFound`] error naming the exact
+/// role and path expected -- never a silent skip of the step.
+///
+/// A file that exists but fails to read or parse is the same typed
+/// [`AgentDefinitionError::Read`]/[`AgentDefinitionError::Invalid`] the
+/// built-in roles' own resolution raises, naming the path.
+pub async fn resolve_custom_step_agent_definition(
+    repo_path: &Path,
+    role_name: &str,
+    agent_name: &str,
+) -> Result<AgentDefinition> {
+    let path = repo_path
+        .join(CUSTOM_STEP_AGENTS_DIR)
+        .join(format!("{agent_name}.md"));
+    match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => {
+            Ok(
+                parse_agent_definition(&raw).map_err(|source| AgentDefinitionError::Invalid {
+                    path: path.clone(),
+                    source,
+                })?,
+            )
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(AgentDefinitionError::CustomStepAgentNotFound {
+                role: role_name.to_string(),
+                expected_path: path,
+            }
+            .into())
+        }
+        Err(source) => Err(AgentDefinitionError::Read { path, source }.into()),
+    }
+}
+
 /// Issue #30 (cross-run agent-definition poisoning, structural fix): the
 /// raw, *unparsed* state `role`'s convention file resolves to when read
 /// through the OS from `repo_path`, via the exact same literal path
@@ -1848,5 +1907,76 @@ mod tests {
             a, different_kind,
             "a different ErrorKind must never compare equal, even with the same message text"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_custom_step_agent_definition (issue #73)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolves_a_custom_steps_definition_from_claude_agents_dir() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(CUSTOM_STEP_AGENTS_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo.path().join(CUSTOM_STEP_AGENTS_DIR).join("techlead.md"),
+            DEFINITION,
+        )
+        .await
+        .unwrap();
+
+        let definition = resolve_custom_step_agent_definition(repo.path(), "techlead", "techlead")
+            .await
+            .unwrap();
+
+        assert_eq!(definition.model.as_deref(), Some("opus"));
+        assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+    }
+
+    #[tokio::test]
+    async fn a_missing_custom_step_definition_is_a_typed_error_naming_the_role_and_path() {
+        let repo = TempDir::new().unwrap();
+
+        let error = resolve_custom_step_agent_definition(repo.path(), "techlead", "techlead")
+            .await
+            .unwrap_err();
+
+        match error {
+            WardenError::AgentDefinition(AgentDefinitionError::CustomStepAgentNotFound {
+                role,
+                expected_path,
+            }) => {
+                assert_eq!(role, "techlead");
+                assert_eq!(
+                    expected_path,
+                    repo.path().join(CUSTOM_STEP_AGENTS_DIR).join("techlead.md")
+                );
+            }
+            other => panic!("expected CustomStepAgentNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_custom_step_definition_is_a_typed_error_naming_the_path() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(CUSTOM_STEP_AGENTS_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            repo.path().join(CUSTOM_STEP_AGENTS_DIR).join("techlead.md"),
+            "no frontmatter here\n",
+        )
+        .await
+        .unwrap();
+
+        let error = resolve_custom_step_agent_definition(repo.path(), "techlead", "techlead")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WardenError::AgentDefinition(AgentDefinitionError::Invalid { .. })
+        ));
     }
 }

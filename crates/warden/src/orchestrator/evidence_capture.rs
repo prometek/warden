@@ -151,6 +151,8 @@ mod tests {
                 intent: "converge even though no evidence tool is installed".to_string(),
                 max_review_cycles: 3,
                 max_test_cycles: 3,
+                workflow: warden_core::Workflow::builtin_default(),
+                max_extra_step_cycles: 5,
                 coder_agent: definition(AgentCommand::new(
                     "sh",
                     [
@@ -163,6 +165,7 @@ mod tests {
                 evidence_tool: None,
                 evidence_store_in_repo: true,
                 gate: None,
+                extra_step_agents: Vec::new(),
                 untrusted_repo_agent_definitions: Vec::new(),
             };
 

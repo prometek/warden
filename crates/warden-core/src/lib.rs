@@ -21,15 +21,16 @@ mod pr_body;
 mod socket;
 mod state;
 mod token_usage;
+mod workflow;
 
 pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
-    parse_agent_input_message, AgentInputMessage, ReviewScope, AGENT_INPUT_VERSION,
-    DIFF_TRUNCATED_MARKER,
+    build_finding_agent_input_json, parse_agent_input_message, AgentInputMessage, ReviewScope,
+    AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
 };
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{
-    decide_next_state, decide_next_state_after_ci, parse_findings,
+    decide_next_state_after_ci, decide_next_state_for_step, parse_findings,
     validate_finding_sources_for_role, CiOutcome, Finding, FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
@@ -44,3 +45,4 @@ pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use state::{AgentRole, RunState};
 pub use token_usage::TokenUsage;
+pub use workflow::{Gate, Role, Workflow, WorkflowStep};

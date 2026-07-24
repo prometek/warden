@@ -74,6 +74,8 @@ impl Orchestrator {
             &config.intent,
             config.max_review_cycles,
             config.max_test_cycles,
+            config.workflow.steps.len() as u32,
+            config.max_extra_step_cycles,
         )
         .await?;
         self.publish_event(RunEvent::RunStarted {
@@ -194,6 +196,12 @@ impl Orchestrator {
         // cycle whose review came back clean (issue #41's gate) -- so this
         // only advances then, independently of `review_cycle_number`.
         let mut test_cycle_number: u32 = 0;
+        // Issue #73: the single shared counter for any workflow step beyond
+        // the built-in reviewer/tester pair -- advances once per cycle in
+        // which that whole extra-step chain actually runs (a clean tester
+        // cycle in a workflow with more steps left), never once per
+        // individual extra step.
+        let mut extra_step_cycle_number: u32 = 0;
         // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
         // coder exactly like a reviewer/tester blocking finding does, just
         // one step later in the pipeline -- these are seeded into the next
@@ -272,7 +280,7 @@ impl Orchestrator {
             // what was one `AwaitingReviewTest` state into `Reviewing` (this
             // wait) and `Testing` (below, only entered once this cycle's
             // review is clean).
-            self.transition(&run_id, RunState::Reviewing).await?;
+            self.transition(&run_id, RunState::RunningStep(1)).await?;
 
             // Phase A -- gate review (issue #37/#41, ADR-0014): the tester
             // must never run before the reviewer is clean. The first
@@ -356,7 +364,7 @@ impl Orchestrator {
                 // -- `review_cycle_number` deliberately did *not* advance a
                 // few lines above, precisely because this cycle's review was
                 // clean.
-                self.transition(&run_id, RunState::Testing).await?;
+                self.transition(&run_id, RunState::RunningStep(2)).await?;
                 test_cycle_number += 1;
                 db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number).await?;
                 findings.extend(
@@ -393,18 +401,117 @@ impl Orchestrator {
                 })
                 .await?;
             }
+
+            // Issue #73: the review/test decision, generalized to the
+            // step-indexed `decide_next_state_for_step` -- `RunningStep(1)`
+            // (reviewer) when this cycle's review wasn't clean, else
+            // `RunningStep(2)` (tester, which only ever ran above on a
+            // review-clean cycle). For the built-in default (three-step)
+            // workflow this is exactly ADR-0014's old per-phase rule; for a
+            // workflow with additional steps beyond the tester, a clean
+            // tester cycle advances to `RunningStep(3)` instead of
+            // converging directly (`Workflow::is_last_step`), picked up by
+            // the generic extra-step loop right below.
+            let mut next_state = if !review_is_clean {
+                decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    1,
+                    review_cycle_number,
+                    config.max_review_cycles,
+                )
+            } else {
+                decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    2,
+                    test_cycle_number,
+                    config.max_test_cycles,
+                )
+            };
+
+            // Issue #73: any workflow step beyond the built-in tester runs
+            // here, generically, driven entirely by `config.workflow` --
+            // never reached at all for the built-in default workflow (its
+            // one and only `decide_next_state_for_step` call above already
+            // covers `RunningStep(1)`/`RunningStep(2)`, its only gated
+            // steps). Every extra step shares one cycle budget/counter
+            // (`config.max_extra_step_cycles`/`extra_step_cycle_number`) --
+            // this whole chain counts as a single attempt for that cycle,
+            // incremented once, not once per extra step.
+            if matches!(next_state, RunState::RunningStep(index) if index as usize >= 3) {
+                extra_step_cycle_number += 1;
+                db::set_run_current_extra_step_cycle(&self.pool, &run_id, extra_step_cycle_number)
+                    .await?;
+            }
+            while let RunState::RunningStep(step_index) = next_state {
+                if (step_index as usize) < 3 {
+                    // Only the built-in pair's own two steps ever reach this
+                    // point directly from the `if`/`else` above -- a genuine
+                    // `RunningStep(1)`/`RunningStep(2)` here means the
+                    // decision above already produced a *terminal-for-this-
+                    // loop* value (`CoderRunning`/`Converged`/
+                    // `StepCyclesExceeded`), so this loop must never run for
+                    // those indices. Kept as an explicit, documented
+                    // invariant rather than an unreachable panic.
+                    break;
+                }
+                let extra_index = step_index as usize - 3;
+                let step = &config.workflow.steps[step_index as usize];
+                let step_agent = &agents.extra[extra_index];
+
+                self.transition(&run_id, RunState::RunningStep(step_index))
+                    .await?;
+
+                let step_findings = self
+                    .run_workflow_step(
+                        &runner,
+                        WorkflowStepInvocation {
+                            run_id: &run_id,
+                            cycle_id: &cycle_id,
+                            cycle_number,
+                            role: &step.role,
+                            agent: step_agent,
+                            env_allowlist: agents.env_allowlist,
+                            worktree_manager: &worktree_manager,
+                            commit: &base_commit,
+                            diff: &coder_result.diff,
+                            prior_findings: &prior_findings,
+                            config: &config,
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await?;
+
+                for finding in &step_findings {
+                    db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
+                        .await?;
+                    self.publish_event(RunEvent::FindingRaised {
+                        cycle_number,
+                        source: finding.source.as_str().to_string(),
+                        severity: finding.severity.as_str().to_string(),
+                        file: finding.file.clone(),
+                        description: finding.description.clone(),
+                        action: finding.action.clone(),
+                    })
+                    .await?;
+                }
+                findings.extend(step_findings);
+
+                next_state = decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    step_index,
+                    extra_step_cycle_number,
+                    config.max_extra_step_cycles,
+                );
+            }
+
             db::close_cycle(&self.pool, &cycle_id).await?;
             // ADR-0012: this cycle is now the "previous cycle" the next
             // iteration's reviewer/tester (if there is one) reports on.
             previous_cycle_id = Some(cycle_id.clone());
 
-            let next_state = decide_next_state(
-                &findings,
-                review_cycle_number,
-                config.max_review_cycles,
-                test_cycle_number,
-                config.max_test_cycles,
-            );
             let mut converged_commit_for_tail: Option<String> = None;
             if next_state == RunState::Converged {
                 // Issue #7 / ADR-0009: fold any evidence captured across
@@ -537,12 +644,15 @@ mod tests {
             intent: "drive the run through a fake runner".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -599,7 +709,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "hook seam", 3, 3)
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "hook seam", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -620,7 +730,7 @@ mod tests {
             .await
             .unwrap();
         orchestrator
-            .transition(&run_id, RunState::Reviewing)
+            .transition(&run_id, RunState::RunningStep(1))
             .await
             .unwrap();
 
@@ -683,12 +793,15 @@ mod tests {
             intent: "bracket a run with run-level hooks".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -765,12 +878,15 @@ mod tests {
             intent: "a setup hook that cannot establish the environment".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -842,12 +958,15 @@ mod tests {
             intent: "a repo hook prepares the environment".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -893,12 +1012,15 @@ mod tests {
             intent: "issue #26: surface an untrusted repo-sourced definition".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
             reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
             tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: vec![
                 UntrustedRepoAgentDefinition {
                     role: AgentRole::Reviewer,
@@ -982,12 +1104,15 @@ mod tests {
             intent: "never gets to run".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(always_passing_tester()),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1058,12 +1183,15 @@ mod tests {
             intent: "issue 31: on_run_started ordering".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1104,12 +1232,15 @@ mod tests {
             intent: "no callback registered".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1217,12 +1348,15 @@ mod tests {
             intent: "issue 33: live agent progress".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1404,12 +1538,15 @@ mod tests {
             intent: "issue 33: malformed progress lines must not crash the run".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1550,12 +1687,15 @@ mod tests {
             intent: "issue #53: token usage is persisted and published".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(coder),
             reviewer_agent: definition(reviewer),
             tester_agent: definition(tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1671,12 +1811,15 @@ mod tests {
             intent: "an ordinary, unrelated change".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(ordinary_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1726,12 +1869,15 @@ mod tests {
                 .to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1740,7 +1886,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
+        assert_eq!(final_state, RunState::StepCyclesExceeded(1));
         assert_no_worktrees_left_behind(repo.path(), warden_home.path(), &run_id);
     }
 
@@ -1849,12 +1995,15 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(capturing_coder),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1887,7 +2036,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(second.findings[0].severity, warden_core::Severity::Blocking);
         assert_eq!(second.findings[0].description, "status is broken");
@@ -1936,12 +2085,15 @@ mod tests {
             intent: "check the prompts land".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: prompted(coder, "you are the coder"),
             reviewer_agent: prompted(capture("reviewer", "true"), "you are the reviewer"),
             tester_agent: prompted(capture("tester", "true"), "you are the tester"),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1978,12 +2130,15 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2065,12 +2220,15 @@ mod tests {
             // `MaxReviewCyclesExceeded` at cycle 1 instead.
             max_review_cycles: 1,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(noop_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_blocking_tester),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2081,7 +2239,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxTestCyclesExceeded,
+            RunState::StepCyclesExceeded(2),
             "the test budget must be what exhausts, not a review budget of 1 falsely tripped \
                  by tester-driven reboucles"
         );
@@ -2130,12 +2288,15 @@ mod tests {
             intent: "never converges".to_string(),
             max_review_cycles: 2,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(noop_coder),
             reviewer_agent: definition(always_blocking_reviewer),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2144,7 +2305,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
+        assert_eq!(final_state, RunState::StepCyclesExceeded(1));
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
             run.current_review_cycle, 2,
@@ -2197,12 +2358,15 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(counting_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2239,13 +2403,13 @@ mod tests {
         assert!(
                 cycle_1_findings
                     .iter()
-                    .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                    .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
                 "expected the status-gated reviewer's blocking finding in cycle 1: {cycle_1_findings:?}"
             );
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Tester),
+                .any(|f| f.source == warden_core::FindingSource::role("tester")),
             "no tester-sourced finding must exist for cycle 1 -- the tester never ran: \
                  {cycle_1_findings:?}"
         );
@@ -2317,12 +2481,15 @@ mod tests {
             intent: "sneak in a reviewer.md change, then revert it".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poison_once_then_revert_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(counting_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2356,14 +2523,14 @@ mod tests {
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
             "the reviewer never raises anything in this test, isolating the block to the \
                  tampering finding: {cycle_1_findings:?}"
         );
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Tester),
+                .any(|f| f.source == warden_core::FindingSource::role("tester")),
             "no tester-sourced finding must exist for cycle 1 -- the tester must never run \
                  while a definition-tampering finding is still blocking: {cycle_1_findings:?}"
         );
@@ -2429,12 +2596,15 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2473,7 +2643,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(second.findings[0].description, "status is broken");
     }
@@ -2542,12 +2712,15 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(flip_status_coder()),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(counting_status_gated_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2588,7 +2761,7 @@ mod tests {
         assert!(
             cycle_1_findings
                 .iter()
-                .all(|f| f.source == warden_core::FindingSource::Tester),
+                .all(|f| f.source == warden_core::FindingSource::role("tester")),
             "cycle 1's only finding must be the tester's: {cycle_1_findings:?}"
         );
         assert_eq!(cycle_1_findings.len(), 1);
@@ -2611,7 +2784,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Tester
+            warden_core::FindingSource::role("tester")
         );
         assert_eq!(second.findings[0].description, "tester found status broken");
     }
@@ -2706,12 +2879,15 @@ mod tests {
             intent: "fix the app without regressing".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(three_state_coder),
             reviewer_agent: definition(capturing_regression_gated_reviewer),
             tester_agent: definition(counting_fixed_gated_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -2752,7 +2928,7 @@ mod tests {
         assert!(
             cycle_2_findings
                 .iter()
-                .all(|f| f.source == warden_core::FindingSource::Reviewer),
+                .all(|f| f.source == warden_core::FindingSource::role("reviewer")),
             "cycle 2's only finding must be the reviewer's own regression finding: \
                  {cycle_2_findings:?}"
         );
@@ -2775,7 +2951,7 @@ mod tests {
         assert_eq!(third.findings.len(), 1);
         assert_eq!(
             third.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(
             third.findings[0].description,
@@ -2787,14 +2963,24 @@ mod tests {
     async fn select_prior_findings_prefers_ci_seeded_findings_over_the_previous_cycle() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-1", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-select-1",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-select-1", "run-select-1", 1)
             .await
             .unwrap();
         let previous_cycle_finding = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "from the previous cycle".to_string(),
@@ -2834,14 +3020,24 @@ mod tests {
     ) {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-2", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-select-2",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-select-2", "run-select-2", 1)
             .await
             .unwrap();
         let previous_cycle_finding = Finding {
-            source: warden_core::FindingSource::Tester,
+            source: warden_core::FindingSource::role("tester"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "from the previous cycle".to_string(),
@@ -2889,22 +3085,32 @@ mod tests {
     async fn select_prior_findings_returns_findings_in_ascending_id_order_not_insertion_order() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-order-1", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-order-1",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-order-1", "run-order-1", 1)
             .await
             .unwrap();
 
         let finding_z = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "inserted first, sorts last by id".to_string(),
             action: None,
         };
         let finding_a = Finding {
-            source: warden_core::FindingSource::Tester,
+            source: warden_core::FindingSource::role("tester"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "inserted second, sorts first by id".to_string(),

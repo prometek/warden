@@ -440,6 +440,49 @@ la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML i
 > reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
 > donc plus aux adaptateurs intégrés.
 
+### Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73)
+
+Par défaut, un run suit le pipeline intégré coder -> gate review -> gate test — rien à
+faire, aucun fichier requis. Un `.warden/workflow.yaml` optionnel à la racine du repo sous
+revue permet d'étendre ce pipeline avec des rôles supplémentaires :
+
+```yaml
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+```
+
+- `role` — nom ouvert (pas une énumération fermée) : identifie l'étape et la source des
+  findings qu'elle lève (`FindingSource::role(...)`).
+- `agent` — nom résolu vers `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013)
+  pour tout rôle au-delà des trois rôles intégrés.
+- `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
+  (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
+
+**Rétro-compatibilité stricte** : sans `.warden/workflow.yaml`, le comportement est
+identique à celui d'avant l'issue #73 — le pipeline intégré (`--max-review-cycles`/
+`--max-test-cycles`) n'est pas affecté.
+
+**Limite actuelle du moteur** : les trois premières étapes doivent être exactement
+`coder`, `reviewer`, `tester` dans cet ordre — la boucle de convergence ne fait
+qu'**ajouter** des étapes après ce pipeline intégré (qui garde sa propre résolution
+d'agent, ADR-0026), jamais les réordonner, remplacer, ni omettre. Toute étape
+au-delà partage un unique budget de cycles, contrôlé par `--max-cycles` (défaut 5),
+distinct de `--max-review-cycles`/`--max-test-cycles`.
+
+Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
+`workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.
+
 ### Prérequis par CLI (`--tool`)
 
 Chaque adaptateur délègue entièrement l'authentification au binaire CLI qu'il invoque

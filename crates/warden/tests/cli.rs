@@ -981,7 +981,7 @@ printf '%s\n' '{"source":"reviewer","severity":"info","description":"codex revie
         .await
         .unwrap();
     assert_eq!(findings.len(), 1, "expected the reviewer's one finding");
-    assert_eq!(findings[0].source, FindingSource::Reviewer);
+    assert_eq!(findings[0].source, FindingSource::role("reviewer"));
     assert_eq!(findings[0].description, "codex reviewer saw the diff");
 
     let usage = warden::db::get_run_token_usage(&pool, &run_id)
@@ -1052,7 +1052,7 @@ printf '%s\n' '{"source":"tester","severity":"info","description":"mistral teste
         .await
         .unwrap();
     assert_eq!(findings.len(), 1, "expected the tester's one finding");
-    assert_eq!(findings[0].source, FindingSource::Tester);
+    assert_eq!(findings[0].source, FindingSource::role("tester"));
     assert_eq!(findings[0].description, "mistral tester ran the suite");
 
     assert_eq!(
@@ -1899,14 +1899,14 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
         ])
         .assert()
         .success()
-        .stdout(contains("finished: MaxReviewCyclesExceeded"));
+        .stdout(contains("finished: StepCyclesExceeded(1)"));
 
     let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
     let pool = warden::db::connect(&warden_home.path().join("state.db"))
         .await
         .unwrap();
     let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
-    assert_eq!(run.state, RunState::MaxReviewCyclesExceeded);
+    assert_eq!(run.state, RunState::StepCyclesExceeded(1));
 }
 
 /// Issue #71 review, HIGH: a reviewer/tester that exits non-zero and prints
@@ -1919,7 +1919,7 @@ async fn e2e_reviewer_findings_extracted_through_the_claude_json_envelope_reach_
 /// "$WARDEN_RESULT_FILE"` ever runs) -- exactly "crashed, printed nothing".
 /// If the orchestrator's own exit-code gate
 /// (`warden::orchestrator::agents::run_finding_agent`) were missing or
-/// removed, this would converge; asserting `MaxReviewCyclesExceeded`
+/// removed, this would converge; asserting `step_cycles_exceeded:1`
 /// instead proves the non-zero exit was turned into a blocking finding
 /// before `extract_findings` (or its blank-is-fine mapping) ever got a say.
 #[cfg(unix)]
@@ -1949,14 +1949,14 @@ async fn e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges() {
         ])
         .assert()
         .success()
-        .stdout(contains("finished: MaxReviewCyclesExceeded"));
+        .stdout(contains("finished: StepCyclesExceeded(1)"));
 
     let run_id = extract_run_id(&String::from_utf8_lossy(&assert.get_output().stdout));
     let pool = warden::db::connect(&warden_home.path().join("state.db"))
         .await
         .unwrap();
     let run = warden::db::get_run(&pool, &run_id).await.unwrap().unwrap();
-    assert_eq!(run.state, RunState::MaxReviewCyclesExceeded);
+    assert_eq!(run.state, RunState::StepCyclesExceeded(1));
 
     // Not just "didn't converge" -- the cycle's finding must actually be the
     // synthesized non-zero-exit blocking finding, proving the exit-code
@@ -1970,9 +1970,11 @@ async fn e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges() {
         .await
         .unwrap();
     assert!(
-        findings.iter().any(|f| f.source == FindingSource::Reviewer
-            && f.severity == warden_core::Severity::Blocking
-            && f.description.contains("exited with status")),
+        findings
+            .iter()
+            .any(|f| f.source == FindingSource::role("reviewer")
+                && f.severity == warden_core::Severity::Blocking
+                && f.description.contains("exited with status")),
         "expected a synthesized non-zero-exit blocking finding, got: {findings:?}"
     );
 }
@@ -2761,6 +2763,8 @@ async fn e2e_crashed_run_is_marked_failed_on_the_next_cli_invocation() {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -3082,11 +3086,11 @@ printf '{"source":"tester","severity":"info","description":"test_target=modified
 
     let reviewer_finding = findings
         .iter()
-        .find(|f| f.source == FindingSource::Reviewer)
+        .find(|f| f.source == FindingSource::role("reviewer"))
         .expect("reviewer finding present");
     let tester_finding = findings
         .iter()
-        .find(|f| f.source == FindingSource::Tester)
+        .find(|f| f.source == FindingSource::role("tester"))
         .expect("tester finding present");
 
     assert!(
@@ -3172,6 +3176,8 @@ async fn e2e_crash_restart_leaves_no_orphan_worktree_or_process() {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -4415,4 +4421,357 @@ async fn e2e_tui_spawn_failure_aborts_the_run_instead_of_degrading_to_headless()
         .failure()
         .stderr(contains("failed to spawn"))
         .stderr(contains(missing_tui_bin.to_str().unwrap().to_string()));
+}
+
+// ---- Issue #73: customizable workflow -------------------------------------
+
+/// Writes `<repo>/.warden/workflow.yaml`.
+fn write_workflow_yaml(repo: &Path, yaml: &str) {
+    let dir = repo.join(".warden");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("workflow.yaml"), yaml).unwrap();
+}
+
+/// Writes `<repo>/.claude/agents/<agent>.md` (issue #73: a custom workflow
+/// step's own agent definition -- ADR-0013's Claude Code subagent
+/// convention, resolved by `agent_def::resolve_custom_step_agent_definition`,
+/// distinct from the built-in roles' `.warden/agents/` convention).
+fn write_custom_step_agent_definition(repo: &Path, agent_name: &str, system_prompt: &str) {
+    let dir = repo.join(".claude").join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{agent_name}.md")),
+        format!("---\n---\n\n{system_prompt}\n"),
+    )
+    .unwrap();
+}
+
+const DEFAULT_WORKFLOW_YAML: &str = r#"
+name: default
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+"#;
+
+/// Issue #73's own central acceptance criterion: parsing the documented
+/// default `workflow.yaml` shape and driving a real run with it through the
+/// actual CLI must converge exactly like today's pipeline -- proving the
+/// *data-driven* default is not merely equivalent on paper
+/// (`warden_core::workflow::tests::parsing_the_documented_default_shape_matches_builtin_default`
+/// already pins that at the data-model level) but actually drives the real
+/// convergence loop the same way.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_an_explicit_workflow_yaml_reproducing_the_default_shape_converges_like_the_builtin_one(
+) {
+    let repo = init_test_repo();
+    write_workflow_yaml(repo.path(), DEFAULT_WORKFLOW_YAML);
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "explicit default-shaped workflow.yaml",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+}
+
+/// Issue #73's strict retro-compat acceptance criterion, made explicit at the
+/// CLI level: with **no** `.warden/workflow.yaml` at all, a run still
+/// converges through exactly the built-in coder -> gate review -> gate test
+/// pipeline (no behaviour change from before this issue).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_no_workflow_file_present_reproduces_the_pre_issue_73_pipeline() {
+    let repo = init_test_repo();
+    assert!(
+        !repo.path().join(".warden").join("workflow.yaml").exists(),
+        "this test's own premise: no workflow.yaml at all"
+    );
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        FLIP_STATUS_CODER_BODY,
+        STATUS_GATED_REVIEWER_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "no workflow.yaml at all",
+            "--max-review-cycles",
+            "5",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+}
+
+/// Issue #73's headline demonstration: a custom `.warden/workflow.yaml`
+/// appends a **new role** (`techlead`) after the built-in tester, backed by
+/// its own `.claude/agents/techlead.md` definition. Drives a real run
+/// through the actual CLI (not the orchestrator API directly) and proves:
+/// - the new role's agent actually runs as a real subprocess, gated exactly
+///   like the reviewer/tester (`gate: loop-until-clean`) -- a blocking
+///   finding on its first invocation reboucles the whole pipeline back to
+///   the coder, and only a subsequent clean pass converges the run;
+/// - its findings are persisted with `source: "techlead"`, aggregating in
+///   the convergence loop the same way a reviewer's/tester's already do
+///   (`FindingSource::role`/`decide_next_state_for_step`, generalized rather
+///   than special-cased for the two built-in gated roles).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_custom_techlead_role_actually_gates_the_pipeline_and_its_findings_aggregate() {
+    let repo = init_test_repo();
+    let yaml = r#"
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+    write_workflow_yaml(repo.path(), yaml);
+    write_custom_step_agent_definition(
+        repo.path(),
+        "techlead",
+        "You are Warden's tech lead: arbitrate reviewer/tester findings and give a go/no-go.",
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // Issue #73: `techlead` is invoked through the very same `--tool`
+    // adapter as every other role (`ResolvedAgents::resolve` maps
+    // `RunConfig::extra_step_agents` through the run's own `ToolAdapter`,
+    // exactly like the built-in three) -- so the fake tool below tells all
+    // four roles apart the same way `write_fake_claude`'s own docs describe
+    // (this module's "The fake `claude` harness" docs), just with a fourth
+    // branch.
+    //
+    // `techlead_marker` is baked directly into the script's own source
+    // rather than passed via an environment variable: `ClaudeAdapter::
+    // env_allowlist` does not forward arbitrary test-chosen variables into
+    // the sandboxed subprocess, and a file the script itself wrote would not
+    // survive past its own ephemeral worktree being removed at the end of
+    // the invocation -- an absolute path outside any worktree, embedded in
+    // the script text itself, is what actually persists across cycles.
+    let techlead_marker = bin_dir.path().join("techlead-has-run-once");
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+stdin_file=$(mktemp)
+cat > "$stdin_file"
+WARDEN_RESULT_FILE=$(mktemp)
+export WARDEN_RESULT_FILE
+: > "$WARDEN_RESULT_FILE"
+
+if grep -q '"role":"coder"' "$stdin_file"; then
+{APPEND_NOTES_CODER_BODY}
+elif grep -q '"role":"reviewer"' "$stdin_file"; then
+{NOOP_BODY}
+elif grep -q '"role":"tester"' "$stdin_file"; then
+{NOOP_BODY}
+else
+    if [ -f "{marker}" ]; then
+        true
+    else
+        touch "{marker}"
+        printf '%s\n' '{{"source":"techlead","severity":"blocking","description":"needs another pass"}}' > "$WARDEN_RESULT_FILE"
+    fi
+fi
+
+result=$(cat "$WARDEN_RESULT_FILE")
+rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
+escaped=$(printf '%s' "$result" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
+printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' "$escaped"
+"#,
+        marker = techlead_marker.display()
+    );
+    write_fake_tool(bin_dir.path(), "claude", &script);
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "exercise the custom techlead role",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    assert!(
+        techlead_marker.exists(),
+        "the techlead role must actually have run as a real subprocess"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let run_id = extract_run_id(&stdout);
+
+    let db_path = warden_home.path().join("state.db");
+    let pool = warden::db::connect(&db_path).await.unwrap();
+
+    let cycle_ids: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM cycles WHERE run_id = ? ORDER BY cycle_number")
+            .bind(&run_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cycle_ids.len(),
+        2,
+        "the techlead's first blocking finding must reboucle to a second cycle"
+    );
+
+    let mut all_findings = Vec::new();
+    for (cycle_id,) in &cycle_ids {
+        all_findings.extend(
+            warden::db::list_findings_for_cycle(&pool, cycle_id)
+                .await
+                .unwrap(),
+        );
+    }
+    let techlead_finding = all_findings
+        .iter()
+        .find(|finding| finding.source == FindingSource::role("techlead"))
+        .expect("the techlead's own finding must be persisted, aggregating like any other role's");
+    assert_eq!(techlead_finding.description, "needs another pass");
+}
+
+/// Issue #73: a malformed `.warden/workflow.yaml` must fail the run with a
+/// clear, actionable error naming the file -- never silently fall back to
+/// the built-in default pipeline (code-standards.md: no silent fallback).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_malformed_workflow_yaml_is_a_clean_cli_error_naming_the_file() {
+    let repo = init_test_repo();
+    write_workflow_yaml(repo.path(), "name: x\nsteps: []\n");
+    let warden_home = TempDir::new().unwrap();
+
+    warden_command()
+        .0
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "malformed workflow file",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("workflow.yaml"))
+        .stderr(contains("at least one step"));
+}
+
+/// Issue #73: an unresolvable custom-step agent must fail the run with a
+/// clear, actionable error naming the role and the exact path expected --
+/// never silently skip the step.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_an_unresolvable_custom_step_agent_is_a_clean_cli_error_naming_the_role_and_path() {
+    let repo = init_test_repo();
+    let yaml = r#"
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+    write_workflow_yaml(repo.path(), yaml);
+    // Deliberately no `.claude/agents/techlead.md` written.
+    let warden_home = TempDir::new().unwrap();
+
+    warden_command()
+        .0
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "unresolvable custom step agent",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("techlead"))
+        .stderr(contains(
+            repo.path()
+                .join(".claude")
+                .join("agents")
+                .join("techlead.md")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ));
 }

@@ -13,7 +13,7 @@
 //! re-review gate before the tester is ever handed that commit again.
 //!
 //! Per-phase budgets: separate `max_review_cycles`/`max_test_cycles`
-//! (config.rs) back separate [`RunState::Reviewing`]/[`RunState::Testing`]
+//! (config.rs) back separate [`RunState::RunningStep(1)`]/[`RunState::RunningStep(2)`]
 //! states -- [`warden_core::decide_next_state`] charges a blocking finding
 //! to whichever budget its own [`warden_core::FindingSource`] belongs to.
 //! Each role gets its own worktree synced onto the coder's commit (see
@@ -53,8 +53,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiOutcome,
-    CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, RunEvent, RunState,
+    decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, AgentRole, CiOutcome,
+    CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, Role, RunEvent, RunState,
     DIFF_TRUNCATED_MARKER,
 };
 use warden_sandbox::{LocalSandbox, Sandbox};
@@ -89,6 +89,38 @@ pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs};
 
 use tampering::AgentDefinitionSnapshot;
 
+/// Issue #73: which agent a [`Orchestrator::run_agent`] invocation is
+/// spawning -- either one of the three built-in roles (whose identity feeds
+/// the existing per-role `agent_processes`/token-usage bookkeeping, unchanged
+/// from before this issue), or a custom workflow step beyond them (e.g. a
+/// `techlead` role), which only carries its display name for
+/// observability (`RunEvent::AgentStarted`/`AgentFinished`/`AgentProgress`).
+///
+/// Deliberate scope limit (documented, not an oversight): a custom step does
+/// **not** get its own `agent_processes` row or per-role token-usage
+/// tracking -- both are backed by columns hardcoded to the three built-in
+/// roles (`cycles.{coder,reviewer,tester}_worktree_path`/`*_tokens`,
+/// migrations/0001/0008), and normalizing them to an arbitrary open role set
+/// is a larger schema change this issue does not make. A custom step's
+/// process is still spawned through the exact same sandboxed seam and
+/// [`process::validate_agent_program`] containment check as a built-in
+/// role's -- see [`Orchestrator::run_agent`]'s own body for exactly what
+/// this narrows.
+#[derive(Debug, Clone, Copy)]
+enum InvocationRole<'a> {
+    Builtin(AgentRole),
+    Custom(&'a Role),
+}
+
+impl InvocationRole<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            InvocationRole::Builtin(role) => role.as_str(),
+            InvocationRole::Custom(role) => role.as_str(),
+        }
+    }
+}
+
 /// One role's markdown definition (issue #24), already mapped onto the
 /// command to spawn for it: what to run, and what to tell it it is.
 ///
@@ -103,11 +135,16 @@ struct ResolvedAgent {
     system_prompt: String,
 }
 
-/// The three roles' definitions, resolved through this run's [`ToolAdapter`].
+/// The three built-in roles' definitions, plus any custom workflow step
+/// beyond them (issue #73), resolved through this run's [`ToolAdapter`].
 struct ResolvedAgents {
     coder: ResolvedAgent,
     reviewer: ResolvedAgent,
     tester: ResolvedAgent,
+    /// Issue #73: one resolved agent per `config.workflow.steps[3..]`, in the
+    /// same order as `config.extra_step_agents` (and thus as the workflow's
+    /// own step order) -- empty for the built-in default workflow.
+    extra: Vec<ResolvedAgent>,
     /// This run's `--tool` adapter's own env allowlist (issue #24), resolved
     /// once here since it's a property of the tool, not of any one role --
     /// `--tool` is global for a run (issue #24, "Sélection d'outil par
@@ -116,9 +153,10 @@ struct ResolvedAgents {
 }
 
 impl ResolvedAgents {
-    /// Maps all three definitions up-front, before the loop spawns anything:
-    /// a definition the adapter cannot honour must fail the run at its
-    /// start, not two cycles in when that role first happens to be invoked.
+    /// Maps every role's definition up-front, before the loop spawns
+    /// anything: a definition the adapter cannot honour must fail the run at
+    /// its start, not several cycles in when that role first happens to be
+    /// invoked.
     fn resolve<R: ToolAdapter>(runner: &R, config: &RunConfig) -> Result<Self> {
         let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
             Ok(ResolvedAgent {
@@ -126,10 +164,16 @@ impl ResolvedAgents {
                 system_prompt: definition.system_prompt.clone(),
             })
         };
+        let extra = config
+            .extra_step_agents
+            .iter()
+            .map(resolve_one)
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             coder: resolve_one(&config.coder_agent)?,
             reviewer: resolve_one(&config.reviewer_agent)?,
             tester: resolve_one(&config.tester_agent)?,
+            extra,
             env_allowlist: runner.env_allowlist(),
         })
     }
@@ -263,6 +307,28 @@ struct TestInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
     cycle_number: u32,
+    agent: &'a ResolvedAgent,
+    env_allowlist: &'static [&'static str],
+    worktree_manager: &'a WorktreeManager,
+    commit: &'a str,
+    diff: &'a str,
+    prior_findings: &'a [Finding],
+    config: &'a RunConfig,
+    cancel: CancellationToken,
+}
+
+/// Parameters for a single custom workflow step invocation (issue #73) --
+/// any step beyond the built-in coder/reviewer/tester pipeline (e.g. a
+/// `techlead` role). The generic counterpart of [`FindingAgentInvocation`]:
+/// `role` is the open [`Role`] the workflow step declares, rather than the
+/// closed `AgentRole`, and there is no `scope` axis at all -- a custom step
+/// is always invoked with this cycle's full context, exactly like the
+/// tester (decision #37 Q2 only ever scoped the reviewer).
+struct WorkflowStepInvocation<'a> {
+    run_id: &'a str,
+    cycle_id: &'a str,
+    cycle_number: u32,
+    role: &'a Role,
     agent: &'a ResolvedAgent,
     env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
@@ -456,7 +522,7 @@ impl Orchestrator {
     /// [`run_convergence_loop`](Orchestrator::run_convergence_loop) first) is
     /// silently a no-op, the same contract [`publish_event`](Orchestrator::publish_event)
     /// already has for the same case.
-    fn publish_progress_event(&self, role: AgentRole, detail: String) {
+    fn publish_progress_event(&self, role_name: &str, detail: String) {
         let Some(context) = self.run_context.get() else {
             return;
         };
@@ -465,7 +531,7 @@ impl Orchestrator {
             id: Uuid::new_v4().to_string(),
             run_id: context.run_id.clone(),
             event: RunEvent::AgentProgress {
-                role: role.as_str().to_string(),
+                role: role_name.to_string(),
                 detail,
             },
             created_at: Utc::now().to_rfc3339(),
@@ -486,7 +552,7 @@ impl Orchestrator {
                 .ok_or_else(|| WardenError::RunNotFound {
                     run_id: run_id.to_string(),
                 })?;
-        run.state.validate_transition(to)?;
+        run.state.validate_transition(to, run.total_steps)?;
         db::update_run_state(&self.pool, run_id, to).await?;
 
         // Issue #55: the single lifecycle-hook dispatch seam. Every legal

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id as \"id!\", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?",
+  "query": "\n        SELECT id as \"id!\", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number\n        FROM runs\n        WHERE state IN ('coder_running', 'awaiting_ci') OR state LIKE 'running_step:%'\n        ",
   "describe": {
     "columns": [
       {
@@ -103,8 +103,41 @@
         }
       },
       {
-        "name": "created_at",
+        "name": "total_steps",
         "ordinal": 9,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_steps"
+          }
+        }
+      },
+      {
+        "name": "max_extra_step_cycles",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "max_extra_step_cycles"
+          }
+        }
+      },
+      {
+        "name": "current_extra_step_cycle",
+        "ordinal": 11,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "current_extra_step_cycle"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 12,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -115,7 +148,7 @@
       },
       {
         "name": "updated_at",
-        "ordinal": 10,
+        "ordinal": 13,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +159,7 @@
       },
       {
         "name": "converged_commit_sha",
-        "ordinal": 11,
+        "ordinal": 14,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -137,7 +170,7 @@
       },
       {
         "name": "pr_number",
-        "ordinal": 12,
+        "ordinal": 15,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -148,10 +181,13 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       true,
+      false,
+      false,
+      false,
       false,
       false,
       false,
@@ -166,5 +202,5 @@
       true
     ]
   },
-  "hash": "e1b129ebb7559d3d66bb28b0242b4240804006e6d70611d7f049f1ac769802c3"
+  "hash": "442e231326827047ec6c7f3dca305ed0f9c4dff5429aa47fc7a3099c34230a3f"
 }

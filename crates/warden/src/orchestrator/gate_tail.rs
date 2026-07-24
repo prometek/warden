@@ -513,16 +513,16 @@ mod tests {
         bare_repo: &TempDir,
     ) -> (String, RunConfig, String) {
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(pool, &run_id, "/tmp/repo", "main", "intent", 5, 5)
+        db::insert_run(pool, &run_id, "/tmp/repo", "main", "intent", 5, 5, 3, 5)
             .await
             .unwrap();
         db::update_run_state(pool, &run_id, RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(pool, &run_id, RunState::Reviewing)
+        db::update_run_state(pool, &run_id, RunState::RunningStep(1))
             .await
             .unwrap();
-        db::update_run_state(pool, &run_id, RunState::Testing)
+        db::update_run_state(pool, &run_id, RunState::RunningStep(2))
             .await
             .unwrap();
         db::update_run_state(pool, &run_id, RunState::Converged)
@@ -549,6 +549,8 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             tester_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
@@ -561,6 +563,7 @@ mod tests {
                 poll_interval_secs: 1,
                 inactivity_timeout_secs: 3600,
             }),
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         // Leaked deliberately: `warden_home`'s TempDir must outlive the
@@ -855,13 +858,23 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-silent", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-silent",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -904,16 +917,16 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 5, 5)
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 5, 5, 3, 5)
             .await
             .unwrap();
         db::update_run_state(&pool, &run_id, RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(&pool, &run_id, RunState::Reviewing)
+        db::update_run_state(&pool, &run_id, RunState::RunningStep(1))
             .await
             .unwrap();
-        db::update_run_state(&pool, &run_id, RunState::Testing)
+        db::update_run_state(&pool, &run_id, RunState::RunningStep(2))
             .await
             .unwrap();
         db::update_run_state(&pool, &run_id, RunState::Converged)
@@ -963,13 +976,13 @@ mod tests {
     async fn apply_ci_result_message_rejects_a_run_id_mismatch() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-a", "/tmp/repo", "main", "intent", 5, 5)
+        db::insert_run(&pool, "run-a", "/tmp/repo", "main", "intent", 5, 5, 3, 5)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -1010,16 +1023,16 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3)
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         db::update_run_state(&pool, "run-ci", RunState::CoderRunning)
             .await
             .unwrap();
-        db::update_run_state(&pool, "run-ci", RunState::Reviewing)
+        db::update_run_state(&pool, "run-ci", RunState::RunningStep(1))
             .await
             .unwrap();
-        db::update_run_state(&pool, "run-ci", RunState::Testing)
+        db::update_run_state(&pool, "run-ci", RunState::RunningStep(2))
             .await
             .unwrap();
         db::update_run_state(&pool, "run-ci", RunState::Converged)
@@ -1048,13 +1061,13 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3)
+        db::insert_run(&pool, "run-ci", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -1091,13 +1104,23 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let warden_home = TempDir::new().unwrap();
 
-        db::insert_run(&pool, "run-no-pr", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-no-pr",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         for state in [
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
@@ -1346,10 +1369,10 @@ mod tests {
             );
             // The main loop returns the run to `Converged` before re-driving
             // the tail (CoderRunning -> Reviewing -> Testing -> Converged).
-            db::update_run_state(&pool, &run_id, RunState::Reviewing)
+            db::update_run_state(&pool, &run_id, RunState::RunningStep(1))
                 .await
                 .unwrap();
-            db::update_run_state(&pool, &run_id, RunState::Testing)
+            db::update_run_state(&pool, &run_id, RunState::RunningStep(2))
                 .await
                 .unwrap();
             db::update_run_state(&pool, &run_id, RunState::Converged)

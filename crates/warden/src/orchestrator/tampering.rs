@@ -246,12 +246,15 @@ mod tests {
             intent: "sneak in a reviewer.md change".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -262,7 +265,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a coder diff touching .warden/agents/ must never reach Converged silently"
         );
 
@@ -314,12 +317,15 @@ mod tests {
             intent: "an ordinary, unrelated change".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(ordinary_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -394,12 +400,15 @@ mod tests {
             intent: "delete the reviewer definition to loosen the next run".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(deleting_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -410,7 +419,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "deleting a definition file under .warden/agents/ must block exactly like adding one"
         );
         let findings = findings_for_the_only_cycle(&pool, &run_id).await;
@@ -500,12 +509,15 @@ mod tests {
             intent: "sneak in a capitalized Agents dir".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -516,7 +528,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a capitalized .warden/Agents/ must block exactly like the canonical lowercase path \
                  on a filesystem that folds case"
         );
@@ -583,12 +595,15 @@ mod tests {
             intent: "sneak in a fully uppercase WARDEN dir".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -599,7 +614,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a fully uppercase .WARDEN/agents/ must block exactly like the canonical lowercase \
                  path on a filesystem that folds case"
         );
@@ -672,12 +687,15 @@ mod tests {
             intent: "sneak in a Unicode-confusable agents dir".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -688,7 +706,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a U+017F Unicode-confusable .warden/agentſ/ must block exactly like the canonical \
                  path on a filesystem that folds it"
         );
@@ -748,12 +766,15 @@ mod tests {
                 .to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -764,7 +785,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a poisoned definition reached through a symlinked .warden must block exactly like \
                  a plain committed one"
         );
@@ -818,12 +839,15 @@ mod tests {
             intent: "write non-parsable bytes into a definition".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -837,7 +861,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "non-parsable bytes written into a definition must still block convergence"
         );
         let findings = findings_for_the_only_cycle(&pool, &run_id).await;
@@ -896,12 +920,15 @@ mod tests {
             intent: "commit a poisoned definition, then scrub it from the working tree".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poisoning_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -912,7 +939,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a poisoned definition committed then scrubbed from the working tree must still \
                  block -- what matters is the committed tree, not the coder's own worktree state \
                  at the moment the check runs"
@@ -969,12 +996,15 @@ mod tests {
             intent: "leave uncommitted scratch content under .warden/agents/".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(coder_with_uncommitted_junk),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1055,12 +1085,15 @@ mod tests {
             intent: "modify the content of an existing reviewer definition".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(modifying_coder),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1071,7 +1104,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "modifying the content of an already-committed definition must block exactly like \
                  an add or a delete"
         );
@@ -1144,12 +1177,15 @@ mod tests {
             intent: "sneak in a reviewer.md change and let it ride through a reboucle".to_string(),
             max_review_cycles: 2,
             max_test_cycles: 2,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(poison_once_then_fix_coder),
             reviewer_agent: definition(status_gated_reviewer()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -1166,7 +1202,7 @@ mod tests {
         assert!(
                 cycle_1_findings
                     .iter()
-                    .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                    .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
                 "expected the ordinary status-gated reviewer finding to fire in cycle 1: {cycle_1_findings:?}"
             );
         assert!(
@@ -1185,7 +1221,7 @@ mod tests {
         assert!(
                 !cycle_2_findings
                     .iter()
-                    .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                    .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
                 "the ordinary reviewer finding must be gone once status.txt is fixed: {cycle_2_findings:?}"
             );
         let cycle_2_tampering_finding = cycle_2_findings
@@ -1207,7 +1243,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxReviewCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             "a definition-tampering finding that keeps firing every cycle must never let the \
                  run reach Converged, however many cycles it takes to notice the ordinary \
                  (unrelated) finding is otherwise resolved"

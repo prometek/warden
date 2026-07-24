@@ -1,0 +1,13 @@
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean

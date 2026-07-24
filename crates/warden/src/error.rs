@@ -195,6 +195,21 @@ pub enum AgentDefinitionError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Issue #73: a custom workflow step (any role beyond the built-in
+    /// coder/reviewer/tester) names an `agent` with no matching
+    /// `.claude/agents/<agent>.md` file. Unlike the built-in roles, a custom
+    /// step has no adapter-default fallback to degrade to (see
+    /// [`resolve_custom_step_agent_definition`]'s own docs) -- a missing file
+    /// is always a hard, typed error naming the exact role/path expected,
+    /// never a silently skipped step.
+    #[error(
+        "no agent definition found for custom workflow role {role:?}: expected {expected_path}"
+    )]
+    CustomStepAgentNotFound {
+        role: String,
+        expected_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Error)]

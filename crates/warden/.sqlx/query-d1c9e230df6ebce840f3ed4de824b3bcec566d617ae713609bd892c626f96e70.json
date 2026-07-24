@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id as \"id!\", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number\n        FROM runs\n        WHERE state IN ('coder_running', 'reviewing', 'testing', 'awaiting_ci')\n        ",
+  "query": "\n        SELECT DISTINCT runs.id as \"id!\", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_review_cycles, runs.max_test_cycles, runs.current_review_cycle, runs.current_test_cycle, runs.total_steps, runs.max_extra_step_cycles, runs.current_extra_step_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number\n        FROM runs\n        WHERE runs.state = 'failed'\n          AND (\n            EXISTS (\n                SELECT 1 FROM agent_processes\n                JOIN cycles ON cycles.id = agent_processes.cycle_id\n                WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL\n            )\n            OR EXISTS (\n                SELECT 1 FROM cycles\n                WHERE cycles.run_id = runs.id\n                  AND (cycles.coder_worktree_path IS NOT NULL\n                       OR cycles.reviewer_worktree_path IS NOT NULL\n                       OR cycles.tester_worktree_path IS NOT NULL)\n            )\n          )\n        ",
   "describe": {
     "columns": [
       {
@@ -103,8 +103,41 @@
         }
       },
       {
-        "name": "created_at",
+        "name": "total_steps",
         "ordinal": 9,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "total_steps"
+          }
+        }
+      },
+      {
+        "name": "max_extra_step_cycles",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "max_extra_step_cycles"
+          }
+        }
+      },
+      {
+        "name": "current_extra_step_cycle",
+        "ordinal": 11,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "current_extra_step_cycle"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 12,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -115,7 +148,7 @@
       },
       {
         "name": "updated_at",
-        "ordinal": 10,
+        "ordinal": 13,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +159,7 @@
       },
       {
         "name": "converged_commit_sha",
-        "ordinal": 11,
+        "ordinal": 14,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -137,7 +170,7 @@
       },
       {
         "name": "pr_number",
-        "ordinal": 12,
+        "ordinal": 15,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -162,9 +195,12 @@
       false,
       false,
       false,
+      false,
+      false,
+      false,
       true,
       true
     ]
   },
-  "hash": "66400552a7cf800914d97e29aef82a0694a6bd4ae986e9204f16982bc666c5b9"
+  "hash": "d1c9e230df6ebce840f3ed4de824b3bcec566d617ae713609bd892c626f96e70"
 }

@@ -229,8 +229,10 @@ fn row_to_token_usage(
 ///
 /// Issue #43 (#37.4) / ADR-0014: `max_cycles`/`current_cycle` are gone,
 /// replaced by two independent per-phase budgets/counters -- see
-/// `crates/warden/migrations/0007_phase_budgets.sql` and
-/// `warden_core::RunState::Reviewing`/`Testing`.
+/// `crates/warden/migrations/0007_phase_budgets.sql`. Issue #73:
+/// `total_steps`/`max_extra_step_cycles`/`current_extra_step_cycle` back the
+/// generic, step-indexed `warden_core::RunState::RunningStep`/
+/// `StepCyclesExceeded` -- see `crates/warden/migrations/0009_generic_workflow_state.sql`.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub id: String,
@@ -242,6 +244,18 @@ pub struct Run {
     pub max_test_cycles: u32,
     pub current_review_cycle: u32,
     pub current_test_cycle: u32,
+    /// Issue #73: how many steps this run's own resolved
+    /// `warden_core::Workflow` has (`workflow.steps.len()`) -- what
+    /// `RunState::validate_transition` needs to decide whether a step is the
+    /// workflow's *last* one. `3` for every run driving the built-in default
+    /// workflow (coder, reviewer, tester).
+    pub total_steps: u32,
+    /// Issue #73: the single shared cycle budget for any workflow step
+    /// beyond the built-in reviewer/tester pair (e.g. a custom `techlead`
+    /// step) -- the built-in pair keeps its own `max_review_cycles`/
+    /// `max_test_cycles` above.
+    pub max_extra_step_cycles: u32,
+    pub current_extra_step_cycle: u32,
     pub created_at: String,
     pub updated_at: String,
     /// The commit SHA the run converged on (see `set_run_converged_commit`,
@@ -254,6 +268,7 @@ pub struct Run {
     pub pr_number: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_run(
     pool: &SqlitePool,
     id: &str,
@@ -262,15 +277,19 @@ pub async fn insert_run(
     intent: &str,
     max_review_cycles: u32,
     max_test_cycles: u32,
+    total_steps: u32,
+    max_extra_step_cycles: u32,
 ) -> Result<()> {
     let now = now_rfc3339();
     let state = RunState::Pending.as_str();
     let max_review_cycles = i64::from(max_review_cycles);
     let max_test_cycles = i64::from(max_test_cycles);
+    let total_steps = i64::from(total_steps);
+    let max_extra_step_cycles = i64::from(max_extra_step_cycles);
     sqlx::query!(
         r#"
-        INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+        INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, ?, ?)
         "#,
         id,
         repo_path,
@@ -279,6 +298,8 @@ pub async fn insert_run(
         state,
         max_review_cycles,
         max_test_cycles,
+        total_steps,
+        max_extra_step_cycles,
         now,
         now,
     )
@@ -342,6 +363,27 @@ pub async fn set_run_current_test_cycle(
     sqlx::query!(
         "UPDATE runs SET current_test_cycle = ?, updated_at = ? WHERE id = ?",
         test_cycle,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Issue #73: records the run's current *extra-step* cycle number -- the
+/// single shared counter for any workflow step beyond the built-in
+/// reviewer/tester pair (see [`Run`]'s own docs on `max_extra_step_cycles`).
+pub async fn set_run_current_extra_step_cycle(
+    pool: &SqlitePool,
+    run_id: &str,
+    extra_step_cycle: u32,
+) -> Result<()> {
+    let now = now_rfc3339();
+    let extra_step_cycle = i64::from(extra_step_cycle);
+    sqlx::query!(
+        "UPDATE runs SET current_extra_step_cycle = ?, updated_at = ? WHERE id = ?",
+        extra_step_cycle,
         now,
         run_id,
     )
@@ -496,6 +538,9 @@ struct RunRow {
     max_test_cycles: i64,
     current_review_cycle: i64,
     current_test_cycle: i64,
+    total_steps: i64,
+    max_extra_step_cycles: i64,
+    current_extra_step_cycle: i64,
     created_at: String,
     updated_at: String,
     converged_commit_sha: Option<String>,
@@ -517,6 +562,15 @@ fn row_to_run(row: RunRow) -> Result<Run> {
         max_test_cycles: checked_u32(row.max_test_cycles, "runs.max_test_cycles")?,
         current_review_cycle: checked_u32(row.current_review_cycle, "runs.current_review_cycle")?,
         current_test_cycle: checked_u32(row.current_test_cycle, "runs.current_test_cycle")?,
+        total_steps: checked_u32(row.total_steps, "runs.total_steps")?,
+        max_extra_step_cycles: checked_u32(
+            row.max_extra_step_cycles,
+            "runs.max_extra_step_cycles",
+        )?,
+        current_extra_step_cycle: checked_u32(
+            row.current_extra_step_cycle,
+            "runs.current_extra_step_cycle",
+        )?,
         created_at: row.created_at,
         updated_at: row.updated_at,
         converged_commit_sha: row.converged_commit_sha,
@@ -527,7 +581,7 @@ fn row_to_run(row: RunRow) -> Result<Run> {
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -537,17 +591,20 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
 }
 
 /// Runs left in an intermediate state (`RunState::is_intermediate`) as of
-/// the last shutdown/crash. The four literal state strings below must stay
-/// in sync with [`RunState::is_intermediate`] — enforced by a test in this
-/// module, since a `?`-parameterised `IN (...)` list isn't expressible in a
-/// macro-checked static query.
+/// the last shutdown/crash. The `coder_running`/`awaiting_ci` literals and
+/// the `running_step:%` pattern below must stay in sync with
+/// [`RunState::is_intermediate`] — enforced by a test in this module, since
+/// a `?`-parameterised `IN (...)` list isn't expressible in a
+/// macro-checked static query. `running_step:%` is a `LIKE` pattern rather
+/// than a literal list (issue #73): a step-indexed state can carry any
+/// index, so there is no fixed set of literal strings left to enumerate.
 pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number
+        SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
-        WHERE state IN ('coder_running', 'reviewing', 'testing', 'awaiting_ci')
+        WHERE state IN ('coder_running', 'awaiting_ci') OR state LIKE 'running_step:%'
         "#
     )
     .fetch_all(pool)
@@ -575,7 +632,7 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_review_cycles, runs.max_test_cycles, runs.current_review_cycle, runs.current_test_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
+        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_review_cycles, runs.max_test_cycles, runs.current_review_cycle, runs.current_test_cycle, runs.total_steps, runs.max_extra_step_cycles, runs.current_extra_step_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
         FROM runs
         WHERE runs.state = 'failed'
           AND (
@@ -1353,18 +1410,20 @@ mod tests {
         for state in [
             RunState::Pending,
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
+            RunState::RunningStep(7),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
             RunState::Done,
-            RunState::MaxReviewCyclesExceeded,
-            RunState::MaxTestCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
+            RunState::StepCyclesExceeded(2),
             RunState::Failed,
         ] {
-            let literal_says_intermediate =
-                ["coder_running", "reviewing", "testing", "awaiting_ci"].contains(&state.as_str());
+            let literal_says_intermediate = state.as_str() == "coder_running"
+                || state.as_str() == "awaiting_ci"
+                || state.as_str().starts_with("running_step:");
             assert_eq!(
                 literal_says_intermediate,
                 state.is_intermediate(),
@@ -1376,9 +1435,19 @@ mod tests {
     #[tokio::test]
     async fn run_round_trips_through_insert_and_get() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-1", "/tmp/repo", "main", "do the thing", 5, 4)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-1",
+            "/tmp/repo",
+            "main",
+            "do the thing",
+            5,
+            4,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let run = get_run(&pool, "run-1").await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Pending);
@@ -1392,7 +1461,7 @@ mod tests {
     #[tokio::test]
     async fn pr_number_is_none_until_set_then_round_trips() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1418,6 +1487,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1434,7 +1505,7 @@ mod tests {
     #[tokio::test]
     async fn update_run_state_persists_and_list_intermediate_finds_it() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-2", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-2", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1453,16 +1524,16 @@ mod tests {
     #[tokio::test]
     async fn converged_run_is_not_listed_as_intermediate() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         update_run_state(&pool, "run-3", RunState::CoderRunning)
             .await
             .unwrap();
-        update_run_state(&pool, "run-3", RunState::Reviewing)
+        update_run_state(&pool, "run-3", RunState::RunningStep(1))
             .await
             .unwrap();
-        update_run_state(&pool, "run-3", RunState::Testing)
+        update_run_state(&pool, "run-3", RunState::RunningStep(2))
             .await
             .unwrap();
         update_run_state(&pool, "run-3", RunState::Converged)
@@ -1476,7 +1547,7 @@ mod tests {
     #[tokio::test]
     async fn cycle_and_finding_round_trip() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-4", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-4", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-1", "run-4", 1).await.unwrap();
@@ -1485,7 +1556,7 @@ mod tests {
             .unwrap();
 
         let finding = Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "missing test".to_string(),
@@ -1509,9 +1580,19 @@ mod tests {
     #[tokio::test]
     async fn cycle_role_token_usage_is_none_until_something_is_recorded() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-usage-none", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-usage-none",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-usage-none", "run-usage-none", 1)
             .await
             .unwrap();
@@ -1528,9 +1609,19 @@ mod tests {
     #[tokio::test]
     async fn add_cycle_role_token_usage_accumulates_across_multiple_invocations() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-usage", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-usage",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-usage", "run-usage", 1)
             .await
             .unwrap();
@@ -1578,6 +1669,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1629,6 +1722,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1679,6 +1774,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1711,6 +1808,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1743,11 +1842,22 @@ mod tests {
     #[tokio::test]
     async fn inserting_a_run_with_a_duplicate_id_is_a_typed_error_not_a_panic() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
-        let result = insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent again", 3, 3).await;
+        let result = insert_run(
+            &pool,
+            "dup-run",
+            "/tmp/repo",
+            "main",
+            "intent again",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await;
         assert!(matches!(result, Err(WardenError::Database(_))));
 
         // The original row must be untouched by the failed duplicate insert.
@@ -1758,9 +1868,19 @@ mod tests {
     #[tokio::test]
     async fn list_findings_for_cycle_with_no_findings_is_empty_not_an_error() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-empty", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-empty",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-empty", "run-empty", 1)
             .await
             .unwrap();
@@ -1780,22 +1900,32 @@ mod tests {
     #[tokio::test]
     async fn list_findings_for_cycle_orders_findings_by_id_ascending_not_insertion_order() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-order",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-order", "run-order", 1)
             .await
             .unwrap();
 
         let finding_z = Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: None,
             description: "inserted first, id sorts last".to_string(),
             action: None,
         };
         let finding_a = Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Blocking,
             file: None,
             description: "inserted second, id sorts first".to_string(),
@@ -1821,9 +1951,19 @@ mod tests {
     #[tokio::test]
     async fn latest_open_agent_process_is_none_when_run_has_no_processes() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-no-proc", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-no-proc",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let open = latest_open_agent_process_for_run(&pool, "run-no-proc")
             .await
@@ -1834,7 +1974,7 @@ mod tests {
     #[tokio::test]
     async fn open_agent_process_is_found_until_marked_ended() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-5", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-5", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-5", "run-5", 1).await.unwrap();
@@ -1866,7 +2006,7 @@ mod tests {
     #[tokio::test]
     async fn list_open_agent_processes_returns_every_open_row_not_just_the_latest() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-6", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-6", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-6", "run-6", 1).await.unwrap();
@@ -1919,7 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn list_open_agent_processes_is_empty_for_a_run_with_no_processes() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-7", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-7", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1932,7 +2072,7 @@ mod tests {
     #[tokio::test]
     async fn list_worktree_paths_collects_distinct_non_null_paths_across_cycles() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-8", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-8", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-8a", "run-8", 1).await.unwrap();
@@ -1965,7 +2105,7 @@ mod tests {
     #[tokio::test]
     async fn list_worktree_paths_is_empty_for_a_run_with_no_cycles() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-9", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-9", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -2131,10 +2271,11 @@ mod tests {
         let mid_cycle = get_run(&pool, "run-mid-cycle").await.unwrap().unwrap();
         assert_eq!(
             mid_cycle.state,
-            RunState::Reviewing,
-            "a legacy 'awaiting_review_test' row must remap onto Reviewing, per the migration's \
-             own comment (the specific phase can't be recovered from the string alone, but both \
-             Reviewing/Testing are equally is_intermediate so crash recovery behaves the same)"
+            RunState::RunningStep(1),
+            "a legacy 'awaiting_review_test' row must remap onto 'reviewing' (0007), then onto \
+             RunningStep(1) once 0009's own remap runs on top of it -- the specific phase can't \
+             be recovered from the string alone, but every RunningStep index is equally \
+             is_intermediate so crash recovery behaves the same regardless"
         );
         assert_eq!(
             mid_cycle.max_review_cycles, 5,
@@ -2153,8 +2294,9 @@ mod tests {
         let exhausted = get_run(&pool, "run-exhausted").await.unwrap().unwrap();
         assert_eq!(
             exhausted.state,
-            RunState::MaxReviewCyclesExceeded,
-            "a legacy 'max_cycles_exceeded' row must remap onto MaxReviewCyclesExceeded"
+            RunState::StepCyclesExceeded(1),
+            "a legacy 'max_cycles_exceeded' row must remap onto 'max_review_cycles_exceeded' \
+             (0007), then onto StepCyclesExceeded(1) once 0009's own remap runs on top of it"
         );
         assert_eq!(exhausted.max_review_cycles, 4);
         assert_eq!(exhausted.max_test_cycles, 4);
@@ -2252,9 +2394,19 @@ mod tests {
     #[tokio::test]
     async fn clear_cycle_worktree_path_nulls_out_only_the_given_role() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-clear", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-clear",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-clear", "run-clear", 1)
             .await
             .unwrap();
@@ -2293,6 +2445,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2313,9 +2467,19 @@ mod tests {
     #[tokio::test]
     async fn failed_run_with_an_open_agent_process_needs_cleanup() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-open-proc", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-open-proc",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-open-proc", "run-open-proc", 1)
             .await
             .unwrap();
@@ -2349,6 +2513,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2389,9 +2555,19 @@ mod tests {
     #[tokio::test]
     async fn evidence_round_trips_through_insert_and_list_evidence_for_run() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-evidence", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-evidence",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-evidence", "run-evidence", 1)
             .await
             .unwrap();
@@ -2436,6 +2612,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2443,7 +2621,7 @@ mod tests {
             .await
             .unwrap();
         let finding = Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "flaky button".to_string(),
@@ -2491,6 +2669,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2515,6 +2695,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2570,6 +2752,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2589,9 +2773,19 @@ mod tests {
     #[tokio::test]
     async fn event_round_trips_through_insert_and_list() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-events", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-events",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let event = RunEvent::CycleStarted { cycle_number: 1 };
         insert_event(
@@ -2615,9 +2809,19 @@ mod tests {
     #[tokio::test]
     async fn list_events_for_run_orders_oldest_first() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-order",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         insert_event(
             &pool,
@@ -2646,9 +2850,19 @@ mod tests {
     #[tokio::test]
     async fn list_events_for_run_is_empty_for_a_run_with_no_events() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-no-events", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-no-events",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let events = list_events_for_run(&pool, "run-no-events").await.unwrap();
         assert!(events.is_empty());
@@ -2662,9 +2876,19 @@ mod tests {
     #[tokio::test]
     async fn mismatched_event_type_and_payload_kind_is_a_typed_error_not_silently_trusted() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-corrupt", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-corrupt",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let payload_json =
             serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();

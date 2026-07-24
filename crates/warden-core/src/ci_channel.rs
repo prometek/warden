@@ -313,10 +313,13 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_finding_source_inside_checks_failed() {
-        // Propagated as-is from `FindingSource::parse` -- still a typed
-        // `CoreError`, just a more specific variant than the generic
-        // `MalformedCiResultMessage` catch-all used for shape errors.
-        let json = r#"{"run_id":"run-1","pr_number":1,"outcome":{"outcome":"checks_failed","findings":[{"source":"ghost","severity":"blocking","file":null,"description":"x","action":null}]}}"#;
+        // Issue #73: roles are now open (workflow-defined) -- a non-blank
+        // source like "ghost" no longer trips `FindingSource::parse` itself
+        // (see its own docs). Only a *blank* source still does, propagated
+        // as-is: still a typed `CoreError`, just a more specific variant
+        // than the generic `MalformedCiResultMessage` catch-all used for
+        // shape errors.
+        let json = r#"{"run_id":"run-1","pr_number":1,"outcome":{"outcome":"checks_failed","findings":[{"source":"   ","severity":"blocking","file":null,"description":"x","action":null}]}}"#;
         assert!(matches!(
             parse_ci_result_message(json),
             Err(CoreError::UnknownFindingSource(_))

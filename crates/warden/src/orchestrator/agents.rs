@@ -35,18 +35,29 @@ fn truncate_for_error(stderr: &str) -> String {
 /// the only available proxy.
 fn tester_succeeded(findings: &[Finding]) -> bool {
     !findings.iter().any(|finding| {
-        finding.source == warden_core::FindingSource::Tester
+        finding.source == warden_core::FindingSource::role("tester")
             && finding.severity == warden_core::Severity::Blocking
     })
 }
 
 fn role_to_finding_source(role: AgentRole) -> warden_core::FindingSource {
     match role {
-        AgentRole::Reviewer => warden_core::FindingSource::Reviewer,
-        AgentRole::Tester => warden_core::FindingSource::Tester,
+        AgentRole::Reviewer => warden_core::FindingSource::role("reviewer"),
+        AgentRole::Tester => warden_core::FindingSource::role("tester"),
         // Coder never produces findings; only used defensively.
-        AgentRole::Coder => warden_core::FindingSource::Reviewer,
+        AgentRole::Coder => warden_core::FindingSource::role("reviewer"),
     }
+}
+
+/// Issue #73: bridges the closed `AgentRole` the built-in coder/reviewer/
+/// tester path still uses (see `warden_core::state::AgentRole`'s own docs on
+/// why) onto the open `warden_core::Role` the generalized
+/// `validate_finding_sources_for_role`/`decide_next_state_for_step` now take
+/// -- `AgentRole::as_str()` is never blank, so this can never fail in
+/// practice; the `expect` documents that invariant rather than threading a
+/// fallible conversion through a hot per-invocation call site.
+fn agent_role_to_workflow_role(role: AgentRole) -> warden_core::Role {
+    warden_core::Role::new(role.as_str()).expect("AgentRole::as_str() is never blank")
 }
 
 impl Orchestrator {
@@ -101,7 +112,7 @@ impl Orchestrator {
         let outcome = self
             .run_agent(
                 cycle_id,
-                AgentRole::Coder,
+                InvocationRole::Builtin(AgentRole::Coder),
                 runner,
                 &agent.command,
                 env_allowlist,
@@ -359,7 +370,7 @@ impl Orchestrator {
         let outcome = self
             .run_agent(
                 cycle_id,
-                role,
+                InvocationRole::Builtin(role),
                 runner,
                 &agent.command,
                 env_allowlist,
@@ -433,7 +444,10 @@ impl Orchestrator {
             match runner
                 .extract_findings(&outcome.stdout)
                 .and_then(|findings| {
-                    warden_core::validate_finding_sources_for_role(&findings, role)?;
+                    warden_core::validate_finding_sources_for_role(
+                        &findings,
+                        &agent_role_to_workflow_role(role),
+                    )?;
                     Ok(findings)
                 }) {
                 Ok(findings) => findings,
@@ -472,6 +486,122 @@ impl Orchestrator {
 
         if let Err(error) = worktree.remove().await {
             tracing::warn!(%error, ?role, "failed to clean up worktree after cycle");
+        }
+
+        Ok(findings)
+    }
+
+    /// Issue #73: invokes a **custom** workflow step -- any step beyond the
+    /// built-in coder/reviewer/tester pipeline (e.g. a `techlead` role). The
+    /// generic counterpart of [`Self::run_finding_agent`]: always full-context
+    /// (no `ReviewScope::Correctif`, exactly like the tester), findings
+    /// validated against the step's own open [`warden_core::Role`] rather
+    /// than a closed `AgentRole`, and no `agent_processes`/per-role token-
+    /// usage persistence (see [`InvocationRole`]'s own docs on that
+    /// deliberate scope limit). Otherwise the same sandboxed subprocess seam,
+    /// the same "never trust a non-zero exit or unparsable/misattributed
+    /// stdout" treatment, and the same worktree-per-invocation isolation as
+    /// every built-in role gets.
+    pub(super) async fn run_workflow_step<R: ToolAdapter>(
+        &self,
+        runner: &R,
+        invocation: WorkflowStepInvocation<'_>,
+    ) -> Result<Vec<Finding>> {
+        let WorkflowStepInvocation {
+            run_id,
+            cycle_id,
+            cycle_number: _cycle_number,
+            role,
+            agent,
+            env_allowlist,
+            worktree_manager,
+            commit,
+            diff,
+            prior_findings,
+            config,
+            cancel,
+        } = invocation;
+
+        let worktree = worktree_manager
+            .create(run_id, role.as_str(), commit)
+            .await?;
+        // Issue #73: deliberately no `db::set_cycle_worktree_path` here --
+        // that column set is hardcoded to the three built-in roles (see
+        // `InvocationRole`'s own docs). A crash mid-invocation of a custom
+        // step therefore leaves its worktree unreclaimed by crash recovery,
+        // unlike a built-in role's.
+
+        let stdin_payload = warden_core::build_finding_agent_input_json(
+            role.as_str(),
+            &agent.system_prompt,
+            commit,
+            diff,
+            prior_findings.to_vec(),
+        )?;
+
+        let outcome = self
+            .run_agent(
+                cycle_id,
+                InvocationRole::Custom(role),
+                runner,
+                &agent.command,
+                env_allowlist,
+                worktree.path(),
+                &config.repo_path,
+                &config.warden_home.join("worktrees").join(run_id),
+                stdin_payload,
+                cancel,
+            )
+            .await?;
+
+        let findings = if outcome.exit_code != 0 {
+            tracing::warn!(
+                run_id,
+                cycle_id,
+                role = role.as_str(),
+                exit_code = outcome.exit_code,
+                stderr = %outcome.stderr,
+                "custom workflow step agent exited non-zero; not trusting its stdout"
+            );
+            vec![Finding {
+                source: warden_core::FindingSource::role(role.as_str()),
+                severity: warden_core::Severity::Blocking,
+                file: None,
+                description: format!(
+                    "{} exited with status {} instead of 0 (stderr: {})",
+                    role,
+                    outcome.exit_code,
+                    truncate_for_error(&outcome.stderr)
+                ),
+                action: Some(
+                    "investigate why the agent process exited non-zero and fix it".to_string(),
+                ),
+            }]
+        } else {
+            match runner
+                .extract_findings(&outcome.stdout)
+                .and_then(|findings| {
+                    warden_core::validate_finding_sources_for_role(&findings, role)?;
+                    Ok(findings)
+                }) {
+                Ok(findings) => findings,
+                Err(parse_error) => {
+                    tracing::warn!(%parse_error, role = role.as_str(), stdout = %outcome.stdout, "custom workflow step agent produced unparsable or misattributed output");
+                    vec![Finding {
+                        source: warden_core::FindingSource::role(role.as_str()),
+                        severity: warden_core::Severity::Blocking,
+                        file: None,
+                        description: format!(
+                            "{role} produced unparsable or misattributed output: {parse_error}"
+                        ),
+                        action: Some("fix the agent's output format/finding sources".to_string()),
+                    }]
+                }
+            }
+        };
+
+        if let Err(error) = worktree.remove().await {
+            tracing::warn!(%error, role = role.as_str(), "failed to clean up worktree after cycle");
         }
 
         Ok(findings)
@@ -528,6 +658,8 @@ mod tests {
             "crossed findings, no collision",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -564,12 +696,15 @@ mod tests {
             intent: "crossed findings, no collision".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(reviewer_command),
             tester_agent: definition(tester_command),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -620,11 +755,11 @@ mod tests {
         assert_eq!(findings.len(), 2);
         let reviewer_finding = findings
             .iter()
-            .find(|f| f.source == warden_core::FindingSource::Reviewer)
+            .find(|f| f.source == warden_core::FindingSource::role("reviewer"))
             .expect("reviewer finding present");
         let tester_finding = findings
             .iter()
-            .find(|f| f.source == warden_core::FindingSource::Tester)
+            .find(|f| f.source == warden_core::FindingSource::role("tester"))
             .expect("tester finding present");
 
         assert!(
@@ -665,6 +800,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -686,19 +823,22 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(capturing_reviewer),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
         let originating_finding = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "unchecked unwrap".to_string(),
@@ -758,6 +898,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -772,12 +914,15 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -853,12 +998,15 @@ mod tests {
             intent: "timing check".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(sleepy_agent.clone()),
             tester_agent: definition(sleepy_agent),
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
@@ -874,6 +1022,8 @@ mod tests {
             "timing check",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -951,7 +1101,7 @@ mod tests {
     /// structural finding only Warden's own `agent_definition_tampering_finding`
     /// may raise (M4) -- must never have that claim honoured: the returned
     /// finding is a *replacement*, correctly attributed back to
-    /// `FindingSource::Reviewer` (the role that actually produced this
+    /// `FindingSource::role("reviewer")` (the role that actually produced this
     /// stdout), not the forged `Warden` source passed through untouched.
     #[tokio::test]
     async fn a_reviewer_forging_the_warden_finding_source_is_rejected_not_accepted() {
@@ -966,6 +1116,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -987,12 +1139,15 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(forging_reviewer),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -1023,7 +1178,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].source,
-            warden_core::FindingSource::Reviewer,
+            warden_core::FindingSource::role("reviewer"),
             "a forged source must never reach the returned findings unchanged: {findings:?}"
         );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
@@ -1042,7 +1197,7 @@ mod tests {
     /// whether to trigger evidence capture. Before the fix, a forged
     /// `source: "reviewer"` finding from the tester would sail through
     /// `extract_findings` unchanged, and `tester_succeeded` (which only ever
-    /// looks for a `FindingSource::Tester` blocking finding) would report
+    /// looks for a `FindingSource::role("tester")` blocking finding) would report
     /// "succeeded" -- triggering evidence capture for a cycle whose e2e test
     /// actually failed.
     #[tokio::test]
@@ -1059,6 +1214,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1080,12 +1237,15 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(self_mislabelling_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -1116,7 +1276,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].source,
-            warden_core::FindingSource::Tester,
+            warden_core::FindingSource::role("tester"),
             "the tester's own mislabelled finding must be re-attributed to Tester, not left as \
                  the forged Reviewer source: {findings:?}"
         );
@@ -1159,6 +1319,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1174,12 +1336,15 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(always_passing_tester()),
             tester_agent: definition(crashing_tester),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -1211,7 +1376,10 @@ mod tests {
             "a crashing tester must synthesize exactly one blocking finding, not be silently \
                  read as zero findings: {findings:?}"
         );
-        assert_eq!(findings[0].source, warden_core::FindingSource::Tester);
+        assert_eq!(
+            findings[0].source,
+            warden_core::FindingSource::role("tester")
+        );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
         assert!(
             findings[0].description.contains("exited with status 7"),
@@ -1241,6 +1409,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1262,12 +1432,15 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
             coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
             reviewer_agent: definition(honest_reviewer),
             tester_agent: definition(always_passing_tester()),
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
+            extra_step_agents: Vec::new(),
             untrusted_repo_agent_definitions: Vec::new(),
         };
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
@@ -1298,7 +1471,7 @@ mod tests {
         assert_eq!(
             findings,
             vec![Finding {
-                source: warden_core::FindingSource::Reviewer,
+                source: warden_core::FindingSource::role("reviewer"),
                 severity: warden_core::Severity::Warning,
                 file: Some("src/lib.rs".to_string()),
                 description: "looks mostly fine".to_string(),

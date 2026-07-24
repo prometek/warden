@@ -1,4 +1,4 @@
-//! Convergence rules: interpreting findings from reviewer/tester agents and
+//! Convergence rules: interpreting findings from a workflow step's agent and
 //! deciding the next [`RunState`]. Pure logic — no I/O, no clock, no
 //! subprocess. Parsing of agent stdout also lives here since it's the
 //! boundary where untrusted external input is validated before it can ever
@@ -7,43 +7,72 @@
 use serde::Deserialize;
 
 use crate::error::{CoreError, Result};
-use crate::state::{AgentRole, RunState};
+use crate::state::RunState;
+use crate::workflow::{Role, Workflow};
 
 /// Which agent (or, for CI/Warden itself, which non-agent process) raised a
-/// finding (`FINDINGS.source`). `Ci` (issue #5) covers a failing check
-/// surfaced by `warden-gated`'s CI watcher; `Warden` (issue #24 review, M4;
-/// resolve-and-compare rework in issue #30) covers a finding the orchestrator
-/// raises directly from a structural check that re-resolves the three
-/// literal paths `.warden/agents/{coder,reviewer,tester}.md` through the OS
-/// from a cycle's resulting commit and compares them against the run-start
-/// snapshot (`warden::orchestrator::agent_definition_tampering_finding`) --
-/// both are distinct from `Reviewer`/`Tester` since neither ever comes from
-/// an agent subprocess's own judgement at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// finding (`FINDINGS.source`).
+///
+/// **Issue #73**: the closed `Reviewer`/`Tester` pair is now
+/// [`FindingSource::Role`], carrying the open, workflow-defined
+/// [`crate::workflow::Role`] name that actually produced it -- `"reviewer"`/
+/// `"tester"` are no longer special-cased here at all, just the names the
+/// *built-in* default workflow happens to use for its two gated steps. This
+/// is what lets a custom role's findings (e.g. a `techlead` step) aggregate
+/// in [`decide_next_state_for_step`] exactly the way a reviewer's or
+/// tester's already did -- there's no separate code path for "the two
+/// hardcoded roles" versus "everything else".
+///
+/// `Ci` (issue #5) covers a failing check surfaced by `warden-gated`'s CI
+/// watcher; `Warden` (issue #24 review, M4; resolve-and-compare rework in
+/// issue #30) covers a finding the orchestrator raises directly from a
+/// structural check that re-resolves the three literal paths
+/// `.warden/agents/{coder,reviewer,tester}.md` through the OS from a cycle's
+/// resulting commit and compares them against the run-start snapshot
+/// (`warden::orchestrator::agent_definition_tampering_finding`) -- both are
+/// reserved words no workflow role name may claim (see [`FindingSource::parse`]),
+/// since neither ever comes from an agent subprocess's own judgement at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindingSource {
-    Reviewer,
-    Tester,
+    /// The workflow role name that raised this finding (e.g. `"reviewer"`,
+    /// `"tester"`, or any custom role a `.warden/workflow.yaml` declares).
+    Role(String),
     Ci,
     Warden,
 }
 
 impl FindingSource {
-    pub fn as_str(self) -> &'static str {
+    /// Convenience constructor for a role-sourced finding -- `FindingSource::role("techlead")`
+    /// reads more directly at call sites than `FindingSource::Role("techlead".to_string())`.
+    pub fn role(name: impl Into<String>) -> Self {
+        FindingSource::Role(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
         match self {
-            FindingSource::Reviewer => "reviewer",
-            FindingSource::Tester => "tester",
+            FindingSource::Role(name) => name,
             FindingSource::Ci => "ci",
             FindingSource::Warden => "warden",
         }
     }
 
+    /// **Issue #73**: roles are open (workflow-defined), so this no longer
+    /// rejects an unrecognized name -- there is no fixed set of role names
+    /// for this crate to validate against in the first place. Only a blank
+    /// name, or one of the two reserved, non-role words (`"ci"`/`"warden"`,
+    /// which never legitimately arrive from an agent's own stdout) are
+    /// rejected here. The security property this used to provide --
+    /// rejecting a role a *particular* invocation isn't entitled to claim --
+    /// still holds, just one layer up: [`validate_finding_sources_for_role`]
+    /// checks the parsed source against the specific role the caller
+    /// expected, at the one call site that knows which step actually
+    /// produced this stdout.
     pub fn parse(raw: &str) -> Result<Self> {
         match raw {
-            "reviewer" => Ok(FindingSource::Reviewer),
-            "tester" => Ok(FindingSource::Tester),
             "ci" => Ok(FindingSource::Ci),
             "warden" => Ok(FindingSource::Warden),
-            other => Err(CoreError::UnknownFindingSource(other.to_string())),
+            other if !other.trim().is_empty() => Ok(FindingSource::Role(other.to_string())),
+            _ => Err(CoreError::UnknownFindingSource(raw.to_string())),
         }
     }
 }
@@ -77,7 +106,7 @@ impl Severity {
     }
 }
 
-/// A single finding raised by a reviewer or tester agent during a cycle.
+/// A single finding raised by a workflow step's agent during a cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub source: FindingSource,
@@ -110,8 +139,8 @@ struct RawFinding {
 /// finding object per non-blank line, not a single JSON blob for the whole
 /// output. Blank lines are ignored.
 ///
-/// Any non-blank line that isn't parsable JSON, or whose `severity`/
-/// `source` isn't a known value, makes the whole call a
+/// Any non-blank line that isn't parsable JSON, or whose `severity` isn't a
+/// known value (or whose `source` is blank), makes the whole call a
 /// [`CoreError::MalformedAgentOutput`] — never a panic. We deliberately
 /// don't try to salvage the lines that *did* parse: once a stream has shown
 /// itself to produce output that doesn't match the protocol, treating the
@@ -140,30 +169,25 @@ pub fn parse_findings(agent_stdout: &str) -> Result<Vec<Finding>> {
 }
 
 /// Rejects any finding whose `source` isn't the one `role` is entitled to
-/// claim -- `parse_findings` only validates that `source` is *some* known
-/// value (issue #24 review, cycle 2, MAJOR 2), not that it's the value the
-/// role that actually produced this stdout is allowed to use. Without this,
-/// a reviewer/tester agent (whose raw output is untrusted input,
-/// code-standards.md "Ne jamais faire confiance à la sortie d'un agent CLI")
-/// could forge `source: "warden"` -- impersonating the structural finding
-/// only Warden itself may raise
-/// (`warden::orchestrator::agent_definition_tampering_finding`, issue #24
-/// review M4) -- or `source: "ci"`, or its sibling role's own source. That
-/// last one is the sharper, non-hypothetical case: a tester could mask a
-/// real failure by emitting it as `source: "reviewer"` instead of
-/// `"tester"`, since `warden::orchestrator::tester_succeeded` (the signal
-/// that gates evidence capture) keys off `FindingSource::Tester` findings
+/// claim -- `parse_findings` only validates that `source` is *some* non-blank
+/// value (issue #73: roles are open, so there is no fixed set left to
+/// validate against there), not that it's the value the role that actually
+/// produced this stdout is allowed to use. Without this, an agent running as
+/// one role (whose raw output is untrusted input, code-standards.md "Ne
+/// jamais faire confiance à la sortie d'un agent CLI") could forge
+/// `source: "warden"` -- impersonating the structural finding only Warden
+/// itself may raise (`warden::orchestrator::agent_definition_tampering_finding`,
+/// issue #24 review M4) -- or `source: "ci"`, or a *different* step's own
+/// role name. That last one is the sharper, non-hypothetical case: a tester
+/// could mask a real failure by emitting it as `source: "reviewer"` instead
+/// of `"tester"`, since `warden::orchestrator::tester_succeeded` (the signal
+/// that gates evidence capture) keys off a `Role("tester")` finding
 /// specifically -- reviewer-mislabelled output would sail straight past it.
 ///
-/// A reviewer may only ever emit [`FindingSource::Reviewer`]; a tester only
-/// [`FindingSource::Tester`]. [`FindingSource::Warden`]/[`FindingSource::Ci`]
-/// may never legitimately arrive from an agent subprocess's own stdout at
-/// all -- both are raised by Warden's own code, never parsed from untrusted
-/// agent output (`Ci` crosses a different, non-agent channel entirely,
-/// `crate::ci_channel`). `role` is only ever `Reviewer`/`Tester` at this
-/// validator's one call site (`warden::orchestrator::run_finding_agent`);
-/// `AgentRole::Coder` is accepted defensively and always rejected, since the
-/// coder role produces commits, never findings of its own.
+/// `expected_role` is the [`Role`] of the workflow step whose invocation this
+/// stdout actually came from -- the caller's own responsibility to supply
+/// correctly (`warden::orchestrator::run_finding_agent`); this function has
+/// no way to independently know which step ran.
 ///
 /// Rejects the *whole* batch on the first mismatch found (index order),
 /// rather than silently dropping just the offending line or silently
@@ -173,21 +197,13 @@ pub fn parse_findings(agent_stdout: &str) -> Result<Vec<Finding>> {
 /// even one finding's own origin, none of the rest of that same stream's
 /// claims are trustworthy either (the same "don't salvage the parts that
 /// looked fine" stance [`parse_findings`] already takes for a shape error).
-pub fn validate_finding_sources_for_role(findings: &[Finding], role: AgentRole) -> Result<()> {
-    let expected = match role {
-        AgentRole::Reviewer => FindingSource::Reviewer,
-        AgentRole::Tester => FindingSource::Tester,
-        AgentRole::Coder => {
-            return Err(CoreError::MalformedAgentOutput(
-                "the coder role never raises findings of its own".to_string(),
-            ));
-        }
-    };
+pub fn validate_finding_sources_for_role(findings: &[Finding], expected_role: &Role) -> Result<()> {
+    let expected = FindingSource::role(expected_role.as_str());
     for (index, finding) in findings.iter().enumerate() {
         if finding.source != expected {
             return Err(CoreError::MalformedAgentOutput(format!(
-                "finding at index {index} claims source {:?}, but the {role:?} role may only \
-                 raise findings with source {:?}",
+                "finding at index {index} claims source {:?}, but the {expected_role} role may \
+                 only raise findings with source {:?}",
                 finding.source.as_str(),
                 expected.as_str(),
             )));
@@ -196,71 +212,65 @@ pub fn validate_finding_sources_for_role(findings: &[Finding], role: AgentRole) 
     Ok(())
 }
 
-/// Decides the next [`RunState`] once a cycle's findings are known -- called
-/// from either [`RunState::Reviewing`] or [`RunState::Testing`], never
-/// meaningful elsewhere (crash recovery, `MaxReviewCyclesExceeded`/
-/// `MaxTestCyclesExceeded` -> `Failed`, ... do not go through this function).
+/// Decides the next [`RunState`] once a workflow step's cycle findings are
+/// known -- called from [`RunState::RunningStep`], never meaningful
+/// elsewhere (crash recovery, `StepCyclesExceeded` -> `Failed`, ... do not go
+/// through this function).
 ///
-/// **Issue #43 / ADR-0014, decision #37 Q1**: review and test now carry
-/// *separate* cycle budgets, and a blocking finding is charged to whichever
-/// budget its own phase belongs to -- never inferred from which `RunState`
-/// the caller happened to be in, but from the finding's own
-/// [`FindingSource`]:
+/// **Issue #73**: replaces the old, two-phase-specific `decide_next_state`
+/// (ADR-0014's `max_review_cycles`/`max_test_cycles` split) with a single
+/// rule that applies uniformly to *any* gated step in a
+/// [`crate::workflow::Workflow`], not just the built-in reviewer/tester
+/// pair:
 ///
-/// - A blocking [`FindingSource::Reviewer`] or [`FindingSource::Warden`]
-///   (the agent-definition-tampering check,
-///   `warden::orchestrator::agent_definition_tampering_finding`) finding is a
-///   **review-phase** failure -- checked against `max_review_cycles`. This is
-///   what makes a *scoped* re-review (issue #41/#42: every re-review after a
-///   tester finding's correctif is scoped, `ReviewScope::Correctif`) count
-///   against the review budget rather than the test budget, exactly as
-///   decision #37 Q1 requires -- it's still a `Reviewer`-sourced finding, so
-///   it takes this branch regardless of what triggered the coder's correctif
-///   in the first place.
-/// - A blocking [`FindingSource::Tester`] finding is a **test-phase**
-///   failure -- checked against `max_test_cycles`. By the caller's own
-///   invariant (`warden::orchestrator::run_convergence_loop`: the tester
-///   never runs on a cycle whose review wasn't clean, issue #41), `findings`
-///   never carries both a blocking reviewer/tampering finding *and* a
-///   blocking tester finding for the same call -- review-phase failures take
-///   priority in the (unreachable in practice) case they did.
-/// - No blocking finding at all: `Converged`.
+/// - A blocking finding whose source is this step's own role (`workflow.steps[step_index].role`),
+///   or [`FindingSource::Warden`] (the agent-definition-tampering check,
+///   `warden::orchestrator::agent_definition_tampering_finding`, always
+///   folded into whichever gated step's findings the caller is currently
+///   evaluating) -- reboucles to [`RunState::CoderRunning`] within
+///   `max_cycles`, or exhausts to [`RunState::StepCyclesExceeded`] at or past
+///   it.
+/// - No such blocking finding: the step is clean. If it's the workflow's
+///   *last* step, the run converges; otherwise the pipeline advances to the
+///   next step.
 ///
-/// `review_cycle`/`test_cycle` are the 1-based counts of review/test
-/// invocations made so far *including this one* (the reviewer runs every
-/// cycle, so `review_cycle` tracks the run's overall cycle number; the tester
-/// only runs on review-clean cycles, so `test_cycle` only advances then) --
-/// at or past the matching budget, the run exhausts that phase's budget
-/// instead of reboucling.
-pub fn decide_next_state(
+/// For the built-in three-step default workflow, this is exactly ADR-0014's
+/// old per-phase rule: `step_index = 1` (reviewer) checks `Role("reviewer")`/
+/// `Warden` against `max_review_cycles`, reboucling to `CoderRunning` or
+/// advancing to `RunningStep(2)` (never converging directly); `step_index = 2`
+/// (tester) checks `Role("tester")` against `max_test_cycles`, reboucling or
+/// converging (it's the last step) -- issue #73's strict retro-compat
+/// requirement, made a property of this one rule rather than two separate
+/// ones.
+///
+/// `current_cycle` is the 1-based count of this step's own invocations made
+/// so far *including this one* -- the caller's responsibility to track per
+/// step, exactly like `review_cycle`/`test_cycle` used to be tracked
+/// separately for the two hardcoded phases.
+pub fn decide_next_state_for_step(
     findings: &[Finding],
-    review_cycle: u32,
-    max_review_cycles: u32,
-    test_cycle: u32,
-    max_test_cycles: u32,
+    workflow: &Workflow,
+    step_index: u32,
+    current_cycle: u32,
+    max_cycles: u32,
 ) -> RunState {
-    let review_blocking = findings.iter().any(|f| {
+    let step_role = &workflow.steps[step_index as usize].role;
+    let expected_source = FindingSource::role(step_role.as_str());
+    let blocking = findings.iter().any(|f| {
         f.severity == Severity::Blocking
-            && matches!(f.source, FindingSource::Reviewer | FindingSource::Warden)
+            && (f.source == expected_source || f.source == FindingSource::Warden)
     });
-    let test_blocking = findings
-        .iter()
-        .any(|f| f.severity == Severity::Blocking && f.source == FindingSource::Tester);
 
-    if !review_blocking && !test_blocking {
-        return RunState::Converged;
-    }
-
-    if review_blocking {
-        return if review_cycle >= max_review_cycles {
-            RunState::MaxReviewCyclesExceeded
+    if !blocking {
+        return if workflow.is_last_step(step_index) {
+            RunState::Converged
         } else {
-            RunState::CoderRunning
+            RunState::RunningStep(step_index + 1)
         };
     }
 
-    if test_cycle >= max_test_cycles {
-        RunState::MaxTestCyclesExceeded
+    if current_cycle >= max_cycles {
+        RunState::StepCyclesExceeded(step_index)
     } else {
         RunState::CoderRunning
     }
@@ -269,12 +279,12 @@ pub fn decide_next_state(
 /// Coarse result of `warden-gated`'s CI watcher polling loop (issue #5),
 /// passed in by the caller rather than re-derived here -- this module only
 /// ever decides which [`RunState`] a given outcome implies, exactly like
-/// [`decide_next_state`] does for reviewer/tester findings. Deliberately not
-/// the same type as `warden-gated::ci_watcher::WatchOutcome`: that one
-/// carries the full per-check `Finding` list for human-readable reporting,
-/// while this crate only needs the coarse signal to pick a `RunState`
-/// (`warden-gated` must never depend on `warden`, and `warden-core` must
-/// never depend on `warden-gated` -- ADR-0006).
+/// [`decide_next_state_for_step`] does for a gated step's findings.
+/// Deliberately not the same type as `warden-gated::ci_watcher::WatchOutcome`:
+/// that one carries the full per-check `Finding` list for human-readable
+/// reporting, while this crate only needs the coarse signal to pick a
+/// `RunState` (`warden-gated` must never depend on `warden`, and
+/// `warden-core` must never depend on `warden-gated` -- ADR-0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiOutcome {
     Merged,
@@ -287,13 +297,13 @@ pub enum CiOutcome {
 /// Decides the next [`RunState`] once a run's CI watch (issue #5) reaches a
 /// terminal outcome. Only meaningful from [`RunState::AwaitingCi`], whose
 /// legal next states are exactly `Done` / `CoderRunning` / `Failed`
-/// ([`RunState::validate_transition`]) -- notably neither
-/// `MaxReviewCyclesExceeded` nor `MaxTestCyclesExceeded`, unlike
-/// [`decide_next_state`]'s per-phase budget cases: a CI failure that exhausts
-/// the cycle budget lands on `Failed` here instead. The caller
-/// (`warden::orchestrator`) checks this against the review budget -- a CI
-/// reboucle re-enters the loop at `CoderRunning` -> `Reviewing`, exactly like
-/// any other reboucle to the coder.
+/// ([`RunState::validate_transition`]) -- notably never
+/// `StepCyclesExceeded`, unlike [`decide_next_state_for_step`]'s per-step
+/// exhaustion case: a CI failure that exhausts the cycle budget lands on
+/// `Failed` here instead. The caller (`warden::orchestrator`) checks this
+/// against the review budget -- a CI reboucle re-enters the loop at
+/// `CoderRunning` -> `RunningStep(1)`, exactly like any other reboucle to the
+/// coder.
 ///
 /// - `Merged` / `ChecksPassed`: `Done`. Warden's own responsibility ends
 ///   once CI is green -- actually merging the PR is deliberately never
@@ -325,10 +335,23 @@ pub fn decide_next_state_after_ci(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::Workflow;
+
+    fn default_workflow() -> Workflow {
+        Workflow::builtin_default()
+    }
+
+    fn reviewer_role() -> Role {
+        Role::new("reviewer").unwrap()
+    }
+
+    fn tester_role() -> Role {
+        Role::new("tester").unwrap()
+    }
 
     fn blocking_finding() -> Finding {
         Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "unchecked unwrap".to_string(),
@@ -339,9 +362,9 @@ mod tests {
     /// Issue #24 review M4: the tampering finding
     /// (`warden::orchestrator::agent_definition_tampering_finding`) is
     /// `FindingSource::Warden`, folded in alongside the reviewer's own
-    /// findings -- must be charged to the review budget exactly like a real
-    /// reviewer finding (decision #37 Q1's imputation rule applies to it
-    /// too, not only to `Reviewer`-sourced findings).
+    /// findings -- must be charged to the review step's own budget exactly
+    /// like a real reviewer finding (decision #37 Q1's imputation rule
+    /// applies to it too, not only to role-sourced findings).
     fn tampering_finding() -> Finding {
         Finding {
             source: FindingSource::Warden,
@@ -354,7 +377,7 @@ mod tests {
 
     fn tester_blocking_finding() -> Finding {
         Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "test fails".to_string(),
@@ -364,7 +387,7 @@ mod tests {
 
     fn info_finding() -> Finding {
         Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Info,
             file: None,
             description: "consider adding a doc comment".to_string(),
@@ -373,95 +396,176 @@ mod tests {
     }
 
     #[test]
-    fn no_findings_converges() {
-        assert_eq!(decide_next_state(&[], 1, 5, 0, 5), RunState::Converged);
-    }
-
-    #[test]
-    fn only_non_blocking_findings_converges() {
+    fn no_findings_converges_on_the_last_step() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[info_finding()], 1, 5, 1, 5),
+            decide_next_state_for_step(&[], &workflow, 2, 1, 5),
             RunState::Converged
         );
     }
 
     #[test]
-    fn blocking_reviewer_finding_within_review_budget_reboucles_to_coder() {
+    fn no_findings_on_a_non_last_step_advances_to_the_next_step() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 1, 5, 0, 5),
+            decide_next_state_for_step(&[], &workflow, 1, 1, 5),
+            RunState::RunningStep(2)
+        );
+    }
+
+    #[test]
+    fn only_non_blocking_findings_advances() {
+        let workflow = default_workflow();
+        assert_eq!(
+            decide_next_state_for_step(&[info_finding()], &workflow, 2, 1, 5),
+            RunState::Converged
+        );
+    }
+
+    #[test]
+    fn blocking_finding_on_the_reviewer_step_within_budget_reboucles_to_coder() {
+        let workflow = default_workflow();
+        assert_eq!(
+            decide_next_state_for_step(&[blocking_finding()], &workflow, 1, 1, 5),
             RunState::CoderRunning
         );
     }
 
     #[test]
-    fn blocking_reviewer_finding_at_review_budget_exceeds_max_review_cycles() {
+    fn blocking_finding_on_the_reviewer_step_at_budget_exceeds_its_own_step_cycles() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 5, 5, 0, 5),
-            RunState::MaxReviewCyclesExceeded
+            decide_next_state_for_step(&[blocking_finding()], &workflow, 1, 5, 5),
+            RunState::StepCyclesExceeded(1)
         );
     }
 
     #[test]
-    fn blocking_reviewer_finding_past_review_budget_exceeds_max_review_cycles() {
+    fn blocking_finding_on_the_reviewer_step_past_budget_exceeds_its_own_step_cycles() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 6, 5, 0, 5),
-            RunState::MaxReviewCyclesExceeded
+            decide_next_state_for_step(&[blocking_finding()], &workflow, 1, 6, 5),
+            RunState::StepCyclesExceeded(1)
         );
     }
 
-    /// The tampering finding (`FindingSource::Warden`) is charged to the
-    /// review budget exactly like a `Reviewer`-sourced one.
+    /// The tampering finding (`FindingSource::Warden`) is charged to
+    /// whichever step's own budget the caller is currently evaluating (the
+    /// review step's, in the built-in default workflow) exactly like a
+    /// role-sourced one.
     #[test]
-    fn blocking_tampering_finding_is_charged_to_the_review_budget() {
+    fn tampering_finding_is_charged_to_the_step_it_is_folded_into() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[tampering_finding()], 5, 5, 0, 5),
-            RunState::MaxReviewCyclesExceeded
+            decide_next_state_for_step(&[tampering_finding()], &workflow, 1, 5, 5),
+            RunState::StepCyclesExceeded(1)
         );
     }
 
-    /// Decision #37 Q1, the core acceptance criterion of issue #43: a
-    /// blocking tester finding reboucles/exhausts against the *test* budget,
-    /// never the review budget -- even when the review budget is itself
-    /// already exhausted, since a tester finding only ever appears in
-    /// `findings` on a cycle whose review already came back clean this same
-    /// cycle (`warden::orchestrator::run_convergence_loop`'s gate, issue
-    /// #41).
+    /// A tester finding on the review step's own evaluation never blocks it
+    /// (it's a different step's own role) -- proving `decide_next_state_for_step`
+    /// really does key off the *specific* step's own role, not "any finding
+    /// at all".
     #[test]
-    fn blocking_tester_finding_within_test_budget_reboucles_to_coder() {
+    fn a_different_steps_finding_never_blocks_this_step() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[tester_blocking_finding()], 5, 5, 1, 5),
+            decide_next_state_for_step(&[tester_blocking_finding()], &workflow, 1, 1, 5),
+            RunState::RunningStep(2),
+            "a tester-sourced finding must not block the reviewer step's own decision"
+        );
+    }
+
+    /// Decision #37 Q1, the core acceptance criterion of issue #43 (now
+    /// generalized, issue #73): a blocking tester finding reboucles/exhausts
+    /// against the *tester step's own* budget, never the reviewer step's --
+    /// even when the reviewer step's own budget is itself already exhausted,
+    /// since a tester finding only ever appears when the caller is
+    /// evaluating the tester step, on a cycle whose review already came back
+    /// clean this same cycle (`warden::orchestrator::run_convergence_loop`'s
+    /// gate, issue #41).
+    #[test]
+    fn blocking_tester_finding_within_its_own_budget_reboucles_to_coder() {
+        let workflow = default_workflow();
+        assert_eq!(
+            decide_next_state_for_step(&[tester_blocking_finding()], &workflow, 2, 1, 5),
             RunState::CoderRunning
         );
     }
 
     #[test]
-    fn blocking_tester_finding_at_test_budget_exceeds_max_test_cycles_not_review() {
+    fn blocking_tester_finding_at_its_own_budget_exceeds_step_cycles_not_the_reviewers() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[tester_blocking_finding()], 1, 5, 3, 3),
-            RunState::MaxTestCyclesExceeded
+            decide_next_state_for_step(&[tester_blocking_finding()], &workflow, 2, 3, 3),
+            RunState::StepCyclesExceeded(2)
         );
     }
 
     #[test]
-    fn blocking_tester_finding_past_test_budget_exceeds_max_test_cycles() {
+    fn blocking_tester_finding_past_its_own_budget_exceeds_step_cycles() {
+        let workflow = default_workflow();
         assert_eq!(
-            decide_next_state(&[tester_blocking_finding()], 1, 5, 4, 3),
-            RunState::MaxTestCyclesExceeded
+            decide_next_state_for_step(&[tester_blocking_finding()], &workflow, 2, 4, 3),
+            RunState::StepCyclesExceeded(2)
         );
     }
 
-    /// A scoped re-review (issue #41/#42) triggered by a *tester* finding's
-    /// correctif is still a `Reviewer`-sourced finding when it itself finds
-    /// something -- decision #37 Q1's whole point: that reboucle is charged
-    /// to the review budget, not the test budget, regardless of what
-    /// motivated the coder's correctif in the first place.
     #[test]
-    fn a_scoped_re_review_finding_after_a_tester_reboucle_is_charged_to_the_review_budget_not_test()
-    {
+    fn decide_next_state_mixed_severities_still_reboucles_on_any_blocking() {
+        let workflow = default_workflow();
+        let findings = vec![info_finding(), blocking_finding()];
         assert_eq!(
-            decide_next_state(&[blocking_finding()], 2, 5, 1, 1),
-            RunState::CoderRunning,
-            "review budget still has room even though the test budget is already exhausted"
+            decide_next_state_for_step(&findings, &workflow, 1, 1, 5),
+            RunState::CoderRunning
+        );
+    }
+
+    /// Issue #73's own new-role demonstration: a fourth, custom step
+    /// (`techlead`) whose findings aggregate in the loop exactly like the
+    /// reviewer's/tester's already do -- a blocking finding attributed to it
+    /// reboucles/exhausts against its own budget, and a clean cycle on it (as
+    /// the workflow's last step) converges the run.
+    #[test]
+    fn a_custom_role_beyond_the_default_pipeline_aggregates_like_any_other_step() {
+        let yaml = r#"
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+
+        let techlead_blocking = Finding {
+            source: FindingSource::role("techlead"),
+            severity: Severity::Blocking,
+            file: None,
+            description: "architecture concern".to_string(),
+            action: Some("reconsider the approach".to_string()),
+        };
+        assert_eq!(
+            decide_next_state_for_step(&[techlead_blocking], &workflow, 3, 1, 5),
+            RunState::CoderRunning
+        );
+        assert_eq!(
+            decide_next_state_for_step(&[], &workflow, 3, 1, 5),
+            RunState::Converged,
+            "techlead is this workflow's last step, so a clean cycle converges"
+        );
+        assert_eq!(
+            decide_next_state_for_step(&[], &workflow, 2, 1, 5),
+            RunState::RunningStep(3),
+            "tester is no longer the last step in this workflow, so a clean cycle advances \
+             instead of converging"
         );
     }
 
@@ -478,7 +582,7 @@ mod tests {
         let stdout = r#"{"source":"tester","severity":"blocking","file":"src/main.rs","description":"test fails","action":"fix panic"}"#;
         let findings = parse_findings(stdout).unwrap();
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].source, FindingSource::Tester);
+        assert_eq!(findings[0].source, FindingSource::role("tester"));
         assert_eq!(findings[0].severity, Severity::Blocking);
         assert_eq!(findings[0].file.as_deref(), Some("src/main.rs"));
     }
@@ -514,10 +618,29 @@ mod tests {
         );
     }
 
+    /// Issue #73: roles are now open (workflow-defined), so an arbitrary
+    /// non-blank `source` string is no longer rejected at this parse layer
+    /// -- there is no fixed set of role names left for this crate to
+    /// validate against (a `.warden/workflow.yaml` could legitimately name a
+    /// step `"ghost"`). Only a *blank* source is still rejected -- see
+    /// `parse_findings_rejects_a_blank_source` below. The security property
+    /// this test used to pin now lives in `validate_finding_sources_for_role`,
+    /// which checks a source against the *specific* role the caller expected
+    /// (see that function's own tests).
     #[test]
-    fn parse_findings_rejects_unknown_source() {
+    fn parse_findings_accepts_any_non_blank_source_as_an_open_role() {
         let stdout = r#"{"source":"ghost","severity":"info","description":"x"}"#;
-        assert!(parse_findings(stdout).is_err());
+        let findings = parse_findings(stdout).unwrap();
+        assert_eq!(findings[0].source, FindingSource::role("ghost"));
+    }
+
+    #[test]
+    fn parse_findings_rejects_a_blank_source() {
+        let stdout = r#"{"source":"   ","severity":"info","description":"x"}"#;
+        assert!(matches!(
+            parse_findings(stdout),
+            Err(CoreError::UnknownFindingSource(_))
+        ));
     }
 
     #[test]
@@ -570,7 +693,7 @@ mod tests {
     }
 
     // ---- validate_finding_sources_for_role (issue #24 review, cycle 2,
-    // MAJOR 2) ----------------------------------------------------------
+    // MAJOR 2; generalized to open roles, issue #73) ---------------------
 
     fn finding_with_source(source: FindingSource) -> Finding {
         Finding {
@@ -584,33 +707,42 @@ mod tests {
 
     #[test]
     fn validate_finding_sources_for_role_accepts_a_reviewer_finding_with_the_reviewer_source() {
-        let findings = vec![finding_with_source(FindingSource::Reviewer)];
-        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_ok());
+        let findings = vec![finding_with_source(FindingSource::role("reviewer"))];
+        assert!(validate_finding_sources_for_role(&findings, &reviewer_role()).is_ok());
     }
 
     #[test]
     fn validate_finding_sources_for_role_accepts_a_tester_finding_with_the_tester_source() {
-        let findings = vec![finding_with_source(FindingSource::Tester)];
-        assert!(validate_finding_sources_for_role(&findings, AgentRole::Tester).is_ok());
+        let findings = vec![finding_with_source(FindingSource::role("tester"))];
+        assert!(validate_finding_sources_for_role(&findings, &tester_role()).is_ok());
+    }
+
+    /// Issue #73: the same rule applies unchanged to a custom role beyond
+    /// the built-in three.
+    #[test]
+    fn validate_finding_sources_for_role_accepts_a_custom_roles_own_finding() {
+        let role = Role::new("techlead").unwrap();
+        let findings = vec![finding_with_source(FindingSource::role("techlead"))];
+        assert!(validate_finding_sources_for_role(&findings, &role).is_ok());
     }
 
     #[test]
     fn validate_finding_sources_for_role_accepts_no_findings_at_all() {
-        assert!(validate_finding_sources_for_role(&[], AgentRole::Reviewer).is_ok());
-        assert!(validate_finding_sources_for_role(&[], AgentRole::Tester).is_ok());
+        assert!(validate_finding_sources_for_role(&[], &reviewer_role()).is_ok());
+        assert!(validate_finding_sources_for_role(&[], &tester_role()).is_ok());
     }
 
     #[test]
     fn validate_finding_sources_for_role_rejects_a_reviewer_finding_claiming_the_warden_source() {
         let findings = vec![finding_with_source(FindingSource::Warden)];
-        let error = validate_finding_sources_for_role(&findings, AgentRole::Reviewer).unwrap_err();
+        let error = validate_finding_sources_for_role(&findings, &reviewer_role()).unwrap_err();
         assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
     }
 
     #[test]
     fn validate_finding_sources_for_role_rejects_a_reviewer_finding_claiming_the_ci_source() {
         let findings = vec![finding_with_source(FindingSource::Ci)];
-        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_err());
+        assert!(validate_finding_sources_for_role(&findings, &reviewer_role()).is_err());
     }
 
     /// The sibling-role impersonation case: a tester claiming the
@@ -618,8 +750,8 @@ mod tests {
     /// trusting an agent-controlled `source`).
     #[test]
     fn validate_finding_sources_for_role_rejects_a_tester_finding_claiming_the_reviewer_source() {
-        let findings = vec![finding_with_source(FindingSource::Reviewer)];
-        let error = validate_finding_sources_for_role(&findings, AgentRole::Tester).unwrap_err();
+        let findings = vec![finding_with_source(FindingSource::role("reviewer"))];
+        let error = validate_finding_sources_for_role(&findings, &tester_role()).unwrap_err();
         assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
     }
 
@@ -630,25 +762,10 @@ mod tests {
     #[test]
     fn validate_finding_sources_for_role_rejects_the_whole_batch_on_one_bad_finding() {
         let findings = vec![
-            finding_with_source(FindingSource::Reviewer),
+            finding_with_source(FindingSource::role("reviewer")),
             finding_with_source(FindingSource::Warden),
         ];
-        assert!(validate_finding_sources_for_role(&findings, AgentRole::Reviewer).is_err());
-    }
-
-    #[test]
-    fn validate_finding_sources_for_role_rejects_the_coder_role_defensively() {
-        let error = validate_finding_sources_for_role(&[], AgentRole::Coder).unwrap_err();
-        assert!(matches!(error, CoreError::MalformedAgentOutput(_)));
-    }
-
-    #[test]
-    fn decide_next_state_mixed_severities_still_reboucles_on_any_blocking() {
-        let findings = vec![info_finding(), blocking_finding()];
-        assert_eq!(
-            decide_next_state(&findings, 1, 5, 0, 5),
-            RunState::CoderRunning
-        );
+        assert!(validate_finding_sources_for_role(&findings, &reviewer_role()).is_err());
     }
 
     // ---- FindingSource::Ci -------------------------------------------------
@@ -705,11 +822,10 @@ mod tests {
     }
 
     #[test]
-    fn checks_failed_at_cycle_budget_fails_the_run_not_a_max_cycles_exceeded_state() {
+    fn checks_failed_at_cycle_budget_fails_the_run_not_a_step_cycles_exceeded_state() {
         // AwaitingCi's only legal next states are Done/CoderRunning/Failed
-        // (state.rs) -- neither MaxReviewCyclesExceeded nor
-        // MaxTestCyclesExceeded is reachable from here, unlike
-        // decide_next_state's reviewer/tester equivalents.
+        // (state.rs) -- `StepCyclesExceeded` is never reachable from here,
+        // unlike `decide_next_state_for_step`'s own exhaustion case.
         assert_eq!(
             decide_next_state_after_ci(CiOutcome::ChecksFailed, 5, 5),
             RunState::Failed
@@ -727,7 +843,7 @@ mod tests {
         ] {
             let next = decide_next_state_after_ci(outcome, 1, 5);
             assert!(
-                RunState::AwaitingCi.validate_transition(next).is_ok(),
+                RunState::AwaitingCi.validate_transition(next, 3).is_ok(),
                 "{outcome:?} -> {next:?} is not a legal AwaitingCi transition"
             );
         }
