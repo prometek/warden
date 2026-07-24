@@ -2304,6 +2304,115 @@ mod tests {
         assert_eq!(exhausted.current_test_cycle, 0);
     }
 
+    /// Issue #73: `0009_generic_workflow_state.sql`'s own remap of the four
+    /// legacy `state` strings the closed `Reviewing`/`Testing`/
+    /// `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` variants used to
+    /// write (`crates/warden/migrations/0009_generic_workflow_state.sql`'s
+    /// own comment: "a lossless, exact remap, not an approximation") --
+    /// `reviewing` -> `running_step:1`, `testing` -> `running_step:2`,
+    /// `max_review_cycles_exceeded` -> `step_cycles_exceeded:1`,
+    /// `max_test_cycles_exceeded` -> `step_cycles_exceeded:2`.
+    ///
+    /// [`phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strings`]
+    /// above already drives rows through 0007's own remap and on into 0009,
+    /// but every row it seeds starts from the *pre-0007* schema, so it only
+    /// ever lands on `reviewing`/`max_review_cycles_exceeded` (index 1) by
+    /// the time 0009 sees them -- `testing`/`max_test_cycles_exceeded`
+    /// (index 2) is never exercised there at all. This test seeds all four
+    /// legacy strings directly, on the schema exactly as 0007/0008 leave it
+    /// (`run_to` the migration immediately before 0009), so every one of
+    /// 0009's four `UPDATE` statements is independently exercised.
+    #[tokio::test]
+    async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let generic_workflow_state_index = migrations
+            .iter()
+            .position(|migration| migration.description.contains("generic workflow state"))
+            .expect("0009_generic_workflow_state.sql must still be a migration in this set");
+        let pre_generic_workflow_state_version =
+            migrations[generic_workflow_state_index - 1].version;
+
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+
+            MIGRATOR
+                .run_to(pre_generic_workflow_state_version, &pool)
+                .await
+                .unwrap();
+
+            // Four rows, one per legacy state string 0009 must remap, seeded
+            // directly on the post-0007/0008 schema (`max_review_cycles`/
+            // `max_test_cycles`/`current_review_cycle`/`current_test_cycle`,
+            // no more single `max_cycles`/`current_cycle` pair).
+            for (id, legacy_state) in [
+                ("run-reviewing", "reviewing"),
+                ("run-testing", "testing"),
+                ("run-max-review-exceeded", "max_review_cycles_exceeded"),
+                ("run-max-test-exceeded", "max_test_cycles_exceeded"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at) \
+                     VALUES (?, '/tmp/repo', 'main', 'legacy run', ?, 5, 5, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                )
+                .bind(id)
+                .bind(legacy_state)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            pool.close().await;
+        }
+
+        // Re-`connect` applies every remaining pending migration, including
+        // 0009, against the seeded rows above.
+        let pool = connect(&db_path).await.unwrap();
+
+        let reviewing = get_run(&pool, "run-reviewing").await.unwrap().unwrap();
+        assert_eq!(
+            reviewing.state,
+            RunState::RunningStep(1),
+            "legacy 'reviewing' must remap onto RunningStep(1)"
+        );
+
+        let testing = get_run(&pool, "run-testing").await.unwrap().unwrap();
+        assert_eq!(
+            testing.state,
+            RunState::RunningStep(2),
+            "legacy 'testing' must remap onto RunningStep(2)"
+        );
+
+        let max_review_exceeded = get_run(&pool, "run-max-review-exceeded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            max_review_exceeded.state,
+            RunState::StepCyclesExceeded(1),
+            "legacy 'max_review_cycles_exceeded' must remap onto StepCyclesExceeded(1)"
+        );
+
+        let max_test_exceeded = get_run(&pool, "run-max-test-exceeded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            max_test_exceeded.state,
+            RunState::StepCyclesExceeded(2),
+            "legacy 'max_test_cycles_exceeded' must remap onto StepCyclesExceeded(2)"
+        );
+    }
+
     /// Issue #6: "a failed backup aborts migration (fails loud) rather than
     /// proceeding". Forces `VACUUM INTO` to fail by revoking write
     /// permission on the directory the backup file would be created in
