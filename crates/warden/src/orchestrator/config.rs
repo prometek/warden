@@ -3,20 +3,20 @@
 
 use std::path::PathBuf;
 
-use warden_core::{AgentDefinition, AgentRole, EvidenceTool};
+use warden_core::{AgentDefinition, AgentRole, EvidenceTool, Workflow};
 
 /// Static configuration for a single run of the convergence loop.
 ///
-/// `coder_agent`/`reviewer_agent`/`tester_agent` are the markdown
-/// definitions of each role (issue #24): what the role *is* (its system
-/// prompt, and optionally its `tools`/`model`). Resolved once, from the
-/// run's base repo, before this run's `runs` row is even written --
-/// `warden::agent_def::resolve_agent_definition`'s own docs explain why
-/// that resolve-once-at-the-base-repo timing matters for reviewer/tester
-/// independence. A [`ToolAdapter`] maps each onto the concrete CLI to spawn
-/// -- ADR-0005: Warden spawns whatever CLI a `--tool` adapter builds, never
-/// calls an LLM API directly, and hardcodes no agent binary of its own (the
-/// adapter is what knows the binary name).
+/// `step_agents` are the markdown definitions of each workflow step (issue
+/// #24): what the step *is* (its system prompt, and optionally its
+/// `tools`/`model`). Resolved once, from the run's base repo, before this
+/// run's `runs` row is even written -- `warden::agent_def::resolve_agent_definition`'s
+/// own docs explain why that resolve-once-at-the-base-repo timing matters
+/// for the built-in reviewer/tester's own independence. A [`ToolAdapter`]
+/// maps each onto the concrete CLI to spawn -- ADR-0005: Warden spawns
+/// whatever CLI a `--tool` adapter builds, never calls an LLM API directly,
+/// and hardcodes no agent binary of its own (the adapter is what knows the
+/// binary name).
 pub struct RunConfig {
     /// The user's pre-existing repository. Never written to directly — only
     /// read to resolve the starting commit and to run `git worktree`.
@@ -26,17 +26,40 @@ pub struct RunConfig {
     pub branch: String,
     pub intent: String,
     /// Issue #43/ADR-0014: the coder<->reviewer round-trip budget
-    /// (`RunState::Reviewing`) -- a scoped re-review's own finding is charged
+    /// (`RunState::RunningStep(1)`) -- a scoped re-review's own finding is charged
     /// here even when a tester finding was what triggered the coder's
     /// correctif (decision #37 Q1).
     pub max_review_cycles: u32,
     /// Issue #43/ADR-0014: how many times the tester may actually run and
-    /// come back with a blocking finding (`RunState::Testing`) before the run
-    /// gives up as `MaxTestCyclesExceeded`.
+    /// come back with a blocking finding (`RunState::RunningStep(2)`) before
+    /// the run gives up as `RunState::StepCyclesExceeded(2)`.
     pub max_test_cycles: u32,
-    pub coder_agent: AgentDefinition,
-    pub reviewer_agent: AgentDefinition,
-    pub tester_agent: AgentDefinition,
+    /// Issue #73: the run's pipeline -- `Workflow::builtin_default()` when
+    /// no `.warden/workflow.yaml` exists (strict retro-compat with the
+    /// pre-issue-#73 coder -> gate review -> gate test pipeline), or the
+    /// parsed/validated contents of that file otherwise. Resolved once by
+    /// the CLI, before this run's `runs` row is even written -- the same
+    /// "resolved once, at the base repo, before the coder ever runs" timing
+    /// `coder_agent`/`reviewer_agent`/`tester_agent` already follow.
+    pub workflow: Workflow,
+    /// Issue #73: the single shared cycle budget for any workflow step
+    /// beyond the built-in reviewer/tester pair (e.g. a custom `techlead`
+    /// step) -- the built-in pair keeps using `max_review_cycles`/
+    /// `max_test_cycles` above. Unused when `workflow` has no such extra
+    /// step (the built-in default workflow never does).
+    pub max_extra_step_cycles: u32,
+    /// Issue #73 (trio-unification follow-up): one resolved
+    /// [`AgentDefinition`] per `workflow.steps`, in the exact same order --
+    /// `step_agents[0]` is the producer's (the coder, in the built-in
+    /// default workflow). No role is privileged in this list: `main.rs`
+    /// resolves the built-in three names (`"coder"`/`"reviewer"`/
+    /// `"tester"`) through their existing hardened, role-asymmetric path
+    /// (`agent_def::resolve_agent_definition`, ADR-0026) and everything else
+    /// through the simpler `agent_def::resolve_custom_step_agent_definition`
+    /// (`.claude/agents/<agent>.md`, ADR-0013) -- but by the time this
+    /// reaches the convergence loop, it is just a flat, uniform list the
+    /// loop indexes by position, never by name.
+    pub step_agents: Vec<AgentDefinition>,
     /// Overrides automatic project-type detection for the Evidence Capture
     /// Adapter (`evidence.tool`, ADR-0009). `None` means "detect from the
     /// repo" (`warden_core::detect_project_type`).

@@ -12,8 +12,8 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    AgentRole, EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState,
-    Severity, TokenUsage,
+    EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
+    TokenUsage,
 };
 
 use crate::error::{Result, WardenError};
@@ -229,8 +229,10 @@ fn row_to_token_usage(
 ///
 /// Issue #43 (#37.4) / ADR-0014: `max_cycles`/`current_cycle` are gone,
 /// replaced by two independent per-phase budgets/counters -- see
-/// `crates/warden/migrations/0007_phase_budgets.sql` and
-/// `warden_core::RunState::Reviewing`/`Testing`.
+/// `crates/warden/migrations/0007_phase_budgets.sql`. Issue #73:
+/// `total_steps`/`max_extra_step_cycles`/`current_extra_step_cycle` back the
+/// generic, step-indexed `warden_core::RunState::RunningStep`/
+/// `StepCyclesExceeded` -- see `crates/warden/migrations/0009_generic_workflow_state.sql`.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub id: String,
@@ -242,6 +244,18 @@ pub struct Run {
     pub max_test_cycles: u32,
     pub current_review_cycle: u32,
     pub current_test_cycle: u32,
+    /// Issue #73: how many steps this run's own resolved
+    /// `warden_core::Workflow` has (`workflow.steps.len()`) -- what
+    /// `RunState::validate_transition` needs to decide whether a step is the
+    /// workflow's *last* one. `3` for every run driving the built-in default
+    /// workflow (coder, reviewer, tester).
+    pub total_steps: u32,
+    /// Issue #73: the single shared cycle budget for any workflow step
+    /// beyond the built-in reviewer/tester pair (e.g. a custom `techlead`
+    /// step) -- the built-in pair keeps its own `max_review_cycles`/
+    /// `max_test_cycles` above.
+    pub max_extra_step_cycles: u32,
+    pub current_extra_step_cycle: u32,
     pub created_at: String,
     pub updated_at: String,
     /// The commit SHA the run converged on (see `set_run_converged_commit`,
@@ -254,6 +268,7 @@ pub struct Run {
     pub pr_number: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_run(
     pool: &SqlitePool,
     id: &str,
@@ -262,15 +277,19 @@ pub async fn insert_run(
     intent: &str,
     max_review_cycles: u32,
     max_test_cycles: u32,
+    total_steps: u32,
+    max_extra_step_cycles: u32,
 ) -> Result<()> {
     let now = now_rfc3339();
     let state = RunState::Pending.as_str();
     let max_review_cycles = i64::from(max_review_cycles);
     let max_test_cycles = i64::from(max_test_cycles);
+    let total_steps = i64::from(total_steps);
+    let max_extra_step_cycles = i64::from(max_extra_step_cycles);
     sqlx::query!(
         r#"
-        INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+        INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, ?, ?)
         "#,
         id,
         repo_path,
@@ -279,6 +298,8 @@ pub async fn insert_run(
         state,
         max_review_cycles,
         max_test_cycles,
+        total_steps,
+        max_extra_step_cycles,
         now,
         now,
     )
@@ -342,6 +363,27 @@ pub async fn set_run_current_test_cycle(
     sqlx::query!(
         "UPDATE runs SET current_test_cycle = ?, updated_at = ? WHERE id = ?",
         test_cycle,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Issue #73: records the run's current *extra-step* cycle number -- the
+/// single shared counter for any workflow step beyond the built-in
+/// reviewer/tester pair (see [`Run`]'s own docs on `max_extra_step_cycles`).
+pub async fn set_run_current_extra_step_cycle(
+    pool: &SqlitePool,
+    run_id: &str,
+    extra_step_cycle: u32,
+) -> Result<()> {
+    let now = now_rfc3339();
+    let extra_step_cycle = i64::from(extra_step_cycle);
+    sqlx::query!(
+        "UPDATE runs SET current_extra_step_cycle = ?, updated_at = ? WHERE id = ?",
+        extra_step_cycle,
         now,
         run_id,
     )
@@ -496,6 +538,9 @@ struct RunRow {
     max_test_cycles: i64,
     current_review_cycle: i64,
     current_test_cycle: i64,
+    total_steps: i64,
+    max_extra_step_cycles: i64,
+    current_extra_step_cycle: i64,
     created_at: String,
     updated_at: String,
     converged_commit_sha: Option<String>,
@@ -517,6 +562,15 @@ fn row_to_run(row: RunRow) -> Result<Run> {
         max_test_cycles: checked_u32(row.max_test_cycles, "runs.max_test_cycles")?,
         current_review_cycle: checked_u32(row.current_review_cycle, "runs.current_review_cycle")?,
         current_test_cycle: checked_u32(row.current_test_cycle, "runs.current_test_cycle")?,
+        total_steps: checked_u32(row.total_steps, "runs.total_steps")?,
+        max_extra_step_cycles: checked_u32(
+            row.max_extra_step_cycles,
+            "runs.max_extra_step_cycles",
+        )?,
+        current_extra_step_cycle: checked_u32(
+            row.current_extra_step_cycle,
+            "runs.current_extra_step_cycle",
+        )?,
         created_at: row.created_at,
         updated_at: row.updated_at,
         converged_commit_sha: row.converged_commit_sha,
@@ -527,7 +581,7 @@ fn row_to_run(row: RunRow) -> Result<Run> {
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     let row = sqlx::query_as!(
         RunRow,
-        r#"SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
+        r#"SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number FROM runs WHERE id = ?"#,
         run_id,
     )
     .fetch_optional(pool)
@@ -537,17 +591,20 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
 }
 
 /// Runs left in an intermediate state (`RunState::is_intermediate`) as of
-/// the last shutdown/crash. The four literal state strings below must stay
-/// in sync with [`RunState::is_intermediate`] — enforced by a test in this
-/// module, since a `?`-parameterised `IN (...)` list isn't expressible in a
-/// macro-checked static query.
+/// the last shutdown/crash. The `coder_running`/`awaiting_ci` literals and
+/// the `running_step:%` pattern below must stay in sync with
+/// [`RunState::is_intermediate`] — enforced by a test in this module, since
+/// a `?`-parameterised `IN (...)` list isn't expressible in a
+/// macro-checked static query. `running_step:%` is a `LIKE` pattern rather
+/// than a literal list (issue #73): a step-indexed state can carry any
+/// index, so there is no fixed set of literal strings left to enumerate.
 pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at, converged_commit_sha, pr_number
+        SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
-        WHERE state IN ('coder_running', 'reviewing', 'testing', 'awaiting_ci')
+        WHERE state IN ('coder_running', 'awaiting_ci') OR state LIKE 'running_step:%'
         "#
     )
     .fetch_all(pool)
@@ -575,7 +632,7 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
     let rows = sqlx::query_as!(
         RunRow,
         r#"
-        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_review_cycles, runs.max_test_cycles, runs.current_review_cycle, runs.current_test_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
+        SELECT DISTINCT runs.id as "id!", runs.repo_path, runs.branch, runs.intent, runs.state, runs.max_review_cycles, runs.max_test_cycles, runs.current_review_cycle, runs.current_test_cycle, runs.total_steps, runs.max_extra_step_cycles, runs.current_extra_step_cycle, runs.created_at, runs.updated_at, runs.converged_commit_sha, runs.pr_number
         FROM runs
         WHERE runs.state = 'failed'
           AND (
@@ -585,11 +642,9 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
                 WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL
             )
             OR EXISTS (
-                SELECT 1 FROM cycles
+                SELECT 1 FROM cycle_worktrees
+                JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
                 WHERE cycles.run_id = runs.id
-                  AND (cycles.coder_worktree_path IS NOT NULL
-                       OR cycles.reviewer_worktree_path IS NOT NULL
-                       OR cycles.tester_worktree_path IS NOT NULL)
             )
           )
         "#
@@ -638,194 +693,97 @@ pub async fn set_cycle_commit_sha(
     Ok(())
 }
 
+/// Issue #73 follow-up (trio-unification): records/overwrites the worktree
+/// path for `role` on `cycle_id` -- generalized from three hardcoded
+/// `cycles.{coder,reviewer,tester}_worktree_path` columns to one row per
+/// (cycle, role) in `cycle_worktrees` (migrations/0010), open to any role a
+/// workflow declares. Every step, built-in or custom, calls this now -- see
+/// `warden::orchestrator::InvocationRole`'s removal: there is no longer a
+/// role for which this bookkeeping is skipped.
 pub async fn set_cycle_worktree_path(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     path: &str,
 ) -> Result<()> {
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                "UPDATE cycles SET coder_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                "UPDATE cycles SET reviewer_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                "UPDATE cycles SET tester_worktree_path = ? WHERE id = ?",
-                path,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        "INSERT INTO cycle_worktrees (cycle_id, role, worktree_path) VALUES (?, ?, ?) \
+         ON CONFLICT (cycle_id, role) DO UPDATE SET worktree_path = excluded.worktree_path",
+        cycle_id,
+        role,
+        path,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Nulls out the recorded worktree path for `role` on `cycle_id`, once crash
-/// recovery has actually removed that worktree from disk (issue #6). This is
-/// what lets [`list_failed_runs_with_pending_cleanup`] stop returning a run
-/// after its orphan cleanup succeeds — the run stays `Failed` forever (a
-/// terminal state), but the *recorded path* is the signal that tells a later
-/// recovery pass whether there is still anything left to reclaim for it.
+/// Removes the recorded worktree path row for `role` on `cycle_id`, once
+/// crash recovery has actually removed that worktree from disk (issue #6).
+/// This is what lets [`list_failed_runs_with_pending_cleanup`] stop
+/// returning a run after its orphan cleanup succeeds — the run stays
+/// `Failed` forever (a terminal state), but the *recorded row* is the
+/// signal that tells a later recovery pass whether there is still anything
+/// left to reclaim for it.
 pub async fn clear_cycle_worktree_path(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
 ) -> Result<()> {
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                "UPDATE cycles SET coder_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                "UPDATE cycles SET reviewer_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                "UPDATE cycles SET tester_worktree_path = NULL WHERE id = ?",
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        "DELETE FROM cycle_worktrees WHERE cycle_id = ? AND role = ?",
+        cycle_id,
+        role,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Issue #53: accumulates one agent invocation's token usage onto `role`'s
-/// running total for this cycle -- the cycle-level half of the aggregation
-/// (see [`add_run_token_usage`]'s own docs for the run-level half and the
-/// shared "cache columns only advance when reported" rule both follow).
-/// Three near-identical arms rather than a dynamic column name, matching
-/// [`set_cycle_worktree_path`]'s own per-role match (code-standards.md: no
-/// SQL built by string concatenation).
+/// Issue #53 (generalized by the trio-unification follow-up, issue #73):
+/// accumulates one agent invocation's token usage onto `role`'s running
+/// total for this cycle -- the cycle-level half of the aggregation (see
+/// [`add_run_token_usage`]'s own docs for the run-level half and the shared
+/// "cache columns only advance when reported" rule both follow). One
+/// upserted row per (cycle, role) in `cycle_token_usage` (migrations/0010)
+/// rather than three hardcoded column groups -- open to any role.
 pub async fn add_cycle_role_token_usage(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     usage: &TokenUsage,
 ) -> Result<()> {
-    let input_tokens = checked_i64(usage.input_tokens, "cycles.<role>_input_tokens")?;
-    let output_tokens = checked_i64(usage.output_tokens, "cycles.<role>_output_tokens")?;
+    let input_tokens = checked_i64(usage.input_tokens, "cycle_token_usage.input_tokens")?;
+    let output_tokens = checked_i64(usage.output_tokens, "cycle_token_usage.output_tokens")?;
     let cache_read_tokens = usage
         .cache_read_tokens
-        .map(|value| checked_i64(value, "cycles.<role>_cache_read_tokens"))
+        .map(|value| checked_i64(value, "cycle_token_usage.cache_read_tokens"))
         .transpose()?;
     let cache_creation_tokens = usage
         .cache_creation_tokens
-        .map(|value| checked_i64(value, "cycles.<role>_cache_creation_tokens"))
+        .map(|value| checked_i64(value, "cycle_token_usage.cache_creation_tokens"))
         .transpose()?;
 
-    match role {
-        AgentRole::Coder => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    coder_input_tokens = COALESCE(coder_input_tokens, 0) + ?,
-                    coder_output_tokens = COALESCE(coder_output_tokens, 0) + ?,
-                    coder_cache_read_tokens = CASE WHEN ? IS NULL THEN coder_cache_read_tokens ELSE COALESCE(coder_cache_read_tokens, 0) + ? END,
-                    coder_cache_creation_tokens = CASE WHEN ? IS NULL THEN coder_cache_creation_tokens ELSE COALESCE(coder_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Reviewer => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    reviewer_input_tokens = COALESCE(reviewer_input_tokens, 0) + ?,
-                    reviewer_output_tokens = COALESCE(reviewer_output_tokens, 0) + ?,
-                    reviewer_cache_read_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_read_tokens ELSE COALESCE(reviewer_cache_read_tokens, 0) + ? END,
-                    reviewer_cache_creation_tokens = CASE WHEN ? IS NULL THEN reviewer_cache_creation_tokens ELSE COALESCE(reviewer_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-        AgentRole::Tester => {
-            sqlx::query!(
-                r#"
-                UPDATE cycles SET
-                    tester_input_tokens = COALESCE(tester_input_tokens, 0) + ?,
-                    tester_output_tokens = COALESCE(tester_output_tokens, 0) + ?,
-                    tester_cache_read_tokens = CASE WHEN ? IS NULL THEN tester_cache_read_tokens ELSE COALESCE(tester_cache_read_tokens, 0) + ? END,
-                    tester_cache_creation_tokens = CASE WHEN ? IS NULL THEN tester_cache_creation_tokens ELSE COALESCE(tester_cache_creation_tokens, 0) + ? END
-                WHERE id = ?
-                "#,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-                cache_creation_tokens,
-                cycle_id,
-            )
-            .execute(pool)
-            .await?;
-        }
-    }
+    sqlx::query!(
+        r#"
+        INSERT INTO cycle_token_usage (cycle_id, role, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (cycle_id, role) DO UPDATE SET
+            input_tokens = COALESCE(cycle_token_usage.input_tokens, 0) + excluded.input_tokens,
+            output_tokens = COALESCE(cycle_token_usage.output_tokens, 0) + excluded.output_tokens,
+            cache_read_tokens = CASE WHEN excluded.cache_read_tokens IS NULL THEN cycle_token_usage.cache_read_tokens ELSE COALESCE(cycle_token_usage.cache_read_tokens, 0) + excluded.cache_read_tokens END,
+            cache_creation_tokens = CASE WHEN excluded.cache_creation_tokens IS NULL THEN cycle_token_usage.cache_creation_tokens ELSE COALESCE(cycle_token_usage.cache_creation_tokens, 0) + excluded.cache_creation_tokens END
+        "#,
+        cycle_id,
+        role,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
-}
-
-/// Raw shape of `cycles`' twelve per-role token-count columns (issue #53),
-/// read back once per [`get_cycle_role_token_usage`] call and then narrowed
-/// to the requested `role`'s four columns -- avoids three near-duplicate
-/// `SELECT`s (one per role) for what is, from the database's own point of
-/// view, a single row read.
-struct CycleTokenUsageRow {
-    coder_input_tokens: Option<i64>,
-    coder_output_tokens: Option<i64>,
-    coder_cache_read_tokens: Option<i64>,
-    coder_cache_creation_tokens: Option<i64>,
-    reviewer_input_tokens: Option<i64>,
-    reviewer_output_tokens: Option<i64>,
-    reviewer_cache_read_tokens: Option<i64>,
-    reviewer_cache_creation_tokens: Option<i64>,
-    tester_input_tokens: Option<i64>,
-    tester_output_tokens: Option<i64>,
-    tester_cache_read_tokens: Option<i64>,
-    tester_cache_creation_tokens: Option<i64>,
 }
 
 /// The running total accumulated by [`add_cycle_role_token_usage`] for
@@ -835,48 +793,26 @@ struct CycleTokenUsageRow {
 pub async fn get_cycle_role_token_usage(
     pool: &SqlitePool,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
 ) -> Result<Option<TokenUsage>> {
-    let row = sqlx::query_as!(
-        CycleTokenUsageRow,
+    let row = sqlx::query!(
         r#"
-        SELECT coder_input_tokens, coder_output_tokens, coder_cache_read_tokens, coder_cache_creation_tokens,
-               reviewer_input_tokens, reviewer_output_tokens, reviewer_cache_read_tokens, reviewer_cache_creation_tokens,
-               tester_input_tokens, tester_output_tokens, tester_cache_read_tokens, tester_cache_creation_tokens
-        FROM cycles WHERE id = ?
+        SELECT input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+        FROM cycle_token_usage WHERE cycle_id = ? AND role = ?
         "#,
         cycle_id,
+        role,
     )
     .fetch_optional(pool)
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let (input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) = match role {
-        AgentRole::Coder => (
-            row.coder_input_tokens,
-            row.coder_output_tokens,
-            row.coder_cache_read_tokens,
-            row.coder_cache_creation_tokens,
-        ),
-        AgentRole::Reviewer => (
-            row.reviewer_input_tokens,
-            row.reviewer_output_tokens,
-            row.reviewer_cache_read_tokens,
-            row.reviewer_cache_creation_tokens,
-        ),
-        AgentRole::Tester => (
-            row.tester_input_tokens,
-            row.tester_output_tokens,
-            row.tester_cache_read_tokens,
-            row.tester_cache_creation_tokens,
-        ),
-    };
     row_to_token_usage(
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_creation_tokens,
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_read_tokens,
+        row.cache_creation_tokens,
     )
 }
 
@@ -888,34 +824,25 @@ pub async fn close_cycle(pool: &SqlitePool, cycle_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The distinct, non-null worktree paths recorded across every cycle of
-/// `run_id` (`cycles.coder_worktree_path` / `reviewer_worktree_path` /
-/// `tester_worktree_path`). Used by crash recovery to find worktrees that
-/// may have been orphaned when the orchestrator that owned them died before
-/// it could call `Worktree::remove` (issue #6).
+/// The distinct worktree paths recorded across every cycle of `run_id`
+/// (`cycle_worktrees`, migrations/0010). Used by crash recovery to find
+/// worktrees that may have been orphaned when the orchestrator that owned
+/// them died before it could call `Worktree::remove` (issue #6) -- every
+/// role's, built-in or custom, since issue #73's trio-unification follow-up.
 pub async fn list_worktree_paths_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<String>> {
     let rows = sqlx::query!(
         r#"
-        SELECT coder_worktree_path, reviewer_worktree_path, tester_worktree_path
-        FROM cycles
-        WHERE run_id = ?
+        SELECT DISTINCT cycle_worktrees.worktree_path as "worktree_path!"
+        FROM cycle_worktrees
+        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
+        WHERE cycles.run_id = ?
         "#,
         run_id,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut paths: Vec<String> = rows
-        .into_iter()
-        .flat_map(|row| {
-            [
-                row.coder_worktree_path,
-                row.reviewer_worktree_path,
-                row.tester_worktree_path,
-            ]
-        })
-        .flatten()
-        .collect();
+    let mut paths: Vec<String> = rows.into_iter().map(|row| row.worktree_path).collect();
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -928,56 +855,41 @@ pub async fn list_worktree_paths_for_run(pool: &SqlitePool, run_id: &str) -> Res
 /// paths for simple removal and loses that association.
 pub struct CycleWorktreeEntry {
     pub cycle_id: String,
-    pub role: AgentRole,
+    pub role: String,
     pub path: String,
 }
 
-/// Every non-null worktree path recorded across `run_id`'s cycles, tagged
-/// with the cycle/role it came from. Used by crash recovery so a
-/// successfully removed worktree's path can be cleared afterwards
-/// (issue #6): without that, a `Failed` run would look like it still has
-/// orphaned worktrees forever, since the path column is otherwise never
-/// cleared once a cycle records it.
+/// Every worktree path recorded across `run_id`'s cycles, tagged with the
+/// cycle/role it came from. Used by crash recovery so a successfully
+/// removed worktree's path can be cleared afterwards (issue #6): without
+/// that, a `Failed` run would look like it still has orphaned worktrees
+/// forever, since the row is otherwise never cleared once a cycle records
+/// it. Every role's, built-in or custom (issue #73's trio-unification
+/// follow-up) -- no step's worktree leaks on crash anymore.
 pub async fn list_cycle_worktree_entries_for_run(
     pool: &SqlitePool,
     run_id: &str,
 ) -> Result<Vec<CycleWorktreeEntry>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id as "id!", coder_worktree_path, reviewer_worktree_path, tester_worktree_path
-        FROM cycles
-        WHERE run_id = ?
+        SELECT cycle_worktrees.cycle_id as "cycle_id!", cycle_worktrees.role as "role!", cycle_worktrees.worktree_path as "worktree_path!"
+        FROM cycle_worktrees
+        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id
+        WHERE cycles.run_id = ?
         "#,
         run_id,
     )
     .fetch_all(pool)
     .await?;
 
-    let mut entries = Vec::new();
-    for row in rows {
-        if let Some(path) = row.coder_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Coder,
-                path,
-            });
-        }
-        if let Some(path) = row.reviewer_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Reviewer,
-                path,
-            });
-        }
-        if let Some(path) = row.tester_worktree_path {
-            entries.push(CycleWorktreeEntry {
-                cycle_id: row.id.clone(),
-                role: AgentRole::Tester,
-                path,
-            });
-        }
-    }
-    Ok(entries)
+    Ok(rows
+        .into_iter()
+        .map(|row| CycleWorktreeEntry {
+            cycle_id: row.cycle_id,
+            role: row.role,
+            path: row.worktree_path,
+        })
+        .collect())
 }
 
 pub async fn insert_finding(
@@ -1224,12 +1136,11 @@ pub async fn insert_agent_process(
     pool: &SqlitePool,
     id: &str,
     cycle_id: &str,
-    role: AgentRole,
+    role: &str,
     pid: u32,
     worktree_path: &str,
 ) -> Result<()> {
     let now = now_rfc3339();
-    let role = role.as_str();
     let pid_started_at_unix =
         crate::process::process_start_time(pid).unwrap_or(crate::process::UNKNOWN_START_TIME);
     let pid = i64::from(pid);
@@ -1339,7 +1250,6 @@ pub async fn list_open_agent_processes_for_run(
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use warden_core::AgentRole;
 
     async fn test_pool() -> (TempDir, SqlitePool) {
         let dir = TempDir::new().unwrap();
@@ -1353,18 +1263,20 @@ mod tests {
         for state in [
             RunState::Pending,
             RunState::CoderRunning,
-            RunState::Reviewing,
-            RunState::Testing,
+            RunState::RunningStep(1),
+            RunState::RunningStep(2),
+            RunState::RunningStep(7),
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
             RunState::Done,
-            RunState::MaxReviewCyclesExceeded,
-            RunState::MaxTestCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
+            RunState::StepCyclesExceeded(2),
             RunState::Failed,
         ] {
-            let literal_says_intermediate =
-                ["coder_running", "reviewing", "testing", "awaiting_ci"].contains(&state.as_str());
+            let literal_says_intermediate = state.as_str() == "coder_running"
+                || state.as_str() == "awaiting_ci"
+                || state.as_str().starts_with("running_step:");
             assert_eq!(
                 literal_says_intermediate,
                 state.is_intermediate(),
@@ -1376,9 +1288,19 @@ mod tests {
     #[tokio::test]
     async fn run_round_trips_through_insert_and_get() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-1", "/tmp/repo", "main", "do the thing", 5, 4)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-1",
+            "/tmp/repo",
+            "main",
+            "do the thing",
+            5,
+            4,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let run = get_run(&pool, "run-1").await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Pending);
@@ -1392,7 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn pr_number_is_none_until_set_then_round_trips() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-pr", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1418,6 +1340,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1434,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn update_run_state_persists_and_list_intermediate_finds_it() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-2", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-2", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1453,16 +1377,16 @@ mod tests {
     #[tokio::test]
     async fn converged_run_is_not_listed_as_intermediate() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         update_run_state(&pool, "run-3", RunState::CoderRunning)
             .await
             .unwrap();
-        update_run_state(&pool, "run-3", RunState::Reviewing)
+        update_run_state(&pool, "run-3", RunState::RunningStep(1))
             .await
             .unwrap();
-        update_run_state(&pool, "run-3", RunState::Testing)
+        update_run_state(&pool, "run-3", RunState::RunningStep(2))
             .await
             .unwrap();
         update_run_state(&pool, "run-3", RunState::Converged)
@@ -1476,16 +1400,16 @@ mod tests {
     #[tokio::test]
     async fn cycle_and_finding_round_trip() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-4", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-4", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-1", "run-4", 1).await.unwrap();
-        set_cycle_worktree_path(&pool, "cycle-1", AgentRole::Coder, "/tmp/wt/coder")
+        set_cycle_worktree_path(&pool, "cycle-1", "coder", "/tmp/wt/coder")
             .await
             .unwrap();
 
         let finding = Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "missing test".to_string(),
@@ -1509,14 +1433,24 @@ mod tests {
     #[tokio::test]
     async fn cycle_role_token_usage_is_none_until_something_is_recorded() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-usage-none", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-usage-none",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-usage-none", "run-usage-none", 1)
             .await
             .unwrap();
 
-        let usage = get_cycle_role_token_usage(&pool, "cycle-usage-none", AgentRole::Coder)
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage-none", "coder")
             .await
             .unwrap();
         assert_eq!(
@@ -1528,9 +1462,19 @@ mod tests {
     #[tokio::test]
     async fn add_cycle_role_token_usage_accumulates_across_multiple_invocations() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-usage", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-usage",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-usage", "run-usage", 1)
             .await
             .unwrap();
@@ -1538,7 +1482,7 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(100, 50, Some(10), None),
         )
         .await
@@ -1546,13 +1490,13 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(20, 10, None, Some(3)),
         )
         .await
         .unwrap();
 
-        let usage = get_cycle_role_token_usage(&pool, "cycle-usage", AgentRole::Coder)
+        let usage = get_cycle_role_token_usage(&pool, "cycle-usage", "coder")
             .await
             .unwrap()
             .unwrap();
@@ -1578,6 +1522,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1588,7 +1534,7 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage-roles",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(100, 50, None, None),
         )
         .await
@@ -1596,22 +1542,21 @@ mod tests {
         add_cycle_role_token_usage(
             &pool,
             "cycle-usage-roles",
-            AgentRole::Reviewer,
+            "reviewer",
             &TokenUsage::new(7, 3, None, None),
         )
         .await
         .unwrap();
 
-        let coder_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Coder)
+        let coder_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", "coder")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(coder_usage.input_tokens, 100);
 
-        let tester_usage =
-            get_cycle_role_token_usage(&pool, "cycle-usage-roles", AgentRole::Tester)
-                .await
-                .unwrap();
+        let tester_usage = get_cycle_role_token_usage(&pool, "cycle-usage-roles", "tester")
+            .await
+            .unwrap();
         assert_eq!(
             tester_usage, None,
             "the tester never ran on this cycle -- must stay n/a"
@@ -1629,6 +1574,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1679,6 +1626,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1711,6 +1660,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1722,7 +1673,7 @@ mod tests {
         let result = add_cycle_role_token_usage(
             &pool,
             "cycle-usage-overflow",
-            AgentRole::Coder,
+            "coder",
             &TokenUsage::new(overflowing, 0, None, None),
         )
         .await;
@@ -1743,11 +1694,22 @@ mod tests {
     #[tokio::test]
     async fn inserting_a_run_with_a_duplicate_id_is_a_typed_error_not_a_panic() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
-        let result = insert_run(&pool, "dup-run", "/tmp/repo", "main", "intent again", 3, 3).await;
+        let result = insert_run(
+            &pool,
+            "dup-run",
+            "/tmp/repo",
+            "main",
+            "intent again",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await;
         assert!(matches!(result, Err(WardenError::Database(_))));
 
         // The original row must be untouched by the failed duplicate insert.
@@ -1758,9 +1720,19 @@ mod tests {
     #[tokio::test]
     async fn list_findings_for_cycle_with_no_findings_is_empty_not_an_error() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-empty", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-empty",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-empty", "run-empty", 1)
             .await
             .unwrap();
@@ -1780,22 +1752,32 @@ mod tests {
     #[tokio::test]
     async fn list_findings_for_cycle_orders_findings_by_id_ascending_not_insertion_order() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-order",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-order", "run-order", 1)
             .await
             .unwrap();
 
         let finding_z = Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: None,
             description: "inserted first, id sorts last".to_string(),
             action: None,
         };
         let finding_a = Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Blocking,
             file: None,
             description: "inserted second, id sorts first".to_string(),
@@ -1821,9 +1803,19 @@ mod tests {
     #[tokio::test]
     async fn latest_open_agent_process_is_none_when_run_has_no_processes() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-no-proc", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-no-proc",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let open = latest_open_agent_process_for_run(&pool, "run-no-proc")
             .await
@@ -1834,20 +1826,13 @@ mod tests {
     #[tokio::test]
     async fn open_agent_process_is_found_until_marked_ended() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-5", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-5", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-5", "run-5", 1).await.unwrap();
-        insert_agent_process(
-            &pool,
-            "proc-1",
-            "cycle-5",
-            AgentRole::Coder,
-            424242,
-            "/tmp/wt/coder",
-        )
-        .await
-        .unwrap();
+        insert_agent_process(&pool, "proc-1", "cycle-5", "coder", 424242, "/tmp/wt/coder")
+            .await
+            .unwrap();
 
         let open = latest_open_agent_process_for_run(&pool, "run-5")
             .await
@@ -1866,7 +1851,7 @@ mod tests {
     #[tokio::test]
     async fn list_open_agent_processes_returns_every_open_row_not_just_the_latest() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-6", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-6", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-6", "run-6", 1).await.unwrap();
@@ -1877,7 +1862,7 @@ mod tests {
             &pool,
             "proc-reviewer",
             "cycle-6",
-            AgentRole::Reviewer,
+            "reviewer",
             111,
             "/tmp/wt/reviewer",
         )
@@ -1887,7 +1872,7 @@ mod tests {
             &pool,
             "proc-tester",
             "cycle-6",
-            AgentRole::Tester,
+            "tester",
             222,
             "/tmp/wt/tester",
         )
@@ -1898,7 +1883,7 @@ mod tests {
             &pool,
             "proc-coder",
             "cycle-6",
-            AgentRole::Coder,
+            "coder",
             333,
             "/tmp/wt/coder",
         )
@@ -1919,7 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn list_open_agent_processes_is_empty_for_a_run_with_no_processes() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-7", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-7", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -1932,19 +1917,19 @@ mod tests {
     #[tokio::test]
     async fn list_worktree_paths_collects_distinct_non_null_paths_across_cycles() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-8", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-8", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         insert_cycle(&pool, "cycle-8a", "run-8", 1).await.unwrap();
         insert_cycle(&pool, "cycle-8b", "run-8", 2).await.unwrap();
 
-        set_cycle_worktree_path(&pool, "cycle-8a", AgentRole::Coder, "/tmp/wt/coder-1")
+        set_cycle_worktree_path(&pool, "cycle-8a", "coder", "/tmp/wt/coder-1")
             .await
             .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-8a", AgentRole::Reviewer, "/tmp/wt/reviewer-1")
+        set_cycle_worktree_path(&pool, "cycle-8a", "reviewer", "/tmp/wt/reviewer-1")
             .await
             .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-8b", AgentRole::Coder, "/tmp/wt/coder-2")
+        set_cycle_worktree_path(&pool, "cycle-8b", "coder", "/tmp/wt/coder-2")
             .await
             .unwrap();
         // Tester path left unset for both cycles — must not appear as a
@@ -1965,7 +1950,7 @@ mod tests {
     #[tokio::test]
     async fn list_worktree_paths_is_empty_for_a_run_with_no_cycles() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-9", "/tmp/repo", "main", "intent", 3, 3)
+        insert_run(&pool, "run-9", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -2131,10 +2116,11 @@ mod tests {
         let mid_cycle = get_run(&pool, "run-mid-cycle").await.unwrap().unwrap();
         assert_eq!(
             mid_cycle.state,
-            RunState::Reviewing,
-            "a legacy 'awaiting_review_test' row must remap onto Reviewing, per the migration's \
-             own comment (the specific phase can't be recovered from the string alone, but both \
-             Reviewing/Testing are equally is_intermediate so crash recovery behaves the same)"
+            RunState::RunningStep(1),
+            "a legacy 'awaiting_review_test' row must remap onto 'reviewing' (0007), then onto \
+             RunningStep(1) once 0009's own remap runs on top of it -- the specific phase can't \
+             be recovered from the string alone, but every RunningStep index is equally \
+             is_intermediate so crash recovery behaves the same regardless"
         );
         assert_eq!(
             mid_cycle.max_review_cycles, 5,
@@ -2153,13 +2139,123 @@ mod tests {
         let exhausted = get_run(&pool, "run-exhausted").await.unwrap().unwrap();
         assert_eq!(
             exhausted.state,
-            RunState::MaxReviewCyclesExceeded,
-            "a legacy 'max_cycles_exceeded' row must remap onto MaxReviewCyclesExceeded"
+            RunState::StepCyclesExceeded(1),
+            "a legacy 'max_cycles_exceeded' row must remap onto 'max_review_cycles_exceeded' \
+             (0007), then onto StepCyclesExceeded(1) once 0009's own remap runs on top of it"
         );
         assert_eq!(exhausted.max_review_cycles, 4);
         assert_eq!(exhausted.max_test_cycles, 4);
         assert_eq!(exhausted.current_review_cycle, 4);
         assert_eq!(exhausted.current_test_cycle, 0);
+    }
+
+    /// Issue #73: `0009_generic_workflow_state.sql`'s own remap of the four
+    /// legacy `state` strings the closed `Reviewing`/`Testing`/
+    /// `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` variants used to
+    /// write (`crates/warden/migrations/0009_generic_workflow_state.sql`'s
+    /// own comment: "a lossless, exact remap, not an approximation") --
+    /// `reviewing` -> `running_step:1`, `testing` -> `running_step:2`,
+    /// `max_review_cycles_exceeded` -> `step_cycles_exceeded:1`,
+    /// `max_test_cycles_exceeded` -> `step_cycles_exceeded:2`.
+    ///
+    /// [`phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strings`]
+    /// above already drives rows through 0007's own remap and on into 0009,
+    /// but every row it seeds starts from the *pre-0007* schema, so it only
+    /// ever lands on `reviewing`/`max_review_cycles_exceeded` (index 1) by
+    /// the time 0009 sees them -- `testing`/`max_test_cycles_exceeded`
+    /// (index 2) is never exercised there at all. This test seeds all four
+    /// legacy strings directly, on the schema exactly as 0007/0008 leave it
+    /// (`run_to` the migration immediately before 0009), so every one of
+    /// 0009's four `UPDATE` statements is independently exercised.
+    #[tokio::test]
+    async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let generic_workflow_state_index = migrations
+            .iter()
+            .position(|migration| migration.description.contains("generic workflow state"))
+            .expect("0009_generic_workflow_state.sql must still be a migration in this set");
+        let pre_generic_workflow_state_version =
+            migrations[generic_workflow_state_index - 1].version;
+
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+
+            MIGRATOR
+                .run_to(pre_generic_workflow_state_version, &pool)
+                .await
+                .unwrap();
+
+            // Four rows, one per legacy state string 0009 must remap, seeded
+            // directly on the post-0007/0008 schema (`max_review_cycles`/
+            // `max_test_cycles`/`current_review_cycle`/`current_test_cycle`,
+            // no more single `max_cycles`/`current_cycle` pair).
+            for (id, legacy_state) in [
+                ("run-reviewing", "reviewing"),
+                ("run-testing", "testing"),
+                ("run-max-review-exceeded", "max_review_cycles_exceeded"),
+                ("run-max-test-exceeded", "max_test_cycles_exceeded"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO runs (id, repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, created_at, updated_at) \
+                     VALUES (?, '/tmp/repo', 'main', 'legacy run', ?, 5, 5, 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                )
+                .bind(id)
+                .bind(legacy_state)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            pool.close().await;
+        }
+
+        // Re-`connect` applies every remaining pending migration, including
+        // 0009, against the seeded rows above.
+        let pool = connect(&db_path).await.unwrap();
+
+        let reviewing = get_run(&pool, "run-reviewing").await.unwrap().unwrap();
+        assert_eq!(
+            reviewing.state,
+            RunState::RunningStep(1),
+            "legacy 'reviewing' must remap onto RunningStep(1)"
+        );
+
+        let testing = get_run(&pool, "run-testing").await.unwrap().unwrap();
+        assert_eq!(
+            testing.state,
+            RunState::RunningStep(2),
+            "legacy 'testing' must remap onto RunningStep(2)"
+        );
+
+        let max_review_exceeded = get_run(&pool, "run-max-review-exceeded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            max_review_exceeded.state,
+            RunState::StepCyclesExceeded(1),
+            "legacy 'max_review_cycles_exceeded' must remap onto StepCyclesExceeded(1)"
+        );
+
+        let max_test_exceeded = get_run(&pool, "run-max-test-exceeded")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            max_test_exceeded.state,
+            RunState::StepCyclesExceeded(2),
+            "legacy 'max_test_cycles_exceeded' must remap onto StepCyclesExceeded(2)"
+        );
     }
 
     /// Issue #6: "a failed backup aborts migration (fails loud) rather than
@@ -2252,25 +2348,30 @@ mod tests {
     #[tokio::test]
     async fn clear_cycle_worktree_path_nulls_out_only_the_given_role() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-clear", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
-        insert_cycle(&pool, "cycle-clear", "run-clear", 1)
-            .await
-            .unwrap();
-        set_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder, "/tmp/wt/coder")
-            .await
-            .unwrap();
-        set_cycle_worktree_path(
+        insert_run(
             &pool,
-            "cycle-clear",
-            AgentRole::Reviewer,
-            "/tmp/wt/reviewer",
+            "run-clear",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
         )
         .await
         .unwrap();
+        insert_cycle(&pool, "cycle-clear", "run-clear", 1)
+            .await
+            .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-clear", "coder", "/tmp/wt/coder")
+            .await
+            .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-clear", "reviewer", "/tmp/wt/reviewer")
+            .await
+            .unwrap();
 
-        clear_cycle_worktree_path(&pool, "cycle-clear", AgentRole::Coder)
+        clear_cycle_worktree_path(&pool, "cycle-clear", "coder")
             .await
             .unwrap();
 
@@ -2278,7 +2379,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(entries.len(), 1, "only the reviewer path should remain");
-        assert_eq!(entries[0].role, AgentRole::Reviewer);
+        assert_eq!(entries[0].role, "reviewer");
         assert_eq!(entries[0].path, "/tmp/wt/reviewer");
     }
 
@@ -2293,6 +2394,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2313,9 +2416,19 @@ mod tests {
     #[tokio::test]
     async fn failed_run_with_an_open_agent_process_needs_cleanup() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-open-proc", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-open-proc",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-open-proc", "run-open-proc", 1)
             .await
             .unwrap();
@@ -2323,7 +2436,7 @@ mod tests {
             &pool,
             "proc-open",
             "cycle-open-proc",
-            AgentRole::Coder,
+            "coder",
             999_999_998,
             "/tmp/wt",
         )
@@ -2349,20 +2462,17 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
         insert_cycle(&pool, "cycle-recorded-wt", "run-recorded-wt", 1)
             .await
             .unwrap();
-        set_cycle_worktree_path(
-            &pool,
-            "cycle-recorded-wt",
-            AgentRole::Coder,
-            "/tmp/wt/coder",
-        )
-        .await
-        .unwrap();
+        set_cycle_worktree_path(&pool, "cycle-recorded-wt", "coder", "/tmp/wt/coder")
+            .await
+            .unwrap();
         update_run_state(&pool, "run-recorded-wt", RunState::Failed)
             .await
             .unwrap();
@@ -2374,7 +2484,7 @@ mod tests {
         // Once the path is cleared (simulating a successful removal), the
         // run must stop being returned -- no separate "cleanup done" flag,
         // the recorded path itself is the signal.
-        clear_cycle_worktree_path(&pool, "cycle-recorded-wt", AgentRole::Coder)
+        clear_cycle_worktree_path(&pool, "cycle-recorded-wt", "coder")
             .await
             .unwrap();
         let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
@@ -2389,9 +2499,19 @@ mod tests {
     #[tokio::test]
     async fn evidence_round_trips_through_insert_and_list_evidence_for_run() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-evidence", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-evidence",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         insert_cycle(&pool, "cycle-evidence", "run-evidence", 1)
             .await
             .unwrap();
@@ -2436,6 +2556,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2443,7 +2565,7 @@ mod tests {
             .await
             .unwrap();
         let finding = Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "flaky button".to_string(),
@@ -2491,6 +2613,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2515,6 +2639,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2570,6 +2696,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -2589,9 +2717,19 @@ mod tests {
     #[tokio::test]
     async fn event_round_trips_through_insert_and_list() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-events", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-events",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let event = RunEvent::CycleStarted { cycle_number: 1 };
         insert_event(
@@ -2615,9 +2753,19 @@ mod tests {
     #[tokio::test]
     async fn list_events_for_run_orders_oldest_first() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-order", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-order",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         insert_event(
             &pool,
@@ -2646,9 +2794,19 @@ mod tests {
     #[tokio::test]
     async fn list_events_for_run_is_empty_for_a_run_with_no_events() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-no-events", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-no-events",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let events = list_events_for_run(&pool, "run-no-events").await.unwrap();
         assert!(events.is_empty());
@@ -2662,9 +2820,19 @@ mod tests {
     #[tokio::test]
     async fn mismatched_event_type_and_payload_kind_is_a_typed_error_not_silently_trusted() {
         let (_dir, pool) = test_pool().await;
-        insert_run(&pool, "run-corrupt", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        insert_run(
+            &pool,
+            "run-corrupt",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
 
         let payload_json =
             serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();

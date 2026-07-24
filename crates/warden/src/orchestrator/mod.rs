@@ -1,23 +1,52 @@
-//! The convergence loop: coder -> [gate review] -> [gate test] -> reboucle
-//! if findings (Architecture.md §5.1, ADR-0014).
+//! The convergence loop: producer -> [gated step]* -> reboucle if findings
+//! (Architecture.md §5.1, ADR-0014; generalized from a hardcoded
+//! coder -> gate review -> gate test pipeline by issue #73's
+//! trio-unification follow-up).
 //!
-//! Reviewer and tester never run in parallel (ADR-0003 amendment); the
-//! tester is gated on the reviewer being clean for the current cycle --
-//! [`agents::Orchestrator::run_review`] (via [`convergence`]) always runs
-//! first, and the tester only runs once that cycle's review carries no
-//! blocking finding. The very first review of a run is full (the whole
-//! diff); every re-review that follows a coder correction is scoped to just
-//! that correctif plus the findings that motivated it
-//! (`warden_core::ReviewScope`). A tester finding reboucles to the coder
-//! exactly like a reviewer finding does, going through the same scoped
-//! re-review gate before the tester is ever handed that commit again.
+//! **One uniform step-execution path (issue #73).** `workflow.steps[0]` --
+//! the producer, the coder in the built-in default workflow -- is the one
+//! step ever invoked via [`Orchestrator::run_producer`]; every step after it
+//! is a **gated** step invoked via [`Orchestrator::run_gated_step`], the
+//! exact same body for the built-in reviewer/tester and any custom role
+//! (e.g. `techlead`) alike. No step is special-cased by role name in either
+//! function -- `warden_core::workflow::Role` (an open, workflow-declared
+//! string) is the only thing that identifies a step; the closed `AgentRole`
+//! enum still exists, but only as a convenience for resolving the built-in
+//! default workflow's own agent definitions (`main.rs`), never as a branch
+//! point in this loop.
 //!
-//! Per-phase budgets: separate `max_review_cycles`/`max_test_cycles`
-//! (config.rs) back separate [`RunState::Reviewing`]/[`RunState::Testing`]
-//! states -- [`warden_core::decide_next_state`] charges a blocking finding
-//! to whichever budget its own [`warden_core::FindingSource`] belongs to.
-//! Each role gets its own worktree synced onto the coder's commit (see
-//! [`crate::worktree::WorktreeManager::create`]), keyed by role. Every
+//! Gated steps never run in parallel (ADR-0003 amendment): each one only
+//! starts once the previous one in the sequence came back clean this cycle.
+//! The first gated step (`workflow.steps[1]`) gets one additional,
+//! positional (not role-name) mechanic: its very first pass over a run's
+//! body of work is full (the whole diff); every re-review that follows a
+//! producer correction is scoped to just that correctif plus the findings
+//! that motivated it (`warden_core::ReviewScope`) -- decision #37 Q2's
+//! scoped-re-review optimization was always about *whichever step reviews
+//! first*, not a role literally named "reviewer". A later gated step's
+//! blocking finding reboucles to the producer exactly like an earlier one
+//! does, going through that same scoped re-review gate before it is ever
+//! handed the correctif's commit again.
+//!
+//! Per-step budgets follow each step's own declared
+//! [`warden_core::WorkflowStep::budget`] (issue #73 review, finding F3 --
+//! before this fix, `workflow.steps[1]`/`steps[2]` were hardcoded to
+//! `max_review_cycles`/`max_test_cycles`, which inverted the rule the moment
+//! the built-in pair was reordered): [`warden_core::StepBudget::Review`]/
+//! [`warden_core::StepBudget::Test`] back `max_review_cycles`/`max_test_cycles`
+//! (decision #37 Q1 -- a blocking finding is charged to whichever step
+//! raised it, wherever it sits); every other step shares
+//! [`warden_core::StepBudget::Extra`] (`max_extra_step_cycles`), one budget
+//! for the whole remaining chain. Evidence capture (ADR-0009, issue #7) is
+//! likewise a step's own declared property now
+//! ([`warden_core::WorkflowStep::captures_evidence`], finding F2), not a
+//! literal role-name check. [`warden_core::decide_next_state_for_step`]
+//! decides the next [`RunState`] for any step, at any position, uniformly.
+//! Each step gets its own worktree synced onto the producer's commit (see
+//! [`crate::worktree::WorktreeManager::create`]), keyed by role, and its own
+//! `agent_processes`/`cycle_token_usage` row -- generalized to every step,
+//! built-in or custom (issue #73's trio-unification follow-up: no step
+//! leaks a worktree or process on crash anymore, see `recovery`). Every
 //! [`RunState`] transition is written to SQLite *before* the action it
 //! authorizes (ADR-0004).
 //!
@@ -37,10 +66,12 @@
 //! - `config`: `RunConfig`/`GateConfig`/`UntrustedRepoAgentDefinition`.
 //! - `convergence`: the main loop (`Orchestrator::run_convergence_loop`).
 //! - `gate_tail`: the post-`Converged` push/PR/CI tail (ADR-0011).
-//! - `agents`: coder/reviewer/tester invocation (`run_coder`/`run_review`/`run_test`).
+//! - `agents`: workflow step invocation (`run_producer`/`run_gated_step`).
 //! - `agent_run`: the sandboxed subprocess seam (`run_agent`, `SandboxGuard`).
 //! - `evidence_capture`: evidence capture/commit around a cycle (ADR-0009).
-//! - `tampering`: cross-run agent-definition-poisoning detection (issue #30).
+//! - `tampering`: cross-run agent-definition-poisoning detection (issue #30) --
+//!   still scoped to the built-in trio's own `.warden/agents/` convention,
+//!   a distinct, pre-existing security feature this issue does not extend.
 //! - `diff`: bounded diff/HEAD-commit reads.
 //! - `recovery`: crash recovery (`recover_crashed_runs`/`resume_awaiting_ci_runs`).
 
@@ -53,8 +84,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state, decide_next_state_after_ci, AgentDefinition, AgentRole, CiOutcome,
-    CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, RunEvent, RunState,
+    decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, AgentRole, CiOutcome,
+    CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, Role, RunEvent, RunState,
     DIFF_TRUNCATED_MARKER,
 };
 use warden_sandbox::{LocalSandbox, Sandbox};
@@ -89,7 +120,7 @@ pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs};
 
 use tampering::AgentDefinitionSnapshot;
 
-/// One role's markdown definition (issue #24), already mapped onto the
+/// One step's markdown definition (issue #24), already mapped onto the
 /// command to spawn for it: what to run, and what to tell it it is.
 ///
 /// Resolved once per run rather than per invocation — a definition is static
@@ -103,56 +134,78 @@ struct ResolvedAgent {
     system_prompt: String,
 }
 
-/// The three roles' definitions, resolved through this run's [`ToolAdapter`].
+/// Issue #73 (trio-unification follow-up): every workflow step's resolved
+/// agent, in `config.workflow.steps` order -- `steps[0]` is always the
+/// producer's (the coder, in the built-in default workflow). No role is
+/// privileged here: the built-in coder/reviewer/tester and any custom step
+/// are resolved and stored identically.
 struct ResolvedAgents {
-    coder: ResolvedAgent,
-    reviewer: ResolvedAgent,
-    tester: ResolvedAgent,
+    steps: Vec<ResolvedAgent>,
     /// This run's `--tool` adapter's own env allowlist (issue #24), resolved
     /// once here since it's a property of the tool, not of any one role --
     /// `--tool` is global for a run (issue #24, "Sélection d'outil par
-    /// rôle... hors scope"), so all three roles share it.
+    /// rôle... hors scope"), so every step shares it.
     env_allowlist: &'static [&'static str],
 }
 
 impl ResolvedAgents {
-    /// Maps all three definitions up-front, before the loop spawns anything:
-    /// a definition the adapter cannot honour must fail the run at its
-    /// start, not two cycles in when that role first happens to be invoked.
+    /// Maps every step's definition up-front, before the loop spawns
+    /// anything: a definition the adapter cannot honour must fail the run at
+    /// its start, not several cycles in when that step first happens to run.
+    ///
+    /// Issue #73 review (F5): `run_convergence_loop`'s per-cycle loop indexes
+    /// `self.steps` and `config.workflow.steps` in lockstep, by position,
+    /// with no further bounds check at each access -- so the one-time
+    /// length check below is what turns a would-be out-of-bounds panic deep
+    /// into a run into a fail-fast, typed error before the run even starts.
     fn resolve<R: ToolAdapter>(runner: &R, config: &RunConfig) -> Result<Self> {
+        if config.step_agents.len() != config.workflow.steps.len() {
+            return Err(WardenError::MismatchedStepAgentCount {
+                workflow_steps: config.workflow.steps.len(),
+                step_agents: config.step_agents.len(),
+            });
+        }
         let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
             Ok(ResolvedAgent {
                 command: runner.build_command(definition)?,
                 system_prompt: definition.system_prompt.clone(),
             })
         };
+        let steps = config
+            .step_agents
+            .iter()
+            .map(resolve_one)
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            coder: resolve_one(&config.coder_agent)?,
-            reviewer: resolve_one(&config.reviewer_agent)?,
-            tester: resolve_one(&config.tester_agent)?,
+            steps,
             env_allowlist: runner.env_allowlist(),
         })
     }
 }
 
-/// Parameters for a single coder invocation. Grouped into a struct (rather
-/// than passed positionally) purely to keep `run_coder`'s signature
+/// Parameters for a single producer invocation (`workflow.steps[0]` -- the
+/// coder in the built-in default workflow). Grouped into a struct (rather
+/// than passed positionally) purely to keep `run_producer`'s signature
 /// readable — it has no behaviour of its own.
-struct CoderInvocation<'a> {
+struct ProducerInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
     cycle_number: u32,
     config: &'a RunConfig,
-    /// This run's coder command + system prompt (issue #24).
+    /// The producer step's own open role (`workflow.steps[0].role`) --
+    /// issue #73's trio-unification follow-up: no longer hardcoded to
+    /// `"coder"`, since a workflow's first step may be named anything.
+    role: &'a Role,
+    /// This run's producer command + system prompt (issue #24).
     agent: &'a ResolvedAgent,
     /// This run's `--tool` adapter's env allowlist (issue #24) --
     /// `ResolvedAgents::env_allowlist`.
     env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
     base_commit: &'a str,
-    /// Issue #30: the run-start snapshot of all three roles' raw,
+    /// Issue #30: the run-start snapshot of the built-in trio's raw,
     /// unparsed definition bytes (resolved once in `run_convergence_loop`,
-    /// before cycle 1's coder ever runs) -- what
+    /// before cycle 1's producer ever runs) -- what
     /// `agent_definition_tampering_finding` compares this cycle's own
     /// re-resolution against (a throwaway checkout of this cycle's
     /// resulting commit, issue #30 review, HIGH -- see that function's own
@@ -162,11 +215,11 @@ struct CoderInvocation<'a> {
     /// start, not something recomputed per cycle.
     run_agent_definition_snapshot: &'a AgentDefinitionSnapshot,
     /// A2 (ADR-0013, issue #22): the findings that triggered this cycle —
-    /// what the coder is being asked to fix, fed to it as
-    /// `AgentInputMessage::findings`. The very same list the reviewer/tester
-    /// of this cycle are told triggered it (`select_prior_findings`),
-    /// including CI findings on a post-convergence reboucle (ADR-0011).
-    /// Empty on a run's first cycle.
+    /// what the producer is being asked to fix, fed to it as
+    /// `AgentInputMessage::findings`. The very same list every gated step of
+    /// this cycle is told triggered it (`select_prior_findings`), including
+    /// CI findings on a post-convergence reboucle (ADR-0011). Empty on a
+    /// run's first cycle.
     prior_findings: &'a [Finding],
     cancel: CancellationToken,
 }
@@ -174,45 +227,49 @@ struct CoderInvocation<'a> {
 /// Parameters for one cycle's evidence capture (ADR-0009). Grouped into a
 /// struct (rather than passed positionally) purely to keep
 /// `capture_evidence_for_cycle`/`try_capture_evidence_for_cycle`'s
-/// signatures readable — the same convention as [`CoderInvocation`] /
-/// [`FindingAgentInvocation`]; it has no behaviour of its own.
+/// signatures readable — the same convention as [`ProducerInvocation`] /
+/// [`GatedStepInvocation`]; it has no behaviour of its own.
 struct EvidenceCapture<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
     cycle_number: u32,
     config: &'a RunConfig,
-    /// The command the tester was invoked with, mapped from its definition
-    /// by this run's `ToolAdapter` (issue #24) — what `asciinema rec`
-    /// records as the session. Passed explicitly because `RunConfig` holds
-    /// definitions rather than commands: only the adapter can map one to the
-    /// other.
+    /// The command the tester step was invoked with, mapped from its
+    /// definition by this run's `ToolAdapter` (issue #24) — what
+    /// `asciinema rec` records as the session. Passed explicitly because
+    /// `RunConfig` holds definitions rather than commands: only the adapter
+    /// can map one to the other.
     tester_command: &'a AgentCommand,
     tester_worktree_path: &'a Path,
     cancel: CancellationToken,
 }
 
-/// Parameters for a single reviewer/tester invocation. Grouped into a
-/// struct (rather than passed positionally) purely to keep
-/// `run_finding_agent`'s signature readable — it has no behaviour of its
-/// own. Built internally by [`Orchestrator::run_review`]/
-/// [`Orchestrator::run_test`] (issue #40) -- not constructed by
-/// `run_convergence_loop` directly any more.
-struct FindingAgentInvocation<'a> {
+/// Parameters for a single **gated** workflow step invocation (issue #73,
+/// trio-unification follow-up) -- any step but the producer
+/// (`workflow.steps[0]`), whether that's the built-in reviewer/tester or a
+/// custom role like `techlead`. One uniform shape for every such step: no
+/// role is special-cased here.
+struct GatedStepInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
     cycle_number: u32,
-    role: AgentRole,
-    /// This role's command + system prompt (issue #24).
+    /// This step's 0-based index in `config.workflow.steps` -- never `0`
+    /// (the producer's own index). Used for worktree/bookkeeping labels and
+    /// error messages; the actual gating decision is made by the caller
+    /// (`run_convergence_loop`, via `decide_next_state_for_step`), not here.
+    step_index: u32,
+    role: &'a Role,
+    /// This step's command + system prompt (issue #24).
     agent: &'a ResolvedAgent,
     /// This run's `--tool` adapter's env allowlist (issue #24) --
     /// `ResolvedAgents::env_allowlist`.
     env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
-    /// The diff this cycle's coder introduced against the cycle's starting
-    /// commit -- fed to the agent as `AgentInputMessage::diff` (ADR-0012,
-    /// issue #20 Scope B), unless `scope` narrows it to a correctif (issue
-    /// #40): see `AgentInputMessage::for_scoped_review`.
+    /// The diff this cycle's producer introduced against the cycle's
+    /// starting commit -- fed to the agent as `AgentInputMessage::diff`
+    /// (ADR-0012, issue #20 Scope B), unless `scope` narrows it to a
+    /// correctif (issue #40).
     diff: &'a str,
     /// Findings that triggered this cycle (including CI findings on a
     /// post-convergence reboucle, ADR-0011) -- fed to the agent as
@@ -220,70 +277,43 @@ struct FindingAgentInvocation<'a> {
     /// cycle. Read as "the findings that prompted this correctif" instead
     /// when `scope` is `Correctif` (issue #40).
     prior_findings: &'a [Finding],
-    /// `ReviewScope::Full` for every tester invocation and a full reviewer
-    /// pass; `ReviewScope::Correctif` only for a scoped reviewer re-review
-    /// (issue #40, decision #37 Q2) -- see [`warden_core::ReviewScope`].
-    /// `run_finding_agent` refuses `Correctif` for any role but
-    /// `AgentRole::Reviewer` (defense in depth: only `Orchestrator::run_review`
-    /// can ever set it in the first place, since `TestInvocation` carries no
-    /// `scope` field at all).
+    /// `ReviewScope::Full` for every step except the first gated one on a
+    /// cycle that follows the run's very first full pass;
+    /// `ReviewScope::Correctif` only then (issue #40, decision #37 Q2) --
+    /// see [`warden_core::ReviewScope`]. This is a **positional** pipeline
+    /// mechanic (`run_convergence_loop` only ever sets `Correctif` for
+    /// `step_index == 1`), never a role-name check -- see
+    /// [`Orchestrator::run_gated_step`]'s own docs for the defensive
+    /// re-check this struct's `step_index` backs.
     scope: warden_core::ReviewScope,
-    /// Only consulted for `AgentRole::Tester` (evidence capture,
-    /// `evidence_tool`/`evidence_store_in_repo`/`warden_home`) -- carried
-    /// through here rather than threading four separate fields.
+    /// This step's own declared [`warden_core::WorkflowStep::captures_evidence`]
+    /// (issue #73 review, finding F2) -- whether a clean run of *this* step
+    /// triggers ADR-0009 evidence capture. Before this, `run_gated_step`
+    /// checked `role.as_str() == "tester"` directly; a custom workflow that
+    /// renamed its test step lost evidence capture silently. Now it's the
+    /// step's own declared property, carried in from `config.workflow.steps
+    /// [step_index]` by the caller, so `run_gated_step` itself never
+    /// consults a role name at all.
+    captures_evidence: bool,
+    /// Consulted only when `captures_evidence` is set (evidence capture's
+    /// own config: `evidence_tool`/`evidence_store_in_repo`/`warden_home`) --
+    /// carried through here rather than threading three separate fields.
     config: &'a RunConfig,
     cancel: CancellationToken,
 }
 
-/// Parameters for an independent reviewer invocation (issue #40): the same
-/// fields as [`FindingAgentInvocation`] minus `role` (always
-/// `AgentRole::Reviewer` -- [`Orchestrator::run_review`] sets it, callers
-/// never do), plus `scope`, the one axis a reviewer invocation can vary on
-/// that a tester's never does (decision #37 Q2).
-struct ReviewInvocation<'a> {
-    run_id: &'a str,
-    cycle_id: &'a str,
-    cycle_number: u32,
-    agent: &'a ResolvedAgent,
-    env_allowlist: &'static [&'static str],
-    worktree_manager: &'a WorktreeManager,
-    commit: &'a str,
-    diff: &'a str,
-    prior_findings: &'a [Finding],
-    scope: warden_core::ReviewScope,
-    config: &'a RunConfig,
-    cancel: CancellationToken,
-}
-
-/// Parameters for an independent tester invocation (issue #40): the same
-/// fields as [`FindingAgentInvocation`] minus `role` (always
-/// `AgentRole::Tester`). No `scope` -- the tester is never invoked scoped
-/// (decision #37 Q2 only scopes the reviewer).
-struct TestInvocation<'a> {
-    run_id: &'a str,
-    cycle_id: &'a str,
-    cycle_number: u32,
-    agent: &'a ResolvedAgent,
-    env_allowlist: &'static [&'static str],
-    worktree_manager: &'a WorktreeManager,
-    commit: &'a str,
-    diff: &'a str,
-    prior_findings: &'a [Finding],
-    config: &'a RunConfig,
-    cancel: CancellationToken,
-}
-
-/// Outcome of a single coder invocation within a cycle: the commit it
+/// Outcome of a single producer invocation within a cycle: the commit it
 /// produced, and the diff introduced against the cycle's starting commit --
-/// the latter is fed to the reviewer/tester as `AgentInputMessage::diff`
+/// the latter is fed to every gated step as `AgentInputMessage::diff`
 /// (ADR-0012, issue #20 Scope B).
-struct CoderCycleResult {
+struct ProducerCycleResult {
     commit: String,
     diff: String,
-    /// Issue #24 review, M4: `Some` when this cycle's coder commit touches
-    /// `.warden/agents/` against the run's original starting commit -- see
-    /// `agent_definition_tampering_finding`'s own docs. `None` on the
-    /// overwhelmingly common case (the coder never touches that directory).
+    /// Issue #24 review, M4: `Some` when this cycle's producer commit
+    /// touches `.warden/agents/` against the run's original starting commit
+    /// -- see `agent_definition_tampering_finding`'s own docs. `None` on the
+    /// overwhelmingly common case (the producer never touches that
+    /// directory).
     definition_tampering_finding: Option<Finding>,
 }
 
@@ -456,7 +486,7 @@ impl Orchestrator {
     /// [`run_convergence_loop`](Orchestrator::run_convergence_loop) first) is
     /// silently a no-op, the same contract [`publish_event`](Orchestrator::publish_event)
     /// already has for the same case.
-    fn publish_progress_event(&self, role: AgentRole, detail: String) {
+    fn publish_progress_event(&self, role_name: &str, detail: String) {
         let Some(context) = self.run_context.get() else {
             return;
         };
@@ -465,7 +495,7 @@ impl Orchestrator {
             id: Uuid::new_v4().to_string(),
             run_id: context.run_id.clone(),
             event: RunEvent::AgentProgress {
-                role: role.as_str().to_string(),
+                role: role_name.to_string(),
                 detail,
             },
             created_at: Utc::now().to_rfc3339(),
@@ -486,7 +516,7 @@ impl Orchestrator {
                 .ok_or_else(|| WardenError::RunNotFound {
                     run_id: run_id.to_string(),
                 })?;
-        run.state.validate_transition(to)?;
+        run.state.validate_transition(to, run.total_steps)?;
         db::update_run_state(&self.pool, run_id, to).await?;
 
         // Issue #55: the single lifecycle-hook dispatch seam. Every legal

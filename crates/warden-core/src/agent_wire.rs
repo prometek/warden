@@ -323,6 +323,131 @@ impl AgentInputMessage {
     }
 }
 
+/// Issue #73 (generalized by the trio-unification follow-up): the stdin JSON
+/// payload for a **gated** workflow step -- any step but the pipeline's
+/// producer (`workflow.steps[0]`), whether that's the built-in reviewer/
+/// tester or a custom role like `techlead`. Mirrors
+/// [`AgentInputMessage::for_finding_agent`]/[`AgentInputMessage::for_scoped_review`]'s
+/// own wire shape *exactly* (same version, same fields, same validation) so
+/// an agent-side consumer sees an identical protocol regardless of which
+/// step it's running as -- the difference is that `role_name` is a plain,
+/// open string rather than the closed [`AgentRole`] those constructors
+/// require, since a workflow step's role has no fixed set of legal values
+/// (`warden_core::workflow::Role`) once no step is privileged over any
+/// other.
+///
+/// Deliberately a standalone function rather than widening
+/// [`AgentInputMessage`] itself: [`AgentInputMessage::role`] is typed
+/// [`AgentRole`], and widening it to an arbitrary string would ripple into
+/// [`parse_agent_input_message`]'s own role-keyed shape dispatch for no
+/// benefit to the closed three-role API that type otherwise still offers --
+/// this function reuses the same private wire shape/validation directly
+/// instead.
+///
+/// `scope` carries decision #37 Q2's scoped-re-review optimization
+/// (`ReviewScope::Correctif`) exactly like [`AgentInputMessage::for_scoped_review`]
+/// did -- generalized to apply to *whichever* step the caller chooses to
+/// scope (`warden::orchestrator::run_convergence_loop` only ever does this
+/// for the first gated step, `workflow.steps[1]`, a positional pipeline
+/// mechanic rather than a role-name check), not hardcoded to a role named
+/// "reviewer".
+///
+/// Rejects a blank `role_name`/`system_prompt`/`target_commit` with the same
+/// rigor [`AgentInputMessage::for_finding_agent`] applies.
+pub fn build_finding_agent_input_json(
+    role_name: &str,
+    system_prompt: impl Into<String>,
+    target_commit: impl Into<String>,
+    diff: impl Into<String>,
+    findings: Vec<Finding>,
+    scope: ReviewScope,
+) -> Result<String> {
+    if role_name.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(
+            "step input role must not be blank".to_string(),
+        ));
+    }
+    let system_prompt = system_prompt.into();
+    if system_prompt.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(format!(
+            "{role_name} input system_prompt must not be blank"
+        )));
+    }
+    let target_commit = target_commit.into();
+    if target_commit.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(format!(
+            "{role_name} input target_commit must not be blank"
+        )));
+    }
+
+    let wire = AgentInputWire {
+        version: AGENT_INPUT_VERSION,
+        role: role_name.to_string(),
+        system_prompt,
+        intent: None,
+        target_commit: Some(target_commit),
+        diff: Some(diff.into()),
+        findings: findings
+            .iter()
+            .map(AgentFindingWire::from_finding)
+            .collect(),
+        scope: scope.as_str().to_string(),
+    };
+    serde_json::to_string(&wire).map_err(|error| CoreError::MalformedAgentInput(error.to_string()))
+}
+
+/// The producer-shaped sibling of [`build_finding_agent_input_json`]: the
+/// stdin JSON payload for `workflow.steps[0]` -- the pipeline's producer
+/// (the coder in the built-in default workflow), whatever its own role name
+/// happens to be. Mirrors [`AgentInputMessage::for_coder`]'s own wire shape
+/// exactly (the run intent, plus the findings that triggered this cycle; no
+/// `target_commit`/`diff`) but, like [`build_finding_agent_input_json`],
+/// takes `role_name` as a plain open string rather than hardcoding
+/// `AgentRole::Coder` -- a reordered/renamed producer step is not
+/// necessarily named `"coder"`.
+///
+/// Rejects a blank `role_name`/`system_prompt`/`intent` with the same rigor
+/// [`AgentInputMessage::for_coder`] applies.
+pub fn build_producer_input_json(
+    role_name: &str,
+    system_prompt: impl Into<String>,
+    intent: impl Into<String>,
+    findings: Vec<Finding>,
+) -> Result<String> {
+    if role_name.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(
+            "step input role must not be blank".to_string(),
+        ));
+    }
+    let system_prompt = system_prompt.into();
+    if system_prompt.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(format!(
+            "{role_name} input system_prompt must not be blank"
+        )));
+    }
+    let intent = intent.into();
+    if intent.trim().is_empty() {
+        return Err(CoreError::MalformedAgentInput(format!(
+            "{role_name} input intent must not be blank"
+        )));
+    }
+
+    let wire = AgentInputWire {
+        version: AGENT_INPUT_VERSION,
+        role: role_name.to_string(),
+        system_prompt,
+        intent: Some(intent),
+        target_commit: None,
+        diff: None,
+        findings: findings
+            .iter()
+            .map(AgentFindingWire::from_finding)
+            .collect(),
+        scope: ReviewScope::Full.as_str().to_string(),
+    };
+    serde_json::to_string(&wire).map_err(|error| CoreError::MalformedAgentInput(error.to_string()))
+}
+
 /// Parses one agent-input JSON payload, with the same rigor as
 /// `parse_ci_result_message`/`parse_findings`: malformed JSON, an unsupported
 /// `version`, an unknown `role`, an unparsable embedded finding, or a
@@ -814,7 +939,11 @@ mod tests {
 
     #[test]
     fn rejects_an_unknown_finding_source_inside_findings() {
-        let json = r#"{"version":3,"role":"tester","system_prompt":"be a tester","intent":null,"target_commit":"abc","diff":"","findings":[{"source":"ghost","severity":"blocking","file":null,"description":"x","action":null}],"scope":"full"}"#;
+        // Issue #73: roles are now open (workflow-defined), so an arbitrary
+        // non-blank `source` like "ghost" is no longer rejected here -- see
+        // `FindingSource::parse`'s own docs. Only a *blank* source is still
+        // a typed error at this parse layer.
+        let json = r#"{"version":3,"role":"tester","system_prompt":"be a tester","intent":null,"target_commit":"abc","diff":"","findings":[{"source":"   ","severity":"blocking","file":null,"description":"x","action":null}],"scope":"full"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
             Err(CoreError::UnknownFindingSource(_))
@@ -840,6 +969,135 @@ mod tests {
         let json = r#"{"version":3,"role":"coder","system_prompt":"be a coder","intent":"x","target_commit":null,"diff":null,"findings":[],"scope":"correctif"}"#;
         assert!(matches!(
             parse_agent_input_message(json),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    // ---- build_finding_agent_input_json (issue #73) ------------------------
+
+    #[test]
+    fn build_finding_agent_input_json_round_trips_for_a_custom_role() {
+        let json = build_finding_agent_input_json(
+            "techlead",
+            SYSTEM_PROMPT,
+            "abc123",
+            "diff --git a/x b/x\n+added line\n",
+            vec![sample_finding()],
+            ReviewScope::Full,
+        )
+        .unwrap();
+        assert!(json.contains(r#""role":"techlead""#));
+        assert!(json.contains(r#""version":3"#));
+
+        // `parse_agent_input_message` still round-trips it -- role dispatch
+        // there fails on an unrecognized role (`AgentRole::parse`), so this
+        // pins that a *custom* role's payload is malformed-role, not a
+        // silently-misparsed shape.
+        assert!(matches!(
+            parse_agent_input_message(&json),
+            Err(CoreError::UnknownRole(_))
+        ));
+    }
+
+    /// The trio-unification follow-up: `scope` generalizes decision #37 Q2's
+    /// scoped-re-review optimization to whichever step the caller chooses to
+    /// scope, not a role named "reviewer".
+    #[test]
+    fn build_finding_agent_input_json_carries_a_correctif_scope_when_asked() {
+        let json = build_finding_agent_input_json(
+            "techlead",
+            SYSTEM_PROMPT,
+            "abc123",
+            "diff",
+            vec![],
+            ReviewScope::Correctif,
+        )
+        .unwrap();
+        assert!(json.contains(r#""scope":"correctif""#));
+    }
+
+    #[test]
+    fn build_finding_agent_input_json_rejects_a_blank_role_name() {
+        assert!(matches!(
+            build_finding_agent_input_json(
+                "   ",
+                SYSTEM_PROMPT,
+                "abc123",
+                "",
+                vec![],
+                ReviewScope::Full
+            ),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn build_finding_agent_input_json_rejects_a_blank_system_prompt() {
+        assert!(matches!(
+            build_finding_agent_input_json(
+                "techlead",
+                "  ",
+                "abc123",
+                "",
+                vec![],
+                ReviewScope::Full
+            ),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn build_finding_agent_input_json_rejects_a_blank_target_commit() {
+        assert!(matches!(
+            build_finding_agent_input_json(
+                "techlead",
+                SYSTEM_PROMPT,
+                "   ",
+                "",
+                vec![],
+                ReviewScope::Full
+            ),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    // ---- build_producer_input_json -----------------------------------------
+
+    #[test]
+    fn build_producer_input_json_round_trips_for_a_renamed_producer_role() {
+        let json = build_producer_input_json(
+            "implementer",
+            SYSTEM_PROMPT,
+            "implement the thing",
+            vec![sample_finding()],
+        )
+        .unwrap();
+        assert!(json.contains(r#""role":"implementer""#));
+        assert!(json.contains(r#""intent":"implement the thing""#));
+        assert!(json.contains(r#""target_commit":null"#));
+        assert!(json.contains(r#""diff":null"#));
+    }
+
+    #[test]
+    fn build_producer_input_json_rejects_a_blank_role_name() {
+        assert!(matches!(
+            build_producer_input_json("   ", SYSTEM_PROMPT, "implement it", vec![]),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn build_producer_input_json_rejects_a_blank_system_prompt() {
+        assert!(matches!(
+            build_producer_input_json("coder", "  ", "implement it", vec![]),
+            Err(CoreError::MalformedAgentInput(_))
+        ));
+    }
+
+    #[test]
+    fn build_producer_input_json_rejects_a_blank_intent() {
+        assert!(matches!(
+            build_producer_input_json("coder", SYSTEM_PROMPT, "   ", vec![]),
             Err(CoreError::MalformedAgentInput(_))
         ));
     }

@@ -73,11 +73,13 @@ pub enum HookPoint {
     /// A cycle's commit was just produced -- the point a deterministic commit
     /// hook (e.g. a conventional-commit check, a sign-off) would run.
     OnCommit,
-    /// Just before the reviewer agent runs (entering [`RunState::Reviewing`]).
+    /// Just before the reviewer agent runs (entering `RunState::RunningStep(1)`
+    /// in the built-in default workflow -- see [`HookPoint::on_entering`]).
     BeforeReview,
     /// Just after the reviewer agent produced its findings.
     AfterReview,
-    /// Just before the tester agent runs (entering [`RunState::Testing`]).
+    /// Just before the tester agent runs (entering `RunState::RunningStep(2)`
+    /// in the built-in default workflow -- see [`HookPoint::on_entering`]).
     BeforeTest,
     /// Just after the tester agent produced its findings.
     AfterTest,
@@ -175,20 +177,29 @@ impl HookPoint {
     /// entry, and fire from explicit dispatch at run start/end, not here.
     ///
     /// States with no lifecycle point of their own (`Pending`, `AwaitingCi`,
-    /// `Done`, the `Max*Exceeded` exhaustion states, `Failed`) return `None`
-    /// -- entering them fires no hook.
+    /// `Done`, `StepCyclesExceeded`, `Failed`) return `None` -- entering them
+    /// fires no hook.
+    ///
+    /// **Issue #73**: `RunState::RunningStep`'s index is mapped by position
+    /// in the built-in default workflow only -- index `1` (the reviewer's
+    /// own step) is `BeforeReview`, index `2` (the tester's) is `BeforeTest`,
+    /// exactly as `Reviewing`/`Testing` used to map before this issue. Any
+    /// other index (a custom workflow's own extra step, e.g. `techlead`)
+    /// currently has no lifecycle point of its own and returns `None` --
+    /// wiring a generic per-step hook point is left to a future issue, not
+    /// this one.
     pub fn on_entering(state: RunState) -> Option<HookPoint> {
         match state {
             RunState::CoderRunning => Some(HookPoint::OnCycleStart),
-            RunState::Reviewing => Some(HookPoint::BeforeReview),
-            RunState::Testing => Some(HookPoint::BeforeTest),
+            RunState::RunningStep(1) => Some(HookPoint::BeforeReview),
+            RunState::RunningStep(2) => Some(HookPoint::BeforeTest),
             RunState::Converged => Some(HookPoint::OnConverged),
             RunState::Pushed => Some(HookPoint::BeforePush),
             RunState::Pending
+            | RunState::RunningStep(_)
             | RunState::AwaitingCi
             | RunState::Done
-            | RunState::MaxReviewCyclesExceeded
-            | RunState::MaxTestCyclesExceeded
+            | RunState::StepCyclesExceeded(_)
             | RunState::Failed => None,
         }
     }
@@ -261,11 +272,11 @@ mod tests {
             Some(HookPoint::OnCycleStart)
         );
         assert_eq!(
-            HookPoint::on_entering(RunState::Reviewing),
+            HookPoint::on_entering(RunState::RunningStep(1)),
             Some(HookPoint::BeforeReview)
         );
         assert_eq!(
-            HookPoint::on_entering(RunState::Testing),
+            HookPoint::on_entering(RunState::RunningStep(2)),
             Some(HookPoint::BeforeTest)
         );
         assert_eq!(
@@ -282,10 +293,10 @@ mod tests {
     fn on_entering_has_no_hook_for_non_milestone_states() {
         for state in [
             RunState::Pending,
+            RunState::RunningStep(3),
             RunState::AwaitingCi,
             RunState::Done,
-            RunState::MaxReviewCyclesExceeded,
-            RunState::MaxTestCyclesExceeded,
+            RunState::StepCyclesExceeded(1),
             RunState::Failed,
         ] {
             assert_eq!(HookPoint::on_entering(state), None);

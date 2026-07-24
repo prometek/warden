@@ -205,8 +205,8 @@ pub fn format_cycle_comment(summary: &CycleSummary) -> String {
         body.push_str("No findings raised this cycle.\n\n");
     } else {
         for source in [
-            FindingSource::Reviewer,
-            FindingSource::Tester,
+            FindingSource::role("reviewer"),
+            FindingSource::role("tester"),
             FindingSource::Warden,
             FindingSource::Ci,
         ] {
@@ -915,7 +915,7 @@ mod tests {
 
     fn reviewer_finding() -> Finding {
         Finding {
-            source: FindingSource::Reviewer,
+            source: FindingSource::role("reviewer"),
             severity: Severity::Blocking,
             file: Some("src/auth.rs".to_string()),
             description: "missing expiry check".to_string(),
@@ -925,7 +925,7 @@ mod tests {
 
     fn tester_finding() -> Finding {
         Finding {
-            source: FindingSource::Tester,
+            source: FindingSource::role("tester"),
             severity: Severity::Info,
             file: None,
             description: "consider adding an e2e test".to_string(),

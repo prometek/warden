@@ -44,7 +44,6 @@ use std::path::Path;
 
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
-use warden_core::AgentRole;
 
 use crate::error::ProcessError;
 use crate::path_util::canonicalize_best_effort;
@@ -76,15 +75,23 @@ pub struct AgentOutcome {
     pub stderr: String,
 }
 
-/// Guards a reviewer/tester `program` against resolving to a path the coder
-/// controls (issue #26, belt-and-braces): no adapter shipped today can
+/// Guards a gated step's `program` against resolving to a path the producer
+/// step controls (issue #26, belt-and-braces): no adapter shipped today can
 /// actually trigger this (see this module's own docs), but nothing stops a
 /// future one from naming a script inside the repo under review, and that
-/// would defeat the entire point of running the reviewer/tester as an
-/// independent gate. Always `Ok(())` for `AgentRole::Coder` -- the coder
-/// already runs with full repo access and is the repo's own untrusted role
-/// in the first place (`agent_def`'s own module docs), so there is nothing
-/// to protect it from here.
+/// would defeat the entire point of running a gated step as an independent
+/// check. Always `Ok(())` for `is_producer` -- the producer step (the coder
+/// in the built-in default workflow) already runs with full repo access and
+/// is the repo's own untrusted step in the first place (`agent_def`'s own
+/// module docs), so there is nothing to protect it from here.
+///
+/// **Issue #73 (trio-unification follow-up)**: takes `role_name`/
+/// `is_producer` rather than the closed `AgentRole` this used to -- every
+/// workflow step goes through this exact same check now, keyed only on
+/// whether it's the pipeline's producer (`workflow.steps[0]`, a positional
+/// fact, not a role name), never on whether its name happens to be
+/// `"coder"`/`"reviewer"`/`"tester"`. `role_name` is otherwise only used to
+/// name the offending role in the returned error.
 ///
 /// Refuses `program` when it is:
 /// - **a relative path** (contains a path separator and is not absolute):
@@ -121,13 +128,14 @@ pub struct AgentOutcome {
 /// silently skipping the containment check it could no longer perform
 /// (code-standards.md: "no silent fallback").
 pub fn validate_agent_program(
-    role: AgentRole,
+    role_name: &str,
+    is_producer: bool,
     program: &str,
     worktree_path: &Path,
     repo_path: &Path,
     run_worktrees_root: &Path,
 ) -> Result<(), ProcessError> {
-    if role == AgentRole::Coder {
+    if is_producer {
         return Ok(());
     }
 
@@ -142,7 +150,7 @@ pub fn validate_agent_program(
     let candidate = Path::new(program);
     if !candidate.is_absolute() {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "relative path -- would resolve against {}, the role's own worktree (a \
@@ -154,7 +162,7 @@ pub fn validate_agent_program(
 
     let canonical_candidate = canonicalize_best_effort(candidate).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve its real location to verify it is outside the repo under \
@@ -164,7 +172,7 @@ pub fn validate_agent_program(
     })?;
     let canonical_worktree = canonicalize_best_effort(worktree_path).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve the role's own worktree ({}) to verify this program is outside \
@@ -175,7 +183,7 @@ pub fn validate_agent_program(
     })?;
     let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
         ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "cannot resolve the run's base repository ({}) to verify this program is \
@@ -187,7 +195,7 @@ pub fn validate_agent_program(
     let canonical_run_worktrees_root =
         canonicalize_best_effort(run_worktrees_root).map_err(|source| {
             ProcessError::UntrustedAgentProgram {
-                role: role.as_str(),
+                role: role_name.to_string(),
                 program: program.to_string(),
                 reason: format!(
                     "cannot resolve this run's own worktrees root ({}) to verify this program is \
@@ -199,7 +207,7 @@ pub fn validate_agent_program(
 
     if canonical_candidate.starts_with(&canonical_worktree) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside the role's own worktree ({}) -- a checkout of the repo the \
@@ -215,7 +223,7 @@ pub fn validate_agent_program(
     // ever covered the checked role's own worktree.
     if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
@@ -226,7 +234,7 @@ pub fn validate_agent_program(
     }
     if canonical_candidate.starts_with(&canonical_repo) {
         return Err(ProcessError::UntrustedAgentProgram {
-            role: role.as_str(),
+            role: role_name.to_string(),
             program: program.to_string(),
             reason: format!(
                 "resolves inside the run's base repository ({}), which the coder can write to \
@@ -646,9 +654,10 @@ mod tests {
         let layout = WorktreeLayout::new();
         let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
-        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+        for role in ["reviewer", "tester"] {
             assert!(validate_agent_program(
                 role,
+                false,
                 "claude",
                 &worktree,
                 repo.path(),
@@ -663,9 +672,10 @@ mod tests {
         let layout = WorktreeLayout::new();
         let worktree = layout.role_worktree("reviewer");
         let repo = TempDir::new().unwrap();
-        for role in [AgentRole::Reviewer, AgentRole::Tester] {
+        for role in ["reviewer", "tester"] {
             let error = validate_agent_program(
                 role,
+                false,
                 "./reviewer.sh",
                 &worktree,
                 repo.path(),
@@ -686,7 +696,8 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         let error = validate_agent_program(
-            AgentRole::Reviewer,
+            "reviewer",
+            false,
             program.to_str().unwrap(),
             &worktree,
             repo.path(),
@@ -706,7 +717,8 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         let error = validate_agent_program(
-            AgentRole::Tester,
+            "tester",
+            false,
             program.to_str().unwrap(),
             &worktree,
             repo.path(),
@@ -733,7 +745,8 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         let error = validate_agent_program(
-            AgentRole::Reviewer,
+            "reviewer",
+            false,
             program.to_str().unwrap(),
             &reviewer_worktree,
             repo.path(),
@@ -754,7 +767,8 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         assert!(validate_agent_program(
-            AgentRole::Reviewer,
+            "reviewer",
+            false,
             program.to_str().unwrap(),
             &worktree,
             repo.path(),
@@ -763,12 +777,13 @@ mod tests {
         .is_ok());
     }
 
-    /// The whole point of this guard: it must never apply to the coder,
-    /// which already has full repo access and is the repo's own untrusted
-    /// role in the first place -- even a program that would be refused for
-    /// the reviewer/tester must pass unchanged for the coder.
+    /// The whole point of this guard: it must never apply to the producer
+    /// step (the coder in the built-in default workflow), which already has
+    /// full repo access and is the repo's own untrusted step in the first
+    /// place -- even a program that would be refused for a gated step must
+    /// pass unchanged for the producer.
     #[test]
-    fn the_coder_is_never_subject_to_this_guard() {
+    fn the_producer_step_is_never_subject_to_this_guard() {
         let layout = WorktreeLayout::new();
         let worktree = layout.role_worktree("coder");
         let repo = TempDir::new().unwrap();
@@ -777,7 +792,8 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
 
         assert!(validate_agent_program(
-            AgentRole::Coder,
+            "coder",
+            true,
             program.to_str().unwrap(),
             &worktree,
             repo.path(),
@@ -785,7 +801,8 @@ mod tests {
         )
         .is_ok());
         assert!(validate_agent_program(
-            AgentRole::Coder,
+            "coder",
+            true,
             "./coder.sh",
             &worktree,
             repo.path(),
@@ -806,7 +823,8 @@ mod tests {
         let program = worktree.join("does-not-exist-yet.sh");
 
         let error = validate_agent_program(
-            AgentRole::Reviewer,
+            "reviewer",
+            false,
             program.to_str().unwrap(),
             &worktree,
             repo.path(),

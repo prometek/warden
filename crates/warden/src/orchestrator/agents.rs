@@ -1,7 +1,8 @@
-//! Coder/reviewer/tester invocation: [`Orchestrator::run_coder`],
-//! [`Orchestrator::run_review`]/[`Orchestrator::run_test`] (independent
-//! since issue #40), and the shared [`Orchestrator::run_finding_agent`]
-//! underneath the latter two.
+//! Workflow step invocation (issue #73, trio-unification follow-up):
+//! [`Orchestrator::run_producer`] for `workflow.steps[0]`, and
+//! [`Orchestrator::run_gated_step`] for every step after it -- one uniform
+//! body for the built-in reviewer/tester and any custom role alike. No step
+//! is special-cased by role name in either function.
 
 use super::diff::{read_diff, read_head_commit};
 use super::gate_tail::protect_cycle_commit;
@@ -29,37 +30,47 @@ fn truncate_for_error(stderr: &str) -> String {
 }
 
 /// "The cycle's e2e test succeeded" (ADR-0009: evidence is captured "après
-/// le succès du test e2e"), inferred as "the tester itself raised no
-/// blocking finding" -- there's no separate pass/fail signal in the
-/// findings protocol, so absence of a blocking `Tester`-sourced finding is
-/// the only available proxy.
-fn tester_succeeded(findings: &[Finding]) -> bool {
+/// le succès du test e2e"), inferred as "the evidence-capturing step itself
+/// raised no blocking finding" -- there's no separate pass/fail signal in
+/// the findings protocol, so absence of a blocking finding sourced from
+/// `role` is the only available proxy. Generalized off `role` (issue #73
+/// review, finding F2) rather than hardcoding `FindingSource::role("tester")`,
+/// since the step this now watches is whichever one declared
+/// `captures_evidence: true`, not necessarily one named `"tester"`.
+fn step_succeeded(role: &Role, findings: &[Finding]) -> bool {
     !findings.iter().any(|finding| {
-        finding.source == warden_core::FindingSource::Tester
+        finding.source == warden_core::FindingSource::role(role.as_str())
             && finding.severity == warden_core::Severity::Blocking
     })
 }
 
-fn role_to_finding_source(role: AgentRole) -> warden_core::FindingSource {
-    match role {
-        AgentRole::Reviewer => warden_core::FindingSource::Reviewer,
-        AgentRole::Tester => warden_core::FindingSource::Tester,
-        // Coder never produces findings; only used defensively.
-        AgentRole::Coder => warden_core::FindingSource::Reviewer,
-    }
-}
-
 impl Orchestrator {
-    pub(super) async fn run_coder<R: ToolAdapter>(
+    /// Invokes `workflow.steps[0]` -- the pipeline's producer (the coder in
+    /// the built-in default workflow) -- for one cycle: its own worktree,
+    /// its own agent spawn, the commit/diff it produced, and the tampering
+    /// check against the run's original agent-definition snapshot.
+    ///
+    /// **Issue #73 (trio-unification follow-up)**: `invocation.role` is the
+    /// producer step's own open [`Role`] rather than a hardcoded
+    /// `AgentRole::Coder` -- a workflow's first step is not necessarily
+    /// named `"coder"`. The one genuine, structural invariant this function
+    /// embodies (documented, not a role-name check): **only the producer
+    /// step may write a new commit** -- it is the one role whose payload
+    /// carries `intent` rather than `target_commit`/`diff`, and the one
+    /// role `run_convergence_loop` ever calls this for (`workflow.steps[0]`,
+    /// a positional fact enforced by [`warden_core::Workflow::parse_yaml`]
+    /// requiring the first step to be a plain pass-through).
+    pub(super) async fn run_producer<R: ToolAdapter>(
         &self,
         runner: &R,
-        invocation: CoderInvocation<'_>,
-    ) -> Result<CoderCycleResult> {
-        let CoderInvocation {
+        invocation: ProducerInvocation<'_>,
+    ) -> Result<ProducerCycleResult> {
+        let ProducerInvocation {
             run_id,
             cycle_id,
             cycle_number,
             config,
+            role,
             agent,
             env_allowlist,
             worktree_manager,
@@ -70,38 +81,39 @@ impl Orchestrator {
         } = invocation;
 
         let worktree = worktree_manager
-            .create(run_id, AgentRole::Coder.as_str(), base_commit)
+            .create(run_id, role.as_str(), base_commit)
             .await?;
         db::set_cycle_worktree_path(
             &self.pool,
             cycle_id,
-            AgentRole::Coder,
+            role.as_str(),
             &worktree.path().display().to_string(),
         )
         .await?;
 
         // ADR-0012: resolved right after the worktree is created (before
-        // the coder runs), so it's a concrete SHA rather than the possibly
-        // ambiguous `base_commit` ref (e.g. the literal string `"HEAD"` on a
-        // run's first cycle) -- needed below to compute the diff this
-        // cycle's coder introduces, once it has run.
+        // the producer runs), so it's a concrete SHA rather than the
+        // possibly ambiguous `base_commit` ref (e.g. the literal string
+        // `"HEAD"` on a run's first cycle) -- needed below to compute the
+        // diff this cycle's producer introduces, once it has run.
         let base_commit_sha = read_head_commit(worktree.path()).await?;
 
-        // ADR-0013: the coder's own definition (system prompt), the run
+        // ADR-0013: the producer's own definition (system prompt), the run
         // intent, and -- A2 -- the findings it is being asked to fix. No
         // `target_commit`/`diff`: this very worktree is already checked out
-        // at that commit, so the coder can `git diff` for itself rather than
-        // be handed a copy of what's on its own disk.
-        let stdin_payload = warden_core::AgentInputMessage::for_coder(
+        // at that commit, so the producer can `git diff` for itself rather
+        // than be handed a copy of what's on its own disk.
+        let stdin_payload = warden_core::build_producer_input_json(
+            role.as_str(),
             &agent.system_prompt,
             config.intent.clone(),
             prior_findings.to_vec(),
-        )?
-        .to_json()?;
+        )?;
         let outcome = self
             .run_agent(
                 cycle_id,
-                AgentRole::Coder,
+                role,
+                true,
                 runner,
                 &agent.command,
                 env_allowlist,
@@ -113,7 +125,7 @@ impl Orchestrator {
             )
             .await?;
 
-        // M2: a coder that exits non-zero has not reliably produced a
+        // M2: a producer that exits non-zero has not reliably produced a
         // commit worth reviewing — `read_head_commit` below would just
         // return the unchanged base commit, silently making the loop look
         // like a no-op success. Fail the run explicitly instead.
@@ -121,9 +133,10 @@ impl Orchestrator {
             tracing::warn!(
                 run_id,
                 cycle_id,
+                role = role.as_str(),
                 exit_code = outcome.exit_code,
                 stderr = %outcome.stderr,
-                "coder exited with a non-zero status; failing the run"
+                "producer step exited with a non-zero status; failing the run"
             );
             // Write-ahead (ADR-0004): persist Failed before returning the
             // error to the caller.
@@ -137,7 +150,7 @@ impl Orchestrator {
             })
             .await?;
             if let Err(error) = worktree.remove().await {
-                tracing::warn!(%error, "failed to clean up coder worktree after a failed coder run");
+                tracing::warn!(%error, "failed to clean up producer worktree after a failed run");
             }
             return Err(WardenError::CoderFailed {
                 run_id: run_id.to_string(),
@@ -151,15 +164,15 @@ impl Orchestrator {
 
         // ADR-0012: computed while the worktree still exists (both commits
         // are reachable from it, since worktrees share the main repo's
-        // object store) -- this is what the reviewer/tester's
+        // object store) -- this is what every gated step's
         // `AgentInputMessage::diff` carries.
         let diff = read_diff(worktree.path(), &base_commit_sha, &new_commit).await?;
 
-        // Issue #30 (review, HIGH): re-resolves all three roles' raw
+        // Issue #30 (review, HIGH): re-resolves the built-in trio's raw
         // definition bytes through a throwaway `git worktree` checkout of
-        // `new_commit` -- deliberately not this cycle's own coder worktree
-        // working directory, which is mutable and not what actually
-        // propagates forward -- and compares each against
+        // `new_commit` -- deliberately not this cycle's own producer
+        // worktree working directory, which is mutable and not what
+        // actually propagates forward -- and compares each against
         // `run_agent_definition_snapshot` (the run's true original start,
         // captured once in `run_convergence_loop`) -- see
         // `agent_definition_tampering_finding`'s own docs for the full
@@ -181,117 +194,50 @@ impl Orchestrator {
         db::set_cycle_commit_sha(&self.pool, cycle_id, &new_commit).await?;
 
         if let Err(error) = worktree.remove().await {
-            tracing::warn!(%error, "failed to clean up coder worktree after cycle");
+            tracing::warn!(%error, "failed to clean up producer worktree after cycle");
         }
 
-        Ok(CoderCycleResult {
+        Ok(ProducerCycleResult {
             commit: new_commit,
             diff,
             definition_tampering_finding,
         })
     }
 
-    /// Independent reviewer invocation (issue #40): its own worktree, its
-    /// own agent spawn, its own findings extraction -- no longer entangled
-    /// with the tester's via `tokio::join!` (ADR-0003 amendment; the removed
-    /// `run_review_and_test` used to run both concurrently). Thin
-    /// role-fixing wrapper around `run_finding_agent`, which still does the
-    /// actual work; kept as its own named entry point so callers -- the
-    /// gate-review loop (issue #41) and its Phase B scoped-re-review
-    /// follow-up (#42) -- have a `Reviewer`-only seam distinct from
-    /// [`Self::run_test`], the one that can be invoked scoped to a single
-    /// correctif (`invocation.scope`, decision #37 Q2).
-    pub(super) async fn run_review<R: ToolAdapter>(
+    /// Invokes a single **gated** workflow step -- any step but the
+    /// producer (`workflow.steps[0]`), whether that's the built-in
+    /// reviewer/tester or a custom role like `techlead`. One uniform body:
+    /// its own worktree, its own agent spawn, its own findings extraction,
+    /// validated against its own open [`Role`] -- no role name ever
+    /// branches this function's own behaviour.
+    ///
+    /// **One narrow, documented exception, positional/functional rather
+    /// than a role-name check:** `scope` may only be
+    /// [`warden_core::ReviewScope::Correctif`] for `invocation.step_index
+    /// == 1` (the first gated step) -- decision #37 Q2's scoped-re-review
+    /// optimization is a pipeline mechanic tied to *position*, not to a role
+    /// named `"reviewer"`; `run_convergence_loop` is the only caller that
+    /// ever sets it, and this is a defensive re-check against a future
+    /// caller doing so incorrectly, mirroring this crate's existing
+    /// "constructor invariant == defensive re-check" convention.
+    ///
+    /// Evidence capture (ADR-0009, issue #7) no longer keys on a literal
+    /// role name either (issue #73 review, finding F2): it fires whenever
+    /// `invocation.captures_evidence` is set, a property `run_convergence_loop`
+    /// reads straight off this step's own `workflow.yaml` declaration
+    /// (`WorkflowStep::captures_evidence`) -- `true` for the built-in
+    /// default's tester step (`Workflow::builtin_default`), for strict
+    /// retro-compat, and opt-in for any custom workflow's own step.
+    pub(super) async fn run_gated_step<R: ToolAdapter>(
         &self,
         runner: &R,
-        invocation: ReviewInvocation<'_>,
+        invocation: GatedStepInvocation<'_>,
     ) -> Result<Vec<Finding>> {
-        let ReviewInvocation {
+        let GatedStepInvocation {
             run_id,
             cycle_id,
             cycle_number,
-            agent,
-            env_allowlist,
-            worktree_manager,
-            commit,
-            diff,
-            prior_findings,
-            scope,
-            config,
-            cancel,
-        } = invocation;
-        self.run_finding_agent(
-            runner,
-            FindingAgentInvocation {
-                run_id,
-                cycle_id,
-                cycle_number,
-                role: AgentRole::Reviewer,
-                agent,
-                env_allowlist,
-                worktree_manager,
-                commit,
-                diff,
-                prior_findings,
-                scope,
-                config,
-                cancel,
-            },
-        )
-        .await
-    }
-
-    /// Independent tester invocation (issue #40): [`Self::run_review`]'s
-    /// mirror image, minus the `scope` axis a tester is never invoked with
-    /// (decision #37 Q2 only scopes the reviewer).
-    pub(super) async fn run_test<R: ToolAdapter>(
-        &self,
-        runner: &R,
-        invocation: TestInvocation<'_>,
-    ) -> Result<Vec<Finding>> {
-        let TestInvocation {
-            run_id,
-            cycle_id,
-            cycle_number,
-            agent,
-            env_allowlist,
-            worktree_manager,
-            commit,
-            diff,
-            prior_findings,
-            config,
-            cancel,
-        } = invocation;
-        self.run_finding_agent(
-            runner,
-            FindingAgentInvocation {
-                run_id,
-                cycle_id,
-                cycle_number,
-                role: AgentRole::Tester,
-                agent,
-                env_allowlist,
-                worktree_manager,
-                commit,
-                diff,
-                prior_findings,
-                scope: warden_core::ReviewScope::Full,
-                config,
-                cancel,
-            },
-        )
-        .await
-    }
-
-    async fn run_finding_agent<R: ToolAdapter>(
-        &self,
-        runner: &R,
-        invocation: FindingAgentInvocation<'_>,
-    ) -> Result<Vec<Finding>> {
-        let FindingAgentInvocation {
-            run_id,
-            cycle_id,
-            cycle_number,
+            step_index,
             role,
             agent,
             env_allowlist,
@@ -300,9 +246,19 @@ impl Orchestrator {
             diff,
             prior_findings,
             scope,
+            captures_evidence,
             config,
             cancel,
         } = invocation;
+
+        if scope == warden_core::ReviewScope::Correctif && step_index != 1 {
+            return Err(WardenError::Core(
+                warden_core::CoreError::MalformedAgentInput(format!(
+                    "step {step_index} ({role}) cannot be invoked with a scoped (\"correctif\") \
+                     review -- only the first gated step (index 1) can be scoped"
+                )),
+            ));
+        }
 
         let worktree = worktree_manager
             .create(run_id, role.as_str(), commit)
@@ -310,56 +266,28 @@ impl Orchestrator {
         db::set_cycle_worktree_path(
             &self.pool,
             cycle_id,
-            role,
+            role.as_str(),
             &worktree.path().display().to_string(),
         )
         .await?;
 
-        // ADR-0012: the reviewer/tester's own role, target commit, this
-        // cycle's diff, and the findings that triggered the cycle -- plus,
-        // since ADR-0013, its own definition's system prompt. `Correctif`
-        // (issue #40) is reviewer-only -- `TestInvocation` carries no
-        // `scope` field at all, so `run_test` can never reach that branch,
-        // but the match below still refuses it defensively for any other
-        // future caller of `run_finding_agent` rather than silently falling
-        // back to `Full` (code-standards.md: no silent fallback).
-        // `for_finding_agent`/`for_scoped_review` both refuse
-        // `AgentRole::Coder`, which can never happen here since `role` is
-        // always `Reviewer`/`Tester` at this call site.
-        let stdin_payload = match (role, scope) {
-            (AgentRole::Reviewer, warden_core::ReviewScope::Correctif) => {
-                warden_core::AgentInputMessage::for_scoped_review(
-                    &agent.system_prompt,
-                    commit,
-                    diff,
-                    prior_findings.to_vec(),
-                )?
-            }
-            (_, warden_core::ReviewScope::Correctif) => {
-                return Err(WardenError::Core(
-                    warden_core::CoreError::MalformedAgentInput(format!(
-                        "{} cannot be invoked with a scoped (\"correctif\") review -- only the \
-                             reviewer can be scoped",
-                        role.as_str()
-                    )),
-                ));
-            }
-            (_, warden_core::ReviewScope::Full) => {
-                warden_core::AgentInputMessage::for_finding_agent(
-                    role,
-                    &agent.system_prompt,
-                    commit,
-                    diff,
-                    prior_findings.to_vec(),
-                )?
-            }
-        }
-        .to_json()?;
+        // ADR-0012: this step's own role, target commit, this cycle's
+        // diff, and the findings that triggered the cycle -- plus, since
+        // ADR-0013, its own definition's system prompt.
+        let stdin_payload = warden_core::build_finding_agent_input_json(
+            role.as_str(),
+            &agent.system_prompt,
+            commit,
+            diff,
+            prior_findings.to_vec(),
+            scope,
+        )?;
 
         let outcome = self
             .run_agent(
                 cycle_id,
                 role,
+                false,
                 runner,
                 &agent.command,
                 env_allowlist,
@@ -371,37 +299,31 @@ impl Orchestrator {
             )
             .await?;
 
-        // Issue #71 review (HIGH): a reviewer/tester that exited non-zero
-        // must never have its stdout trusted at all -- checked *before*
+        // Issue #71 review (HIGH): a gated step that exited non-zero must
+        // never have its stdout trusted at all -- checked *before*
         // `extract_findings` is ever called, independent of whatever that
         // adapter's own mapping does with a blank/malformed buffer.
-        // Mirrors the coder path's own non-zero-exit check above (M2), but
-        // a blocking finding rather than failing the whole run: a
-        // crashed/misbehaving reviewer or tester is exactly the kind of
-        // problem a reboucle back to the coder can plausibly recover from
-        // (a transient invocation failure, a flaky sandbox, ...), unlike a
-        // coder that never produced a commit worth reviewing at all. This
-        // closes a fail-open some adapters could otherwise incidentally
-        // reopen: `MistralAdapter::extract_findings` (see its own docs)
-        // trusts a blank buffer as "no findings" precisely *because* this
-        // check has already confirmed the process exited cleanly --
-        // without it, a `mistral` reviewer that crashed and printed
-        // nothing would read as a clean, converging pass.
+        // Mirrors the producer path's own non-zero-exit check above (M2),
+        // but a blocking finding rather than failing the whole run: a
+        // crashed/misbehaving step is exactly the kind of problem a
+        // reboucle back to the producer can plausibly recover from (a
+        // transient invocation failure, a flaky sandbox, ...), unlike a
+        // producer that never produced a commit worth reviewing at all.
         let findings = if outcome.exit_code != 0 {
             tracing::warn!(
                 run_id,
                 cycle_id,
-                ?role,
+                role = role.as_str(),
                 exit_code = outcome.exit_code,
                 stderr = %outcome.stderr,
-                "agent exited non-zero; not trusting its stdout"
+                "gated step exited non-zero; not trusting its stdout"
             );
             vec![Finding {
-                source: role_to_finding_source(role),
+                source: warden_core::FindingSource::role(role.as_str()),
                 severity: warden_core::Severity::Blocking,
                 file: None,
                 description: format!(
-                    "{role:?} exited with status {} instead of 0 (stderr: {})",
+                    "{role} exited with status {} instead of 0 (stderr: {})",
                     outcome.exit_code,
                     truncate_for_error(&outcome.stderr)
                 ),
@@ -416,16 +338,15 @@ impl Orchestrator {
             // sortie d'un agent CLI"). `runner.extract_findings` is this
             // run's `--tool` adapter's own translation from its CLI's raw
             // output into findings NDJSON (issue #24 point 1, third
-            // bullet) -- the user no longer writes that translation as a
-            // wrapper script.
+            // bullet).
             //
             // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
             // necessarily an *honest* one -- `extract_findings` only checks
             // that every finding's `source` is some known value, not that
             // it's the one this role is entitled to claim.
             // `validate_finding_sources_for_role` closes that gap (a forged
-            // `source: "warden"`, or a tester mislabelling its own failure
-            // as `source: "reviewer"` to slip past `tester_succeeded`
+            // `source: "warden"`, or a step mislabelling its own failure as
+            // a sibling step's own source to slip past `step_succeeded`
             // below) with the exact same "reject the whole batch, describe
             // why, never silently drop/relabel" treatment as an
             // unparsable-output failure -- see that function's own docs
@@ -438,13 +359,13 @@ impl Orchestrator {
                 }) {
                 Ok(findings) => findings,
                 Err(parse_error) => {
-                    tracing::warn!(%parse_error, ?role, stdout = %outcome.stdout, "agent produced unparsable or misattributed output");
+                    tracing::warn!(%parse_error, role = role.as_str(), stdout = %outcome.stdout, "gated step produced unparsable or misattributed output");
                     vec![Finding {
-                        source: role_to_finding_source(role),
+                        source: warden_core::FindingSource::role(role.as_str()),
                         severity: warden_core::Severity::Blocking,
                         file: None,
                         description: format!(
-                            "{role:?} produced unparsable or misattributed output: {parse_error}"
+                            "{role} produced unparsable or misattributed output: {parse_error}"
                         ),
                         action: Some("fix the agent's output format/finding sources".to_string()),
                     }]
@@ -453,11 +374,11 @@ impl Orchestrator {
         };
 
         // ADR-0009 (issue #7): capture evidence right after a *successful*
-        // tester run, still inside its worktree -- which is about to be
-        // removed below, so this must happen before that, not after.
-        if role == AgentRole::Tester && tester_succeeded(&findings) {
-            // `agent.command` *is* the tester command here: this branch only
-            // runs for `AgentRole::Tester`.
+        // run of this step, still inside its worktree -- which is about to
+        // be removed below, so this must happen before that, not after.
+        // Gated on the step's own declared `captures_evidence` (issue #73
+        // review, finding F2), never on a literal role name.
+        if captures_evidence && step_succeeded(role, &findings) {
             self.capture_evidence_for_cycle(EvidenceCapture {
                 run_id,
                 cycle_id,
@@ -471,7 +392,7 @@ impl Orchestrator {
         }
 
         if let Err(error) = worktree.remove().await {
-            tracing::warn!(%error, ?role, "failed to clean up worktree after cycle");
+            tracing::warn!(%error, role = role.as_str(), "failed to clean up worktree after cycle");
         }
 
         Ok(findings)
@@ -485,19 +406,29 @@ mod tests {
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
+    fn reviewer_role() -> Role {
+        Role::new("reviewer").unwrap()
+    }
+
+    fn tester_role() -> Role {
+        Role::new("tester").unwrap()
+    }
+
     /// Acceptance criterion 1 (issue #2), updated for issue #40's
-    /// independent `run_review`/`run_test` (the removed `run_review_and_test`
-    /// used to exercise this concurrently via `tokio::join!`; reviewer and
-    /// tester now run sequentially, see `run_review_and_test_runs_...`
-    /// below): reviewer and tester each write to a DIFFERENT file in their
-    /// own worktree, then read back the *other* role's target file from
-    /// their own worktree. Each gets a fresh worktree checked out from the
-    /// same base `commit` (`WorktreeManager::create`, keyed by role), so if
-    /// the two ever shared a worktree/directory, the other role's write
-    /// would already be visible here instead of the original, untouched
-    /// content -- regardless of whether the two run concurrently or in
-    /// sequence, this is what distinguishes "isolated worktrees" from
-    /// "shared worktree".
+    /// independent reviewer/tester invocations (the removed
+    /// `run_review_and_test` used to exercise this concurrently via
+    /// `tokio::join!`; reviewer and tester now run sequentially, see
+    /// `run_review_and_test_runs_...` below), further generalized by issue
+    /// #73's trio-unification follow-up (both now go through the single
+    /// generic [`Orchestrator::run_gated_step`]): reviewer and tester each
+    /// write to a DIFFERENT file in their own worktree, then read back the
+    /// *other* role's target file from their own worktree. Each gets a
+    /// fresh worktree checked out from the same base `commit`
+    /// (`WorktreeManager::create`, keyed by role), so if the two ever
+    /// shared a worktree/directory, the other role's write would already be
+    /// visible here instead of the original, untouched content -- regardless
+    /// of whether the two run concurrently or in sequence, this is what
+    /// distinguishes "isolated worktrees" from "shared worktree".
     #[tokio::test]
     async fn run_review_and_test_isolates_writes_to_different_worktree_files() {
         let repo = init_test_repo();
@@ -528,6 +459,8 @@ mod tests {
             "crossed findings, no collision",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -564,9 +497,13 @@ mod tests {
             intent: "crossed findings, no collision".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(reviewer_command),
-            tester_agent: definition(tester_command),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(reviewer_command),
+                definition(tester_command),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -575,40 +512,49 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
 
         let orchestrator = Orchestrator::new(pool.clone());
+        let reviewer_role = reviewer_role();
         let mut findings = orchestrator
-            .run_review(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                ReviewInvocation {
+                GatedStepInvocation {
                     run_id: "collision-run",
                     cycle_id: "collision-cycle",
                     cycle_number: 1,
-                    agent: &agents.reviewer,
+                    step_index: 1,
+                    role: &reviewer_role,
+                    agent: &agents.steps[1],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
             )
             .await
             .unwrap();
+        let tester_role = tester_role();
         findings.extend(
             orchestrator
-                .run_test(
+                .run_gated_step(
                     &FakeCommandAdapter,
-                    TestInvocation {
+                    GatedStepInvocation {
                         run_id: "collision-run",
                         cycle_id: "collision-cycle",
                         cycle_number: 1,
-                        agent: &agents.tester,
+                        step_index: 2,
+                        role: &tester_role,
+                        agent: &agents.steps[2],
                         env_allowlist: agents.env_allowlist,
                         worktree_manager: &worktree_manager,
                         commit: "HEAD",
                         diff: "",
                         prior_findings: &[],
+                        scope: warden_core::ReviewScope::Full,
+                        captures_evidence: true,
                         config: &config,
                         cancel: CancellationToken::new(),
                     },
@@ -620,11 +566,11 @@ mod tests {
         assert_eq!(findings.len(), 2);
         let reviewer_finding = findings
             .iter()
-            .find(|f| f.source == warden_core::FindingSource::Reviewer)
+            .find(|f| f.source == warden_core::FindingSource::role("reviewer"))
             .expect("reviewer finding present");
         let tester_finding = findings
             .iter()
-            .find(|f| f.source == warden_core::FindingSource::Tester)
+            .find(|f| f.source == warden_core::FindingSource::role("tester"))
             .expect("tester finding present");
 
         assert!(
@@ -645,14 +591,13 @@ mod tests {
         );
     }
 
-    /// Issue #40 / decision #37 Q2: a reviewer invoked through `run_review`
-    /// with `ReviewScope::Correctif` must receive a payload scoped to the
+    /// Issue #40 / decision #37 Q2, generalized by issue #73's trio-
+    /// unification follow-up: a step invoked at `step_index: 1` with
+    /// `ReviewScope::Correctif` must receive a payload scoped to the
     /// correctif's own diff plus the findings that prompted it -- captured
-    /// directly from what the reviewer agent actually reads off stdin, the
-    /// same way `every_role_receives_its_own_definitions_system_prompt_over_stdin`
-    /// captures a full-cycle payload.
+    /// directly from what the agent actually reads off stdin.
     #[tokio::test]
-    async fn run_review_with_a_correctif_scope_sends_the_reviewer_a_scoped_payload() {
+    async fn a_step_1_invocation_with_a_correctif_scope_sends_a_scoped_payload() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
             finding_agent_test_fixture().await;
         let payloads = TempDir::new().unwrap();
@@ -665,6 +610,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -686,9 +633,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(capturing_reviewer),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(capturing_reviewer),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -698,27 +649,31 @@ mod tests {
         let orchestrator = Orchestrator::new(pool.clone());
 
         let originating_finding = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: Some("src/lib.rs".to_string()),
             description: "unchecked unwrap".to_string(),
             action: Some("handle the error".to_string()),
         };
 
+        let reviewer_role = reviewer_role();
         orchestrator
-            .run_review(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                ReviewInvocation {
+                GatedStepInvocation {
                     run_id: "scoped-run",
                     cycle_id: "scoped-cycle",
                     cycle_number: 1,
-                    agent: &agents.reviewer,
+                    step_index: 1,
+                    role: &reviewer_role,
+                    agent: &agents.steps[1],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "diff --git a/x b/x\n+fixed the unwrap\n",
                     prior_findings: std::slice::from_ref(&originating_finding),
                     scope: warden_core::ReviewScope::Correctif,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -739,14 +694,13 @@ mod tests {
         assert_eq!(payload.findings, vec![originating_finding]);
     }
 
-    /// Issue #40: `run_finding_agent` must refuse a `Correctif` scope for
-    /// any role but `AgentRole::Reviewer` -- defense in depth against a
-    /// future caller that (mis)constructs a `FindingAgentInvocation`
-    /// directly instead of going through `run_test` (whose `TestInvocation`
-    /// carries no `scope` field at all, so this path can't be reached via
-    /// the intended entry points).
+    /// Issue #40, generalized by issue #73's trio-unification follow-up:
+    /// `run_gated_step` must refuse a `Correctif` scope for any step but
+    /// `step_index == 1` -- defense in depth against a future caller
+    /// constructing a `GatedStepInvocation` directly with a mismatched
+    /// index/scope pair.
     #[tokio::test]
-    async fn run_finding_agent_rejects_a_correctif_scope_for_the_tester_role() {
+    async fn run_gated_step_rejects_a_correctif_scope_for_a_non_first_gated_step() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
             finding_agent_test_fixture().await;
 
@@ -758,6 +712,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -772,9 +728,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -783,21 +743,24 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
+        let tester_role = tester_role();
         let result = orchestrator
-            .run_finding_agent(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                FindingAgentInvocation {
+                GatedStepInvocation {
                     run_id: "bad-scope-run",
                     cycle_id: "bad-scope-cycle",
                     cycle_number: 1,
-                    role: AgentRole::Tester,
-                    agent: &agents.tester,
+                    step_index: 2,
+                    role: &tester_role,
+                    agent: &agents.steps[2],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Correctif,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -815,13 +778,14 @@ mod tests {
         );
     }
 
-    /// Issue #40 (ADR-0003 amendment): reviewer and tester must now run
+    /// Issue #40 (ADR-0003 amendment), generalized by issue #73's trio-
+    /// unification follow-up: reviewer and tester must now run
     /// **sequentially** -- the opposite of what this test asserted before
     /// the removed `run_review_and_test`'s `tokio::join!` path. Regression
     /// coverage for "no one quietly reintroduces `tokio::join!`/`try_join!`
-    /// here": `run_review` immediately followed by `run_test`, each backed
-    /// by a sleepy agent, must together take at least as long as both
-    /// sleeps combined, not just the slower one.
+    /// here": one `run_gated_step` call immediately followed by another,
+    /// each backed by a sleepy agent, must together take at least as long as
+    /// both sleeps combined, not just the slower one.
     ///
     /// Deliberately not a fixed wall-clock threshold (e.g. `elapsed >
     /// 1.9 * SLEEP`): under cargo's default parallel test harness, `git
@@ -853,9 +817,13 @@ mod tests {
             intent: "timing check".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(sleepy_agent.clone()),
-            tester_agent: definition(sleepy_agent),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(sleepy_agent.clone()),
+                definition(sleepy_agent),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -874,6 +842,8 @@ mod tests {
             "timing check",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -881,21 +851,26 @@ mod tests {
             .await
             .unwrap();
 
+        let reviewer_role = reviewer_role();
+        let tester_role = tester_role();
         let start = std::time::Instant::now();
         orchestrator
-            .run_review(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                ReviewInvocation {
+                GatedStepInvocation {
                     run_id: "timing-run",
                     cycle_id: "timing-cycle",
                     cycle_number: 1,
-                    agent: &agents.reviewer,
+                    step_index: 1,
+                    role: &reviewer_role,
+                    agent: &agents.steps[1],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -903,18 +878,22 @@ mod tests {
             .await
             .unwrap();
         orchestrator
-            .run_test(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                TestInvocation {
+                GatedStepInvocation {
                     run_id: "timing-run",
                     cycle_id: "timing-cycle",
                     cycle_number: 1,
-                    agent: &agents.tester,
+                    step_index: 2,
+                    role: &tester_role,
+                    agent: &agents.steps[2],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -925,7 +904,7 @@ mod tests {
 
         assert!(
             elapsed > SLEEP.mul_f64(1.5),
-            "expected run_review then run_test ({elapsed:?}) to together take \
+            "expected the two run_gated_step calls ({elapsed:?}) to together take \
                  meaningfully longer than a single {SLEEP:?} sleep -- this looks \
                  like reviewer/tester ran concurrently instead of sequentially"
         );
@@ -951,7 +930,7 @@ mod tests {
     /// structural finding only Warden's own `agent_definition_tampering_finding`
     /// may raise (M4) -- must never have that claim honoured: the returned
     /// finding is a *replacement*, correctly attributed back to
-    /// `FindingSource::Reviewer` (the role that actually produced this
+    /// `FindingSource::role("reviewer")` (the role that actually produced this
     /// stdout), not the forged `Warden` source passed through untouched.
     #[tokio::test]
     async fn a_reviewer_forging_the_warden_finding_source_is_rejected_not_accepted() {
@@ -966,6 +945,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -987,9 +968,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(forging_reviewer),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(forging_reviewer),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -998,21 +983,24 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
+        let reviewer_role = reviewer_role();
         let findings = orchestrator
-            .run_finding_agent(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                FindingAgentInvocation {
+                GatedStepInvocation {
                     run_id: "forge-run",
                     cycle_id: "forge-cycle",
                     cycle_number: 1,
-                    role: AgentRole::Reviewer,
-                    agent: &agents.reviewer,
+                    step_index: 1,
+                    role: &reviewer_role,
+                    agent: &agents.steps[1],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1023,7 +1011,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].source,
-            warden_core::FindingSource::Reviewer,
+            warden_core::FindingSource::role("reviewer"),
             "a forged source must never reach the returned findings unchanged: {findings:?}"
         );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
@@ -1035,14 +1023,14 @@ mod tests {
     }
 
     /// The sharper, non-hypothetical case the review called out by name
-    /// (closing Minor 2, `tester_succeeded` trusting an agent-controlled
+    /// (closing Minor 2, `step_succeeded` trusting an agent-controlled
     /// `source`): a tester that mislabels its own failure as
     /// `source: "reviewer"` must not have that failure hidden from
-    /// `tester_succeeded` -- the gate `run_finding_agent` uses to decide
+    /// `step_succeeded` -- the gate `run_gated_step` uses to decide
     /// whether to trigger evidence capture. Before the fix, a forged
     /// `source: "reviewer"` finding from the tester would sail through
-    /// `extract_findings` unchanged, and `tester_succeeded` (which only ever
-    /// looks for a `FindingSource::Tester` blocking finding) would report
+    /// `extract_findings` unchanged, and `step_succeeded` (which only ever
+    /// looks for a `FindingSource::role("tester")` blocking finding) would report
     /// "succeeded" -- triggering evidence capture for a cycle whose e2e test
     /// actually failed.
     #[tokio::test]
@@ -1059,6 +1047,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1080,9 +1070,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(self_mislabelling_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(always_passing_tester()),
+                definition(self_mislabelling_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1091,21 +1085,24 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
+        let tester_role = tester_role();
         let findings = orchestrator
-            .run_finding_agent(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                FindingAgentInvocation {
+                GatedStepInvocation {
                     run_id: "mislabel-run",
                     cycle_id: "mislabel-cycle",
                     cycle_number: 1,
-                    role: AgentRole::Tester,
-                    agent: &agents.tester,
+                    step_index: 2,
+                    role: &tester_role,
+                    agent: &agents.steps[2],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1116,35 +1113,33 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].source,
-            warden_core::FindingSource::Tester,
+            warden_core::FindingSource::role("tester"),
             "the tester's own mislabelled finding must be re-attributed to Tester, not left as \
                  the forged Reviewer source: {findings:?}"
         );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
         assert!(
-            !tester_succeeded(&findings),
+            !step_succeeded(&tester_role, &findings),
             "Minor 2: a tester that mislabels its own failure must still be seen as failed by \
-                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+                 step_succeeded, the gate that decides whether to trigger evidence capture"
         );
     }
 
     /// Issue #71 review (HIGH), tester side: the exit-code guard added to
-    /// `run_finding_agent` closes the fail-open "for every `--tool` adapter
-    /// at once, not just mistral" (see this fix's own commit message) --
-    /// this repo's only other regression coverage for that guard
+    /// `run_gated_step` closes the fail-open "for every `--tool` adapter at
+    /// once, not just mistral" (see this fix's own commit message) -- this
+    /// repo's only other regression coverage for that guard
     /// (`e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges`,
     /// `crates/warden/tests/cli.rs`) drives it exclusively through the
-    /// **reviewer** role. Since `run_review`/`run_test` share the exact same
-    /// `run_finding_agent` body, the guard is structurally the same code
-    /// path for both -- but that's an implementation detail a future
+    /// **reviewer** role. Since every gated step shares the exact same
+    /// `run_gated_step` body now, the guard is structurally the same code
+    /// path for all of them -- but that's an implementation detail a future
     /// refactor could break without any test failing today. This exercises
-    /// the **tester** side directly, through `run_test` (the same entry
-    /// point `Orchestrator::run_convergence_loop` itself calls), with a
-    /// tester that exits non-zero and prints nothing to stdout: it must
-    /// come back as a synthesized blocking `Tester` finding naming the exit
-    /// status, never as "zero findings" (which `tester_succeeded` would
-    /// otherwise read as a passing test suite and wrongly trigger evidence
-    /// capture for).
+    /// the **tester** side directly, with a tester that exits non-zero and
+    /// prints nothing to stdout: it must come back as a synthesized blocking
+    /// `Tester` finding naming the exit status, never as "zero findings"
+    /// (which `step_succeeded` would otherwise read as a passing test
+    /// suite and wrongly trigger evidence capture for).
     #[tokio::test]
     async fn a_tester_that_exits_nonzero_with_no_output_synthesizes_a_blocking_finding_not_a_silent_pass(
     ) {
@@ -1159,6 +1154,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1174,9 +1171,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(crashing_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(always_passing_tester()),
+                definition(crashing_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1185,19 +1186,24 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
+        let tester_role = tester_role();
         let findings = orchestrator
-            .run_test(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                TestInvocation {
+                GatedStepInvocation {
                     run_id: "tester-crash-run",
                     cycle_id: "tester-crash-cycle",
                     cycle_number: 1,
-                    agent: &agents.tester,
+                    step_index: 2,
+                    role: &tester_role,
+                    agent: &agents.steps[2],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
+                    scope: warden_core::ReviewScope::Full,
+                    captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1211,7 +1217,10 @@ mod tests {
             "a crashing tester must synthesize exactly one blocking finding, not be silently \
                  read as zero findings: {findings:?}"
         );
-        assert_eq!(findings[0].source, warden_core::FindingSource::Tester);
+        assert_eq!(
+            findings[0].source,
+            warden_core::FindingSource::role("tester")
+        );
         assert_eq!(findings[0].severity, warden_core::Severity::Blocking);
         assert!(
             findings[0].description.contains("exited with status 7"),
@@ -1219,9 +1228,9 @@ mod tests {
             findings[0].description
         );
         assert!(
-            !tester_succeeded(&findings),
+            !step_succeeded(&tester_role, &findings),
             "a tester that crashed non-zero must never be read as a passing test suite by \
-                 tester_succeeded, the gate that decides whether to trigger evidence capture"
+                 step_succeeded, the gate that decides whether to trigger evidence capture"
         );
     }
 
@@ -1241,6 +1250,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -1262,9 +1273,13 @@ mod tests {
             intent: "intent".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("sh", ["-c", "true"])),
-            reviewer_agent: definition(honest_reviewer),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("sh", ["-c", "true"])),
+                definition(honest_reviewer),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1273,21 +1288,24 @@ mod tests {
         let agents = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
         let orchestrator = Orchestrator::new(pool.clone());
 
+        let reviewer_role = reviewer_role();
         let findings = orchestrator
-            .run_finding_agent(
+            .run_gated_step(
                 &FakeCommandAdapter,
-                FindingAgentInvocation {
+                GatedStepInvocation {
                     run_id: "legit-run",
                     cycle_id: "legit-cycle",
                     cycle_number: 1,
-                    role: AgentRole::Reviewer,
-                    agent: &agents.reviewer,
+                    step_index: 1,
+                    role: &reviewer_role,
+                    agent: &agents.steps[1],
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
                 },
@@ -1298,7 +1316,7 @@ mod tests {
         assert_eq!(
             findings,
             vec![Finding {
-                source: warden_core::FindingSource::Reviewer,
+                source: warden_core::FindingSource::role("reviewer"),
                 severity: warden_core::Severity::Warning,
                 file: Some("src/lib.rs".to_string()),
                 description: "looks mostly fine".to_string(),

@@ -1,0 +1,898 @@
+//! Issue #73: the user-definable pipeline. Before this, the pipeline was
+//! wired directly into code -- a closed `AgentRole { Coder, Reviewer, Tester }`
+//! (`crate::state::AgentRole`) and a hardcoded coder -> gate review -> gate
+//! test sequence (`warden::orchestrator`). [`Workflow`] moves that sequence
+//! from code to **data** a user can define in `.warden/workflow.yaml`:
+//!
+//! ```yaml
+//! name: default
+//! steps:
+//!   - role: coder
+//!     agent: coder
+//!   - role: reviewer
+//!     agent: code-reviewer
+//!     gate: loop-until-clean
+//!     budget: review
+//!   - role: tester
+//!     agent: test-runner
+//!     gate: loop-until-clean
+//!     budget: test
+//!     evidence: true
+//! ```
+//!
+//! [`Workflow::builtin_default`] is exactly this shape -- what a run uses
+//! when no `.warden/workflow.yaml` exists at all, so the **absence** of a
+//! workflow file reproduces today's pipeline exactly (strict retro-compat,
+//! the acceptance criterion issue #73 calls out as the most important one).
+//!
+//! Deliberately linear (issue #73 "out of scope"): a [`Workflow`] is a plain
+//! ordered list of [`WorkflowStep`]s, each an open, named [`Role`] resolved
+//! to an agent, with an optional [`Gate`]. No DAG, no conditional branches,
+//! no parallel steps -- every step but the first (the "producer", coder-like
+//! role that has no gate of its own) may loop back to the first step when its
+//! own gate finds a blocking problem, exactly like the reviewer/tester
+//! already did. [`Gate`] is deliberately a small, explicit enum rather than a
+//! free-form string precisely so it stays *extensible* without a schema
+//! change: adding a new gate kind later is a new variant plus two match arms
+//! here, never a change to this module's shape.
+//!
+//! Pure/parsing shape only, mirroring every other user-facing file this
+//! crate parses (`agent_def`, `ci_channel`, `evidence_wire`): reading
+//! `.warden/workflow.yaml` off disk lives in `warden::agent_def` (I/O), this
+//! module only knows the schema and its invariants.
+
+use serde::Deserialize;
+
+use crate::error::{CoreError, Result};
+
+/// A step's name in the pipeline (`steps[].role` in `workflow.yaml`) --
+/// open, unlike the closed `AgentRole` the built-in coder/reviewer/tester
+/// path still uses internally (see this module's own docs and
+/// `crate::state::AgentRole`'s). Any non-blank string is a legal role name:
+/// `"coder"`/`"reviewer"`/`"tester"` are not special-cased by this type at
+/// all -- they're just the names the *built-in* default workflow happens to
+/// use. A custom workflow can name a step anything (`"techlead"`, `"docs"`,
+/// ...); [`crate::FindingSource::role`] and [`crate::decide_next_state_for_step`]
+/// key off exactly this string, so a custom role's findings aggregate in the
+/// convergence loop the same way a reviewer's or tester's already do.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Role(String);
+
+impl Role {
+    /// Rejects a blank (empty or all-whitespace) name -- a step with no real
+    /// name can never be meaningfully compared against a
+    /// [`crate::FindingSource`], so this is validated once, at construction,
+    /// rather than left for every later comparison to silently no-op
+    /// against.
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(CoreError::InvalidWorkflow(
+                "a step's role must not be blank".to_string(),
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How a step's findings gate the pipeline. Deliberately a closed enum, not
+/// a free-form string: an unknown gate name in `workflow.yaml` must be a
+/// clear parse error naming the bad value, never silently treated as one of
+/// the two known kinds. Extensible in principle (issue #73: "conçu pour
+/// être extensible") -- a future kind is a new variant plus two match arms
+/// here (`as_str`/`parse`), not a change to [`WorkflowStep`]'s shape or to
+/// any caller's signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// No gate at all: the step runs once per cycle and never reboucles the
+    /// pipeline back to the first step, whatever it reports. This is the
+    /// first step's own implicit gate (see [`Workflow::validate`]) -- a
+    /// producer step (the coder-equivalent) has nothing to gate *on* yet,
+    /// since it hasn't produced this cycle's work until it runs.
+    PassThrough,
+    /// The step's findings gate the pipeline exactly like the reviewer/
+    /// tester already do: a blocking finding attributed to this step's own
+    /// role reboucles the whole pipeline back to the first step (within this
+    /// step's own cycle budget), instead of letting the pipeline advance.
+    LoopUntilClean,
+}
+
+impl Gate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gate::PassThrough => "pass-through",
+            Gate::LoopUntilClean => "loop-until-clean",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "pass-through" => Ok(Gate::PassThrough),
+            "loop-until-clean" => Ok(Gate::LoopUntilClean),
+            other => Err(CoreError::InvalidWorkflow(format!(
+                "unknown gate {other:?} (expected \"loop-until-clean\", or omit the key for a \
+                 plain pass-through)"
+            ))),
+        }
+    }
+}
+
+/// Which run-level cycle budget a gated step's blocking findings are
+/// charged against, and how (issue #73 review, finding F3). Before this,
+/// the budget rule followed a step's *position* (`workflow.steps[1]` always
+/// got `max_review_cycles`, `steps[2]` always got `max_test_cycles`) -- but
+/// steps can now be reordered, so a swapped built-in pair would silently
+/// apply the wrong rule to each. This is [`WorkflowStep`]'s own declared
+/// property instead: whichever step claims [`StepBudget::Review`] gets the
+/// review rule, wherever it sits in the pipeline.
+///
+/// `None` only ever applies to `steps[0]` (the producer, which has no gate
+/// and so nothing to charge a budget against) -- every other step always
+/// carries `Some` (defaulted to [`StepBudget::Extra`] when
+/// `workflow.yaml` omits the key, see [`Workflow::parse_yaml`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepBudget {
+    /// `max_review_cycles` -- charged only when *this* step's own
+    /// evaluation is blocking (decision #37 Q1's imputation rule): a cycle
+    /// whose first pass over the work is clean never advances this
+    /// counter, however many cycles a *different* step's own blocking
+    /// finding costs.
+    Review,
+    /// `max_test_cycles` -- charged unconditionally, once per invocation
+    /// (this step runs, and its counter advances, every time the pipeline
+    /// reaches it).
+    Test,
+    /// `max_extra_step_cycles` -- the single budget shared by every step
+    /// that isn't `Review` or `Test`, charged once per cycle the first time
+    /// any such step is entered (never once per individual extra step).
+    Extra,
+}
+
+impl StepBudget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepBudget::Review => "review",
+            StepBudget::Test => "test",
+            StepBudget::Extra => "extra",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "review" => Ok(StepBudget::Review),
+            "test" => Ok(StepBudget::Test),
+            "extra" => Ok(StepBudget::Extra),
+            other => Err(CoreError::InvalidWorkflow(format!(
+                "unknown budget {other:?} (expected \"review\", \"test\", \"extra\", or omit the \
+                 key for \"extra\")"
+            ))),
+        }
+    }
+}
+
+/// One step of a [`Workflow`]: a [`Role`] resolved to an `agent` (a name
+/// `warden::agent_def` resolves onto a markdown agent definition, ADR-0013 --
+/// e.g. `.claude/agents/<agent>.md` for a role beyond the built-in three),
+/// gated by an optional [`Gate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub role: Role,
+    /// The agent definition name this step resolves to -- not necessarily
+    /// the same string as `role` (`workflow.yaml`'s own example: `role:
+    /// reviewer` / `agent: code-reviewer`), since a workflow may want two
+    /// steps sharing a role's *function* to still be told apart by name, or
+    /// simply prefer a differently-named agent file for a role.
+    pub agent: String,
+    pub gate: Gate,
+    /// See [`StepBudget`]'s own docs -- `None` only for `steps[0]`.
+    pub budget: Option<StepBudget>,
+    /// Issue #73 review, finding F2: whether this step's successful,
+    /// clean run triggers ADR-0009 evidence capture. Before this, capture
+    /// fired whenever `role.as_str() == "tester"` -- a custom workflow that
+    /// renamed its test step lost evidence capture silently. Declared here
+    /// instead, so the property is explicit in `workflow.yaml` (or in
+    /// [`Workflow::builtin_default`]'s literal) rather than inferred from a
+    /// name. Only one step may set this per workflow (see
+    /// [`Workflow::parse_yaml`]).
+    pub captures_evidence: bool,
+}
+
+/// A user-definable pipeline (issue #73): an ordered, non-empty list of
+/// [`WorkflowStep`]s. `steps[0]` is always the **producer** -- the
+/// coder-equivalent role that does this cycle's actual work -- and every
+/// later step gates on that cycle's work, looping back to `steps[0]` on a
+/// blocking finding attributed to its own role (see
+/// [`crate::decide_next_state_for_step`]). Deliberately linear: no DAG, no
+/// conditional branching, no parallel steps (issue #73 "out of scope").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workflow {
+    pub name: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+/// Wire shape of one `workflow.yaml` step -- `gate` absent means "plain
+/// pass-through" (never "reject", never "assume loop-until-clean": an
+/// omitted key and a wrong one must not be conflated, see [`Gate::parse`]).
+/// `budget` absent means [`StepBudget::Extra`] (see [`Workflow::parse_yaml`]);
+/// `evidence` absent means `false`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowStepWire {
+    role: String,
+    agent: String,
+    gate: Option<String>,
+    budget: Option<String>,
+    #[serde(default)]
+    evidence: bool,
+}
+
+/// Wire shape of `.warden/workflow.yaml` itself.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowWire {
+    name: String,
+    steps: Vec<WorkflowStepWire>,
+}
+
+/// Issue #73 review (LOW security, path traversal): a step's `role`/`agent`
+/// value ends up embedded, verbatim, in a filesystem path built by an I/O
+/// caller downstream -- `agent` in
+/// `warden::agent_def::resolve_custom_step_agent_definition`'s
+/// `.claude/agents/<agent>.md` join, `role` in
+/// `warden::worktree::WorktreeManager::create`'s per-role worktree
+/// directory name. Neither caller re-validates it (this is the one place
+/// every step is already validated), so a value containing a path
+/// separator (`/` or `\`) or a `..` component is rejected right here, at the
+/// boundary, rather than trusted through to those two path joins.
+fn reject_path_like_value(step_index: usize, field: &'static str, value: &str) -> Result<()> {
+    let has_separator = value.contains('/') || value.contains('\\');
+    let has_dotdot_component = value.split(['/', '\\']).any(|part| part == "..");
+    if has_separator || has_dotdot_component {
+        return Err(CoreError::InvalidWorkflow(format!(
+            "step {step_index}: {field} {value:?} must not contain a path separator (\"/\" or \
+             \"\\\") or a \"..\" component"
+        )));
+    }
+    Ok(())
+}
+
+impl Workflow {
+    /// The pipeline every run drives when no `.warden/workflow.yaml` exists
+    /// at all -- the exact shape `workflow.yaml`'s own doc-comment example
+    /// carries, and the one this crate's tests pin against the pre-issue-#73
+    /// pipeline (coder -> gate review -> gate test): this is issue #73's
+    /// central retro-compat guarantee, made an explicit, testable value
+    /// rather than an implicit "well, the code just happens to still do
+    /// that" claim.
+    pub fn builtin_default() -> Self {
+        // Constructed from already-valid literals -- `expect` here is an
+        // invariant on this crate's own hardcoded default, never on
+        // user-controlled input (`parse_yaml`'s job).
+        Self {
+            name: "default".to_string(),
+            steps: vec![
+                WorkflowStep {
+                    role: Role::new("coder").expect("literal role name is never blank"),
+                    agent: "coder".to_string(),
+                    gate: Gate::PassThrough,
+                    budget: None,
+                    captures_evidence: false,
+                },
+                WorkflowStep {
+                    role: Role::new("reviewer").expect("literal role name is never blank"),
+                    agent: "code-reviewer".to_string(),
+                    gate: Gate::LoopUntilClean,
+                    budget: Some(StepBudget::Review),
+                    captures_evidence: false,
+                },
+                WorkflowStep {
+                    role: Role::new("tester").expect("literal role name is never blank"),
+                    agent: "test-runner".to_string(),
+                    gate: Gate::LoopUntilClean,
+                    budget: Some(StepBudget::Test),
+                    captures_evidence: true,
+                },
+            ],
+        }
+    }
+
+    /// Parses and validates a `.warden/workflow.yaml` document. Every
+    /// failure is a [`CoreError::InvalidWorkflow`] naming *what* is wrong
+    /// (malformed YAML, an unknown key, a blank role/agent, a duplicate
+    /// role, an unknown gate, a first step that isn't a plain
+    /// pass-through) -- the caller (`warden::agent_def`, which reads the
+    /// file) names *which file*, never silently falling back to
+    /// [`Self::builtin_default`] on a parse failure (code-standards.md: no
+    /// silent fallback -- a malformed workflow file must fail the run, not
+    /// quietly run the default pipeline instead).
+    pub fn parse_yaml(raw: &str) -> Result<Self> {
+        let wire: WorkflowWire = serde_yaml::from_str(raw)
+            .map_err(|error| CoreError::InvalidWorkflow(format!("invalid YAML: {error}")))?;
+
+        if wire.name.trim().is_empty() {
+            return Err(CoreError::InvalidWorkflow(
+                "workflow name must not be blank".to_string(),
+            ));
+        }
+        if wire.steps.is_empty() {
+            return Err(CoreError::InvalidWorkflow(
+                "workflow must declare at least one step".to_string(),
+            ));
+        }
+
+        let mut steps = Vec::with_capacity(wire.steps.len());
+        let mut seen_roles = std::collections::HashSet::new();
+        // Issue #73 review F3: at most one step may claim each of `Review`/
+        // `Test` -- two steps sharing the same budget counter would silently
+        // conflate two independent cycle counts. `Extra` is deliberately
+        // exempt: it's the *shared* bucket every non-review/test step already
+        // pools into.
+        let mut review_budget_step: Option<usize> = None;
+        let mut test_budget_step: Option<usize> = None;
+        // Issue #73 review F2: at most one step may capture evidence -- ADR-
+        // 0009's evidence is one artifact per converged run, not per step.
+        let mut evidence_capture_step: Option<usize> = None;
+        for (index, step) in wire.steps.into_iter().enumerate() {
+            reject_path_like_value(index, "role", &step.role)?;
+            if crate::convergence::FindingSource::RESERVED_ROLE_NAMES.contains(&step.role.as_str())
+            {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "step {index}: role {:?} is reserved (findings from a \"ci\" or \"warden\" \
+                     step could never be told apart from `FindingSource::Ci`/`FindingSource::Warden`, \
+                     which are not role findings) -- pick a different role name",
+                    step.role
+                )));
+            }
+            let role = Role::new(step.role)
+                .map_err(|error| CoreError::InvalidWorkflow(format!("step {index}: {error}")))?;
+            if step.agent.trim().is_empty() {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "step {index} (role {role:?}): agent must not be blank"
+                )));
+            }
+            reject_path_like_value(index, "agent", &step.agent)?;
+            if !seen_roles.insert(role.as_str().to_string()) {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "duplicate role {role:?} at step {index} -- every step must have a unique role"
+                )));
+            }
+            let gate = match step.gate {
+                Some(raw_gate) => Gate::parse(&raw_gate).map_err(|_| {
+                    CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}): unknown gate {raw_gate:?} (expected \
+                         \"loop-until-clean\", or omit the key for a plain pass-through)"
+                    ))
+                })?,
+                None => Gate::PassThrough,
+            };
+            if index == 0 && gate != Gate::PassThrough {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "the first step (role {role:?}) is the pipeline's producer and must be a \
+                     plain pass-through (no \"gate\" key) -- only later steps may gate the \
+                     pipeline"
+                )));
+            }
+
+            if index == 0 && step.evidence {
+                return Err(CoreError::InvalidWorkflow(format!(
+                    "the first step (role {role:?}) is the pipeline's producer and cannot \
+                     capture evidence -- remove its \"evidence\" key"
+                )));
+            }
+
+            let budget = if index == 0 {
+                if step.budget.is_some() {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "the first step (role {role:?}) is the pipeline's producer and has no \
+                         cycle budget of its own -- remove its \"budget\" key"
+                    )));
+                }
+                None
+            } else {
+                let budget = match &step.budget {
+                    Some(raw_budget) => StepBudget::parse(raw_budget).map_err(|_| {
+                        CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): unknown budget {raw_budget:?} \
+                             (expected \"review\", \"test\", \"extra\", or omit the key for \
+                             \"extra\")"
+                        ))
+                    })?,
+                    None => StepBudget::Extra,
+                };
+                let duplicate_of = match budget {
+                    StepBudget::Review => &mut review_budget_step,
+                    StepBudget::Test => &mut test_budget_step,
+                    // `Extra` is the shared bucket -- no single-claimant
+                    // invariant applies, so there's nothing to check.
+                    StepBudget::Extra => &mut None,
+                };
+                if let Some(prior_index) = *duplicate_of {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}) claims budget \"{}\", already claimed by \
+                         step {prior_index} -- only one step may claim each of \"review\"/\"test\"",
+                        budget.as_str()
+                    )));
+                }
+                *duplicate_of = Some(index);
+                Some(budget)
+            };
+
+            if step.evidence {
+                if let Some(prior_index) = evidence_capture_step {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}) sets \"evidence: true\", already set by \
+                         step {prior_index} -- only one step may capture evidence"
+                    )));
+                }
+                evidence_capture_step = Some(index);
+            }
+
+            steps.push(WorkflowStep {
+                role,
+                agent: step.agent,
+                gate,
+                budget,
+                captures_evidence: step.evidence,
+            });
+        }
+
+        Ok(Self {
+            name: wire.name,
+            steps,
+        })
+    }
+
+    /// The step this pipeline reboucles to when a later step's gate finds a
+    /// blocking problem -- always the first one (issue #73: linear sequence,
+    /// no DAG). Named rather than every caller writing `steps[0]` directly,
+    /// so the "reboucle target is always the producer" invariant has exactly
+    /// one place it's stated.
+    pub fn producer_role(&self) -> &Role {
+        &self.steps[0].role
+    }
+
+    /// `true` when `step_index` is this workflow's last step -- the point at
+    /// which a clean gate converges the run instead of advancing to the next
+    /// step (see [`crate::decide_next_state_for_step`]).
+    pub fn is_last_step(&self, step_index: u32) -> bool {
+        step_index as usize == self.steps.len() - 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT_YAML: &str = r#"
+name: default
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+    budget: test
+    evidence: true
+"#;
+
+    #[test]
+    fn parsing_the_documented_default_shape_matches_builtin_default() {
+        assert_eq!(
+            Workflow::parse_yaml(DEFAULT_YAML).unwrap(),
+            Workflow::builtin_default()
+        );
+    }
+
+    #[test]
+    fn builtin_default_has_the_pre_issue_73_three_step_shape() {
+        let workflow = Workflow::builtin_default();
+        assert_eq!(workflow.steps.len(), 3);
+        assert_eq!(workflow.steps[0].role.as_str(), "coder");
+        assert_eq!(workflow.steps[0].gate, Gate::PassThrough);
+        assert_eq!(workflow.steps[0].budget, None);
+        assert!(!workflow.steps[0].captures_evidence);
+        assert_eq!(workflow.steps[1].role.as_str(), "reviewer");
+        assert_eq!(workflow.steps[1].gate, Gate::LoopUntilClean);
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Review));
+        assert!(!workflow.steps[1].captures_evidence);
+        assert_eq!(workflow.steps[2].role.as_str(), "tester");
+        assert_eq!(workflow.steps[2].gate, Gate::LoopUntilClean);
+        assert_eq!(workflow.steps[2].budget, Some(StepBudget::Test));
+        assert!(workflow.steps[2].captures_evidence);
+    }
+
+    #[test]
+    fn a_custom_workflow_can_append_a_new_role_after_the_default_pipeline() {
+        let yaml = r#"
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps.len(), 4);
+        assert_eq!(workflow.steps[3].role.as_str(), "techlead");
+        assert_eq!(workflow.steps[3].gate, Gate::LoopUntilClean);
+        assert!(workflow.is_last_step(3));
+        assert!(!workflow.is_last_step(1));
+    }
+
+    #[test]
+    fn a_step_with_no_gate_key_defaults_to_pass_through() {
+        let yaml = r#"
+name: minimal
+steps:
+  - role: coder
+    agent: coder
+  - role: notifier
+    agent: notifier
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].gate, Gate::PassThrough);
+    }
+
+    #[test]
+    fn rejects_malformed_yaml() {
+        assert!(matches!(
+            Workflow::parse_yaml("not: valid: yaml: at: all: ["),
+            Err(CoreError::InvalidWorkflow(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unknown_top_level_key() {
+        let yaml = "name: x\nsteps: []\nextra: true\n";
+        assert!(matches!(
+            Workflow::parse_yaml(yaml),
+            Err(CoreError::InvalidWorkflow(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_empty_steps_list() {
+        let yaml = "name: empty\nsteps: []\n";
+        assert!(matches!(
+            Workflow::parse_yaml(yaml),
+            Err(CoreError::InvalidWorkflow(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_blank_role() {
+        let yaml = "name: x\nsteps:\n  - role: \"  \"\n    agent: coder\n";
+        assert!(matches!(
+            Workflow::parse_yaml(yaml),
+            Err(CoreError::InvalidWorkflow(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_blank_agent() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: \"  \"\n";
+        assert!(matches!(
+            Workflow::parse_yaml(yaml),
+            Err(CoreError::InvalidWorkflow(_))
+        ));
+    }
+
+    /// Issue #73 review (LOW security): `agent` ends up joined verbatim into
+    /// `.claude/agents/<agent>.md` (`warden::agent_def::resolve_custom_step_agent_definition`)
+    /// -- a relative path-traversal component must never reach that join.
+    #[test]
+    fn rejects_an_agent_name_containing_a_path_traversal_component() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: ../../../etc/os-release
+    gate: loop-until-clean
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// An absolute path is rejected too -- it contains a leading `/`, caught
+    /// by the same separator check regardless of whether it also has a
+    /// `..` component.
+    #[test]
+    fn rejects_an_agent_name_that_is_an_absolute_path() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: /etc/passwd\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// A backslash-separated traversal must be rejected identically -- the
+    /// check must not only recognize the Unix separator.
+    #[test]
+    fn rejects_an_agent_name_containing_a_backslash_path_traversal_component() {
+        let yaml = r#"name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: "..\\..\\windows\\system32\\drivers\\etc\\hosts"
+    gate: loop-until-clean
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+    }
+
+    /// `role` is checked too -- it flows into
+    /// `warden::worktree::WorktreeManager::create`'s per-role worktree
+    /// directory name, a second path-building call site besides `agent`.
+    #[test]
+    fn rejects_a_role_name_containing_a_path_traversal_component() {
+        let yaml = "name: x\nsteps:\n  - role: ../coder\n    agent: coder\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("path separator"), "{error}");
+    }
+
+    /// A bare `..` with no separator at all must still be rejected -- the
+    /// whole value, not just a `/../` pattern, is a traversal component.
+    #[test]
+    fn rejects_a_bare_dot_dot_agent_name_with_no_separator() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: \"..\"\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains(".."), "{error}");
+    }
+
+    /// The legitimate control: ordinary hyphenated names (used throughout
+    /// this module's own other tests) must never trip this check.
+    #[test]
+    fn accepts_ordinary_hyphenated_role_and_agent_names() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+  - role: techlead
+    agent: tech-lead-v2
+    gate: loop-until-clean
+"#;
+        assert!(Workflow::parse_yaml(yaml).is_ok());
+    }
+
+    /// Review F1: `role: warden`/`role: ci` would break the finding
+    /// round-trip (`FindingSource::Warden`/`Ci` vs `FindingSource::Role`),
+    /// so both reserved words must be rejected at parse time, not left to
+    /// fail obscurely at run time via `validate_finding_sources_for_role`.
+    #[test]
+    fn rejects_a_reserved_role_name() {
+        for reserved in crate::convergence::FindingSource::RESERVED_ROLE_NAMES {
+            let yaml = format!(
+                "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: {reserved}\n    \
+                 agent: {reserved}\n    gate: loop-until-clean\n"
+            );
+            let error = Workflow::parse_yaml(&yaml).unwrap_err();
+            assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+            assert!(error.to_string().contains("reserved"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_duplicate_role() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: coder
+    agent: another-coder
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("duplicate role"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_gate() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: whenever-it-feels-like-it
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("unknown gate"));
+    }
+
+    #[test]
+    fn rejects_a_first_step_that_declares_a_gate() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+    gate: loop-until-clean
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"));
+    }
+
+    #[test]
+    fn gate_round_trips_through_its_string_form() {
+        for gate in [Gate::PassThrough, Gate::LoopUntilClean] {
+            assert_eq!(Gate::parse(gate.as_str()).unwrap(), gate);
+        }
+        assert!(Gate::parse("ghost").is_err());
+    }
+
+    #[test]
+    fn role_rejects_a_blank_name() {
+        assert!(Role::new("").is_err());
+        assert!(Role::new("   ").is_err());
+        assert!(Role::new("techlead").is_ok());
+    }
+
+    #[test]
+    fn producer_role_is_always_the_first_step() {
+        let workflow = Workflow::builtin_default();
+        assert_eq!(workflow.producer_role().as_str(), "coder");
+    }
+
+    /// Issue #73 review, F3: a gated step that omits `budget` altogether
+    /// falls into the shared "extra" bucket -- exactly the pre-fix behaviour
+    /// for any step beyond the built-in reviewer/tester pair.
+    #[test]
+    fn a_gated_step_with_no_budget_key_defaults_to_extra() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Extra));
+    }
+
+    /// The producer has no gate and no budget of its own -- declaring one
+    /// is rejected exactly like declaring a gate on it already was.
+    #[test]
+    fn rejects_a_budget_declared_on_the_first_step() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    budget: extra\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
+    }
+
+    /// Review follow-up (MEDIUM introduced by F2): the producer never runs
+    /// through `run_gated_step` (the only place `captures_evidence` is ever
+    /// consulted), so `evidence: true` on the first step used to parse fine
+    /// and silently capture nothing -- a silent misconfiguration, and
+    /// asymmetric with the sibling `budget`-on-producer rejection above.
+    #[test]
+    fn rejects_an_evidence_flag_declared_on_the_first_step() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    evidence: true\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_unknown_budget() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
+                     agent: reviewer\n    gate: loop-until-clean\n    budget: whenever\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("unknown budget"), "{error}");
+    }
+
+    /// Issue #73 review, F3: two steps can't both claim `review` (or both
+    /// claim `test`) -- the counter each backs is a single run-level value,
+    /// so a second claimant would silently share it with the first.
+    #[test]
+    fn rejects_two_steps_claiming_the_same_review_or_test_budget() {
+        for budget in ["review", "test"] {
+            let yaml = format!(
+                "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: one\n    agent: \
+                 one\n    gate: loop-until-clean\n    budget: {budget}\n  - role: two\n    \
+                 agent: two\n    gate: loop-until-clean\n    budget: {budget}\n"
+            );
+            let error = Workflow::parse_yaml(&yaml).unwrap_err();
+            assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+            assert!(error.to_string().contains("already claimed"), "{error}");
+        }
+    }
+
+    /// Unlike `review`/`test`, `extra` is the shared bucket every non-
+    /// review/test step already pools into -- multiple steps claiming it
+    /// (or omitting `budget` altogether) is completely legal.
+    #[test]
+    fn multiple_steps_may_share_the_extra_budget() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    agent: one
+    gate: loop-until-clean
+    budget: extra
+  - role: two
+    agent: two
+    gate: loop-until-clean
+    budget: extra
+"#;
+        assert!(Workflow::parse_yaml(yaml).is_ok());
+    }
+
+    /// Issue #73 review, F2: evidence capture is a declared per-step
+    /// property, not inferred from a role literally named `"tester"` --
+    /// a custom step can opt in by name.
+    #[test]
+    fn a_step_can_declare_itself_as_the_evidence_capturing_step() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: qa
+    agent: qa
+    gate: loop-until-clean
+    evidence: true
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert!(workflow.steps[1].captures_evidence);
+    }
+
+    #[test]
+    fn rejects_two_steps_both_declaring_evidence_capture() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    agent: one
+    gate: loop-until-clean
+    evidence: true
+  - role: two
+    agent: two
+    gate: loop-until-clean
+    evidence: true
+"#;
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("already set"), "{error}");
+    }
+}

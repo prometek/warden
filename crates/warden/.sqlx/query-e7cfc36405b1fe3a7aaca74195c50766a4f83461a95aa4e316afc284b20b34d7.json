@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE runs SET current_extra_step_cycle = ?, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "e7cfc36405b1fe3a7aaca74195c50766a4f83461a95aa4e316afc284b20b34d7"
+}

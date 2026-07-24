@@ -1,6 +1,6 @@
-//! The sandboxed subprocess seam every coder/reviewer/tester invocation
-//! runs through: [`Orchestrator::run_agent`], its [`SandboxGuard`]
-//! create->destroy pairing (issue #50), and [`map_sandbox_error`].
+//! The sandboxed subprocess seam every workflow step's invocation runs
+//! through: [`Orchestrator::run_agent`], its [`SandboxGuard`] create->destroy
+//! pairing (issue #50), and [`map_sandbox_error`].
 
 use super::*;
 
@@ -33,15 +33,24 @@ impl Orchestrator {
     /// `repo_path` is the run's base repository; `run_worktrees_root` is
     /// this run's own `<warden_home>/worktrees/<run_id>`. Both are passed
     /// through to [`process::validate_agent_program`] (issue #26), the one
-    /// choke point every coder/reviewer/tester spawn goes through, so a
-    /// future `ToolAdapter` that names a repo-relative or in-worktree
-    /// `command.program` for the reviewer/tester is refused here, before the
+    /// choke point every workflow step's spawn goes through, so a future
+    /// `ToolAdapter` that names a repo-relative or in-worktree
+    /// `command.program` for a gated step is refused here, before the
     /// sandbox ever runs it.
+    ///
+    /// **Issue #73 (trio-unification follow-up)**: `role`/`is_producer`
+    /// replace the old `InvocationRole::Builtin`/`Custom` split -- every
+    /// step, built-in or custom, goes through this exact same body now,
+    /// including the `agent_processes` row and per-role token-usage
+    /// bookkeeping below (previously built-in-roles-only; see
+    /// [`recover_crashed_runs`](crate::orchestrator::recover_crashed_runs)'s
+    /// own docs on why no step's worktree leaks on crash anymore).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_agent<R: ToolAdapter>(
         &self,
         cycle_id: &str,
-        role: AgentRole,
+        role: &Role,
+        is_producer: bool,
         runner: &R,
         command: &AgentCommand,
         env_allowlist: &[&str],
@@ -52,7 +61,8 @@ impl Orchestrator {
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
         process::validate_agent_program(
-            role,
+            role.as_str(),
+            is_producer,
             &command.program,
             cwd,
             repo_path,
@@ -86,7 +96,7 @@ impl Orchestrator {
                 // `publish_progress_event`'s own docs).
                 let on_stdout_line = |line: &str| {
                     if let Some(detail) = runner.parse_progress_line(line) {
-                        self.publish_progress_event(role, detail);
+                        self.publish_progress_event(role.as_str(), detail);
                     }
                 };
                 let sandbox_command = warden_sandbox::Command {
@@ -116,13 +126,19 @@ impl Orchestrator {
                 let pid = execution.pid.ok_or_else(|| ProcessError::MissingPid {
                     command: command.program.clone(),
                 })?;
+                // Issue #73 (trio-unification follow-up): every step,
+                // built-in or custom, gets an `agent_processes` row now --
+                // `agent_processes.role` was already a plain, unconstrained
+                // TEXT column (migrations/0001_initial.sql); only the
+                // orchestrator used to gate this on `InvocationRole::Builtin`.
+                // This is what lets `recover_crashed_runs` detect a crash
+                // mid-invocation of *any* step, not just the built-in three.
                 let process_id = Uuid::new_v4().to_string();
-
                 db::insert_agent_process(
                     &self.pool,
                     &process_id,
                     cycle_id,
-                    role,
+                    role.as_str(),
                     pid,
                     &cwd.display().to_string(),
                 )
@@ -164,7 +180,14 @@ impl Orchestrator {
                     // this never fails an otherwise-successful invocation.
                     let usage = runner.extract_usage(&outcome.stdout);
                     if let Some(usage) = &usage {
-                        db::add_cycle_role_token_usage(&self.pool, cycle_id, role, usage).await?;
+                        // Issue #73 (trio-unification follow-up): the
+                        // per-cycle *per-role* breakdown is recorded for
+                        // every step now, not just the built-in three (see
+                        // `cycle_token_usage`, migrations/0010) -- the
+                        // run-level running total just below always
+                        // accumulated every role's usage regardless.
+                        db::add_cycle_role_token_usage(&self.pool, cycle_id, role.as_str(), usage)
+                            .await?;
                         // Only reachable with a run in progress (see
                         // `publish_event`'s own docs on why a missing
                         // `run_context` is a silent no-op here too): a test that
@@ -525,7 +548,7 @@ mod tests {
         run_id: &str,
         cycle_id: &str,
     ) -> Orchestrator {
-        db::insert_run(pool, run_id, "/tmp/repo", "main", "intent", 3, 3)
+        db::insert_run(pool, run_id, "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         db::insert_cycle(pool, cycle_id, run_id, 1).await.unwrap();
@@ -552,10 +575,12 @@ mod tests {
         )
         .await;
 
+        let coder_role = Role::new("coder").unwrap();
         let outcome = orchestrator
             .run_agent(
                 "sandbox-seam-cycle",
-                AgentRole::Coder,
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "echo hi"]),
                 &[],
@@ -571,6 +596,66 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert_eq!(outcome.stdout.trim(), "hi");
         assert_eq!(sandbox.calls(), vec!["create", "execute", "destroy"]);
+    }
+
+    /// Issue #73 (trio-unification follow-up): every step -- built-in or
+    /// custom -- goes through the exact same `validate_agent_program` call
+    /// now, keyed on `role.as_str()` directly rather than an
+    /// `AgentRole::Reviewer` stand-in rewritten after the fact. A custom
+    /// step's containment-check failure names its own real role from the
+    /// start.
+    #[tokio::test]
+    async fn a_custom_steps_containment_violation_names_its_own_real_role() {
+        let worktree = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let run_worktrees_root = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let sandbox = Arc::new(RecordingSandbox::new(false));
+
+        let orchestrator = orchestrator_with_sandbox_and_cycle(
+            &pool,
+            sandbox as Arc<dyn Sandbox>,
+            "sandbox-seam-custom-role-run",
+            "sandbox-seam-custom-role-cycle",
+        )
+        .await;
+
+        // Resolves inside `worktree` itself -- exactly the containment
+        // violation `process::validate_agent_program` refuses for any
+        // non-producer step.
+        let program_inside_worktree = worktree.path().join("evil.sh");
+        let techlead_role = Role::new("techlead").unwrap();
+
+        let error = orchestrator
+            .run_agent(
+                "sandbox-seam-custom-role-cycle",
+                &techlead_role,
+                false,
+                &FakeCommandAdapter,
+                &AgentCommand::new(
+                    program_inside_worktree.to_str().unwrap(),
+                    Vec::<String>::new(),
+                ),
+                &[],
+                worktree.path(),
+                repo.path(),
+                run_worktrees_root.path(),
+                "{}".to_string(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("techlead"),
+            "expected the real custom role name in the error, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("reviewer"),
+            "must never name an unrelated built-in role: {rendered}"
+        );
     }
 
     /// Issue #50 review, MEDIUM 1: a sandbox created for an invocation whose
@@ -594,10 +679,12 @@ mod tests {
         )
         .await;
 
+        let coder_role = Role::new("coder").unwrap();
         let result = orchestrator
             .run_agent(
                 "sandbox-seam-failure-cycle",
-                AgentRole::Coder,
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "echo hi"]),
                 &[],
@@ -655,10 +742,12 @@ mod tests {
             cancel_clone.cancel();
         });
 
+        let coder_role = Role::new("coder").unwrap();
         let result = orchestrator
             .run_agent(
                 "sandbox-seam-cancel-cycle",
-                AgentRole::Coder,
+                &coder_role,
+                true,
                 &FakeCommandAdapter,
                 &AgentCommand::new("sh", ["-c", "sleep 30"]),
                 &[],
@@ -718,10 +807,12 @@ mod tests {
         let repo_path = repo.path().to_path_buf();
 
         let handle = tokio::spawn(async move {
+            let coder_role = Role::new("coder").unwrap();
             let _ = orchestrator_for_task
                 .run_agent(
                     "sandbox-seam-abort-cycle",
-                    AgentRole::Coder,
+                    &coder_role,
+                    true,
                     &FakeCommandAdapter,
                     &AgentCommand::new("sh", ["-c", "sleep 30"]),
                     &[],

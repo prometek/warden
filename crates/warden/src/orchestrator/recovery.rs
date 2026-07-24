@@ -59,7 +59,8 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
             continue;
         }
 
-        run.state.validate_transition(RunState::Failed)?;
+        run.state
+            .validate_transition(RunState::Failed, run.total_steps)?;
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
@@ -120,7 +121,8 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
                 run_id = %run.id,
                 "run stuck in AwaitingCi with no pr_number recorded; nothing to resume watching, marking Failed"
             );
-            run.state.validate_transition(RunState::Failed)?;
+            run.state
+                .validate_transition(RunState::Failed, run.total_steps)?;
             db::update_run_state(&pool, &run.id, RunState::Failed).await?;
             // Issue #15 review, L3: mirrors recover_crashed_runs's own
             // orphan reclaim for every other path that fails a run outright
@@ -202,7 +204,7 @@ async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()
         match worktree::remove_orphan_worktree(main_repo_path, Path::new(&entry.path)).await {
             Ok(()) => {
                 if let Err(error) =
-                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, entry.role).await
+                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, &entry.role).await
                 {
                     tracing::error!(run_id = %run.id, cycle_id = %entry.cycle_id, %error, "failed to clear recorded worktree path after removing it");
                 }
@@ -283,9 +285,19 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "crashed-run", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "crashed-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::update_run_state(&pool, "crashed-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -306,7 +318,7 @@ mod tests {
             &pool,
             "crashed-process",
             "crashed-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             "/tmp/wt",
         )
@@ -328,7 +340,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3, 3)
+        db::insert_run(&pool, "live-run", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
             .await
             .unwrap();
         db::update_run_state(&pool, "live-run", RunState::CoderRunning)
@@ -348,7 +360,7 @@ mod tests {
             &pool,
             "live-process",
             "live-cycle",
-            AgentRole::Coder,
+            "coder",
             live_pid,
             "/tmp/wt",
         )
@@ -397,6 +409,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -409,7 +423,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "orphan-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -427,7 +441,7 @@ mod tests {
             &pool,
             "orphan-recovery-process",
             "orphan-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             &worktree_path.display().to_string(),
         )
@@ -461,10 +475,12 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
-        db::update_run_state(&pool, "orphan-process-run", RunState::Testing)
+        db::update_run_state(&pool, "orphan-process-run", RunState::RunningStep(2))
             .await
             .unwrap();
         db::insert_cycle(&pool, "orphan-process-cycle", "orphan-process-run", 1)
@@ -486,7 +502,7 @@ mod tests {
             &pool,
             "orphan-process-live",
             "orphan-process-cycle",
-            AgentRole::Tester,
+            "tester",
             live_pid,
             "/tmp/wt/tester",
         )
@@ -508,7 +524,7 @@ mod tests {
             &pool,
             "orphan-process-dead",
             "orphan-process-cycle",
-            AgentRole::Reviewer,
+            "reviewer",
             dead_pid,
             "/tmp/wt/reviewer",
         )
@@ -548,9 +564,19 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        db::insert_run(&pool, "pid-reuse-run", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "pid-reuse-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::update_run_state(&pool, "pid-reuse-run", RunState::CoderRunning)
             .await
             .unwrap();
@@ -660,6 +686,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -674,7 +702,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "crash-during-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -693,7 +721,7 @@ mod tests {
             &pool,
             "crash-during-recovery-process",
             "crash-during-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             pid,
             &worktree_path.display().to_string(),
         )
@@ -770,6 +798,8 @@ mod tests {
             "intent",
             3,
             3,
+            3,
+            5,
         )
         .await
         .unwrap();
@@ -787,7 +817,7 @@ mod tests {
         db::set_cycle_worktree_path(
             &pool,
             "idempotent-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             &worktree_path.display().to_string(),
         )
         .await
@@ -803,7 +833,7 @@ mod tests {
             &pool,
             "idempotent-recovery-process",
             "idempotent-recovery-cycle",
-            AgentRole::Coder,
+            "coder",
             dead_pid,
             &worktree_path.display().to_string(),
         )

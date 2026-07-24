@@ -74,6 +74,8 @@ impl Orchestrator {
             &config.intent,
             config.max_review_cycles,
             config.max_test_cycles,
+            config.workflow.steps.len() as u32,
+            config.max_extra_step_cycles,
         )
         .await?;
         self.publish_event(RunEvent::RunStarted {
@@ -194,6 +196,12 @@ impl Orchestrator {
         // cycle whose review came back clean (issue #41's gate) -- so this
         // only advances then, independently of `review_cycle_number`.
         let mut test_cycle_number: u32 = 0;
+        // Issue #73: the single shared counter for any workflow step beyond
+        // the built-in reviewer/tester pair -- advances once per cycle in
+        // which that whole extra-step chain actually runs (a clean tester
+        // cycle in a workflow with more steps left), never once per
+        // individual extra step.
+        let mut extra_step_cycle_number: u32 = 0;
         // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
         // coder exactly like a reviewer/tester blocking finding does, just
         // one step later in the pipeline -- these are seeded into the next
@@ -248,15 +256,17 @@ impl Orchestrator {
                 select_prior_findings(&self.pool, ci_seeded_findings, previous_cycle_id.as_deref())
                     .await?;
 
-            let coder_result = self
-                .run_coder(
+            let producer_role = &config.workflow.steps[0].role;
+            let producer_result = self
+                .run_producer(
                     &runner,
-                    CoderInvocation {
+                    ProducerInvocation {
                         run_id: &run_id,
                         cycle_id: &cycle_id,
                         cycle_number,
                         config: &config,
-                        agent: &agents.coder,
+                        role: producer_role,
+                        agent: &agents.steps[0],
                         env_allowlist: agents.env_allowlist,
                         worktree_manager: &worktree_manager,
                         base_commit: &base_commit,
@@ -266,122 +276,18 @@ impl Orchestrator {
                     },
                 )
                 .await?;
-            base_commit = coder_result.commit;
+            base_commit = producer_result.commit;
 
-            // Write-ahead: about to launch the reviewer -- issue #43 splits
-            // what was one `AwaitingReviewTest` state into `Reviewing` (this
-            // wait) and `Testing` (below, only entered once this cycle's
-            // review is clean).
-            self.transition(&run_id, RunState::Reviewing).await?;
-
-            // Phase A -- gate review (issue #37/#41, ADR-0014): the tester
-            // must never run before the reviewer is clean. The first
-            // review of this run's body of work is full (the whole diff);
-            // every re-review that follows a coder correction -- whether
-            // prompted by the reviewer itself here, or, per Phase B (#42),
-            // by the tester -- is scoped to just that correctif plus
-            // the findings that motivated it (decision #37 Q3). This branch
-            // does not need to know which role's finding triggered this
-            // cycle: `has_reviewed_once` only tracks whether the run has had
-            // its one full pass yet, not who asked for the reboucle.
-            let review_scope = if has_reviewed_once {
-                warden_core::ReviewScope::Correctif
-            } else {
-                warden_core::ReviewScope::Full
-            };
-            let mut findings = self
-                .run_review(
-                    &runner,
-                    ReviewInvocation {
-                        run_id: &run_id,
-                        cycle_id: &cycle_id,
-                        cycle_number,
-                        agent: &agents.reviewer,
-                        env_allowlist: agents.env_allowlist,
-                        worktree_manager: &worktree_manager,
-                        commit: &base_commit,
-                        diff: &coder_result.diff,
-                        prior_findings: &prior_findings,
-                        scope: review_scope,
-                        config: &config,
-                        cancel: cancel.clone(),
-                    },
-                )
-                .await?;
-            has_reviewed_once = true;
-
-            // Issue #24 review, M4: folded in alongside the reviewer's own
-            // findings -- an unresolved definition-tampering finding gates
-            // Phase A exactly like a reviewer finding does; the tester must
-            // never run over a coder commit that still carries one either.
-            if let Some(finding) = coder_result.definition_tampering_finding {
-                findings.push(finding);
-            }
-
-            // Gate review clean == no blocking finding in `findings` so
-            // far (reviewer + tampering). Only then may this cycle reach
-            // Phase B (issue #41 acceptance criterion: "le tester ne
-            // tourne jamais avant que la review soit clean"). A clean
-            // review lets the tester run once this cycle; if it raises a
-            // blocking finding, `decide_next_state` below reboucles to the
-            // coder exactly like any other blocking finding would, and that
-            // reboucle's own re-review (above) is scoped to it -- issue #42,
-            // Phase B's "aucun retour au tester tant que le correctif n'est
-            // pas revu-clean" acceptance criterion, without this branch
-            // needing any special case for a tester-originated reboucle.
-            let review_is_clean = !findings
-                .iter()
-                .any(|finding| finding.severity == warden_core::Severity::Blocking);
-            // Issue #43 code review (MEDIUM): the review budget's own
-            // counter only advances when this cycle's reboucle is actually
-            // charged to the review phase -- a blocking Reviewer/Warden-
-            // sourced finding, mirroring `decide_next_state`'s own
-            // imputation rule (decision #37 Q1) below. A cycle whose review
-            // is clean -- whether it's the run's very first review, or a
-            // scoped re-review that clears a *tester*-driven reboucle --
-            // never advances it, which is what keeps the two budgets
-            // genuinely independent: a run whose every reboucle is
-            // tester-driven (review clean every single cycle) can exhaust
-            // `max_test_cycles` without ever coming close to
-            // `max_review_cycles`, and vice versa.
-            if !review_is_clean {
-                review_cycle_number += 1;
-            }
-            db::set_run_current_review_cycle(&self.pool, &run_id, review_cycle_number).await?;
-            if review_is_clean {
-                // Write-ahead: about to launch the tester -- issue #43's
-                // other half of the old `AwaitingReviewTest` split. Only
-                // entered from `Reviewing` on a review-clean cycle, so this
-                // is also where the test-cycle counter actually advances
-                // -- `review_cycle_number` deliberately did *not* advance a
-                // few lines above, precisely because this cycle's review was
-                // clean.
-                self.transition(&run_id, RunState::Testing).await?;
-                test_cycle_number += 1;
-                db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number).await?;
-                findings.extend(
-                    self.run_test(
-                        &runner,
-                        TestInvocation {
-                            run_id: &run_id,
-                            cycle_id: &cycle_id,
-                            cycle_number,
-                            agent: &agents.tester,
-                            env_allowlist: agents.env_allowlist,
-                            worktree_manager: &worktree_manager,
-                            commit: &base_commit,
-                            diff: &coder_result.diff,
-                            prior_findings: &prior_findings,
-                            config: &config,
-                            cancel: cancel.clone(),
-                        },
-                    )
-                    .await?,
-                );
-            }
-
-            for finding in &findings {
-                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
+            let mut findings: Vec<Finding> = Vec::new();
+            // Issue #24 review, M4: folded in alongside the first gated
+            // step's own findings below -- an unresolved definition-
+            // tampering finding gates it exactly like that step's own
+            // finding would; no later step ever runs over a producer
+            // commit that still carries one either. Persisted here,
+            // immediately, since it never appears in any step's own
+            // `step_findings` batch persisted further down.
+            if let Some(finding) = producer_result.definition_tampering_finding {
+                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, &finding)
                     .await?;
                 self.publish_event(RunEvent::FindingRaised {
                     cycle_number,
@@ -392,19 +298,200 @@ impl Orchestrator {
                     action: finding.action.clone(),
                 })
                 .await?;
+                findings.push(finding);
             }
+
+            let total_steps = config.workflow.steps.len();
+            // Issue #73 (trio-unification follow-up): one uniform loop over
+            // every gated step (`workflow.steps[1..]`) -- the built-in
+            // reviewer/tester and any custom step (e.g. `techlead`) are
+            // driven through the exact same `run_gated_step` call, never
+            // branched on role name. Only one thing still varies by
+            // **position**, not by name (the "genuine invariant" issue #73
+            // asks to keep, generalized off step semantics rather than role
+            // names): `step_index == 1` (the first gated step) is the only
+            // one ever offered `ReviewScope::Correctif` (decision #37 Q2 was
+            // never really "the reviewer specifically", just "whichever
+            // step reviews the cycle's full body of work first, before
+            // later steps see it") -- gated on the run's own
+            // `has_reviewed_once`, exactly like before.
+            //
+            // Which cycle-budget flag charges a step's own counter is *not*
+            // positional (issue #73 review, finding F3: reordering the
+            // built-in pair used to invert the budget rule) -- it follows
+            // each step's own declared `WorkflowStep::budget` instead:
+            // [`warden_core::StepBudget::Review`] charges `max_review_cycles`
+            // (only when this step's own evaluation is blocking, decision
+            // #37 Q1); [`warden_core::StepBudget::Test`] charges
+            // `max_test_cycles` (unconditionally, once per invocation);
+            // [`warden_core::StepBudget::Extra`] shares `max_extra_step_cycles`
+            // (charged once per cycle for the whole remaining chain, the
+            // first time any such step is entered -- tracked below by
+            // `entered_extra_budget_this_cycle`). `Workflow::builtin_default`
+            // declares its reviewer/tester steps' budgets explicitly
+            // (`Review`/`Test`), so this is byte-for-byte the same rule the
+            // pre-review code applied by position.
+            let mut next_state = if total_steps <= 1 {
+                // Issue #73 review, finding F4: a degenerate one-step
+                // workflow (producer only, no gates at all) has no later
+                // gated step to catch a blocking finding the producer itself
+                // already raised this cycle (a definition-tampering finding,
+                // `FindingSource::Warden`, folded into `findings` above) --
+                // unconditionally converging here would silently let it
+                // through. Reused via `decide_next_state_for_step` at
+                // `step_index == 0` (structurally `workflow.is_last_step(0)`
+                // whenever `total_steps == 1`) rather than a bespoke check,
+                // so a single-step workflow follows the exact same
+                // "blocking Warden/role-sourced finding" rule every other
+                // step already does. The producer has no budget of its own
+                // (`WorkflowStep::budget` is `None` for `steps[0]`), so a
+                // reboucle here shares the same `max_extra_step_cycles`
+                // bucket any other budget-less step would.
+                extra_step_cycle_number += 1;
+                db::set_run_current_extra_step_cycle(&self.pool, &run_id, extra_step_cycle_number)
+                    .await?;
+                decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    0,
+                    extra_step_cycle_number,
+                    config.max_extra_step_cycles,
+                )
+            } else {
+                RunState::RunningStep(1)
+            };
+            // Reset once per cycle -- `Some(StepBudget::Extra)` is charged
+            // (the counter advanced) at most once per cycle, the first time
+            // any extra-budgeted step is entered, never once per individual
+            // extra step (see the loop's own docs above).
+            let mut entered_extra_budget_this_cycle = false;
+            while let RunState::RunningStep(step_index) = next_state {
+                let step = &config.workflow.steps[step_index as usize];
+                let step_agent = &agents.steps[step_index as usize];
+
+                let scope = if step_index == 1 && has_reviewed_once {
+                    warden_core::ReviewScope::Correctif
+                } else {
+                    warden_core::ReviewScope::Full
+                };
+
+                self.transition(&run_id, RunState::RunningStep(step_index))
+                    .await?;
+                if step.budget == Some(warden_core::StepBudget::Extra)
+                    && !entered_extra_budget_this_cycle
+                {
+                    // First entry into the shared extra-step budget this
+                    // cycle -- charged once for the whole remaining chain,
+                    // never once per extra step (see the loop's own docs
+                    // above).
+                    entered_extra_budget_this_cycle = true;
+                    extra_step_cycle_number += 1;
+                    db::set_run_current_extra_step_cycle(
+                        &self.pool,
+                        &run_id,
+                        extra_step_cycle_number,
+                    )
+                    .await?;
+                }
+
+                let step_findings = self
+                    .run_gated_step(
+                        &runner,
+                        GatedStepInvocation {
+                            run_id: &run_id,
+                            cycle_id: &cycle_id,
+                            cycle_number,
+                            step_index,
+                            role: &step.role,
+                            agent: step_agent,
+                            env_allowlist: agents.env_allowlist,
+                            worktree_manager: &worktree_manager,
+                            commit: &base_commit,
+                            diff: &producer_result.diff,
+                            prior_findings: &prior_findings,
+                            scope,
+                            captures_evidence: step.captures_evidence,
+                            config: &config,
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await?;
+                if step_index == 1 {
+                    has_reviewed_once = true;
+                }
+
+                for finding in &step_findings {
+                    db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
+                        .await?;
+                    self.publish_event(RunEvent::FindingRaised {
+                        cycle_number,
+                        source: finding.source.as_str().to_string(),
+                        severity: finding.severity.as_str().to_string(),
+                        file: finding.file.clone(),
+                        description: finding.description.clone(),
+                        action: finding.action.clone(),
+                    })
+                    .await?;
+                }
+                findings.extend(step_findings);
+
+                let this_step_is_blocking = findings.iter().any(|finding| {
+                    finding.severity == warden_core::Severity::Blocking
+                        && (finding.source == warden_core::FindingSource::role(step.role.as_str())
+                            || finding.source == warden_core::FindingSource::Warden)
+                });
+
+                // Issue #73 review, finding F3: which counter/rule applies
+                // follows this step's own declared `budget`, not its
+                // position -- see the loop's own docs above.
+                let (current_cycle, max_cycles) = match step.budget {
+                    Some(warden_core::StepBudget::Review) => {
+                        // Issue #43 code review (MEDIUM): the review
+                        // budget's own counter only advances when this
+                        // cycle's reboucle is actually charged to the
+                        // review phase -- decision #37 Q1's imputation
+                        // rule. A cycle whose first gated step is clean --
+                        // whether it's the run's very first pass, or a
+                        // scoped re-review that clears a later step's own
+                        // reboucle -- never advances it, which is what
+                        // keeps the budgets genuinely independent.
+                        if this_step_is_blocking {
+                            review_cycle_number += 1;
+                        }
+                        db::set_run_current_review_cycle(&self.pool, &run_id, review_cycle_number)
+                            .await?;
+                        (review_cycle_number, config.max_review_cycles)
+                    }
+                    Some(warden_core::StepBudget::Test) => {
+                        test_cycle_number += 1;
+                        db::set_run_current_test_cycle(&self.pool, &run_id, test_cycle_number)
+                            .await?;
+                        (test_cycle_number, config.max_test_cycles)
+                    }
+                    Some(warden_core::StepBudget::Extra) => {
+                        (extra_step_cycle_number, config.max_extra_step_cycles)
+                    }
+                    None => unreachable!(
+                        "workflow steps at index >= 1 always carry Some(budget) -- \
+                         Workflow::parse_yaml's own invariant, only steps[0] (never reached by \
+                         this loop) has none"
+                    ),
+                };
+
+                next_state = decide_next_state_for_step(
+                    &findings,
+                    &config.workflow,
+                    step_index,
+                    current_cycle,
+                    max_cycles,
+                );
+            }
+
             db::close_cycle(&self.pool, &cycle_id).await?;
             // ADR-0012: this cycle is now the "previous cycle" the next
             // iteration's reviewer/tester (if there is one) reports on.
             previous_cycle_id = Some(cycle_id.clone());
 
-            let next_state = decide_next_state(
-                &findings,
-                review_cycle_number,
-                config.max_review_cycles,
-                test_cycle_number,
-                config.max_test_cycles,
-            );
             let mut converged_commit_for_tail: Option<String> = None;
             if next_state == RunState::Converged {
                 // Issue #7 / ADR-0009: fold any evidence captured across
@@ -537,9 +624,13 @@ mod tests {
             intent: "drive the run through a fake runner".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
-            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
-            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+                definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+                definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -599,7 +690,7 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let run_id = Uuid::new_v4().to_string();
-        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "hook seam", 3, 3)
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "hook seam", 3, 3, 3, 5)
             .await
             .unwrap();
 
@@ -620,7 +711,7 @@ mod tests {
             .await
             .unwrap();
         orchestrator
-            .transition(&run_id, RunState::Reviewing)
+            .transition(&run_id, RunState::RunningStep(1))
             .await
             .unwrap();
 
@@ -683,9 +774,13 @@ mod tests {
             intent: "bracket a run with run-level hooks".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
-            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
-            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+                definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+                definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -765,9 +860,13 @@ mod tests {
             intent: "a setup hook that cannot establish the environment".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
-            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
-            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+                definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+                definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -842,9 +941,13 @@ mod tests {
             intent: "a repo hook prepares the environment".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
-            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
-            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+                definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+                definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -893,9 +996,13 @@ mod tests {
             intent: "issue #26: surface an untrusted repo-sourced definition".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(AgentCommand::new("the-coder", Vec::<String>::new())),
-            reviewer_agent: definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
-            tester_agent: definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(AgentCommand::new("the-coder", Vec::<String>::new())),
+                definition(AgentCommand::new("the-reviewer", Vec::<String>::new())),
+                definition(AgentCommand::new("the-tester", Vec::<String>::new())),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -982,9 +1089,13 @@ mod tests {
             intent: "never gets to run".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(always_passing_tester()),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1058,9 +1169,13 @@ mod tests {
             intent: "issue 31: on_run_started ordering".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1104,9 +1219,13 @@ mod tests {
             intent: "no callback registered".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(flip_status_coder()),
-            reviewer_agent: definition(status_gated_reviewer()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(status_gated_reviewer()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1217,9 +1336,13 @@ mod tests {
             intent: "issue 33: live agent progress".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1404,9 +1527,13 @@ mod tests {
             intent: "issue 33: malformed progress lines must not crash the run".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1550,9 +1677,9 @@ mod tests {
             intent: "issue #53: token usage is persisted and published".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: definition(coder),
-            reviewer_agent: definition(reviewer),
-            tester_agent: definition(tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![definition(coder), definition(reviewer), definition(tester)],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1573,7 +1700,7 @@ mod tests {
         .await
         .unwrap();
 
-        let coder_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Coder)
+        let coder_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, "coder")
             .await
             .unwrap()
             .expect("the coder reported usage");
@@ -1582,7 +1709,7 @@ mod tests {
             warden_core::TokenUsage::new(100, 50, None, None)
         );
 
-        let reviewer_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Reviewer)
+        let reviewer_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, "reviewer")
             .await
             .unwrap()
             .expect("the reviewer reported usage");
@@ -1591,7 +1718,7 @@ mod tests {
             warden_core::TokenUsage::new(30, 10, None, None)
         );
 
-        let tester_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, AgentRole::Tester)
+        let tester_usage = db::get_cycle_role_token_usage(&pool, &cycle_id, "tester")
             .await
             .unwrap()
             .expect("the tester reported usage");
@@ -1671,9 +1798,13 @@ mod tests {
             intent: "an ordinary, unrelated change".to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
-            coder_agent: definition(ordinary_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(ordinary_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1726,9 +1857,13 @@ mod tests {
                 .to_string(),
             max_review_cycles: 1,
             max_test_cycles: 1,
-            coder_agent: definition(poisoning_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(poisoning_coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1740,7 +1875,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
+        assert_eq!(final_state, RunState::StepCyclesExceeded(1));
         assert_no_worktrees_left_behind(repo.path(), warden_home.path(), &run_id);
     }
 
@@ -1849,9 +1984,13 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(capturing_coder),
-            reviewer_agent: definition(status_gated_reviewer()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(capturing_coder),
+                definition(status_gated_reviewer()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1887,7 +2026,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(second.findings[0].severity, warden_core::Severity::Blocking);
         assert_eq!(second.findings[0].description, "status is broken");
@@ -1936,9 +2075,13 @@ mod tests {
             intent: "check the prompts land".to_string(),
             max_review_cycles: 3,
             max_test_cycles: 3,
-            coder_agent: prompted(coder, "you are the coder"),
-            reviewer_agent: prompted(capture("reviewer", "true"), "you are the reviewer"),
-            tester_agent: prompted(capture("tester", "true"), "you are the tester"),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                prompted(coder, "you are the coder"),
+                prompted(capture("reviewer", "true"), "you are the reviewer"),
+                prompted(capture("tester", "true"), "you are the tester"),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -1978,9 +2121,13 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(flip_status_coder()),
-            reviewer_agent: definition(status_gated_reviewer()),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(status_gated_reviewer()),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -2065,9 +2212,13 @@ mod tests {
             // `MaxReviewCyclesExceeded` at cycle 1 instead.
             max_review_cycles: 1,
             max_test_cycles: 3,
-            coder_agent: definition(noop_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(always_blocking_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_passing_tester()),
+                definition(always_blocking_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -2081,7 +2232,7 @@ mod tests {
 
         assert_eq!(
             final_state,
-            RunState::MaxTestCyclesExceeded,
+            RunState::StepCyclesExceeded(2),
             "the test budget must be what exhausts, not a review budget of 1 falsely tripped \
                  by tester-driven reboucles"
         );
@@ -2092,6 +2243,108 @@ mod tests {
                  clean never charges the review budget at all, so the counter never leaves 0"
         );
         assert_eq!(run.current_test_cycle, 3, "the test budget is what ran out");
+    }
+
+    /// Issue #73 review, finding F3: before this, `step_index == 1` always
+    /// meant "review budget" and `step_index == 2` always meant "test
+    /// budget" -- reordering the built-in pair inverted the rule. This
+    /// pins a workflow with the two swapped (a `Test`-budgeted step at
+    /// `step_index == 1`, a `Review`-budgeted step at `step_index == 2`):
+    /// the counters must still follow each step's own declared `budget`,
+    /// not its slot.
+    #[tokio::test]
+    async fn cycle_budgets_follow_a_steps_declared_budget_not_its_position() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        // At `step_index == 1` (the slot the pre-fix code always charged to
+        // `max_review_cycles`) but declares `budget: test` -- always raises
+        // its own blocking finding, so the run never converges and the
+        // *test* budget (charged unconditionally, once per invocation) is
+        // what exhausts first.
+        let always_blocking_qa = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo '{"source":"qa","severity":"blocking","description":"never happy"}'"#,
+            ],
+        );
+        // At `step_index == 2` (the slot the pre-fix code always charged to
+        // `max_test_cycles`) but declares `budget: review`, and this step
+        // never even runs (the swapped `qa` step ahead of it always
+        // reboucles first) -- its own counter must stay at 0.
+        let never_reached_sign_off = AgentCommand::new("sh", ["-c", "true"]);
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: swapped
+steps:
+  - role: coder
+    agent: coder
+  - role: qa
+    agent: qa
+    gate: loop-until-clean
+    budget: test
+  - role: sign-off
+    agent: sign-off
+    gate: loop-until-clean
+    budget: review
+"#,
+        )
+        .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 2,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_blocking_qa),
+                definition(never_reached_sign_off),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(1),
+            "the step at index 1 (\"qa\", declared budget \"test\") is what never clears"
+        );
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_test_cycle, 2,
+            "the \"qa\" step's own declared budget (\"test\") is what exhausted, even though \
+                 it sits at step_index 1 -- the slot the pre-fix code always charged to \
+                 max_review_cycles instead"
+        );
+        assert_eq!(
+            run.current_review_cycle, 0,
+            "\"sign-off\" (declared budget \"review\") never even ran -- the \"qa\" step ahead \
+                 of it always reboucles first -- so the review counter must stay untouched"
+        );
     }
 
     /// The converse of
@@ -2130,9 +2383,13 @@ mod tests {
             intent: "never converges".to_string(),
             max_review_cycles: 2,
             max_test_cycles: 1,
-            coder_agent: definition(noop_coder),
-            reviewer_agent: definition(always_blocking_reviewer),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_blocking_reviewer),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: true,
             gate: None,
@@ -2144,7 +2401,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(final_state, RunState::MaxReviewCyclesExceeded);
+        assert_eq!(final_state, RunState::StepCyclesExceeded(1));
         let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
         assert_eq!(
             run.current_review_cycle, 2,
@@ -2197,9 +2454,13 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(flip_status_coder()),
-            reviewer_agent: definition(status_gated_reviewer()),
-            tester_agent: definition(counting_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(status_gated_reviewer()),
+                definition(counting_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -2239,13 +2500,13 @@ mod tests {
         assert!(
                 cycle_1_findings
                     .iter()
-                    .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                    .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
                 "expected the status-gated reviewer's blocking finding in cycle 1: {cycle_1_findings:?}"
             );
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Tester),
+                .any(|f| f.source == warden_core::FindingSource::role("tester")),
             "no tester-sourced finding must exist for cycle 1 -- the tester never ran: \
                  {cycle_1_findings:?}"
         );
@@ -2317,9 +2578,13 @@ mod tests {
             intent: "sneak in a reviewer.md change, then revert it".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(poison_once_then_revert_coder),
-            reviewer_agent: definition(always_passing_tester()),
-            tester_agent: definition(counting_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(poison_once_then_revert_coder),
+                definition(always_passing_tester()),
+                definition(counting_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -2356,14 +2621,14 @@ mod tests {
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Reviewer),
+                .any(|f| f.source == warden_core::FindingSource::role("reviewer")),
             "the reviewer never raises anything in this test, isolating the block to the \
                  tampering finding: {cycle_1_findings:?}"
         );
         assert!(
             !cycle_1_findings
                 .iter()
-                .any(|f| f.source == warden_core::FindingSource::Tester),
+                .any(|f| f.source == warden_core::FindingSource::role("tester")),
             "no tester-sourced finding must exist for cycle 1 -- the tester must never run \
                  while a definition-tampering finding is still blocking: {cycle_1_findings:?}"
         );
@@ -2429,9 +2694,13 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(flip_status_coder()),
-            reviewer_agent: definition(capturing_reviewer),
-            tester_agent: definition(always_passing_tester()),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(capturing_reviewer),
+                definition(always_passing_tester()),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -2473,7 +2742,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(second.findings[0].description, "status is broken");
     }
@@ -2542,9 +2811,13 @@ mod tests {
             intent: "flip status to fixed".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(flip_status_coder()),
-            reviewer_agent: definition(capturing_reviewer),
-            tester_agent: definition(counting_status_gated_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(capturing_reviewer),
+                definition(counting_status_gated_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -2588,7 +2861,7 @@ mod tests {
         assert!(
             cycle_1_findings
                 .iter()
-                .all(|f| f.source == warden_core::FindingSource::Tester),
+                .all(|f| f.source == warden_core::FindingSource::role("tester")),
             "cycle 1's only finding must be the tester's: {cycle_1_findings:?}"
         );
         assert_eq!(cycle_1_findings.len(), 1);
@@ -2611,7 +2884,7 @@ mod tests {
         assert_eq!(second.findings.len(), 1);
         assert_eq!(
             second.findings[0].source,
-            warden_core::FindingSource::Tester
+            warden_core::FindingSource::role("tester")
         );
         assert_eq!(second.findings[0].description, "tester found status broken");
     }
@@ -2706,9 +2979,13 @@ mod tests {
             intent: "fix the app without regressing".to_string(),
             max_review_cycles: 5,
             max_test_cycles: 5,
-            coder_agent: definition(three_state_coder),
-            reviewer_agent: definition(capturing_regression_gated_reviewer),
-            tester_agent: definition(counting_fixed_gated_tester),
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(three_state_coder),
+                definition(capturing_regression_gated_reviewer),
+                definition(counting_fixed_gated_tester),
+            ],
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate: None,
@@ -2752,7 +3029,7 @@ mod tests {
         assert!(
             cycle_2_findings
                 .iter()
-                .all(|f| f.source == warden_core::FindingSource::Reviewer),
+                .all(|f| f.source == warden_core::FindingSource::role("reviewer")),
             "cycle 2's only finding must be the reviewer's own regression finding: \
                  {cycle_2_findings:?}"
         );
@@ -2775,7 +3052,7 @@ mod tests {
         assert_eq!(third.findings.len(), 1);
         assert_eq!(
             third.findings[0].source,
-            warden_core::FindingSource::Reviewer
+            warden_core::FindingSource::role("reviewer")
         );
         assert_eq!(
             third.findings[0].description,
@@ -2787,14 +3064,24 @@ mod tests {
     async fn select_prior_findings_prefers_ci_seeded_findings_over_the_previous_cycle() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-1", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-select-1",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-select-1", "run-select-1", 1)
             .await
             .unwrap();
         let previous_cycle_finding = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "from the previous cycle".to_string(),
@@ -2834,14 +3121,24 @@ mod tests {
     ) {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-select-2", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-select-2",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-select-2", "run-select-2", 1)
             .await
             .unwrap();
         let previous_cycle_finding = Finding {
-            source: warden_core::FindingSource::Tester,
+            source: warden_core::FindingSource::role("tester"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "from the previous cycle".to_string(),
@@ -2889,22 +3186,32 @@ mod tests {
     async fn select_prior_findings_returns_findings_in_ascending_id_order_not_insertion_order() {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
-        db::insert_run(&pool, "run-order-1", "/tmp/repo", "main", "intent", 3, 3)
-            .await
-            .unwrap();
+        db::insert_run(
+            &pool,
+            "run-order-1",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
         db::insert_cycle(&pool, "cycle-order-1", "run-order-1", 1)
             .await
             .unwrap();
 
         let finding_z = Finding {
-            source: warden_core::FindingSource::Reviewer,
+            source: warden_core::FindingSource::role("reviewer"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "inserted first, sorts last by id".to_string(),
             action: None,
         };
         let finding_a = Finding {
-            source: warden_core::FindingSource::Tester,
+            source: warden_core::FindingSource::role("tester"),
             severity: warden_core::Severity::Blocking,
             file: None,
             description: "inserted second, sorts first by id".to_string(),

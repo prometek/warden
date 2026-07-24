@@ -1,0 +1,16 @@
+name: with-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+    budget: test
+    evidence: true
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean

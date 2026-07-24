@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT cycle_worktrees.cycle_id as \"cycle_id!\", cycle_worktrees.role as \"role!\", cycle_worktrees.worktree_path as \"worktree_path!\"\n        FROM cycle_worktrees\n        JOIN cycles ON cycles.id = cycle_worktrees.cycle_id\n        WHERE cycles.run_id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "cycle_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycle_worktrees",
+            "name": "cycle_id"
+          }
+        }
+      },
+      {
+        "name": "role!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycle_worktrees",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "name": "worktree_path!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "cycle_worktrees",
+            "name": "worktree_path"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e4c7949504a5e91b59e05be6e4762f808d865c7d4fe672d7269096d543697db6"
+}

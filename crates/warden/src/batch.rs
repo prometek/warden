@@ -57,6 +57,7 @@ pub struct SingleIntentArgs<'a> {
     pub branch: &'a str,
     pub max_review_cycles: u32,
     pub max_test_cycles: u32,
+    pub max_cycles: u32,
     pub warden_home: &'a str,
     pub tool: &'a str,
     pub trust_repo_agents: bool,
@@ -96,6 +97,8 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out.push(args.max_review_cycles.to_string());
     out.push("--max-test-cycles".to_string());
     out.push(args.max_test_cycles.to_string());
+    out.push("--max-cycles".to_string());
+    out.push(args.max_cycles.to_string());
     out.push("--warden-home".to_string());
     out.push(args.warden_home.to_string());
     out.push("--tool".to_string());
@@ -152,7 +155,7 @@ pub fn parse_started_line(line: &str) -> Option<&str> {
 /// Parses a `warden run` child's final `"run <id> finished: <State>"` stdout
 /// line (see `main.rs::run`'s own final `print_stdout_line_or_log` call),
 /// returning `(run_id, final_state)`. `final_state` is `RunState`'s `Debug`
-/// form (e.g. `"Converged"`, `"MaxReviewCyclesExceeded"`) -- **display only**
+/// form (e.g. `"Converged"`, `"StepCyclesExceeded(1)"`) -- **display only**
 /// (issue #72 review, MEDIUM 1): `Debug`'s exact spelling carries no
 /// stability guarantee, so this batch never classifies an intent's success
 /// from it. Only used to give [`summarize`] a nicer label than
@@ -181,8 +184,8 @@ pub fn parse_outcome_line(line: &str) -> Option<(&str, &str)> {
 /// `"done"` (the post-gate terminal state, ADR-0011) counts alongside
 /// `"converged"` (the no-gate terminal state) -- both mean the run's own
 /// goal was reached, just with or without the post-`Converged` push/PR/CI
-/// tail configured. Every other value (`"max_review_cycles_exceeded"`,
-/// `"max_test_cycles_exceeded"`, `"failed"`, or anything else) is not a
+/// tail configured. Every other value (`"step_cycles_exceeded:1"`,
+/// `"step_cycles_exceeded:2"`, `"failed"`, or anything else) is not a
 /// success.
 pub fn is_converged_state(final_state: &str) -> bool {
     matches!(final_state, "converged" | "done")
@@ -194,8 +197,8 @@ pub enum IntentStatus {
     /// The child exited successfully and its run reached `Converged`/`Done`.
     Converged { final_state: String },
     /// The child exited successfully, but its run ended in a non-converged
-    /// terminal state (`MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded`/
-    /// `Failed`/other) -- not a crash, just "didn't converge".
+    /// terminal state (`StepCyclesExceeded(index)`/`Failed`/other) -- not a
+    /// crash, just "didn't converge".
     NotConverged { final_state: String },
     /// The child either exited non-zero, or exited zero but never printed a
     /// parseable `"... outcome: ..."` line at all (a bug, or a crash after
@@ -327,6 +330,7 @@ mod tests {
             branch: "main",
             max_review_cycles: 5,
             max_test_cycles: 5,
+            max_cycles: 5,
             warden_home: "/home/.warden",
             tool: "claude",
             trust_repo_agents: true,
@@ -362,6 +366,8 @@ mod tests {
                 "5",
                 "--max-test-cycles",
                 "5",
+                "--max-cycles",
+                "5",
                 "--warden-home",
                 "/home/.warden",
                 "--tool",
@@ -396,6 +402,7 @@ mod tests {
             branch: "main",
             max_review_cycles: 5,
             max_test_cycles: 5,
+            max_cycles: 5,
             warden_home: "/home/.warden",
             tool: "claude",
             trust_repo_agents: false,
@@ -490,15 +497,18 @@ mod tests {
         assert_eq!(warden_core::RunState::Converged.as_str(), "converged");
         assert_eq!(warden_core::RunState::Done.as_str(), "done");
         assert!(is_converged_state(
-            warden_core::RunState::Converged.as_str()
+            &warden_core::RunState::Converged.as_str()
         ));
-        assert!(is_converged_state(warden_core::RunState::Done.as_str()));
-        assert!(!is_converged_state(warden_core::RunState::Failed.as_str()));
+        assert!(is_converged_state(&warden_core::RunState::Done.as_str()));
+        assert!(!is_converged_state(&warden_core::RunState::Failed.as_str()));
+        // Issue #73: the phase-specific `MaxReviewCyclesExceeded`/
+        // `MaxTestCyclesExceeded` variants became the generic per-step
+        // `StepCyclesExceeded(index)` (`step_cycles_exceeded:1`/`:2`).
         assert!(!is_converged_state(
-            warden_core::RunState::MaxReviewCyclesExceeded.as_str()
+            &warden_core::RunState::StepCyclesExceeded(1).as_str()
         ));
         assert!(!is_converged_state(
-            warden_core::RunState::MaxTestCyclesExceeded.as_str()
+            &warden_core::RunState::StepCyclesExceeded(2).as_str()
         ));
     }
 

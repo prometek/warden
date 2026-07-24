@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO cycle_token_usage (cycle_id, role, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)\n        VALUES (?, ?, ?, ?, ?, ?)\n        ON CONFLICT (cycle_id, role) DO UPDATE SET\n            input_tokens = COALESCE(cycle_token_usage.input_tokens, 0) + excluded.input_tokens,\n            output_tokens = COALESCE(cycle_token_usage.output_tokens, 0) + excluded.output_tokens,\n            cache_read_tokens = CASE WHEN excluded.cache_read_tokens IS NULL THEN cycle_token_usage.cache_read_tokens ELSE COALESCE(cycle_token_usage.cache_read_tokens, 0) + excluded.cache_read_tokens END,\n            cache_creation_tokens = CASE WHEN excluded.cache_creation_tokens IS NULL THEN cycle_token_usage.cache_creation_tokens ELSE COALESCE(cycle_token_usage.cache_creation_tokens, 0) + excluded.cache_creation_tokens END\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "1ebc7768aa1e315072f10bb7d08517ea26ff7da0f9eaa9615d528ca75f151ae4"
+}
