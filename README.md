@@ -320,7 +320,16 @@ Flags de `warden run` :
 - `--isolation <worktree|docker>` (défaut `worktree`, issue #49/ADR-0015/ADR-0019) —
   sélectionne le backend `warden-sandbox` utilisé pour **chaque** invocation d'agent de ce
   run. `worktree` est `LocalSandbox` : comportement inchangé, l'agent tourne directement sur
-  cet hôte. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
+  cet hôte. **Modèle de menace à connaître (issue #25/ADR-0021)** : sous `worktree`,
+  l'agent tourne comme *vous*, avec vos droits fichier — `env_clear()` (voir "Sécurité"
+  dans `docs/Architecture.md`, §10) borne uniquement les variables d'environnement, jamais
+  le filesystem : `~/.ssh`, `~/.aws`, `~/.config/gh`, ou tout `.env` ailleurs sur le disque
+  restent atteignables par chemin absolu, que `HOME` soit transmis ou non. Ce n'est pas une
+  régression, c'est le comportement documenté de ce mode depuis l'origine (ADR-0001) — mais
+  `warden run` l'affiche désormais explicitement (`tracing::warn!`, visible dès la
+  verbosité par défaut) au démarrage de tout run sous `worktree`, plutôt que de le laisser
+  implicite. Utilisez `--isolation docker` si vous avez besoin d'une vraie frontière
+  filesystem. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
   `docker run --rm` séparé, avec seulement le worktree du rôle et le `.git` du dépôt de base
   montés en lecture-écriture (pour que git fonctionne), et `~/.claude` de l'hôte monté en
   **lecture seule** comme unique source d'authentification — rien d'autre de l'hôte n'est
