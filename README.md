@@ -221,6 +221,10 @@ warden run \
   --tool claude
 ```
 
+> **Modèle de menace à connaître avant de lancer cette commande (issue #25/ADR-0021)** :
+> sans `--isolation docker`, l'agent tourne avec vos droits fichier complets — voir la
+> documentation du flag `--isolation` ci-dessous pour le détail.
+
 Aucun fichier `.md` n'est requis : `--tool claude` sélectionne l'adaptateur intégré pour
 Claude Code (`warden::tool_adapter::ClaudeAdapter`), qui fournit un prompt et un jeu
 d'outils par défaut pour les trois rôles (coder, reviewer, tester). Voir "Définir un agent"
@@ -320,7 +324,26 @@ Flags de `warden run` :
 - `--isolation <worktree|docker>` (défaut `worktree`, issue #49/ADR-0015/ADR-0019) —
   sélectionne le backend `warden-sandbox` utilisé pour **chaque** invocation d'agent de ce
   run. `worktree` est `LocalSandbox` : comportement inchangé, l'agent tourne directement sur
-  cet hôte. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
+  cet hôte. **Modèle de menace à connaître (issue #25/ADR-0021)** : sous `worktree`,
+  l'agent tourne comme *vous*, avec au moins vos droits **lecture** fichier, et vos droits
+  **écriture** aussi selon les permissions propres à l'outil `--tool` choisi (détail par
+  outil ci-dessous et ADR-0021 §3bis) — `env_clear()` (voir "Sécurité" dans
+  `docs/Architecture.md`, §10) borne uniquement les variables d'environnement, jamais le
+  filesystem : `~/.ssh`, `~/.aws`, `~/.config/gh`, ou tout `.env` ailleurs sur le disque
+  restent lisibles par chemin absolu, que `HOME` soit transmis ou non. Ce n'est pas une
+  régression, c'est le comportement documenté de ce mode depuis l'origine (ADR-0001) — mais
+  `warden run` l'affiche désormais explicitement, en écrivant directement sur **stderr** au
+  démarrage de tout run sous `worktree` (jamais via `tracing::warn!` : un `RUST_LOG`
+  quelconque, courant dans un shell de dev, remplacerait le filtre par défaut de `warden`
+  tout entier et ferait taire l'avertissement — ce n'est **pas** le cas ici, il reste
+  visible quel que soit `RUST_LOG`), plutôt que de le laisser implicite. Par outil : `claude`
+  (défaut) accorde `Bash` aux trois rôles par défaut, donc lecture *et* écriture par chemin
+  absolu pour un agent qui se comporte normalement ; `codex`, avec ses défauts
+  (`workspace-write`/`read-only`), impose une vraie frontière d'écriture OS même sous
+  `worktree` — mais une définition d'agent du dépôt peut demander `danger-full-access` et la
+  désactiver ; `mistral` n'a aucune contrainte d'outil, aucune frontière nulle part. Utilisez
+  `--isolation docker` si vous avez besoin d'une vraie frontière filesystem, quel que soit
+  l'outil. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
   `docker run --rm` séparé, avec seulement le worktree du rôle et le `.git` du dépôt de base
   montés en lecture-écriture (pour que git fonctionne), et `~/.claude` de l'hôte monté en
   **lecture seule** comme unique source d'authentification — rien d'autre de l'hôte n'est

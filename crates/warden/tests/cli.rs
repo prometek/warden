@@ -1257,8 +1257,76 @@ fn e2e_an_unknown_isolation_is_a_clean_cli_error_naming_the_value() {
 /// must not itself fail arg parsing; it is exercised indirectly by every
 /// other `e2e_*` test in this file that never passes `--isolation` at all
 /// and still runs a real (non-docker) convergence loop successfully.
+///
+/// Issue #25/ADR-0021 review: also the positive half of the filesystem
+/// threat-model warning's coverage -- `print_isolation_worktree_warning`
+/// (`crates/warden/src/main.rs`) runs at the very top of `run`, before
+/// `warden` ever tries (and, here, fails) to spawn `claude`, so this run's
+/// own stderr already carries it by the time the process exits. See
+/// `e2e_isolation_docker_never_prints_the_worktree_filesystem_warning` for
+/// the negative half.
+///
+/// `PATH` is pinned to a `claude`-free minimal set here (unlike this file's
+/// other "no fake `claude` on `PATH`" tests, which just inherit whatever
+/// `PATH` the test process itself runs under): a real `claude` install on
+/// a developer's own `PATH` (e.g. `~/.local/bin/claude`) would otherwise be
+/// found and actually invoked, found empirically while adding this test --
+/// slow/hanging and a real side effect this test must never risk causing.
+/// Pinned to exactly `/usr/bin:/bin` -- the only external binary `warden`
+/// itself shells out to before reaching the `--tool` spawn is `git`
+/// (`worktree.rs`), present at `/usr/bin/git` on both Linux and macOS; no
+/// wider prefix (in particular not `/usr/local/bin`, the default npm-global
+/// install location for `claude` on Linux and Intel macOS) may be added
+/// without re-verifying it cannot itself carry a real `claude` binary.
 #[test]
 fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.env("PATH", "/usr/bin:/bin")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        // Issue #25/ADR-0021 review: the filesystem threat-model warning
+        // itself, present under the default `--isolation worktree` -- its
+        // presence on this run's stderr also proves the failure below is
+        // downstream (spawning `claude`, absent from this pinned `PATH`),
+        // never a clap arg-parsing error on the omitted `--isolation`:
+        // `print_isolation_worktree_warning` only runs once `run` has
+        // already accepted the parsed isolation config.
+        .stderr(contains("ADR-0021"));
+}
+
+/// Issue #25/ADR-0021 review: the negative half of
+/// `e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error`'s
+/// warning coverage -- `print_isolation_worktree_warning` only runs when
+/// `isolation_config.isolation == Isolation::Worktree`, so `--isolation
+/// docker` must never print it, regardless of whether Docker itself is
+/// installed/reachable on this machine. This test is not gated on
+/// `docker_daemon_available` (unlike
+/// `e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container`
+/// below, which needs a real daemon for its own different assertion)
+/// because `.failure()` here does not depend on a daemon being reachable
+/// at all: `DockerSandbox::execute` bails with `SandboxError::DockerUnavailable`
+/// (`crates/warden-sandbox/src/docker.rs`) as soon as it can't canonicalize
+/// a host `~/.claude` config directory, which does not exist under
+/// `warden_command()`'s hermetic `HOME` -- no `docker` process is ever
+/// spawned to fail or succeed on. The warning-ordering claim above only
+/// explains the `.not()` assertion; the exit status is explained by this
+/// unrelated, earlier bail-out.
+#[test]
+fn e2e_isolation_docker_never_prints_the_worktree_filesystem_warning() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let (mut cmd, _hermetic_home) = warden_command();
@@ -1273,12 +1341,47 @@ fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
         warden_home.path().to_str().unwrap(),
         "--tool",
         "claude",
+        "--isolation",
+        "docker",
     ])
     .assert()
     .failure()
-    // Fails downstream (no fake `claude` on `PATH`), never on arg parsing --
-    // proven by never seeing clap's own "--isolation" complaint.
-    .stderr(contains("--isolation").not());
+    .stderr(contains("ADR-0021").not());
+}
+
+/// Issue #25/ADR-0021 review: the guarantee this warning exists to add over
+/// the `tracing::warn!` it replaced -- `RUST_LOG` must never suppress it.
+/// `init_tracing`'s `EnvFilter::try_from_default_env()` replaces the whole
+/// default filter wholesale on any `RUST_LOG` value (verified live against
+/// the previous `tracing::warn!`-based implementation: `RUST_LOG=error`
+/// silenced it entirely) -- `print_isolation_worktree_warning` writes
+/// directly to stderr instead, structurally outside `tracing`'s reach.
+///
+/// `PATH` pinned exactly like
+/// `e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error`
+/// above, same reason.
+#[test]
+fn e2e_isolation_worktree_warning_survives_rust_log_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.env("PATH", "/usr/bin:/bin")
+        .env("RUST_LOG", "error")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("ADR-0021"));
 }
 
 /// Cheapest daemon-reachability probe available (mirrors
@@ -5170,6 +5273,63 @@ async fn e2e_batch_three_intents_each_converge_as_their_own_isolated_run() {
         let run = warden::db::get_run(&pool, run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Converged);
     }
+}
+
+/// Issue #25/ADR-0021 review: `print_isolation_worktree_warning` fires once
+/// per process (`main.rs::run`'s own top-of-function call), and a batch
+/// child re-enters `run` as a brand new OS process
+/// (`run_one_batch_intent`'s `tokio::process::Command::new(current_exe)`,
+/// see `run_batch`'s own docs) -- so under the default `--isolation
+/// worktree`, a 2-intent batch must carry the warning marker on `stderr`
+/// exactly twice, never once (dedup) and never more (double-print per
+/// child). Also the negative half of point 5's "does not corrupt any
+/// machine-readable stream" contract: `run_one_batch_intent` only pipes and
+/// line-parses the child's **stdout** (`command.stdout(Stdio::piped())`,
+/// `stderr` left to inherit) -- so the warning, on `stderr`, must never
+/// appear on `stdout` alongside the `"run <id> started/finished/outcome"`
+/// lines the batch parser depends on, and the parser must still classify
+/// both intents as converged despite the extra `stderr` traffic.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_prints_the_isolation_warning_once_per_child_never_on_stdout() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "batch warning intent one",
+            "--intent",
+            "batch warning intent two",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("batch summary: 2/2 intent(s) converged"))
+        .stdout(contains("ADR-0021").not());
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let warning_count = stderr.matches("ADR-0021").count();
+    assert_eq!(
+        warning_count, 2,
+        "expected exactly one isolation warning per batch child (2 intents), got {warning_count} in stderr: {stderr:?}"
+    );
 }
 
 /// Issue #72 acceptance criterion: "a failing intent doesn't block the
