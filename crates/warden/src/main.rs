@@ -609,36 +609,15 @@ async fn run<R: ToolAdapter>(
     isolation_config: IsolationConfig,
 ) -> anyhow::Result<()> {
     // Issue #25/ADR-0021: `--isolation worktree` (the default) gives the
-    // agent subprocess the invoking OS user's full filesystem rights --
-    // `env_clear()` (see `warden_sandbox::LocalSandbox`) bounds only
-    // environment variables, never file access by absolute path (`~/.ssh`,
-    // `~/.aws`, any `.env` elsewhere on disk stay reachable regardless of
-    // whether `HOME` itself is forwarded). `--isolation docker` is the only
-    // backend that adds a real filesystem boundary (ADR-0015/ADR-0019).
-    // Surfaced once, at the top of every run (including each batch child --
-    // issue #72 -- since each one re-enters `run` as its own process), via
-    // `tracing::warn!` -- the same channel every other advisory-not-fatal
-    // message in this binary already uses (crash recovery, `--trust-repo-
-    // agents`, a missing allowlisted env var) -- so it shows at the default
-    // `warn` verbosity without requiring `-v`. `tracing_subscriber::fmt`'s
-    // default writer is stdout (unconfigured here, same as every other
-    // `tracing::warn!` call site in this file), the same stream batch mode
-    // parses line-by-line (`warden::batch::parse_started_line` et al.) -- a
-    // pre-existing property of this binary's logging setup, not something
-    // this line changes. Harmless there: those parsers only ever react to
-    // their own exact `"run <id> ..."` prefix and silently pass through any
-    // other line, this one included (verified in `crates/warden/tests/cli.rs`
-    // batch tests, which already tolerate the crash-recovery `tracing::warn!`
-    // lines that print ahead of them on the very same stream today).
-    // code-standards.md forbids exactly this kind of silent gap.
+    // agent subprocess the invoking OS user's full filesystem read rights
+    // (write too, for `--tool claude`/`mistral` -- see ADR-0021 §3bis for
+    // the per-adapter nuance codex's own OS sandbox adds). Surfaced once, at
+    // the top of every run (including each batch child, issue #72, since
+    // each re-enters `run` as its own process), unconditionally and with no
+    // suppression knob -- see ADR-0021 for why this is a direct stderr
+    // write rather than `tracing::warn!`.
     if isolation_config.isolation == Isolation::Worktree {
-        tracing::warn!(
-            "--isolation worktree (default): the agent runs directly on this host, as this OS \
-             user, with this user's filesystem rights. env_clear() bounds only environment \
-             variables -- it does not sandbox the filesystem: ~/.ssh, ~/.aws, ~/.config/gh, or \
-             any other file this user can read/write remain reachable by absolute path. Use \
-             --isolation docker for a real filesystem boundary (see docs/adr/ADR-0021)."
-        );
+        print_isolation_worktree_warning();
     }
 
     // Issue #26 review: `Option::unwrap_or` (the previous form here)
@@ -1595,6 +1574,37 @@ fn print_stdout_line_or_log(line: &str) {
     if let Err(error) = writeln!(handle, "{line}") {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
             tracing::warn!(%error, "failed to print to stdout");
+        }
+    }
+}
+
+/// Issue #25/ADR-0021: prints the `--isolation worktree` filesystem-boundary
+/// warning straight to stderr through a locked handle, deliberately
+/// bypassing `tracing::warn!` -- `init_tracing`'s `EnvFilter::
+/// try_from_default_env()` lets any `RUST_LOG` value replace the
+/// `warden=warn` default wholesale, which would let a common dev-shell env
+/// var silently suppress a security notice this exists to make
+/// unsuppressible (see ADR-0021 for the alternatives considered, including
+/// why this stays unconditional -- no opt-out env var, no once-per-home
+/// suppression -- and prints once per batch child, issue #72).
+///
+/// Same broken-pipe tolerance as `print_stdout_line_or_log` above, for the
+/// same reason: this is an advisory line, not something a run's own
+/// correctness depends on reaching a terminal.
+fn print_isolation_worktree_warning() {
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    if let Err(error) = writeln!(
+        handle,
+        "warden: warning: --isolation worktree (default): the agent runs directly on this \
+         host, as this OS user. env_clear() bounds only environment variables -- it never \
+         sandboxes the filesystem: ~/.ssh, ~/.aws, ~/.config/gh, or any other file this user \
+         can read remain reachable by absolute path, and writable too depending on the agent \
+         tool's own permissions (see docs/adr/ADR-0021 for the --tool breakdown). Use \
+         --isolation docker for a real filesystem boundary."
+    ) {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            tracing::warn!(%error, "failed to print isolation warning to stderr");
         }
     }
 }

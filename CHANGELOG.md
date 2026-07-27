@@ -7,6 +7,52 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Security — Issue #25 / ADR-0021 : modèle de menace du sous-processus agent — ce que `env_clear()` protège, ce qu'il ne protège pas
+
+- **Constat** : `env_clear()` (`warden_sandbox::LocalSandbox`) ne borne jamais que les
+  variables d'environnement — sous `--isolation worktree` (le défaut de tout `warden run`),
+  l'agent tourne comme un process ordinaire de l'utilisateur invoquant, avec ses droits
+  fichier complets. Rien n'empêche l'agent de lire `~/.ssh`, `~/.aws`, `~/.config/gh`, ou
+  tout `.env` ailleurs sur le disque **par chemin absolu**, que `HOME` soit repropagé ou non.
+  Comportement documenté et voulu depuis l'origine (ADR-0001), pas une régression — mais
+  jusqu'ici implicite dans le code seul, jamais nommé explicitement au moment où
+  l'utilisateur choisit (ou omet de choisir) `--isolation`.
+- **Documenté à trois endroits** : `docs/adr/ADR-0021-agent-subprocess-filesystem-threat-model.md`
+  (nouvelle ADR, tranche la troisième piste laissée ouverte par l'issue #25 — les deux
+  premières étaient déjà closes par `--isolation docker`, ADR-0015/ADR-0019, issue #49),
+  `docs/Architecture.md` §10 (Sécurité, amendement), et `README.md` (note à côté de la
+  documentation du flag `--isolation`, plus un pointeur d'une ligne sous l'exemple `warden
+  run` de la prise en main).
+- **Avertissement runtime, une fois par run, sans opt-out** : `warden run` écrit désormais
+  cette limite directement sur **stderr** au démarrage de tout run sous `--isolation
+  worktree` (`crates/warden/src/main.rs`, `print_isolation_worktree_warning`) — jamais via
+  `tracing::warn!`, dont `init_tracing` construit le filtre avec
+  `EnvFilter::try_from_default_env()` en premier : n'importe quel `RUST_LOG` (une variable
+  d'environnement banale dans un shell de dev) remplaçait le filtre par défaut tout entier et
+  faisait taire l'avertissement, vérifié en conditions réelles (`RUST_LOG=error`,
+  `RUST_LOG=warden_core=info`). L'écriture stderr directe est structurellement insensible à
+  `RUST_LOG`/`EnvFilter`, quelle que soit sa valeur, et reconcilie du même coup cette ligne
+  avec la règle déjà documentée par `warden-tui` (« logs go to stderr, never stdout »).
+  Imprimé une fois par run, donc une fois par sous-processus enfant en mode batch (issue
+  #72) — un batch à 5 intentions imprime la ligne 5 fois, sans déduplication ; décision
+  assumée : un avertissement de sécurité supprimable réintroduirait le silence que cette
+  issue existe à faire disparaître.
+- **Nuance par `--tool` (issue #71 : `codex`/`mistral`, en plus de `claude`)** : la lecture
+  par chemin absolu n'est bornée par aucun adaptateur, mais l'écriture, si — `claude` (défaut)
+  accorde `Bash` aux trois rôles, donc lecture *et* écriture par chemin absolu pour un agent
+  qui se comporte normalement ; `codex`, avec ses défauts (`workspace-write`/`read-only`),
+  impose une vraie frontière d'écriture OS même sous `--isolation worktree` — mais une
+  définition d'agent du dépôt peut demander `--sandbox danger-full-access` et la désactiver
+  (`definition.tools` transmis verbatim, non validé côté Warden) ; `mistral` n'a aucune
+  contrainte d'outil, aucune frontière nulle part, la combinaison la moins bornée des trois.
+  Le texte de l'avertissement qualifie désormais l'écriture en conséquence plutôt que de
+  l'affirmer inconditionnellement.
+- **Limite acceptée, non résolue ici** : cette ADR ne ferme pas le risque sous `--isolation
+  worktree` lui-même, elle le documente et le surface — `--isolation docker` reste la seule
+  option qui ferme réellement l'écart (ADR-0015/ADR-0019). L'incohérence plus large « le
+  reste des logs de `warden` vit sur stdout, contrairement à la règle de `warden-tui` » reste
+  ouverte, hors périmètre de ce correctif.
+
 ### Added — Issue #73 / ADR-0020 : workflow personnalisable piloté par la donnée (`.warden/workflow.yaml`)
 
 - **`.warden/workflow.yaml`** (optionnel, pur YAML) : le pipeline coder → gate review → gate

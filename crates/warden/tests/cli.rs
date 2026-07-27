@@ -1257,8 +1257,65 @@ fn e2e_an_unknown_isolation_is_a_clean_cli_error_naming_the_value() {
 /// must not itself fail arg parsing; it is exercised indirectly by every
 /// other `e2e_*` test in this file that never passes `--isolation` at all
 /// and still runs a real (non-docker) convergence loop successfully.
+///
+/// Issue #25/ADR-0021 review: also the positive half of the filesystem
+/// threat-model warning's coverage -- `print_isolation_worktree_warning`
+/// (`crates/warden/src/main.rs`) runs at the very top of `run`, before
+/// `warden` ever tries (and, here, fails) to spawn `claude`, so this run's
+/// own stderr already carries it by the time the process exits. See
+/// `e2e_isolation_docker_never_prints_the_worktree_filesystem_warning` for
+/// the negative half.
+///
+/// `PATH` is pinned to a `claude`-free minimal set here (unlike this file's
+/// other "no fake `claude` on `PATH`" tests, which just inherit whatever
+/// `PATH` the test process itself runs under): a real `claude` install on
+/// a developer's own `PATH` (e.g. `~/.local/bin/claude`) would otherwise be
+/// found and actually invoked, found empirically while adding this test --
+/// slow/hanging and a real side effect this test must never risk causing.
 #[test]
 fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        // Fails downstream (no `claude` on this pinned `PATH`), never on arg
+        // parsing -- proven by never seeing clap's own invalid-value
+        // complaint (not a bare "--isolation" substring: the warning below
+        // legitimately mentions "--isolation worktree"/"--isolation docker"
+        // itself now that it lives on this same stream, see issue
+        // #25/ADR-0021 review).
+        .stderr(contains("error: invalid value").not())
+        // Issue #25/ADR-0021 review: the filesystem threat-model warning
+        // itself, present under the default `--isolation worktree`.
+        .stderr(contains("ADR-0021"));
+}
+
+/// Issue #25/ADR-0021 review: the negative half of
+/// `e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error`'s
+/// warning coverage -- `print_isolation_worktree_warning` only runs when
+/// `isolation_config.isolation == Isolation::Worktree`, so `--isolation
+/// docker` must never print it, regardless of whether Docker itself is
+/// installed/reachable on this machine (the warning check happens before
+/// `DockerSandbox` ever touches Docker, so this run fails downstream for an
+/// unrelated reason either way -- never gated on `docker_daemon_available`,
+/// unlike `e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container`
+/// below, which needs a real daemon for its own different assertion).
+#[test]
+fn e2e_isolation_docker_never_prints_the_worktree_filesystem_warning() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let (mut cmd, _hermetic_home) = warden_command();
@@ -1273,12 +1330,47 @@ fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
         warden_home.path().to_str().unwrap(),
         "--tool",
         "claude",
+        "--isolation",
+        "docker",
     ])
     .assert()
     .failure()
-    // Fails downstream (no fake `claude` on `PATH`), never on arg parsing --
-    // proven by never seeing clap's own "--isolation" complaint.
-    .stderr(contains("--isolation").not());
+    .stderr(contains("ADR-0021").not());
+}
+
+/// Issue #25/ADR-0021 review: the guarantee this warning exists to add over
+/// the `tracing::warn!` it replaced -- `RUST_LOG` must never suppress it.
+/// `init_tracing`'s `EnvFilter::try_from_default_env()` replaces the whole
+/// default filter wholesale on any `RUST_LOG` value (verified live against
+/// the previous `tracing::warn!`-based implementation: `RUST_LOG=error`
+/// silenced it entirely) -- `print_isolation_worktree_warning` writes
+/// directly to stderr instead, structurally outside `tracing`'s reach.
+///
+/// `PATH` pinned exactly like
+/// `e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error`
+/// above, same reason.
+#[test]
+fn e2e_isolation_worktree_warning_survives_rust_log_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let (mut cmd, _hermetic_home) = warden_command();
+
+    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin")
+        .env("RUST_LOG", "error")
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "irrelevant",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("ADR-0021"));
 }
 
 /// Cheapest daemon-reachability probe available (mirrors
