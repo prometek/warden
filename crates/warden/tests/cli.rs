@@ -5275,6 +5275,63 @@ async fn e2e_batch_three_intents_each_converge_as_their_own_isolated_run() {
     }
 }
 
+/// Issue #25/ADR-0021 review: `print_isolation_worktree_warning` fires once
+/// per process (`main.rs::run`'s own top-of-function call), and a batch
+/// child re-enters `run` as a brand new OS process
+/// (`run_one_batch_intent`'s `tokio::process::Command::new(current_exe)`,
+/// see `run_batch`'s own docs) -- so under the default `--isolation
+/// worktree`, a 2-intent batch must carry the warning marker on `stderr`
+/// exactly twice, never once (dedup) and never more (double-print per
+/// child). Also the negative half of point 5's "does not corrupt any
+/// machine-readable stream" contract: `run_one_batch_intent` only pipes and
+/// line-parses the child's **stdout** (`command.stdout(Stdio::piped())`,
+/// `stderr` left to inherit) -- so the warning, on `stderr`, must never
+/// appear on `stdout` alongside the `"run <id> started/finished/outcome"`
+/// lines the batch parser depends on, and the parser must still classify
+/// both intents as converged despite the extra `stderr` traffic.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_batch_prints_the_isolation_warning_once_per_child_never_on_stdout() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    let assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "batch warning intent one",
+            "--intent",
+            "batch warning intent two",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("batch summary: 2/2 intent(s) converged"))
+        .stdout(contains("ADR-0021").not());
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let warning_count = stderr.matches("ADR-0021").count();
+    assert_eq!(
+        warning_count, 2,
+        "expected exactly one isolation warning per batch child (2 intents), got {warning_count} in stderr: {stderr:?}"
+    );
+}
+
 /// Issue #72 acceptance criterion: "a failing intent doesn't block the
 /// following ones (continue by default)". The reviewer here only ever
 /// blocks when the incoming payload's `intent` field carries a specific
