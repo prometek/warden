@@ -2782,6 +2782,64 @@ fn e2e_empty_home_with_no_xdg_config_home_is_a_clean_cli_error() {
         .stderr(contains("cannot resolve the user config directory"));
 }
 
+/// Issue #57: `--warden-home` given explicitly and a workflow with no
+/// "reviewer"/"tester" step at all (just the producer) must never require
+/// `XDG_CONFIG_HOME`/`HOME` -- `default_user_config_agents_dir` is now only
+/// resolved lazily, from inside the "reviewer"/"tester" arms of `main.rs`'s
+/// own step-resolution loop, so a workflow that never reaches either arm
+/// never touches the env at all. Reproduces the exact repro from the issue
+/// (`env -u HOME -u XDG_CONFIG_HOME warden run --warden-home ...`) and
+/// asserts the run actually converges instead of aborting before doing any
+/// work -- `e2e_missing_xdg_config_home_and_home_is_a_clean_cli_error`/
+/// `e2e_empty_home_with_no_xdg_config_home_is_a_clean_cli_error` above cover
+/// the opposite case (the built-in default workflow, which *does* have a
+/// reviewer/tester step, still fails exactly as clearly as before once that
+/// resolution is actually needed).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_workflow_with_no_reviewer_or_tester_step_never_needs_home_or_xdg_config_home() {
+    let repo = init_test_repo();
+    write_workflow_yaml(
+        repo.path(),
+        r#"
+name: coder-only
+steps:
+  - role: coder
+    agent: coder
+"#,
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "no reviewer/tester step at all",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"))
+        .stderr(contains("cannot resolve the user config directory").not());
+}
+
 /// Architecture.md §10 (`ClaudeAdapter::env_allowlist`, issue #24 point 6):
 /// the allowlist is `["HOME", "USER"]`, not just `HOME` -- the coder's own
 /// live-verification note in `tool_adapter.rs` documents `USER` as required
