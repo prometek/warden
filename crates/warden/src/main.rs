@@ -593,6 +593,86 @@ async fn load_workflow(repo: &std::path::Path) -> anyhow::Result<warden_core::Wo
     }
 }
 
+/// Interactive human-validation wait point for `Decision::RequireApproval`
+/// (issue #51/ADR-0016): prompts the operator on stderr and reads a `y`/`yes`
+/// answer from stdin. `warden::policy_gate::ApprovalGate`'s own trait docs
+/// say exactly why this concrete implementation lives here rather than in
+/// the lib -- code-standards.md's "the lib emits tracing spans/events... it
+/// never writes to stdout/stderr directly" is the same rule that already
+/// keeps `Orchestrator::on_run_started`'s printing (`print_run_started_hint`,
+/// below) out of the lib.
+///
+/// **Non-interactive session (no TTY on stdin)**: refuses to prompt and
+/// denies outright, fail-closed -- there is no human to ask, and blocking
+/// forever on a `read_line` that will never receive input would hang the
+/// run rather than fail it cleanly. The reason is printed to stderr (naming
+/// the action and the rule's own reason) before returning `false`, so a
+/// `RequireApproval` in a non-interactive run (CI, a script) is never a
+/// silent, unexplained failure -- `PolicyGate::decide` additionally logs
+/// this refusal, so it is never dropped entirely even when stderr is
+/// discarded.
+struct TtyApprovalGate;
+
+#[async_trait::async_trait]
+impl warden::policy_gate::ApprovalGate for TtyApprovalGate {
+    async fn approve(&self, request: warden::policy_gate::ApprovalRequest<'_>) -> bool {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "warden: run {} requires human approval for {} ({}) but stdin is not a \
+                 terminal -- refusing to prompt; denying",
+                request.run_id, request.description, request.reason
+            );
+            return false;
+        }
+
+        eprint!(
+            "warden: run {} requires approval for {} ({}) -- approve? [y/N] ",
+            request.run_id, request.description, request.reason
+        );
+        if std::io::stderr().flush().is_err() {
+            return false;
+        }
+
+        let mut line = String::new();
+        match BufReader::new(tokio::io::stdin())
+            .read_line(&mut line)
+            .await
+        {
+            Ok(0) => {
+                eprintln!("warden: no input received (EOF) -- denying");
+                false
+            }
+            Ok(_) => parse_approval_answer(&line),
+            Err(err) => {
+                eprintln!("warden: failed to read approval response: {err} -- denying");
+                false
+            }
+        }
+    }
+}
+
+/// Pure parsing of [`TtyApprovalGate`]'s stdin line -- split out from
+/// [`TtyApprovalGate::approve`] so the accept/reject rule is unit-testable
+/// without a real terminal (code-standards.md: tests déterministes, pas de
+/// dépendance à un TTY). Only an explicit affirmative answer approves;
+/// anything else -- blank, `"n"`, a typo -- denies, fail-closed.
+///
+/// **Not unit-tested here**: whether [`TtyApprovalGate::approve`] itself
+/// prompts at all depends on `std::io::stdin().is_terminal()`, i.e. on the
+/// *test process's own* ambient stdin -- true under this sandbox/CI (stdin
+/// piped/redirected, never a real tty), but not guaranteed for a developer
+/// running `cargo test` directly in an interactive shell with stdin
+/// inherited. A test exercising that branch would then genuinely block on
+/// `read_line`, waiting on a real terminal (code-standards.md: "pas de temps
+/// réel non mocké" -- this is exactly that hazard) -- refactoring
+/// `approve` to accept an injectable terminal-check purely to make that
+/// safe was judged not worth it for a two-line guard clause, the same
+/// call `resolve_tui_binary_falls_back_to_a_bare_name_when_no_sibling_binary_exists`'s
+/// own doc comment already makes for `std::env::current_exe()`.
+fn parse_approval_answer(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run<R: ToolAdapter>(
     repo: PathBuf,
@@ -977,12 +1057,15 @@ async fn run<R: ToolAdapter>(
     // shell-command decision point) and the orchestrator's own `git_push`
     // decision point (`gate_tail::drive_post_convergence_tail`) -- a single
     // rule set governs both. Absent file -> `PolicyGate::empty` (no-op,
-    // strict parity with pre-issue-#51 behaviour). No interactive
-    // `ApprovalGate` is wired here yet: a `RequireApproval` decision is
-    // denied fail-closed (see `PolicyGate::decide`'s own docs) until one is.
+    // strict parity with pre-issue-#51 behaviour). `TtyApprovalGate` is the
+    // human-validation wait point a `RequireApproval` decision suspends on
+    // (fail-closed if stdin is not a terminal -- see its own docs).
     let policy_rules =
         load_repo_policy(&config.repo_path).context("failed to load .warden/policy.yaml")?;
-    let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(policy_rules)));
+    let policy_gate = Arc::new(
+        PolicyGate::new(warden_policy::Evaluator::new(policy_rules))
+            .with_approval_gate(Arc::new(TtyApprovalGate)),
+    );
 
     let hook_sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
     let hooks = load_repo_hooks(&config.repo_path, hook_sandbox, Arc::clone(&policy_gate))
@@ -1665,6 +1748,26 @@ fn init_tracing(verbosity: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #51: only an explicit affirmative answer approves --
+    /// `TtyApprovalGate`'s human-validation wait point must fail closed on
+    /// anything else, including a bare newline (the operator just pressed
+    /// enter) or a typo.
+    #[test]
+    fn parse_approval_answer_accepts_only_y_or_yes_case_insensitively() {
+        for approved in ["y", "Y", "yes", "YES", "Yes", "  y  ", "y\n", "y\r\n"] {
+            assert!(
+                parse_approval_answer(approved),
+                "{approved:?} must be accepted"
+            );
+        }
+        for denied in ["", "n", "no", "N", "yess", "ye", " ", "yes please"] {
+            assert!(
+                !parse_approval_answer(denied),
+                "{denied:?} must be denied, fail-closed"
+            );
+        }
+    }
 
     /// Issue #32 re-review: pins down `should_wait_for_spawned_tui`'s gate
     /// in isolation, without needing a real pty (impractical in this test

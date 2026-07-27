@@ -9,7 +9,9 @@
 /// push to the real `origin` remote still goes exclusively through
 /// `warden-gated`'s own independent, re-verified barrier (ADR-0002/0006).
 /// `warden-policy` informs the orchestrator upstream of that barrier; it
-/// never replaces it (ADR-0016).
+/// never replaces it (ADR-0016). Likewise, `Deny` for a `shell` action is
+/// advisory defence-in-depth, not a security boundary -- see
+/// `crate::rules`'s own "`deny` is not a security control" docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// No matching rule objects to this action (or every matching rule
@@ -27,31 +29,4 @@ pub enum Decision {
     /// `warden::policy_gate::PolicyGate::decide`'s own docs for the concrete
     /// wiring.
     RequireApproval { reason: String },
-}
-
-impl Decision {
-    /// `true` for [`Decision::Allow`] only -- the one variant a caller may
-    /// act on without any further step (no approval to await, no block to
-    /// honour).
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Decision::Allow)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_allow_reports_is_allow() {
-        assert!(Decision::Allow.is_allow());
-        assert!(!Decision::Deny {
-            reason: "x".to_string()
-        }
-        .is_allow());
-        assert!(!Decision::RequireApproval {
-            reason: "x".to_string()
-        }
-        .is_allow());
-    }
 }

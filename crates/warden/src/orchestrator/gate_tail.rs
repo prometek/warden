@@ -272,10 +272,25 @@ impl Orchestrator {
         {
             tracing::warn!(run_id, reason, "policy blocked the push; failing the run");
             self.transition(run_id, RunState::Failed).await?;
-            self.publish_event(RunEvent::RunFinished {
-                final_state: RunState::Failed.as_str().to_string(),
-            })
-            .await?;
+            // Issue #15 review, L-new-1 (same invariant a stateful
+            // `ApprovalGate` -- issue #51 -- makes reachable for the first
+            // time here): a reboucled run's *prior* pass through this method
+            // may already have staged a real commit under this run's own
+            // staging ref before a later pass gets denied/un-approved. This
+            // is the one `Terminal` outcome this function produces before
+            // reaching the shared cleanup at the bottom (below), so it
+            // reclaims the ref itself rather than leaving it to accumulate.
+            //
+            // Deliberately no `run_teardown`/`RunFinished` publish here:
+            // `run_convergence_loop` -- the sole caller, via
+            // `PostConvergenceOutcome::Terminal` -- already runs both exactly
+            // once for whatever final state it receives (see its own
+            // `on_run_start`/teardown comment block); duplicating either
+            // here would double-publish and, for teardown, run it before the
+            // loop's own bookkeeping settles. Every other terminal path this
+            // module returns (`fail_awaiting_ci_run`,
+            // `apply_ci_result_message`) follows the same contract.
+            delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
             return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
         }
 
@@ -465,6 +480,7 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use crate::orchestrator::test_support::*;
+    use crate::policy_gate::{ApprovalGate, ApprovalRequest};
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
@@ -607,6 +623,181 @@ mod tests {
         (run_id, config, converged_commit)
     }
 
+    /// A [`GateTrigger`] that panics if invoked at all -- proves the policy
+    /// check (issue #51) short-circuits `drive_post_convergence_tail`
+    /// strictly before any `warden-gated` interaction, not just before the
+    /// state transition.
+    struct UnreachableGateTrigger;
+
+    impl GateTrigger for UnreachableGateTrigger {
+        async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<GateChild> {
+            panic!("trigger_run_tail must never run once the policy has denied the push");
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            _run_id: &str,
+            _pr_number: u64,
+            _ci_result_socket: &Path,
+        ) -> Result<GateChild> {
+            panic!("trigger_resume_watch must never run in this test");
+        }
+    }
+
+    /// Asserts `run_id` has no staging ref in `bare_repo` -- what a
+    /// policy-denied/un-approved push must never have reached (issue #51).
+    fn assert_no_staging_ref(bare_repo: &TempDir, run_id: &str) {
+        let check = SyncCommand::new("git")
+            .current_dir(bare_repo.path())
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/warden-staging/{run_id}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !check.status.success(),
+            "the converged commit must never be staged once the policy has blocked the push"
+        );
+    }
+
+    /// Issue #51/ADR-0016, review MEDIUM 3: the flagship `git_push` decision
+    /// point, exercised end to end through the real `drive_post_convergence_tail`
+    /// (not just the pure `warden_core::state`/`warden_policy` unit tests a
+    /// `Deny` decision already has on their own). A denying `PolicyGate`
+    /// must fail the run, never invoke `warden-gated`, and never stage
+    /// anything into the bare gate repo.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_fails_the_run_when_policy_denies_the_push() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let rules =
+            warden_policy::RuleSet::from_yaml("rules:\n  - action: git_push\n    deny: [main]\n")
+                .unwrap();
+        let orchestrator = Orchestrator::new(pool.clone()).with_policy_gate(Arc::new(
+            PolicyGate::new(warden_policy::Evaluator::new(rules)),
+        ));
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(
+                &run_id,
+                &config,
+                &converged_commit,
+                &UnreachableGateTrigger,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+        assert_no_staging_ref(&bare_repo, &run_id);
+    }
+
+    /// A fake [`ApprovalGate`] that records whether it was asked and returns
+    /// a scripted answer -- standing in for the interactive TTY prompt
+    /// `main.rs`'s `TtyApprovalGate` provides in a real run.
+    struct FakeApprovalGate {
+        approve: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for FakeApprovalGate {
+        async fn approve(&self, _request: ApprovalRequest<'_>) -> bool {
+            self.approve
+        }
+    }
+
+    /// Issue #51/ADR-0016, review MEDIUM 3 + HIGH 1: the `git_push` decision
+    /// point's `RequireApproval` path, exercised end to end -- a granted
+    /// approval must let the push proceed exactly as an outright `Allow`
+    /// would (this reuses `FakeGateTrigger`'s existing success path, proving
+    /// `warden-gated` *is* reached once approved).
+    #[tokio::test]
+    async fn drive_post_convergence_tail_pushes_once_a_required_approval_is_granted() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let rules = warden_policy::RuleSet::from_yaml(
+            "rules:\n  - action: git_push\n    require: [tests]\n",
+        )
+        .unwrap();
+        let policy_gate = PolicyGate::new(warden_policy::Evaluator::new(rules))
+            .with_approval_gate(Arc::new(FakeApprovalGate { approve: true }));
+        let orchestrator = Orchestrator::new(pool.clone()).with_policy_gate(Arc::new(policy_gate));
+        let trigger = FakeGateTrigger {
+            outcome: warden_core::CiWatchOutcome::checks_passed(),
+            pr_number: Some(42),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Done)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Done);
+    }
+
+    /// The mirror of the test above: a refused approval must fail the run
+    /// exactly like an outright `Deny`, never invoking `warden-gated` and
+    /// never staging the commit.
+    #[tokio::test]
+    async fn drive_post_convergence_tail_fails_the_run_when_a_required_approval_is_refused() {
+        let repo = init_test_repo();
+        let bare_repo = init_bare_repo_fixture();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (run_id, config, converged_commit) =
+            converged_run_fixture(&pool, &repo, &bare_repo).await;
+
+        let rules = warden_policy::RuleSet::from_yaml(
+            "rules:\n  - action: git_push\n    require: [tests]\n",
+        )
+        .unwrap();
+        let policy_gate = PolicyGate::new(warden_policy::Evaluator::new(rules))
+            .with_approval_gate(Arc::new(FakeApprovalGate { approve: false }));
+        let orchestrator = Orchestrator::new(pool.clone()).with_policy_gate(Arc::new(policy_gate));
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(
+                &run_id,
+                &config,
+                &converged_commit,
+                &UnreachableGateTrigger,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+        assert_no_staging_ref(&bare_repo, &run_id);
+    }
+
+    /// No `.warden/policy.yaml` at all -- `PolicyGate::empty` (the
+    /// orchestrator's own default) must never touch this path: strict parity
+    /// with pre-issue-#51 behaviour.
     #[tokio::test]
     async fn drive_post_convergence_tail_reaches_done_on_checks_passed() {
         let repo = init_test_repo();

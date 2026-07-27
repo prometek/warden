@@ -1,7 +1,6 @@
 //! [`Evaluator`] (issue #51, ADR-0016): evaluates one [`Action`] against a
 //! [`RuleSet`], producing the single [`Decision`] the orchestrator acts on.
 
-use crate::rules::decide_one;
 use crate::{Action, Decision, RuleSet};
 
 /// Evaluates actions against a fixed [`RuleSet`]. Immutable and cheap to
@@ -37,7 +36,7 @@ impl Evaluator {
     pub fn evaluate(&self, action: &Action) -> Decision {
         let mut decision = Decision::Allow;
         for rule in self.rules.matching(action) {
-            decision = escalate(decision, decide_one(rule, action));
+            decision = escalate(decision, rule.decide(action));
         }
         decision
     }
@@ -134,35 +133,39 @@ mod tests {
         );
     }
 
+    /// Two rules both matching the same push, both `RequireApproval` -- the
+    /// aggregate must stay `RequireApproval`, never silently collapse to
+    /// `Allow` just because neither individually denies.
     #[test]
-    fn deny_escalates_over_a_prior_require_approval_from_an_earlier_rule() {
+    fn two_require_approval_rules_matching_the_same_push_stay_require_approval() {
         let rules = RuleSet::from_yaml(
             "rules:\n  - action: git_push\n    require: [tests]\n  - action: git_push\n    \
-             branch: main\n    require: [tests]\n",
+             branch: main\n    require: [review]\n",
         )
         .unwrap();
-        // Neither rule above denies -- add a real deny scenario instead:
-        // a shell action matched by two rules, one allowing, one denying.
         let evaluator = Evaluator::new(rules);
-        // Sanity: with only RequireApproval-producing rules, the result stays
-        // RequireApproval (never silently downgraded to Allow by escalation).
         assert_eq!(
             evaluator.evaluate(&action_push("main")),
             Decision::RequireApproval {
                 reason: "push to branch \"main\" requires: tests".to_string()
-            }
+            },
+            "the first matching rule's own decision wins the escalation tie"
         );
+    }
 
-        let deny_rules = RuleSet::from_yaml(
+    /// Two `shell` rules with different patterns, only the second matching --
+    /// proves escalation aggregates across every matching rule ("strictest
+    /// match wins"), not just the first one in file order.
+    #[test]
+    fn a_deny_rule_further_down_the_file_still_denies() {
+        let rules = RuleSet::from_yaml(
             "rules:\n  - action: shell\n    deny: [\"curl\"]\n  - action: shell\n    deny: \
              [\"rm -rf /\"]\n",
         )
         .unwrap();
-        let deny_evaluator = Evaluator::new(deny_rules);
-        // Matches only the second rule's pattern -- still denied, proving
-        // escalation isn't "first match wins" but "strictest match wins".
+        let evaluator = Evaluator::new(rules);
         assert_eq!(
-            deny_evaluator.evaluate(&action_shell("rm -rf /tmp")),
+            evaluator.evaluate(&action_shell("rm -rf /tmp")),
             Decision::Deny {
                 reason: "shell command matches denied pattern \"rm -rf /\": rm -rf /tmp"
                     .to_string()
@@ -178,14 +181,14 @@ mod tests {
         // file order.
         let rules = RuleSet::from_yaml(
             "rules:\n  - action: git_push\n    require: [tests]\n  - action: git_push\n    \
-             branch: main\n    deny: [\"main\"]\n",
+             branch: main\n    deny: [main]\n",
         )
         .unwrap();
         let evaluator = Evaluator::new(rules);
         assert_eq!(
             evaluator.evaluate(&action_push("main")),
             Decision::Deny {
-                reason: "push to branch \"main\" matches denied pattern \"main\"".to_string()
+                reason: "push to branch \"main\" matches denied branch \"main\"".to_string()
             }
         );
         // A different branch only matches the first (RequireApproval) rule.
