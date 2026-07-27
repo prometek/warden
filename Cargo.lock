@@ -3372,6 +3372,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "warden-core",
+ "warden-policy",
  "warden-sandbox",
 ]
 
@@ -3404,6 +3405,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warden-core",
+]
+
+[[package]]
+name = "warden-policy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

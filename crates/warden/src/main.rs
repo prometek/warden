@@ -14,6 +14,8 @@ use warden::db;
 use warden::gate_trigger;
 use warden::hook_config::load_repo_hooks;
 use warden::orchestrator::{self, Orchestrator, RunConfig};
+use warden::policy_config::load_repo_policy;
+use warden::policy_gate::PolicyGate;
 use warden::tool_adapter::{ClaudeAdapter, CodexAdapter, MistralAdapter, ToolAdapter};
 use warden_core::AgentRole;
 use warden_sandbox::{LocalSandbox, Sandbox};
@@ -970,12 +972,25 @@ async fn run<R: ToolAdapter>(
     // empty registry (dispatch stays a no-op). See `warden::hook_config` for
     // the trust model: a repo's hook commands are honoured by default,
     // consistent with its `.warden/agents/coder.md`.
+    // Issue #51/ADR-0016: `.warden/policy.yaml` resolved once, shared between
+    // this run's `.warden/hooks.toml` commands (each `CommandHook`'s own
+    // shell-command decision point) and the orchestrator's own `git_push`
+    // decision point (`gate_tail::drive_post_convergence_tail`) -- a single
+    // rule set governs both. Absent file -> `PolicyGate::empty` (no-op,
+    // strict parity with pre-issue-#51 behaviour). No interactive
+    // `ApprovalGate` is wired here yet: a `RequireApproval` decision is
+    // denied fail-closed (see `PolicyGate::decide`'s own docs) until one is.
+    let policy_rules =
+        load_repo_policy(&config.repo_path).context("failed to load .warden/policy.yaml")?;
+    let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(policy_rules)));
+
     let hook_sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
-    let hooks = load_repo_hooks(&config.repo_path, hook_sandbox)
+    let hooks = load_repo_hooks(&config.repo_path, hook_sandbox, Arc::clone(&policy_gate))
         .context("failed to load .warden/hooks.toml")?;
 
     let orchestrator = orchestrator
         .with_hooks(hooks)
+        .with_policy_gate(policy_gate)
         .on_run_started(move |run_id| {
             print_run_started_hint(run_id, &attach_warden_home_quoted);
 

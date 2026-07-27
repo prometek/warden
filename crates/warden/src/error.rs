@@ -247,6 +247,14 @@ pub enum WardenError {
     #[error("invalid hook config {path}: {reason}")]
     HookConfig { path: PathBuf, reason: String },
 
+    /// The repo's `.warden/policy.yaml` could not be read as a policy rule
+    /// set (issue #51, ADR-0016) -- malformed YAML, an unknown top-level
+    /// key, or a rule naming an unknown `action`. Per code-standards.md
+    /// ("no silent fallback"), a present-but-broken policy file aborts
+    /// rather than being quietly treated as "no rules at all".
+    #[error("invalid policy config {path}: {reason}")]
+    PolicyConfig { path: PathBuf, reason: String },
+
     #[error("run {run_id} exceeded its review cycle budget ({max_review_cycles} cycles) without converging")]
     MaxReviewCyclesExceeded {
         run_id: String,

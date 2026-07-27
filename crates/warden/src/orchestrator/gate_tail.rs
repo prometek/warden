@@ -248,6 +248,37 @@ impl Orchestrator {
         // the `warden-gated` side of this boundary.
         let evidence = evidence_rows_for_run(&self.pool, run_id).await?;
 
+        // Issue #51/ADR-0016: the policy decision layer's one wiring into
+        // this crate's push path. Evaluated while the run is still
+        // `Converged` (before the write-ahead transition below), so a
+        // `Deny`/unapproved `RequireApproval` can fail the run cleanly
+        // (`Converged -> Failed` is a legal transition precisely for this,
+        // see `warden_core::state`'s own docs) instead of either staging the
+        // commit anyway or leaving the run stuck `Converged` forever. This
+        // governs only the push into the *local bare gate repo* -- never
+        // `origin` itself, which stays `warden-gated`'s own, independently
+        // re-verified barrier (ADR-0002/0006), entirely untouched by this
+        // check.
+        if let PolicyOutcome::Blocked { reason } = self
+            .policy_gate
+            .decide(
+                run_id,
+                &format!("git_push to branch {:?}", config.branch),
+                &warden_policy::Action::GitPush {
+                    branch: config.branch.clone(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(run_id, reason, "policy blocked the push; failing the run");
+            self.transition(run_id, RunState::Failed).await?;
+            self.publish_event(RunEvent::RunFinished {
+                final_state: RunState::Failed.as_str().to_string(),
+            })
+            .await?;
+            return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
+        }
+
         self.transition(run_id, RunState::Pushed).await?;
         push_converged_commit_to_bare_repo(
             &config.repo_path,
