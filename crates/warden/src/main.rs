@@ -1841,6 +1841,33 @@ mod tests {
         }
     }
 
+    /// Issue #51 review round 2, finding A: `NoTuiApprovalGate` -- installed
+    /// whenever `--tui` is attached -- must deny a `RequireApproval` decision
+    /// immediately, with no attempt to read stdin/prompt a terminal. This is
+    /// the one behaviour `TtyApprovalGate`'s own docs say a real prompt would
+    /// get wrong under `--tui` (raw mode swallows `\n`, so a `read_line`
+    /// there would simply hang forever). A test that resolves at all --
+    /// rather than timing out -- is itself the proof there is no hidden
+    /// blocking read on this path; the explicit `false` assertion additionally
+    /// pins the fail-closed contract.
+    #[tokio::test]
+    async fn no_tui_approval_gate_denies_immediately_without_prompting() {
+        let gate = NoTuiApprovalGate;
+        let approved = warden::policy_gate::ApprovalGate::approve(
+            &gate,
+            warden::policy_gate::ApprovalRequest {
+                run_id: "run-1",
+                description: "git_push to branch \"main\"",
+                reason: "push to branch \"main\" requires: tests",
+            },
+        )
+        .await;
+        assert!(
+            !approved,
+            "NoTuiApprovalGate must fail closed while --tui owns the terminal"
+        );
+    }
+
     /// Issue #32 re-review: pins down `should_wait_for_spawned_tui`'s gate
     /// in isolation, without needing a real pty (impractical in this test
     /// harness -- `assert_cmd` never gives a spawned binary a real

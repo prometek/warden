@@ -495,4 +495,65 @@ rules:
             }
         );
     }
+
+    /// A `git_push` rule's `deny` list may name more than one branch --
+    /// every one of them, not just the first, must be caught.
+    #[test]
+    fn a_git_push_rule_denies_any_of_several_listed_branches() {
+        let rules = RuleSet::from_yaml("rules:\n  - action: git_push\n    deny: [main, release]\n")
+            .unwrap();
+        let rule = &rules.rules[0];
+        for denied in ["main", "release"] {
+            assert_eq!(
+                rule.decide(&Action::GitPush {
+                    branch: denied.to_string()
+                }),
+                Decision::Deny {
+                    reason: format!("push to branch {denied:?} matches denied branch {denied:?}")
+                },
+                "{denied} must be denied"
+            );
+        }
+        assert_eq!(
+            rule.decide(&Action::GitPush {
+                branch: "develop".to_string()
+            }),
+            Decision::Allow
+        );
+    }
+
+    /// [`Rule::matches`] scopes a `branch`-restricted `git_push` rule to
+    /// exactly that branch *before* [`Rule::decide`] ever runs -- so a `deny`
+    /// entry naming a *different* branch than the rule's own `branch` field
+    /// is unreachable dead configuration, never a rule that silently denies
+    /// the "wrong" branch. Pins this down explicitly: `RuleSet::matching`
+    /// (the only caller of both) never even offers this rule a push to
+    /// `"release"` to evaluate, because [`Rule::matches`] already excluded it.
+    #[test]
+    fn a_branch_scoped_deny_entry_for_a_different_branch_is_unreachable_through_matching() {
+        let rules = RuleSet::from_yaml(
+            "rules:\n  - action: git_push\n    branch: main\n    deny: [release]\n",
+        )
+        .unwrap();
+        let rule = &rules.rules[0];
+        assert!(
+            !rule.matches(&Action::GitPush {
+                branch: "release".to_string()
+            }),
+            "the branch scope excludes \"release\" from ever reaching Rule::decide, so its \
+             presence in `deny` has no effect through RuleSet::matching"
+        );
+        assert!(rule.matches(&Action::GitPush {
+            branch: "main".to_string()
+        }));
+        // The only branch this rule ever evaluates (`main`, per its own
+        // `branch` scope) is not itself in `deny`, so it resolves to Allow --
+        // the `deny: [release]` entry is inert for this rule.
+        assert_eq!(
+            rule.decide(&Action::GitPush {
+                branch: "main".to_string()
+            }),
+            Decision::Allow
+        );
+    }
 }
