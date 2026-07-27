@@ -7,6 +7,41 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #51 / ADR-0016 : moteur de politiques (`warden-policy`, `.warden/policy.yaml`)
+
+- **Nouveau crate `warden-policy`** : couche de décision explicite, en amont — `Decision {
+  Allow, Deny { reason }, RequireApproval { reason } }`, un `Evaluator` qui réduit toutes les
+  règles correspondant à une action à la décision la plus stricte (`Deny` > `RequireApproval`
+  > `Allow`, indépendant de l'ordre des règles ; aucune règle correspondante = `Allow`). Ne
+  dépend ni de `warden-core` ni de `warden` (seulement `serde`/`serde_yaml`/`thiserror`) — voir
+  `docs/adr/ADR-0016-policy-engine.md`, amendée pour refléter cette indépendance totale.
+- **`.warden/policy.yaml`** (optionnel, à la racine du repo sous revue, comme `hooks.toml`) :
+  deux types de règle, `git_push` (`branch`/`require`/`deny`) et `shell` (`deny`), un enum
+  serde interne à `action` — un champ `git_push` sur une règle `shell` (ou l'inverse) est
+  rejeté au parsing plutôt que silencieusement ignoré. Fichier absent ou vide/commentaires
+  seuls -> aucune règle (tout autorisé) ; fichier malformé -> erreur bloquante du run, jamais
+  une gouvernance silencieusement désactivée.
+- **Asymétrie voulue entre les deux `deny`** : `git_push.deny` est une égalité exacte sur le
+  nom de branche (`deny: [main]` ne bloque jamais `domain-refactor` ou `remain`) ; `shell.deny`
+  est une sous-chaîne littérale. `deny` n'est **pas un contrôle de sécurité** — seulement une
+  défense en profondeur contre les accidents, triviale à contourner par l'auteur du dépôt cible
+  (les commandes shell qu'il gouverne viennent de `.warden/hooks.toml`, fourni par ce même
+  dépôt) ; ne jamais s'y fier comme substitut à ne pas exécuter les hooks d'un dépôt auquel on
+  ne fait pas confiance.
+- **Câblage dans `warden`** : `policy_config.rs` charge `.warden/policy.yaml` ;
+  `policy_gate.rs` (`PolicyGate::decide`) résout une `Decision` en `PolicyOutcome`, suspendant
+  sur un `ApprovalGate` pour `RequireApproval` — fail-closed (bloqué) si aucun gate n'est
+  configuré. Deux points d'évaluation : `hook.rs` avant tout `.warden/hooks.toml` shell,
+  `orchestrator/gate_tail.rs` avant de pousser le commit convergé vers le dépôt bare local.
+  `warden run` installe un prompt interactif sur stderr (`TtyApprovalGate`, exige stdin *et*
+  stderr tous deux un terminal) par défaut, ou un refus immédiat fail-closed
+  (`NoTuiApprovalGate`) dès que `--tui` est attaché — le TUI possède le terminal en mode raw,
+  un prompt y bloquerait indéfiniment.
+- **`warden-gated` inchangé** : reste l'unique barrière d'application finale sur `git push
+  origin`, hors d'atteinte de `warden-policy`.
+- `warden-core` gagne une transition `Converged -> Failed` (un push refusé par la politique
+  fait échouer le run).
+
 ### Security — Issue #25 / ADR-0021 : modèle de menace du sous-processus agent — ce que `env_clear()` protège, ce qu'il ne protège pas
 
 - **Constat** : `env_clear()` (`warden_sandbox::LocalSandbox`) ne borne jamais que les

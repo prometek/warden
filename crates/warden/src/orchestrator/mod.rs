@@ -99,6 +99,7 @@ use crate::evidence::{self, EvidenceCaptureContext};
 use crate::gate_trigger::{GateChild, GateTrigger, RunTailTrigger};
 use crate::git_util::NO_HOST_HOOKS;
 use crate::hook::HookRegistry;
+use crate::policy_gate::{PolicyGate, PolicyOutcome};
 use crate::process::{self, AgentCommand, AgentOutcome};
 use crate::tool_adapter::ToolAdapter;
 use crate::worktree::{self, WorktreeManager};
@@ -390,6 +391,14 @@ pub struct Orchestrator {
     /// convergence loop. No concrete hook ships yet (issue #55 is foundation
     /// only).
     hooks: HookRegistry,
+    /// Issue #51/ADR-0016: the policy decision layer consulted before this
+    /// run's `git_push` action (`gate_tail::drive_post_convergence_tail`,
+    /// right before staging the converged commit into the local bare gate
+    /// repo -- never `origin` itself, which stays `warden-gated`'s own,
+    /// independently re-verified job, unchanged). **No rules by default**
+    /// ([`PolicyGate::empty`]), so this check is a strict no-op until a
+    /// caller installs one via [`Orchestrator::with_policy_gate`].
+    policy_gate: Arc<PolicyGate>,
 }
 
 /// See the `on_run_started` field docs on [`Orchestrator`]. Named alias
@@ -404,6 +413,7 @@ impl Orchestrator {
             on_run_started: None,
             sandbox: Arc::new(LocalSandbox::new()),
             hooks: HookRegistry::new(),
+            policy_gate: Arc::new(PolicyGate::empty()),
         }
     }
 
@@ -436,6 +446,17 @@ impl Orchestrator {
     /// becomes part of any run-time signature.
     pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Installs the [`PolicyGate`] consulted before this run's `git_push`
+    /// action (issue #51/ADR-0016). Defaults to [`PolicyGate::empty`] (a
+    /// no-op seam, every push allowed); `main.rs` resolves a real one from
+    /// `.warden/policy.yaml` (`crate::policy_config::load_repo_policy`) and
+    /// installs it here, the same builder-style construction-time choice as
+    /// [`Orchestrator::with_sandbox`]/[`Orchestrator::with_hooks`].
+    pub fn with_policy_gate(mut self, policy_gate: Arc<PolicyGate>) -> Self {
+        self.policy_gate = policy_gate;
         self
     }
 

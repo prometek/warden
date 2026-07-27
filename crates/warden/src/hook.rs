@@ -27,6 +27,7 @@ use warden_core::{HookContext, HookOutcome, HookPoint};
 use warden_sandbox::{Command, ExecuteOptions, Sandbox, SandboxSpec};
 
 use crate::error::Result;
+use crate::policy_gate::{PolicyGate, PolicyOutcome};
 
 /// A deterministic action bound to one or more [`HookPoint`]s. Runs inside the
 /// `warden` crate (where FS/process/sandbox live), never in `warden-core`.
@@ -154,28 +155,42 @@ impl HookRegistry {
 /// nothing to run against), otherwise a logged `Continue`. An error actually
 /// *running* the command (the sandbox failed to spawn) propagates as `Err`,
 /// per the [`Hook::run`] contract.
+///
+/// # Policy (issue #51, ADR-0016)
+///
+/// Before the command ever reaches the sandbox, it is evaluated as a
+/// `warden_policy::Action::Shell` against this hook's [`PolicyGate`]. A
+/// [`crate::policy_gate::PolicyOutcome::Blocked`] outcome -- whether from an
+/// outright `Deny`, or an unapproved/unconfigured `RequireApproval` -- turns
+/// into a [`HookOutcome::Block`] with the policy's own reason, and the
+/// command is never run at all. With no `.warden/policy.yaml` present
+/// (`PolicyGate::empty`, the default), this check is a strict no-op.
 pub struct CommandHook {
     points: Vec<HookPoint>,
     /// The raw shell line, kept for log/block messages.
     run: String,
     block_on_failure: bool,
     sandbox: Arc<dyn Sandbox>,
+    policy_gate: Arc<PolicyGate>,
 }
 
 impl CommandHook {
-    /// Binds `run` (a shell line) to `points`, executed through `sandbox`.
-    /// `block_on_failure` decides whether a non-zero exit blocks the run.
+    /// Binds `run` (a shell line) to `points`, executed through `sandbox`
+    /// once `policy_gate` allows it. `block_on_failure` decides whether a
+    /// non-zero exit blocks the run.
     pub fn new(
         points: Vec<HookPoint>,
         run: impl Into<String>,
         block_on_failure: bool,
         sandbox: Arc<dyn Sandbox>,
+        policy_gate: Arc<PolicyGate>,
     ) -> Self {
         Self {
             points,
             run: run.into(),
             block_on_failure,
             sandbox,
+            policy_gate,
         }
     }
 
@@ -194,6 +209,21 @@ impl Hook for CommandHook {
     }
 
     async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        let description = format!("shell: {}", self.run);
+        if let PolicyOutcome::Blocked { reason } = self
+            .policy_gate
+            .decide(
+                ctx.run_id,
+                &description,
+                &warden_policy::Action::Shell {
+                    command: self.run.clone(),
+                },
+            )
+            .await
+        {
+            return Ok(HookOutcome::Block { reason });
+        }
+
         let id = self
             .sandbox
             .create(SandboxSpec {
@@ -481,10 +511,24 @@ mod tests {
         }
     }
 
+    /// No `.warden/policy.yaml` -- every `CommandHook` test below that isn't
+    /// specifically exercising issue #51's policy gate uses this, so the
+    /// policy check stays a strict no-op exactly like it does with no file
+    /// present in a real run.
+    fn empty_policy_gate() -> Arc<PolicyGate> {
+        Arc::new(PolicyGate::empty())
+    }
+
     #[tokio::test]
     async fn command_hook_continues_on_a_zero_exit() {
         let sandbox = Arc::new(LocalSandbox::new());
-        let hook = CommandHook::new(vec![HookPoint::OnRunStart], "exit 0", true, sandbox);
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunStart],
+            "exit 0",
+            true,
+            sandbox,
+            empty_policy_gate(),
+        );
         let dir = TempDir::new().unwrap();
         assert_eq!(
             hook.run(&ctx_in(HookPoint::OnRunStart, dir.path()))
@@ -502,6 +546,7 @@ mod tests {
             "echo boom >&2; exit 3",
             true,
             sandbox,
+            empty_policy_gate(),
         );
         let dir = TempDir::new().unwrap();
         match hook
@@ -526,7 +571,13 @@ mod tests {
     #[tokio::test]
     async fn command_hook_continues_on_failure_when_not_block_on_failure() {
         let sandbox = Arc::new(LocalSandbox::new());
-        let hook = CommandHook::new(vec![HookPoint::OnRunEnd], "exit 1", false, sandbox);
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunEnd],
+            "exit 1",
+            false,
+            sandbox,
+            empty_policy_gate(),
+        );
         let dir = TempDir::new().unwrap();
         assert_eq!(
             hook.run(&ctx_in(HookPoint::OnRunEnd, dir.path()))
@@ -540,7 +591,13 @@ mod tests {
     #[tokio::test]
     async fn command_hook_runs_in_the_repo_path_cwd() {
         let sandbox = Arc::new(LocalSandbox::new());
-        let hook = CommandHook::new(vec![HookPoint::OnRunStart], "touch ran.txt", true, sandbox);
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunStart],
+            "touch ran.txt",
+            true,
+            sandbox,
+            empty_policy_gate(),
+        );
         let dir = TempDir::new().unwrap();
         hook.run(&ctx_in(HookPoint::OnRunStart, dir.path()))
             .await
@@ -549,5 +606,71 @@ mod tests {
             dir.path().join("ran.txt").exists(),
             "the command runs with repo_path as its cwd"
         );
+    }
+
+    /// Issue #51: a `.warden/policy.yaml` rule denying this exact shell
+    /// command must block the hook -- and the command must never actually
+    /// run (the file it would create must not exist).
+    #[tokio::test]
+    async fn command_hook_is_blocked_by_a_policy_deny_and_never_runs_the_command() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let rules =
+            warden_policy::RuleSet::from_yaml("rules:\n  - action: shell\n    deny: [\"touch\"]\n")
+                .unwrap();
+        let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(rules)));
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunStart],
+            "touch denied.txt",
+            true,
+            sandbox,
+            policy_gate,
+        );
+        let dir = TempDir::new().unwrap();
+        match hook
+            .run(&ctx_in(HookPoint::OnRunStart, dir.path()))
+            .await
+            .unwrap()
+        {
+            HookOutcome::Block { reason } => {
+                assert!(reason.contains("touch"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("denied.txt").exists(),
+            "a denied command must never actually run"
+        );
+    }
+
+    /// Issue #51 end-to-end: a policy-denied `on_run_start` hook command,
+    /// consumed through the *existing* `HookOutcome::Block` handling
+    /// `run_convergence_loop` already applies for that point, fails the run
+    /// before the coder ever spawns -- exactly the same path a non-zero
+    /// exit already took, now reachable from a policy decision instead.
+    #[tokio::test]
+    async fn a_policy_denied_on_run_start_hook_still_blocks_via_the_existing_dispatch() {
+        let sandbox = Arc::new(LocalSandbox::new());
+        let rules =
+            warden_policy::RuleSet::from_yaml("rules:\n  - action: shell\n    deny: [\"boom\"]\n")
+                .unwrap();
+        let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(rules)));
+        let hook = CommandHook::new(
+            vec![HookPoint::OnRunStart],
+            "echo boom",
+            true,
+            sandbox,
+            policy_gate,
+        );
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(hook));
+        let dir = TempDir::new().unwrap();
+        let outcome = registry
+            .run_hooks(
+                HookPoint::OnRunStart,
+                &ctx_in(HookPoint::OnRunStart, dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, HookOutcome::Block { .. }));
     }
 }

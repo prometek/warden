@@ -49,6 +49,7 @@ use warden_sandbox::Sandbox;
 
 use crate::error::{Result, WardenError};
 use crate::hook::{CommandHook, HookRegistry};
+use crate::policy_gate::PolicyGate;
 
 /// The parsed shape of a `.warden/hooks.toml` file.
 #[derive(Debug, Deserialize)]
@@ -85,8 +86,14 @@ fn hooks_file_path(repo_path: &Path) -> std::path::PathBuf {
 /// [`CommandHook`] per entry (file order preserved). An absent file yields an
 /// empty registry; a malformed one is a [`WardenError::HookConfig`]. Every
 /// hook runs through `sandbox` (shared with the orchestrator's own so a single
-/// backend choice covers both -- see `crate::main`).
-pub fn load_repo_hooks(repo_path: &Path, sandbox: Arc<dyn Sandbox>) -> Result<HookRegistry> {
+/// backend choice covers both -- see `crate::main`), and is gated by
+/// `policy_gate` (issue #51, ADR-0016) -- see [`CommandHook`]'s own "Policy"
+/// docs.
+pub fn load_repo_hooks(
+    repo_path: &Path,
+    sandbox: Arc<dyn Sandbox>,
+    policy_gate: Arc<PolicyGate>,
+) -> Result<HookRegistry> {
     let path = hooks_file_path(repo_path);
     let contents = match std::fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -126,6 +133,7 @@ pub fn load_repo_hooks(repo_path: &Path, sandbox: Arc<dyn Sandbox>) -> Result<Ho
             raw.run,
             raw.block_on_failure,
             Arc::clone(&sandbox),
+            Arc::clone(&policy_gate),
         )));
     }
     Ok(registry)
@@ -141,6 +149,10 @@ mod tests {
         Arc::new(LocalSandbox::new())
     }
 
+    fn policy_gate() -> Arc<PolicyGate> {
+        Arc::new(PolicyGate::empty())
+    }
+
     fn write_hooks(dir: &Path, contents: &str) {
         let warden = dir.join(".warden");
         std::fs::create_dir_all(&warden).unwrap();
@@ -150,7 +162,7 @@ mod tests {
     #[test]
     fn absent_file_is_an_empty_registry_not_an_error() {
         let dir = TempDir::new().unwrap();
-        let registry = load_repo_hooks(dir.path(), sandbox()).unwrap();
+        let registry = load_repo_hooks(dir.path(), sandbox(), policy_gate()).unwrap();
         assert!(registry.is_empty(), "no config -> no hooks");
     }
 
@@ -170,7 +182,7 @@ mod tests {
             block_on_failure = false
             "#,
         );
-        let registry = load_repo_hooks(dir.path(), sandbox()).unwrap();
+        let registry = load_repo_hooks(dir.path(), sandbox(), policy_gate()).unwrap();
         assert!(!registry.is_empty());
         // Registration order is the observable contract; the count and the
         // points are asserted through the registry's public dispatch behaviour
@@ -189,7 +201,7 @@ mod tests {
             run = "true"
             "#,
         );
-        let err = load_repo_hooks(dir.path(), sandbox()).unwrap_err();
+        let err = load_repo_hooks(dir.path(), sandbox(), policy_gate()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("on_run_startt"), "names the offender: {msg}");
         assert!(msg.contains("on_run_start"), "lists valid names: {msg}");
@@ -199,7 +211,7 @@ mod tests {
     fn malformed_toml_is_a_hard_error_not_a_silent_empty_registry() {
         let dir = TempDir::new().unwrap();
         write_hooks(dir.path(), "this is not = valid toml [[[");
-        let err = load_repo_hooks(dir.path(), sandbox()).unwrap_err();
+        let err = load_repo_hooks(dir.path(), sandbox(), policy_gate()).unwrap_err();
         assert!(matches!(err, WardenError::HookConfig { .. }));
     }
 
@@ -216,6 +228,6 @@ mod tests {
             run = "cargo fmt --check"
             "#,
         );
-        assert!(load_repo_hooks(dir.path(), sandbox()).is_ok());
+        assert!(load_repo_hooks(dir.path(), sandbox(), policy_gate()).is_ok());
     }
 }

@@ -183,7 +183,15 @@ impl RunState {
                     RunState::Failed,
                 ]
             }
-            RunState::Converged => vec![RunState::Pushed],
+            // Issue #51: a policy `Deny` (or an unapproved `RequireApproval`)
+            // on the `git_push` action -- evaluated by `warden::policy_gate`
+            // right before this transition would otherwise fire -- must be
+            // able to fail the run instead of either pushing anyway or
+            // leaving it stuck `Converged` forever. Mirrors the existing
+            // `Pending -> Failed` escape a blocked `on_run_start` lifecycle
+            // hook already uses for the same reason (see
+            // `Orchestrator::run_convergence_loop`).
+            RunState::Converged => vec![RunState::Pushed, RunState::Failed],
             RunState::Pushed => vec![RunState::AwaitingCi],
             RunState::AwaitingCi => {
                 vec![RunState::Done, RunState::CoderRunning, RunState::Failed]
@@ -425,9 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn converged_can_only_move_to_pushed() {
+    fn converged_can_move_to_pushed_or_fail_on_a_policy_denial() {
         assert!(RunState::Converged
             .validate_transition(RunState::Pushed, DEFAULT_TOTAL_STEPS)
+            .is_ok());
+        // Issue #51: a policy `Deny`/unapproved `RequireApproval` on the
+        // `git_push` action fails the run instead of pushing it.
+        assert!(RunState::Converged
+            .validate_transition(RunState::Failed, DEFAULT_TOTAL_STEPS)
             .is_ok());
         assert!(RunState::Converged
             .validate_transition(RunState::Done, DEFAULT_TOTAL_STEPS)

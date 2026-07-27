@@ -931,6 +931,7 @@ mod tests {
         let hooks = crate::hook_config::load_repo_hooks(
             repo.path(),
             Arc::new(warden_sandbox::LocalSandbox::new()),
+            Arc::new(crate::policy_gate::PolicyGate::empty()),
         )
         .unwrap();
         let orchestrator = Orchestrator::new(pool.clone()).with_hooks(hooks);

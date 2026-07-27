@@ -115,6 +115,11 @@ garde le comportement même-hôte décrit ci-dessus.
   invocation dans un conteneur `docker run --rm` séparé — voir "Flags de `warden run`"
   ci-dessous et `crates/warden-sandbox/docker/README.md` pour l'image de référence et les
   garanties exactes. Dont dépend `crates/warden/` (jamais `warden-core`, dans aucun sens).
+- `crates/warden-policy/` — couche de décision pure (issue #51/ADR-0016) : évalue une action
+  (`git_push`/`shell`) contre les règles déclaratives de `.warden/policy.yaml` (`RuleSet`,
+  `Evaluator`) et rend `Allow`/`Deny`/`RequireApproval` — pas d'I/O, ne dépend ni de
+  `warden-core` ni de `warden`. Voir "Gouverner les actions de warden (`.warden/policy.yaml`)"
+  ci-dessous.
 - `crates/warden/` — binaire orchestrateur (`[[bin]] warden`) : CLI, gestion des
   worktrees git, spawn des agents via la seam `warden-sandbox`, persistance SQLite
   (`sqlx`), boucle de convergence.
@@ -586,6 +591,56 @@ silencieusement ignorée.
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
 `workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.
+
+### Gouverner les actions de warden (`.warden/policy.yaml`, issue #51/ADR-0016)
+
+Par défaut, aucune restriction : `warden` pousse le commit convergé vers le dépôt bare local et
+exécute les commandes de `.warden/hooks.toml` sans y faire obstacle. Un `.warden/policy.yaml`
+optionnel, à la racine du repo sous revue, permet d'exiger une validation humaine ou d'interdire
+certaines actions avant qu'elles ne s'exécutent :
+
+```yaml
+rules:
+  - action: git_push
+    branch: main
+    require: [tests, review]
+  - action: git_push
+    deny: [release]
+  - action: shell
+    deny: ["rm -rf /"]
+```
+
+- `action: git_push` — évalué juste avant que `warden` ne pousse le commit convergé vers le
+  dépôt bare local (jamais `origin` : ce push-là reste l'affaire exclusive de `warden-gated`,
+  revérifié indépendamment). `branch` restreint la règle à une branche donnée (absent = toutes
+  les branches) ; `require` (liste non vide) exige une approbation humaine avant de pousser ;
+  `deny` interdit purement et simplement le push si la branche visée y figure.
+- `action: shell` — évalué juste avant l'exécution d'une commande de `.warden/hooks.toml`.
+  `deny` interdit la commande si elle contient l'un des motifs listés.
+- **`deny` n'a pas les mêmes règles de correspondance selon l'action, volontairement** :
+  `git_push.deny` compare le nom de branche **exactement** (`deny: [main]` ne bloque jamais
+  `domain-refactor` ni `remain`) ; `shell.deny` teste une **sous-chaîne littérale** dans la
+  commande. Une branche est un identifiant unique nommé en toutes lettres par l'opérateur ;
+  une ligne de commande shell a besoin d'attraper des variantes (`rm -rf /`, `sudo rm -rf /`,
+  ...), d'où l'écart.
+- **`deny` n'est pas un contrôle de sécurité.** C'est de la défense en profondeur contre les
+  accidents (un `deny: ["curl"]` copié-collé un peu vite), pas une barrière : rien n'empêche
+  `wget`, un `cur''l` échappé, ou un payload encodé en base64 de passer au travers. Les
+  commandes shell qu'elle gouverne viennent de `.warden/hooks.toml`, un fichier **fourni par le
+  dépôt cible lui-même** — n'exécutez pas les hooks d'un dépôt auquel vous ne faites pas
+  confiance en comptant sur `deny` pour vous protéger.
+- **`require` suspend le run sur une approbation humaine.** Sans `--tui`, `warden run` invite
+  directement sur stderr (`approve? [y/N]`) et attend une réponse sur stdin ; toute réponse
+  autre qu'une confirmation explicite refuse l'action. Si la session n'est pas pleinement
+  interactive (stdin **et** stderr doivent tous deux être un terminal), ou si `--tui` est
+  attaché (le TUI possède le terminal en mode raw — y afficher un prompt bloquerait le run
+  indéfiniment), l'approbation est **refusée immédiatement, fail-closed** : réexécutez sans
+  `--tui` pour être invité interactivement, ou ajustez `.warden/policy.yaml` pour ne plus
+  exiger d'approbation sur cette action.
+- Un `.warden/policy.yaml` **absent, vide, ou uniquement des commentaires** équivaut à aucune
+  règle (tout autorisé). Un fichier présent mais malformé (YAML invalide, champ inconnu pour
+  l'action, `action` inconnue) fait échouer le run avec une erreur nommant le fichier, la ligne
+  et la colonne fautives — jamais une politique silencieusement ignorée.
 
 ### Prérequis par CLI (`--tool`)
 

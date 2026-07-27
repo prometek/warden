@@ -14,6 +14,8 @@ pub mod hook;
 pub mod hook_config;
 pub mod orchestrator;
 pub(crate) mod path_util;
+pub mod policy_config;
+pub mod policy_gate;
 pub mod pr_summary;
 pub mod process;
 pub mod tool_adapter;
