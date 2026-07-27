@@ -1272,13 +1272,19 @@ fn e2e_an_unknown_isolation_is_a_clean_cli_error_naming_the_value() {
 /// a developer's own `PATH` (e.g. `~/.local/bin/claude`) would otherwise be
 /// found and actually invoked, found empirically while adding this test --
 /// slow/hanging and a real side effect this test must never risk causing.
+/// Pinned to exactly `/usr/bin:/bin` -- the only external binary `warden`
+/// itself shells out to before reaching the `--tool` spawn is `git`
+/// (`worktree.rs`), present at `/usr/bin/git` on both Linux and macOS; no
+/// wider prefix (in particular not `/usr/local/bin`, the default npm-global
+/// install location for `claude` on Linux and Intel macOS) may be added
+/// without re-verifying it cannot itself carry a real `claude` binary.
 #[test]
 fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
     let repo = init_test_repo();
     let warden_home = TempDir::new().unwrap();
     let (mut cmd, _hermetic_home) = warden_command();
 
-    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin")
+    cmd.env("PATH", "/usr/bin:/bin")
         .args([
             "run",
             "--repo",
@@ -1292,15 +1298,13 @@ fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
         ])
         .assert()
         .failure()
-        // Fails downstream (no `claude` on this pinned `PATH`), never on arg
-        // parsing -- proven by never seeing clap's own invalid-value
-        // complaint (not a bare "--isolation" substring: the warning below
-        // legitimately mentions "--isolation worktree"/"--isolation docker"
-        // itself now that it lives on this same stream, see issue
-        // #25/ADR-0021 review).
-        .stderr(contains("error: invalid value").not())
         // Issue #25/ADR-0021 review: the filesystem threat-model warning
-        // itself, present under the default `--isolation worktree`.
+        // itself, present under the default `--isolation worktree` -- its
+        // presence on this run's stderr also proves the failure below is
+        // downstream (spawning `claude`, absent from this pinned `PATH`),
+        // never a clap arg-parsing error on the omitted `--isolation`:
+        // `print_isolation_worktree_warning` only runs once `run` has
+        // already accepted the parsed isolation config.
         .stderr(contains("ADR-0021"));
 }
 
@@ -1309,11 +1313,18 @@ fn e2e_omitting_isolation_entirely_defaults_to_worktree_not_a_cli_error() {
 /// warning coverage -- `print_isolation_worktree_warning` only runs when
 /// `isolation_config.isolation == Isolation::Worktree`, so `--isolation
 /// docker` must never print it, regardless of whether Docker itself is
-/// installed/reachable on this machine (the warning check happens before
-/// `DockerSandbox` ever touches Docker, so this run fails downstream for an
-/// unrelated reason either way -- never gated on `docker_daemon_available`,
-/// unlike `e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container`
-/// below, which needs a real daemon for its own different assertion).
+/// installed/reachable on this machine. This test is not gated on
+/// `docker_daemon_available` (unlike
+/// `e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container`
+/// below, which needs a real daemon for its own different assertion)
+/// because `.failure()` here does not depend on a daemon being reachable
+/// at all: `DockerSandbox::execute` bails with `SandboxError::DockerUnavailable`
+/// (`crates/warden-sandbox/src/docker.rs`) as soon as it can't canonicalize
+/// a host `~/.claude` config directory, which does not exist under
+/// `warden_command()`'s hermetic `HOME` -- no `docker` process is ever
+/// spawned to fail or succeed on. The warning-ordering claim above only
+/// explains the `.not()` assertion; the exit status is explained by this
+/// unrelated, earlier bail-out.
 #[test]
 fn e2e_isolation_docker_never_prints_the_worktree_filesystem_warning() {
     let repo = init_test_repo();
@@ -1355,7 +1366,7 @@ fn e2e_isolation_worktree_warning_survives_rust_log_error() {
     let warden_home = TempDir::new().unwrap();
     let (mut cmd, _hermetic_home) = warden_command();
 
-    cmd.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin")
+    cmd.env("PATH", "/usr/bin:/bin")
         .env("RUST_LOG", "error")
         .args([
             "run",

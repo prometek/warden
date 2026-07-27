@@ -610,8 +610,10 @@ async fn run<R: ToolAdapter>(
 ) -> anyhow::Result<()> {
     // Issue #25/ADR-0021: `--isolation worktree` (the default) gives the
     // agent subprocess the invoking OS user's full filesystem read rights
-    // (write too, for `--tool claude`/`mistral` -- see ADR-0021 §3bis for
-    // the per-adapter nuance codex's own OS sandbox adds). Surfaced once, at
+    // (write too, for `--tool claude` via its `Bash` grant, and for
+    // `--tool mistral` since no adapter-side tool constraint or sandbox
+    // flag exists at all -- see ADR-0021 §3bis for the per-adapter nuance
+    // codex's own OS sandbox adds). Surfaced once, at
     // the top of every run (including each batch child, issue #72, since
     // each re-enters `run` as its own process), unconditionally and with no
     // suppression knob -- see ADR-0021 for why this is a direct stderr
@@ -1599,7 +1601,7 @@ fn print_isolation_worktree_warning() {
         "warden: warning: --isolation worktree (default): the agent runs directly on this \
          host, as this OS user. env_clear() bounds only environment variables -- it never \
          sandboxes the filesystem: ~/.ssh, ~/.aws, ~/.config/gh, or any other file this user \
-         can read remain reachable by absolute path, and writable too depending on the agent \
+         can read remains reachable by absolute path, and writable too depending on the agent \
          tool's own permissions (see docs/adr/ADR-0021 for the --tool breakdown). Use \
          --isolation docker for a real filesystem boundary."
     ) {
