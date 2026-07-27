@@ -205,13 +205,25 @@ impl RuleSet {
     /// (`warden::policy_config`'s own convention) and with
     /// `warden::hook_config::load_repo_hooks`'s TOML equivalent, which
     /// already parses an empty file to an empty table.
+    ///
+    /// Detected with a plain line scan (every line blank or `#`-commented),
+    /// checked *before* any YAML parsing -- not by parsing to
+    /// `serde_yaml::Value` first and checking `is_null()` (issue #51 review
+    /// round 2, finding B). That alternative was tried and reverted: a
+    /// `serde_yaml::Value` deserialized via `from_value` carries no source
+    /// marks, so every schema error past this point (an unknown `action`, a
+    /// field that means nothing for one, a bad top-level key) lost its
+    /// `, line: N, column: M` suffix entirely -- exactly the locator a
+    /// multi-rule file needs to be actionable. Parsing straight from `raw`
+    /// with `serde_yaml::from_str::<RuleSet>` below keeps it.
     pub fn from_yaml(raw: &str) -> Result<Self> {
-        let value: serde_yaml::Value = serde_yaml::from_str(raw)
-            .map_err(|error| PolicyError::InvalidYaml(error.to_string()))?;
-        if value.is_null() {
+        let is_empty_or_comment_only = raw
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim().starts_with('#'));
+        if is_empty_or_comment_only {
             return Ok(RuleSet::empty());
         }
-        serde_yaml::from_value(value).map_err(|error| PolicyError::InvalidYaml(error.to_string()))
+        serde_yaml::from_str(raw).map_err(|error| PolicyError::InvalidYaml(error.to_string()))
     }
 
     /// Every rule matching `action`, in file order -- [`crate::Evaluator`]'s
@@ -288,6 +300,24 @@ rules:
     fn rejects_an_unknown_top_level_key() {
         let error = RuleSet::from_yaml("rules: []\nextra: true\n").unwrap_err();
         assert!(matches!(error, PolicyError::InvalidYaml(_)));
+    }
+
+    /// Issue #51 review round 2, finding B: a schema error must still carry
+    /// its source position (`, line: N, column: M`) -- lost entirely by an
+    /// earlier version of this function that parsed to `serde_yaml::Value`
+    /// first (no source marks survive that round trip) before checking for
+    /// an unknown `action`/field. A multi-rule `.warden/policy.yaml` is
+    /// barely actionable without it.
+    #[test]
+    fn a_schema_error_past_a_leading_comment_still_carries_its_line_number() {
+        let yaml = "# a leading comment, so the empty-document short-circuit must not fire\n\
+                     rules:\n  - action: launch_missiles\n";
+        let error = RuleSet::from_yaml(yaml).unwrap_err();
+        match error {
+            PolicyError::InvalidYaml(msg) => {
+                assert!(msg.contains("line"), "expected a line locator: {msg}");
+            }
+        }
     }
 
     #[test]

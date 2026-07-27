@@ -602,24 +602,47 @@ async fn load_workflow(repo: &std::path::Path) -> anyhow::Result<warden_core::Wo
 /// keeps `Orchestrator::on_run_started`'s printing (`print_run_started_hint`,
 /// below) out of the lib.
 ///
-/// **Non-interactive session (no TTY on stdin)**: refuses to prompt and
-/// denies outright, fail-closed -- there is no human to ask, and blocking
-/// forever on a `read_line` that will never receive input would hang the
-/// run rather than fail it cleanly. The reason is printed to stderr (naming
-/// the action and the rule's own reason) before returning `false`, so a
-/// `RequireApproval` in a non-interactive run (CI, a script) is never a
-/// silent, unexplained failure -- `PolicyGate::decide` additionally logs
-/// this refusal, so it is never dropped entirely even when stderr is
-/// discarded.
+/// **Never installed when `--tui` is attached** (issue #51 review round 2,
+/// finding A) -- see [`NoTuiApprovalGate`]'s own docs for why, and `run`'s
+/// own call site for the `tui_launch.is_none()` gate that enforces it.
+///
+/// **Non-interactive session (no TTY on stdin or stderr)**: refuses to
+/// prompt and denies outright, fail-closed -- there is no human to ask (or
+/// nowhere visible to ask them: a prompt written to a redirected stderr is
+/// invisible, yet `warden` would still block on stdin waiting for an answer
+/// nobody can see to give), and blocking forever on a `read_line` that will
+/// never receive input would hang the run rather than fail it cleanly. The
+/// reason is printed to stderr (naming the action and the rule's own reason)
+/// before returning `false` -- meaningful whenever *stderr itself* is still
+/// a terminal (stdin redirected, stderr not), and otherwise at least
+/// captured by whatever stderr was redirected to -- so a `RequireApproval`
+/// in a non-interactive run (CI, a script) is never a silent, unexplained
+/// failure. `PolicyGate::decide` additionally logs this refusal via
+/// `tracing`, so it is never dropped entirely even when stderr is discarded.
+///
+/// **Concurrent interactive runs**: two `warden run` processes attached to
+/// the *same* terminal (e.g. two shells sharing one tty via `screen`/`tmux`
+/// panes misconfigured to the same device, or a backgrounded run sharing its
+/// launching shell's tty with a foreground one) will interleave their
+/// prompts and race for the next keystroke -- there is no locking across
+/// processes. Batch mode (`warden run --intents-file ...`) is not subject to
+/// this: `run_one_batch_intent` awaits each child inline, so batch intents
+/// are strictly sequential, never concurrent, regardless of `--tui`.
 struct TtyApprovalGate;
 
 #[async_trait::async_trait]
 impl warden::policy_gate::ApprovalGate for TtyApprovalGate {
     async fn approve(&self, request: warden::policy_gate::ApprovalRequest<'_>) -> bool {
-        if !std::io::stdin().is_terminal() {
+        // Issue #51 review round 2, finding C: stdin alone is not enough --
+        // `warden run ... 2> run.log` leaves stdin a real tty while stderr
+        // (where the prompt is written) is redirected. Testing both means
+        // the prompt is only ever attempted when there is somewhere visible
+        // to show it *and* someone at the keyboard to answer it.
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
             eprintln!(
-                "warden: run {} requires human approval for {} ({}) but stdin is not a \
-                 terminal -- refusing to prompt; denying",
+                "warden: run {} requires human approval for {} ({}) but this session is not \
+                 fully interactive (stdin/stderr not both a terminal) -- refusing to prompt; \
+                 denying",
                 request.run_id, request.description, request.reason
             );
             return false;
@@ -629,7 +652,12 @@ impl warden::policy_gate::ApprovalGate for TtyApprovalGate {
             "warden: run {} requires approval for {} ({}) -- approve? [y/N] ",
             request.run_id, request.description, request.reason
         );
-        if std::io::stderr().flush().is_err() {
+        // Issue #51 review round 2, finding D: a flush failure must not deny
+        // silently -- every other branch of this method says why it denied,
+        // and this one is no exception (code-standards.md: no catch-and-
+        // ignore).
+        if let Err(err) = std::io::stderr().flush() {
+            eprintln!("warden: failed to write the approval prompt: {err} -- denying");
             return false;
         }
 
@@ -648,6 +676,38 @@ impl warden::policy_gate::ApprovalGate for TtyApprovalGate {
                 false
             }
         }
+    }
+}
+
+/// Installed instead of [`TtyApprovalGate`] whenever `--tui` is attached
+/// (issue #51 review round 2, finding A). `warden-tui` takes over the
+/// shared terminal -- alternate screen plus raw mode
+/// (`warden-tui`'s own `enable_raw_mode`/`EnterAlternateScreen`) -- the
+/// moment it starts, which breaks every part of the interactive prompt at
+/// once: the prompt itself would be written into a screen the TUI owns
+/// (invisible, or corrupting its frame); raw mode delivers Enter as `\r`,
+/// which [`AsyncBufReadExt::read_line`]'s `\n` scan never sees, so the read
+/// never completes; and raw mode also clears `ISIG`, so not even Ctrl-C
+/// reaches `warden` to break out. Installing [`TtyApprovalGate`] here
+/// instead would net a run that hangs forever after spending the entire
+/// agent budget, recoverable only by `kill` from another terminal -- worse
+/// than simply failing the run. This denies
+/// immediately instead, fail-closed, with a reason naming exactly why (no
+/// interactive channel is available while `--tui` owns the terminal) and
+/// what to do about it.
+struct NoTuiApprovalGate;
+
+#[async_trait::async_trait]
+impl warden::policy_gate::ApprovalGate for NoTuiApprovalGate {
+    async fn approve(&self, request: warden::policy_gate::ApprovalRequest<'_>) -> bool {
+        eprintln!(
+            "warden: run {} requires human approval for {} ({}) but --tui is attached -- the \
+             terminal is owned by warden-tui, so no interactive approval prompt is available; \
+             denying. Re-run without --tui to be prompted interactively, or adjust \
+             .warden/policy.yaml so this action does not require approval.",
+            request.run_id, request.description, request.reason
+        );
+        false
     }
 }
 
@@ -1057,14 +1117,26 @@ async fn run<R: ToolAdapter>(
     // shell-command decision point) and the orchestrator's own `git_push`
     // decision point (`gate_tail::drive_post_convergence_tail`) -- a single
     // rule set governs both. Absent file -> `PolicyGate::empty` (no-op,
-    // strict parity with pre-issue-#51 behaviour). `TtyApprovalGate` is the
-    // human-validation wait point a `RequireApproval` decision suspends on
-    // (fail-closed if stdin is not a terminal -- see its own docs).
+    // strict parity with pre-issue-#51 behaviour).
+    //
+    // Issue #51 review round 2, finding A: the human-validation wait point a
+    // `RequireApproval` decision suspends on is `TtyApprovalGate` only when
+    // no `--tui` is attached -- `warden-tui` owns the shared terminal (raw
+    // mode, alternate screen) the instant it starts, which would turn an
+    // interactive prompt into a permanent, unrecoverable-by-Ctrl-C hang
+    // (see `NoTuiApprovalGate`'s own docs). `tui_launch` already reflects
+    // `--tui` for this invocation, batch child or not (`run_one_batch_intent`
+    // re-parses argv fresh in the child, forwarding the flag verbatim).
     let policy_rules =
         load_repo_policy(&config.repo_path).context("failed to load .warden/policy.yaml")?;
+    let approval_gate: Arc<dyn warden::policy_gate::ApprovalGate> = if tui_launch.is_none() {
+        Arc::new(TtyApprovalGate)
+    } else {
+        Arc::new(NoTuiApprovalGate)
+    };
     let policy_gate = Arc::new(
         PolicyGate::new(warden_policy::Evaluator::new(policy_rules))
-            .with_approval_gate(Arc::new(TtyApprovalGate)),
+            .with_approval_gate(approval_gate),
     );
 
     let hook_sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
