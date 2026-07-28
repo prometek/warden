@@ -7,6 +7,25 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
+
+- **Régression introduite par l'issue #26** : `main.rs` résolvait
+  `default_user_config_agents_dir()` de façon inconditionnelle, dès le début de tout
+  `warden run` — y compris un run passant `--warden-home` explicitement et dont le pipeline
+  (`.warden/workflow.yaml`, issue #73) ne comporte ni étape `reviewer` ni étape `tester`.
+  Conséquence concrète : une unité systemd, un conteneur minimal ou un runner CI sans `HOME`
+  ni `XDG_CONFIG_HOME` définis échouait avant même de démarrer le premier cycle, alors que
+  rien dans ce run n'avait besoin de ce répertoire.
+- **Résolution désormais paresseuse et mémoïsée** : la boucle de résolution des étapes ne
+  résout `default_user_config_agents_dir()` (au plus une fois par run) que lorsqu'elle
+  atteint effectivement une étape `"reviewer"` ou `"tester"`. Un workflow coder-only, ou
+  coder + rôle(s) personnalisé(s) sans reviewer/tester, ne touche donc plus jamais
+  `HOME`/`XDG_CONFIG_HOME`.
+- **Le workflow par défaut n'est pas affecté** : celui-ci comporte toujours un reviewer et un
+  tester, donc un simple `warden run --warden-home ...` sans `.warden/workflow.yaml`
+  personnalisé exige toujours l'un des deux et échoue avec le même message d'erreur clair
+  qu'auparavant si aucun n'est disponible.
+
 ### Added — Issue #51 / ADR-0016 : moteur de politiques (`warden-policy`, `.warden/policy.yaml`)
 
 - **Nouveau crate `warden-policy`** : couche de décision explicite, en amont — `Decision {
