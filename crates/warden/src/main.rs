@@ -911,11 +911,13 @@ async fn run<R: ToolAdapter>(
         let definition = match step.role.as_str() {
             "coder" => {
                 // Issue #57: `resolve_agent_definition`'s `Coder` arm never
-                // reads `user_config_agents_dir` (see its own docs) -- an
-                // empty placeholder satisfies the shared `&Path` parameter
-                // without resolving the real, possibly env-dependent
-                // directory for a workflow whose only built-in step is the
-                // coder itself.
+                // reads `user_config_agents_dir` at all -- documented on its
+                // own doc comment and pinned by its own
+                // `coder_resolution_ignores_the_user_config_dir_entirely`
+                // unit test. An empty placeholder satisfies the shared
+                // `&Path` parameter without resolving the real, possibly
+                // env-dependent directory for a workflow whose only
+                // built-in step is the coder itself.
                 let (definition, _source) = resolve_agent_definition(
                     &repo,
                     AgentRole::Coder,
@@ -934,7 +936,7 @@ async fn run<R: ToolAdapter>(
                     &repo,
                     AgentRole::Reviewer,
                     &adapter,
-                    &user_config_dir,
+                    user_config_dir,
                     &warden_home,
                     trust_repo_agents.0,
                 )
@@ -961,7 +963,7 @@ async fn run<R: ToolAdapter>(
                     &repo,
                     AgentRole::Tester,
                     &adapter,
-                    &user_config_dir,
+                    user_config_dir,
                     &warden_home,
                     trust_repo_agents.0,
                 )
@@ -1811,18 +1813,22 @@ fn print_isolation_worktree_warning() {
 /// all, and a workflow with both only reads the env once. Mirrors the
 /// `match` already used for `--warden-home` a few lines above `run`'s own
 /// call site (same "an `Option::unwrap_or`-shaped eager evaluation would
-/// silently require an env var this run may not need" review finding) --
-/// a plain `match`, rather than `Option::get_or_insert_with`, because the
-/// latter's closure can't propagate this resolution's own `?` failure.
-fn resolve_lazy_user_config_agents_dir(cache: &mut Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    match cache {
-        Some(dir) => Ok(dir.clone()),
-        None => {
-            let dir = warden::agent_def::default_user_config_agents_dir()?;
-            *cache = Some(dir.clone());
-            Ok(dir)
-        }
+/// silently require an env var this run may not need" review finding).
+///
+/// Returns a borrow of the cached `PathBuf` rather than a clone (issue #57
+/// review, finding 3: code-standards.md's "chaque clone justifié") -- no
+/// caller needs an owned copy, and `cache` outlives every borrow this
+/// returns (each call site's borrow ends with that loop iteration, well
+/// before `cache` itself is next mutably borrowed on a later iteration).
+/// `Option::get_or_insert_with`'s closure can't propagate this resolution's
+/// own `?` failure, so a plain `if`/`expect` populates `cache` instead.
+fn resolve_lazy_user_config_agents_dir(cache: &mut Option<PathBuf>) -> anyhow::Result<&Path> {
+    if cache.is_none() {
+        *cache = Some(warden::agent_def::default_user_config_agents_dir()?);
     }
+    Ok(cache
+        .as_deref()
+        .expect("just populated with Some above if it was still None"))
 }
 
 fn default_warden_home() -> anyhow::Result<PathBuf> {

@@ -2840,6 +2840,87 @@ steps:
         .stderr(contains("cannot resolve the user config directory").not());
 }
 
+/// Issue #57 review, finding 5: the same claim as
+/// `e2e_a_workflow_with_no_reviewer_or_tester_step_never_needs_home_or_xdg_config_home`
+/// above, but for a workflow with a **custom** (non-reviewer/tester) second
+/// step instead of just the bare producer -- `resolve_custom_step_agent_definition`
+/// (`agent_def.rs`) never takes `user_config_agents_dir` as a parameter at
+/// all, so this must be just as unaffected by a missing `HOME`/
+/// `XDG_CONFIG_HOME` as the coder-only case, not merely "happens to not need
+/// it because there is only one step".
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_workflow_with_a_custom_role_but_no_reviewer_or_tester_never_needs_home_or_xdg_config_home(
+) {
+    let repo = init_test_repo();
+    write_workflow_yaml(
+        repo.path(),
+        r#"
+name: coder-plus-custom
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+"#,
+    );
+    write_custom_step_agent_definition(
+        repo.path(),
+        "techlead",
+        "You are Warden's tech lead, running with no reviewer/tester in the pipeline.",
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // Handles the "coder" and "techlead" roles only -- this workflow never
+    // runs a reviewer or tester at all, so `write_fake_claude`'s own
+    // reviewer/tester branches would go unused here; a two-branch script
+    // (mirroring its shape) is clearer than passing it two dead bodies.
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+stdin_file=$(mktemp)
+cat > "$stdin_file"
+WARDEN_RESULT_FILE=$(mktemp)
+export WARDEN_RESULT_FILE
+: > "$WARDEN_RESULT_FILE"
+
+if grep -q '"role":"coder"' "$stdin_file"; then
+{APPEND_NOTES_CODER_BODY}
+else
+{NOOP_BODY}
+fi
+
+result=$(cat "$WARDEN_RESULT_FILE")
+rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
+escaped=$(printf '%s' "$result" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
+printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' "$escaped"
+"#
+    );
+    write_fake_tool(bin_dir.path(), "claude", &script);
+
+    warden_command()
+        .0
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "custom role, no reviewer/tester step",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"))
+        .stderr(contains("cannot resolve the user config directory").not());
+}
+
 /// Architecture.md §10 (`ClaudeAdapter::env_allowlist`, issue #24 point 6):
 /// the allowlist is `["HOME", "USER"]`, not just `HOME` -- the coder's own
 /// live-verification note in `tool_adapter.rs` documents `USER` as required
