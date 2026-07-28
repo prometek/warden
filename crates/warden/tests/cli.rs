@@ -2872,32 +2872,18 @@ steps:
 
     let warden_home = TempDir::new().unwrap();
     let bin_dir = TempDir::new().unwrap();
-    // Handles the "coder" and "techlead" roles only -- this workflow never
-    // runs a reviewer or tester at all, so `write_fake_claude`'s own
-    // reviewer/tester branches would go unused here; a two-branch script
-    // (mirroring its shape) is clearer than passing it two dead bodies.
-    let script = format!(
-        r#"#!/bin/sh
-set -e
-stdin_file=$(mktemp)
-cat > "$stdin_file"
-WARDEN_RESULT_FILE=$(mktemp)
-export WARDEN_RESULT_FILE
-: > "$WARDEN_RESULT_FILE"
-
-if grep -q '"role":"coder"' "$stdin_file"; then
-{APPEND_NOTES_CODER_BODY}
-else
-{NOOP_BODY}
-fi
-
-result=$(cat "$WARDEN_RESULT_FILE")
-rm -f "$WARDEN_RESULT_FILE" "$stdin_file"
-escaped=$(printf '%s' "$result" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
-printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' "$escaped"
-"#
+    // This workflow never runs a reviewer or tester at all -- `write_fake_claude`'s
+    // role-detection only special-cases "coder"/"reviewer" (see its own
+    // docs), so "techlead" falls into its catch-all `else`, i.e. its
+    // `tester_body` argument. The `reviewer_body` argument is unreachable
+    // here (nothing in this workflow is ever named "reviewer"); `NOOP_BODY`
+    // for both keeps that explicit rather than reusing an unrelated body.
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
     );
-    write_fake_tool(bin_dir.path(), "claude", &script);
 
     warden_command()
         .0

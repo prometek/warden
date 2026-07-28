@@ -1820,15 +1820,13 @@ fn print_isolation_worktree_warning() {
 /// caller needs an owned copy, and `cache` outlives every borrow this
 /// returns (each call site's borrow ends with that loop iteration, well
 /// before `cache` itself is next mutably borrowed on a later iteration).
-/// `Option::get_or_insert_with`'s closure can't propagate this resolution's
-/// own `?` failure, so a plain `if`/`expect` populates `cache` instead.
 fn resolve_lazy_user_config_agents_dir(cache: &mut Option<PathBuf>) -> anyhow::Result<&Path> {
-    if cache.is_none() {
-        *cache = Some(warden::agent_def::default_user_config_agents_dir()?);
+    match cache {
+        Some(dir) => Ok(dir.as_path()),
+        None => Ok(cache
+            .insert(warden::agent_def::default_user_config_agents_dir()?)
+            .as_path()),
     }
-    Ok(cache
-        .as_deref()
-        .expect("just populated with Some above if it was still None"))
 }
 
 fn default_warden_home() -> anyhow::Result<PathBuf> {
