@@ -288,7 +288,15 @@ pub enum AgentDefinitionSource {
 /// once per role, at run start, against the base repo.
 ///
 /// - **Coder**: `<repo>/.warden/agents/coder.md` if present, else
-///   `adapter`'s own default -- unchanged from issue #24.
+///   `adapter`'s own default -- unchanged from issue #24. **Never reads
+///   `user_config_agents_dir` at all**, in either direction -- neither
+///   substituted for `repo_path` nor consulted in addition to it (pinned by
+///   `tests::coder_resolution_ignores_the_user_config_dir_entirely` and
+///   `tests::coder_resolution_ignores_a_user_config_dir_that_does_contain_a_coder_md`
+///   respectively) -- issue #57's caller (`main.rs`) relies on this to pass
+///   an unusable placeholder path for this role rather than eagerly
+///   resolving the real directory for a workflow whose only built-in step
+///   is the coder itself.
 /// - **Reviewer/Tester**: `<user_config_agents_dir>/<role>.md` if present
 ///   *and* it genuinely resolves outside both `repo_path` and
 ///   `<warden_home>/worktrees/` (issue #26 review, HIGH / escalated
@@ -689,9 +697,16 @@ fn adapter_default_definition(
 /// `$HOME`-based, no crate), and two env vars don't justify a new
 /// dependency just for this one.
 ///
-/// Called exactly once, from `main.rs`, with the result threaded down into
+/// Called from `main.rs`, with the result threaded down into
 /// [`resolve_agent_definition`] as an explicit parameter rather than read
-/// from the environment deep inside this module. This is deliberate for
+/// from the environment deep inside this module. Issue #57: no longer
+/// called *unconditionally* -- `main.rs`'s own step-resolution loop calls
+/// this lazily (and memoizes the result) only from the "reviewer"/"tester"
+/// arms, so it runs **at most once** per `warden run`, and not at all for a
+/// workflow with neither role in its pipeline (e.g. a producer-only one).
+/// This function itself is unaware of that laziness -- it is still a plain,
+/// eagerly-evaluated call from its own caller's point of view; only *when*
+/// `main.rs` chooses to call it changed. This remains deliberate for
 /// testability: `agent_def.rs`'s own unit tests run in the same process as
 /// every other test in this crate, and mutating real process environment
 /// variables from there (`std::env::set_var`) would be exactly the
@@ -1189,6 +1204,82 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("coder.md"), "{rendered}");
         assert!(rendered.contains("frontmatter"), "{rendered}");
+    }
+
+    /// Pins half of the invariant `resolve_agent_definition`'s own docs now
+    /// state for `AgentRole::Coder` (issue #57 review, finding 1):
+    /// `user_config_agents_dir` is never read for this role, at all --
+    /// `main.rs` relies on this to pass an unusable placeholder path
+    /// (`Path::new("")`) for the coder rather than eagerly resolving the
+    /// real (possibly env-dependent) directory for a workflow whose only
+    /// built-in step is the coder itself.
+    ///
+    /// This alone only catches a *substitution* regression (the `Coder` arm
+    /// resolving from `user_config_agents_dir` instead of `repo_path`) --
+    /// `Path::new("").join("coder.md")` is the relative path `coder.md`,
+    /// which doesn't exist in the test process's own cwd, so a regression
+    /// that mistakenly read it would still fall through to
+    /// `repo_path`/`coder.md` here and pass every assertion below unnoticed
+    /// (issue #57 review round 2, finding B). The complementary case right
+    /// after this one, `coder_resolution_ignores_a_user_config_dir_that_does_contain_a_coder_md`,
+    /// covers the other direction: an *additive* read, where
+    /// `user_config_agents_dir` is a real, existing directory that *does*
+    /// have its own `coder.md`.
+    #[tokio::test]
+    async fn coder_resolution_ignores_the_user_config_dir_entirely() {
+        let repo = TempDir::new().unwrap();
+        tokio::fs::create_dir_all(repo.path().join(AGENTS_DIR))
+            .await
+            .unwrap();
+        tokio::fs::write(repo.path().join(AGENTS_DIR).join("coder.md"), DEFINITION)
+            .await
+            .unwrap();
+
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            Path::new(""),
+            no_warden_home_worktrees().path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.model.as_deref(), Some("opus"));
+        assert_eq!(definition.system_prompt, "You are Warden's reviewer.");
+        assert!(matches!(source, AgentDefinitionSource::RepoConvention(_)));
+    }
+
+    /// The other half of the invariant pinned above (issue #57 review round
+    /// 2, finding B): the repo has **no** `.warden/agents/coder.md` at all,
+    /// while `user_config_agents_dir` is a real, existing directory that
+    /// *does* contain its own `coder.md` with distinct content. If the
+    /// `Coder` arm ever started reading `user_config_agents_dir` in
+    /// addition to `repo_path` (rather than substituting one for the
+    /// other), this definition would come back from that file instead of
+    /// the adapter's own default -- the one shape the previous test alone
+    /// could not have caught.
+    #[tokio::test]
+    async fn coder_resolution_ignores_a_user_config_dir_that_does_contain_a_coder_md() {
+        let repo = TempDir::new().unwrap();
+        let user_config = TempDir::new().unwrap();
+        write_definition(user_config.path(), AgentRole::Coder, DEFINITION).await;
+
+        let (definition, source) = resolve_agent_definition(
+            repo.path(),
+            AgentRole::Coder,
+            &FakeAdapter,
+            user_config.path(),
+            no_warden_home_worktrees().path(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(definition.system_prompt, "default coder prompt");
+        assert_eq!(definition.model, None);
+        assert_eq!(source, AgentDefinitionSource::AdapterDefault);
     }
 
     // -----------------------------------------------------------------

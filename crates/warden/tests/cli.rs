@@ -2782,6 +2782,199 @@ fn e2e_empty_home_with_no_xdg_config_home_is_a_clean_cli_error() {
         .stderr(contains("cannot resolve the user config directory"));
 }
 
+/// Issue #57: `--warden-home` given explicitly and a workflow with no
+/// "reviewer"/"tester" step at all (just the producer) must never require
+/// `XDG_CONFIG_HOME`/`HOME` -- `default_user_config_agents_dir` is now only
+/// resolved lazily, from inside the "reviewer"/"tester" arms of `main.rs`'s
+/// own step-resolution loop, so a workflow that never reaches either arm
+/// never touches the env at all. Reproduces the exact repro from the issue
+/// (`env -u HOME -u XDG_CONFIG_HOME warden run --warden-home ...`) and
+/// asserts the run actually converges instead of aborting before doing any
+/// work -- `e2e_missing_xdg_config_home_and_home_is_a_clean_cli_error`/
+/// `e2e_empty_home_with_no_xdg_config_home_is_a_clean_cli_error` above cover
+/// the opposite case (the built-in default workflow, which *does* have a
+/// reviewer/tester step, still fails exactly as clearly as before once that
+/// resolution is actually needed).
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_workflow_with_no_reviewer_or_tester_step_never_needs_home_or_xdg_config_home() {
+    let repo = init_test_repo();
+    write_workflow_yaml(
+        repo.path(),
+        r#"
+name: coder-only
+steps:
+  - role: coder
+    agent: coder
+"#,
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "no reviewer/tester step at all",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"))
+        .stderr(contains("cannot resolve the user config directory").not());
+}
+
+/// Issue #57 review, finding 5: the same claim as
+/// `e2e_a_workflow_with_no_reviewer_or_tester_step_never_needs_home_or_xdg_config_home`
+/// above, but for a workflow with a **custom** (non-reviewer/tester) second
+/// step instead of just the bare producer -- `resolve_custom_step_agent_definition`
+/// (`agent_def.rs`) never takes `user_config_agents_dir` as a parameter at
+/// all, so this must be just as unaffected by a missing `HOME`/
+/// `XDG_CONFIG_HOME` as the coder-only case, not merely "happens to not need
+/// it because there is only one step".
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_workflow_with_a_custom_role_but_no_reviewer_or_tester_never_needs_home_or_xdg_config_home(
+) {
+    let repo = init_test_repo();
+    write_workflow_yaml(
+        repo.path(),
+        r#"
+name: coder-plus-custom
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+"#,
+    );
+    write_custom_step_agent_definition(
+        repo.path(),
+        "techlead",
+        "You are Warden's tech lead, running with no reviewer/tester in the pipeline.",
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    // This workflow never runs a reviewer or tester at all -- `write_fake_claude`'s
+    // role-detection only special-cases "coder"/"reviewer" (see its own
+    // docs), so "techlead" falls into its catch-all `else`, i.e. its
+    // `tester_body` argument. The `reviewer_body` argument is unreachable
+    // here (nothing in this workflow is ever named "reviewer"); `NOOP_BODY`
+    // for both keeps that explicit rather than reusing an unrelated body.
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "custom role, no reviewer/tester step",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"))
+        .stderr(contains("cannot resolve the user config directory").not());
+}
+
+/// Issue #57, test-adequacy companion to
+/// `e2e_a_workflow_with_no_reviewer_or_tester_step_never_needs_home_or_xdg_config_home`:
+/// that test (and its custom-role sibling just above) prove the "never
+/// touches `HOME`/`XDG_CONFIG_HOME`" claim only by observing that the whole
+/// run *converges* -- which additionally requires the fake `claude`
+/// subprocess for the coder step to actually spawn, run to completion, and
+/// be read back correctly. That is an orthogonal concern from the one this
+/// issue is about, and on a host under heavy load a real subprocess can
+/// occasionally be killed out from under it for reasons that have nothing
+/// to do with `warden`'s own code (observed independently of this change,
+/// on pre-existing spawn-driving tests too). This test proves the exact
+/// same claim -- the lazy resolution loop in `main.rs` never calls
+/// `default_user_config_agents_dir` for a coder-only workflow -- without
+/// ever forking a real child process for `claude` at all: `PATH` points at
+/// a directory that deliberately contains no `claude` binary, so
+/// `LocalSandbox::execute`'s own `cmd.spawn()` fails synchronously with
+/// `ENOENT` before any subprocess exists to be killed. The run still fails
+/// overall (the coder step can never run), but on a *different, spawn-level*
+/// error -- never on `default_user_config_agents_dir`'s
+/// `UserConfigDirUnresolvable` message, which is what would reappear if the
+/// lazy-resolution fix ever regressed back to eagerly resolving
+/// `user_config_agents_dir` before this workflow's step-resolution loop even
+/// looks at which roles are actually present.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_coder_only_workflow_never_resolves_user_config_dir_even_when_the_coder_itself_cannot_spawn(
+) {
+    let repo = init_test_repo();
+    write_workflow_yaml(
+        repo.path(),
+        r#"
+name: coder-only
+steps:
+  - role: coder
+    agent: coder
+"#,
+    );
+
+    let warden_home = TempDir::new().unwrap();
+    // Deliberately empty: no `claude` binary anywhere on `PATH` at all, so
+    // the coder step's own spawn fails immediately and synchronously, with
+    // no real child process ever created (hence no dependency on a real
+    // subprocess actually running to completion for this assertion to
+    // hold).
+    let empty_bin_dir = TempDir::new().unwrap();
+
+    warden_command()
+        .0
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("PATH", empty_bin_dir.path().to_str().unwrap())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "coder-only workflow, no claude binary on PATH at all",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("No such file or directory"))
+        .stderr(contains("cannot resolve the user config directory").not());
+}
+
 /// Architecture.md §10 (`ClaudeAdapter::env_allowlist`, issue #24 point 6):
 /// the allowlist is `["HOME", "USER"]`, not just `HOME` -- the coder's own
 /// live-verification note in `tool_adapter.rs` documents `USER` as required

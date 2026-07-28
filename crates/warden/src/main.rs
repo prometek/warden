@@ -859,15 +859,27 @@ async fn run<R: ToolAdapter>(
     // timing is the security-relevant part of this call.
     //
     // Issue #26: the reviewer/tester's own trusted source
-    // (`user_config_agents_dir`) is resolved once here, from this process's
-    // real environment (`XDG_CONFIG_HOME`/`HOME`) -- see
+    // (`user_config_agents_dir`) is resolved from this process's real
+    // environment (`XDG_CONFIG_HOME`/`HOME`) -- see
     // `agent_def::default_user_config_agents_dir`'s own docs for why that
     // env read lives here rather than inside `resolve_agent_definition`
     // itself. `warden_home` is passed alongside it (owner's ruling,
     // "escalated asymmetry"): a user-config source resolving under
     // `<warden_home>/worktrees/` -- a stale worktree from a crashed run --
     // must be degraded exactly like one resolving inside the repo itself.
-    let user_config_agents_dir = warden::agent_def::default_user_config_agents_dir()?;
+    //
+    // Issue #57: no longer resolved eagerly here. `default_user_config_agents_dir`
+    // requires `XDG_CONFIG_HOME` or `HOME`; calling it unconditionally made
+    // every `warden run` -- including one with `--warden-home` given
+    // explicitly and a workflow with no "reviewer"/"tester" step at all --
+    // abort in an environment with neither set (a systemd unit, a minimal
+    // container, some CI runners), even though nothing in that run would
+    // ever have used the result. This undid, ~100 lines later, the very
+    // eager-evaluation fix made just above for `warden_home` (see that
+    // `match`'s own comment). `resolve_lazy_user_config_agents_dir` (below)
+    // resolves and memoizes it the moment a "reviewer"/"tester" step in the
+    // loop below actually needs it, mirroring that same `match` pattern.
+    let mut user_config_agents_dir: Option<PathBuf> = None;
 
     // Issue #73: `.warden/workflow.yaml`, if present, defines this run's
     // pipeline; its absence reproduces the pre-issue-#73 pipeline exactly
@@ -898,11 +910,19 @@ async fn run<R: ToolAdapter>(
     for step in &workflow.steps {
         let definition = match step.role.as_str() {
             "coder" => {
+                // Issue #57: `resolve_agent_definition`'s `Coder` arm never
+                // reads `user_config_agents_dir` at all -- documented on its
+                // own doc comment and pinned by its own
+                // `coder_resolution_ignores_the_user_config_dir_entirely`
+                // unit test. An empty placeholder satisfies the shared
+                // `&Path` parameter without resolving the real, possibly
+                // env-dependent directory for a workflow whose only
+                // built-in step is the coder itself.
                 let (definition, _source) = resolve_agent_definition(
                     &repo,
                     AgentRole::Coder,
                     &adapter,
-                    &user_config_agents_dir,
+                    Path::new(""),
                     &warden_home,
                     trust_repo_agents.0,
                 )
@@ -910,11 +930,13 @@ async fn run<R: ToolAdapter>(
                 definition
             }
             "reviewer" => {
+                let user_config_dir =
+                    resolve_lazy_user_config_agents_dir(&mut user_config_agents_dir)?;
                 let (definition, source) = resolve_agent_definition(
                     &repo,
                     AgentRole::Reviewer,
                     &adapter,
-                    &user_config_agents_dir,
+                    user_config_dir,
                     &warden_home,
                     trust_repo_agents.0,
                 )
@@ -935,11 +957,13 @@ async fn run<R: ToolAdapter>(
                 definition
             }
             "tester" => {
+                let user_config_dir =
+                    resolve_lazy_user_config_agents_dir(&mut user_config_agents_dir)?;
                 let (definition, source) = resolve_agent_definition(
                     &repo,
                     AgentRole::Tester,
                     &adapter,
-                    &user_config_agents_dir,
+                    user_config_dir,
                     &warden_home,
                     trust_repo_agents.0,
                 )
@@ -1778,6 +1802,30 @@ fn print_isolation_worktree_warning() {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
             tracing::warn!(%error, "failed to print isolation warning to stderr");
         }
+    }
+}
+
+/// Resolves the reviewer/tester's trusted user-config agents directory
+/// (`warden::agent_def::default_user_config_agents_dir`) on first use and
+/// memoizes it in `cache` (issue #57): the `for step in &workflow.steps`
+/// loop above calls this only from the "reviewer"/"tester" arms, so a
+/// workflow with neither step never touches `XDG_CONFIG_HOME`/`HOME` at
+/// all, and a workflow with both only reads the env once. Mirrors the
+/// `match` already used for `--warden-home` a few lines above `run`'s own
+/// call site (same "an `Option::unwrap_or`-shaped eager evaluation would
+/// silently require an env var this run may not need" review finding).
+///
+/// Returns a borrow of the cached `PathBuf` rather than a clone (issue #57
+/// review, finding 3: code-standards.md's "chaque clone justifié") -- no
+/// caller needs an owned copy, and `cache` outlives every borrow this
+/// returns (each call site's borrow ends with that loop iteration, well
+/// before `cache` itself is next mutably borrowed on a later iteration).
+fn resolve_lazy_user_config_agents_dir(cache: &mut Option<PathBuf>) -> anyhow::Result<&Path> {
+    match cache {
+        Some(dir) => Ok(dir.as_path()),
+        None => Ok(cache
+            .insert(warden::agent_def::default_user_config_agents_dir()?)
+            .as_path()),
     }
 }
 
