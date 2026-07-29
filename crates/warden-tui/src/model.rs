@@ -6,13 +6,23 @@
 //! (ratatui)": "la couche modèle ... testable sans terminal").
 
 use warden_core::RunEvent;
+use warden_core::RunEventHistoryEntry;
 use warden_core::RunEventRecord;
+use warden_core::UndecodableEvent;
 
 /// The state of one run, built up by applying its event stream in order.
 #[derive(Debug, Clone, Default)]
 pub struct RunModel {
     seen_ids: std::collections::HashSet<String>,
     events: Vec<RunEventRecord>,
+    /// Issue #58: `events` history rows that couldn't be decoded/validated
+    /// (see `warden_core::RunEventHistoryEntry::Undecodable`'s own docs).
+    /// Kept separate from `events` rather than interleaved into it: every
+    /// business-logic derivation below (`workflow_tree`, `current_progress`,
+    /// token usage, ...) only ever needs to reason about real, decoded
+    /// `RunEvent`s -- [`Self::history`] is what merges the two back into one
+    /// chronological sequence for rendering.
+    undecodable: Vec<UndecodableEvent>,
 }
 
 impl RunModel {
@@ -40,15 +50,72 @@ impl RunModel {
         true
     }
 
-    /// The run this model has observed events for, if any have arrived yet.
+    /// Records one `events` history row that could not be decoded (issue
+    /// #58) -- never silently dropped, so [`Self::history`] can still
+    /// surface it to a renderer. Deduplicates by `id`, same rationale as
+    /// [`Self::apply`], though in practice an `Undecodable` row is only ever
+    /// seen once, from the history replay (never re-delivered live: the live
+    /// Event Bus only ever carries already-decoded `RunEventRecord`s).
+    ///
+    /// Returns `true` if `event` was newly inserted, `false` if its `id` was
+    /// already known.
+    pub fn apply_undecodable(&mut self, event: UndecodableEvent) -> bool {
+        if !self.seen_ids.insert(event.id.clone()) {
+            return false;
+        }
+        self.undecodable.push(event);
+        true
+    }
+
+    /// Applies one `list_events_for_run` history row, whichever outcome it
+    /// is (issue #58) -- the single entry point [`crate::attach::attach`]
+    /// replays a run's full history through, so it never has to know which
+    /// of [`Self::apply`]/[`Self::apply_undecodable`] a given row needs.
+    pub fn apply_history_entry(&mut self, entry: RunEventHistoryEntry) -> bool {
+        match entry {
+            RunEventHistoryEntry::Decoded(record) => self.apply(record),
+            RunEventHistoryEntry::Undecodable(event) => self.apply_undecodable(event),
+        }
+    }
+
+    /// The run this model has observed events for, if any have arrived yet
+    /// -- falls back to an undecodable row's own `run_id` so a run whose
+    /// *entire* history failed to decode still isn't reported as "no run
+    /// observed at all" (issue #58).
     pub fn run_id(&self) -> Option<&str> {
-        self.events.first().map(|record| record.run_id.as_str())
+        self.events
+            .first()
+            .map(|record| record.run_id.as_str())
+            .or_else(|| self.undecodable.first().map(|event| event.run_id.as_str()))
     }
 
     /// Every event applied so far, in the order they were applied -- the
     /// scrollable log view renders this directly.
     pub fn events(&self) -> &[RunEventRecord] {
         &self.events
+    }
+
+    /// Every `events` history row that failed to decode/validate, in the
+    /// order they were applied (issue #58) -- see [`Self::apply_undecodable`].
+    pub fn undecodable_events(&self) -> &[UndecodableEvent] {
+        &self.undecodable
+    }
+
+    /// [`Self::events`] and [`Self::undecodable_events`] merged back into
+    /// one chronological sequence (`created_at` then `id`, matching
+    /// `list_events_for_run`'s own `ORDER BY`) -- what a renderer that must
+    /// show "this event could not be decoded" in its rightful place, rather
+    /// than as an afterthought at the end, iterates over instead of
+    /// [`Self::events`] alone.
+    pub fn history(&self) -> Vec<HistoryItem<'_>> {
+        let mut items: Vec<HistoryItem> = self
+            .events
+            .iter()
+            .map(HistoryItem::Event)
+            .chain(self.undecodable.iter().map(HistoryItem::Undecodable))
+            .collect();
+        items.sort_by_key(|item| (item.created_at(), item.id()));
+        items
     }
 
     /// The most recently started cycle's number, or `0` before any cycle
@@ -376,6 +443,32 @@ impl RunModel {
     }
 }
 
+/// One entry of [`RunModel::history`]'s merged chronological sequence
+/// (issue #58): either a decoded event, or a row that couldn't be
+/// decoded/validated -- see `warden_core::UndecodableEvent`'s own docs for
+/// why that happens.
+#[derive(Debug, Clone, Copy)]
+pub enum HistoryItem<'a> {
+    Event(&'a RunEventRecord),
+    Undecodable(&'a UndecodableEvent),
+}
+
+impl<'a> HistoryItem<'a> {
+    fn created_at(self) -> &'a str {
+        match self {
+            HistoryItem::Event(record) => &record.created_at,
+            HistoryItem::Undecodable(event) => &event.created_at,
+        }
+    }
+
+    fn id(self) -> &'a str {
+        match self {
+            HistoryItem::Event(record) => &record.id,
+            HistoryItem::Undecodable(event) => &event.id,
+        }
+    }
+}
+
 /// `true` if a blocking finding from `source` (a raw `FindingSource::as_str`
 /// value, per `warden_core::convergence`) is charged to `role`'s gate --
 /// mirrors `warden_core::decide_next_state`'s own imputation rule
@@ -514,6 +607,112 @@ mod tests {
             1,
             "a duplicate delivery (live + history overlap) must not be logged twice"
         );
+    }
+
+    fn undecodable(id: &str, created_at: &str) -> UndecodableEvent {
+        UndecodableEvent {
+            id: id.to_string(),
+            run_id: "run-1".to_string(),
+            event_type: "run_finished".to_string(),
+            reason: "payload's own kind is \"cycle_started\"".to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    /// Issue #58: an undecodable history row is never silently dropped --
+    /// it must show up through its own accessor, separate from
+    /// [`RunModel::events`] (which only ever holds real, decoded events).
+    #[test]
+    fn apply_undecodable_surfaces_the_row_without_touching_the_decoded_event_log() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply_undecodable(undecodable("e2", "2026-07-12T00:00:01+00:00"));
+
+        assert_eq!(
+            model.events().len(),
+            1,
+            "undecodable rows never join events()"
+        );
+        assert_eq!(model.undecodable_events().len(), 1);
+        assert_eq!(model.undecodable_events()[0].id, "e2");
+    }
+
+    /// Same dedup contract as [`RunModel::apply`], applied to undecodable
+    /// rows -- a duplicate delivery must not be recorded twice.
+    #[test]
+    fn apply_undecodable_deduplicates_by_id() {
+        let mut model = RunModel::new();
+        let event = undecodable("e1", "2026-07-12T00:00:00+00:00");
+        model.apply_undecodable(event.clone());
+        model.apply_undecodable(event);
+
+        assert_eq!(model.undecodable_events().len(), 1);
+    }
+
+    /// A run whose history includes at least one undecodable row must still
+    /// expose every other, genuinely decoded event (issue #58's actual
+    /// acceptance criterion): applying a mix of `Decoded`/`Undecodable`
+    /// history entries keeps both halves intact and queryable.
+    #[test]
+    fn apply_history_entry_dispatches_decoded_and_undecodable_rows_correctly() {
+        let mut model = RunModel::new();
+        model.apply_history_entry(RunEventHistoryEntry::Decoded(record(
+            "e1",
+            RunEvent::CycleStarted { cycle_number: 1 },
+        )));
+        model.apply_history_entry(RunEventHistoryEntry::Undecodable(undecodable(
+            "e2",
+            "2026-07-12T00:00:01+00:00",
+        )));
+        model.apply_history_entry(RunEventHistoryEntry::Decoded(record(
+            "e3",
+            RunEvent::RunFinished {
+                final_state: "converged".to_string(),
+            },
+        )));
+
+        assert_eq!(
+            model.events().len(),
+            2,
+            "the two decoded rows must both apply"
+        );
+        assert_eq!(model.undecodable_events().len(), 1);
+        assert!(model.is_finished(), "RunFinished must still be reachable");
+    }
+
+    /// [`RunModel::history`] merges both halves back into one chronological
+    /// sequence by `created_at`, regardless of the order they were applied
+    /// in -- what a renderer needs to show the undecodable marker in its
+    /// rightful place rather than always last.
+    #[test]
+    fn history_merges_events_and_undecodable_rows_by_created_at() {
+        let mut model = RunModel::new();
+        model.apply(RunEventRecord {
+            id: "e1".to_string(),
+            run_id: "run-1".to_string(),
+            event: RunEvent::CycleStarted { cycle_number: 1 },
+            created_at: "2026-07-12T00:00:00+00:00".to_string(),
+        });
+        model.apply_undecodable(undecodable("e2", "2026-07-12T00:00:01+00:00"));
+        model.apply(RunEventRecord {
+            id: "e3".to_string(),
+            run_id: "run-1".to_string(),
+            event: RunEvent::CycleStarted { cycle_number: 2 },
+            created_at: "2026-07-12T00:00:02+00:00".to_string(),
+        });
+
+        let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
+        assert_eq!(ids, vec!["e1", "e2", "e3"]);
+    }
+
+    /// Falls back to an undecodable row's own `run_id` so a run whose entire
+    /// history failed to decode still reports a run rather than "none".
+    #[test]
+    fn run_id_falls_back_to_an_undecodable_row_when_no_event_decoded_at_all() {
+        let mut model = RunModel::new();
+        model.apply_undecodable(undecodable("e1", "2026-07-12T00:00:00+00:00"));
+
+        assert_eq!(model.run_id(), Some("run-1"));
     }
 
     #[test]

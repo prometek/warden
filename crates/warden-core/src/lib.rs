@@ -34,7 +34,7 @@ pub use convergence::{
     validate_finding_sources_for_role, CiOutcome, Finding, FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
-pub use event::{EventKind, RunEvent, RunEventRecord};
+pub use event::{EventKind, RunEvent, RunEventHistoryEntry, RunEventRecord, UndecodableEvent};
 pub use evidence::{
     detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,
     ProjectType,

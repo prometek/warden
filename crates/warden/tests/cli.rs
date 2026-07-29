@@ -2425,9 +2425,9 @@ async fn e2e_trust_repo_agents_uses_the_repo_definition_and_surfaces_it_as_untru
         .unwrap();
     let expected_canonical_path = expected_path.canonicalize().unwrap();
     assert!(
-        events.iter().any(|record| matches!(
-            &record.event,
-            warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path }
+        events.iter().any(|entry| matches!(
+            entry.event(),
+            Some(warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path })
                 if role == "reviewer"
                     && path == &expected_path.display().to_string()
                     && canonical_path == &expected_canonical_path.display().to_string()
@@ -2595,9 +2595,9 @@ async fn e2e_xdg_config_home_pointing_inside_the_repo_is_degraded_to_untrusted()
         // still be present and correct.
         let expected_canonical_path = expected_path.canonicalize().unwrap();
         assert!(
-            events.iter().any(|record| matches!(
-                &record.event,
-                warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path }
+            events.iter().any(|entry| matches!(
+                entry.event(),
+                Some(warden_core::RunEvent::UntrustedAgentDefinitionUsed { role, path, canonical_path })
                     if role == "reviewer"
                         && path == &expected_path.display().to_string()
                         && canonical_path == &expected_canonical_path.display().to_string()

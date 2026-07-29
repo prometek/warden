@@ -12,8 +12,8 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventRecord, RunState, Severity,
-    TokenUsage,
+    EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventHistoryEntry,
+    RunEventRecord, RunState, Severity, TokenUsage, UndecodableEvent,
 };
 
 use crate::error::{Result, WardenError};
@@ -1025,7 +1025,7 @@ pub async fn insert_evidence(
 
 /// Raw shape of an `events` row as decoded by sqlx, before `event_type` and
 /// `payload_json` have been validated into a [`RunEvent`]. Kept private:
-/// [`RunEventRecord`] is the only form that ever leaves this module.
+/// [`RunEventHistoryEntry`] is the only form that ever leaves this module.
 struct EventRow {
     id: String,
     run_id: String,
@@ -1034,20 +1034,39 @@ struct EventRow {
     created_at: String,
 }
 
-fn row_to_event_record(row: EventRow) -> Result<RunEventRecord> {
-    let declared_kind = EventKind::parse(&row.event_type)?;
-    let event: RunEvent = serde_json::from_str(&row.payload_json)?;
-    if event.kind() != declared_kind {
-        return Err(WardenError::EventKindMismatch {
-            id: row.id,
-            event_type: row.event_type,
-            payload_kind: event.kind().as_str(),
-        });
-    }
-    Ok(RunEventRecord {
+/// Validates one row's `event_type`/`payload_json` into a
+/// [`RunEventHistoryEntry`] -- infallible (issue #58): a row that fails to
+/// decode/validate becomes an explicit `Undecodable` marker rather than an
+/// `Err`, so one bad row (e.g. an event-payload reshape that shipped without
+/// a migration rewriting existing rows) never fails
+/// [`list_events_for_run`]'s whole query and takes out the rest of the run's
+/// history with it (code-standards.md: "no silent fallback, no
+/// symptom-masking guards" -- the row is never silently dropped either).
+fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
+    let reason = match EventKind::parse(&row.event_type) {
+        Ok(declared_kind) => match serde_json::from_str::<RunEvent>(&row.payload_json) {
+            Ok(event) if event.kind() == declared_kind => {
+                return RunEventHistoryEntry::Decoded(RunEventRecord {
+                    id: row.id,
+                    run_id: row.run_id,
+                    event,
+                    created_at: row.created_at,
+                });
+            }
+            Ok(event) => format!(
+                "event_type {:?} but payload's own kind is {:?}",
+                row.event_type,
+                event.kind().as_str()
+            ),
+            Err(error) => format!("payload_json failed to deserialize: {error}"),
+        },
+        Err(error) => format!("{error}"),
+    };
+    RunEventHistoryEntry::Undecodable(UndecodableEvent {
         id: row.id,
         run_id: row.run_id,
-        event,
+        event_type: row.event_type,
+        reason,
         created_at: row.created_at,
     })
 }
@@ -1057,7 +1076,15 @@ fn row_to_event_record(row: EventRow) -> Result<RunEventRecord> {
 /// stream (Architecture.md §5.4). Ordered by `created_at` then `id` so two
 /// events sharing the same (second-resolution) timestamp still come back in
 /// a stable, deterministic order rather than SQLite's unspecified row order.
-pub async fn list_events_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<RunEventRecord>> {
+///
+/// Issue #58: a row that can't be decoded/validated is returned as a typed
+/// [`RunEventHistoryEntry::Undecodable`] entry, never dropped and never a
+/// reason for the whole query to fail -- only a genuine query/connection
+/// error (`?` below) still does that.
+pub async fn list_events_for_run(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Vec<RunEventHistoryEntry>> {
     let rows = sqlx::query_as!(
         EventRow,
         r#"
@@ -1071,7 +1098,7 @@ pub async fn list_events_for_run(pool: &SqlitePool, run_id: &str) -> Result<Vec<
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter().map(row_to_event_record).collect()
+    Ok(rows.into_iter().map(row_to_history_entry).collect())
 }
 
 /// One `evidence` row together with the `cycle_number` it belongs to -- the
@@ -2744,10 +2771,11 @@ mod tests {
 
         let events = list_events_for_run(&pool, "run-events").await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "event-1");
-        assert_eq!(events[0].run_id, "run-events");
-        assert_eq!(events[0].event, event);
-        assert_eq!(events[0].created_at, "2026-07-12T00:00:00+00:00");
+        let record = events[0].decoded().expect("well-formed row must decode");
+        assert_eq!(record.id, "event-1");
+        assert_eq!(record.run_id, "run-events");
+        assert_eq!(record.event, event);
+        assert_eq!(record.created_at, "2026-07-12T00:00:00+00:00");
     }
 
     #[tokio::test]
@@ -2787,7 +2815,7 @@ mod tests {
         .unwrap();
 
         let events = list_events_for_run(&pool, "run-order").await.unwrap();
-        let ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
         assert_eq!(ids, vec!["event-a", "event-b"]);
     }
 
@@ -2815,10 +2843,12 @@ mod tests {
     /// code-standards.md: "toute ligne relue est reparsée en type Rust
     /// fort" -- a row whose `event_type` column disagrees with what its own
     /// `payload_json` decodes to (corruption, or a write from something
-    /// other than `insert_event`) must be a typed error, never silently
-    /// trusted as whichever of the two the reader happens to pick.
+    /// other than `insert_event`) must never be silently trusted as
+    /// whichever of the two the reader happens to pick. Issue #58: this must
+    /// no longer fail the whole query -- it's surfaced as a typed
+    /// `Undecodable` entry instead.
     #[tokio::test]
-    async fn mismatched_event_type_and_payload_kind_is_a_typed_error_not_silently_trusted() {
+    async fn mismatched_event_type_and_payload_kind_is_an_undecodable_entry_not_a_failed_query() {
         let (_dir, pool) = test_pool().await;
         insert_run(
             &pool,
@@ -2848,7 +2878,137 @@ mod tests {
         .await
         .unwrap();
 
-        let result = list_events_for_run(&pool, "run-corrupt").await;
-        assert!(matches!(result, Err(WardenError::EventKindMismatch { .. })));
+        let events = list_events_for_run(&pool, "run-corrupt")
+            .await
+            .expect("one bad row must never fail the whole query");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RunEventHistoryEntry::Undecodable(event) => {
+                assert_eq!(event.id, "event-corrupt");
+                assert_eq!(event.event_type, "run_finished");
+                assert!(!event.reason.is_empty());
+            }
+            RunEventHistoryEntry::Decoded(record) => {
+                panic!("expected an Undecodable entry, got a decoded record: {record:?}")
+            }
+        }
+    }
+
+    /// Issue #58 acceptance: a run whose history includes one row with
+    /// malformed `payload_json` *and* one row with a kind-mismatched
+    /// `event_type` must still return the full history -- the good events
+    /// intact, both bad rows surfaced as typed `Undecodable` markers, never
+    /// dropped and never a reason for the whole query to fail.
+    #[tokio::test]
+    async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_every_good_event() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-mixed",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        insert_event(
+            &pool,
+            "event-good-1",
+            "run-mixed",
+            &RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+            "2026-07-12T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
+
+        // Malformed `payload_json` -- not even valid JSON for any `RunEvent`
+        // variant (simulates a reshape that changed the payload shape
+        // without a rewrite migration, issue #58's own motivating scenario).
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-malformed",
+            "run-mixed",
+            "cycle_started",
+            "{ not json",
+            "2026-07-12T00:00:01+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Kind-mismatched row: valid JSON, but for the wrong `event_type`.
+        let mismatched_payload =
+            serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-mismatched",
+            "run-mixed",
+            "run_finished",
+            mismatched_payload,
+            "2026-07-12T00:00:02+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_event(
+            &pool,
+            "event-good-2",
+            "run-mixed",
+            &RunEvent::CycleStarted { cycle_number: 2 },
+            "2026-07-12T00:00:03+00:00",
+        )
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-mixed")
+            .await
+            .expect("undecodable rows must never fail the whole query");
+
+        assert_eq!(events.len(), 4, "{events:?}");
+        let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "event-good-1",
+                "event-malformed",
+                "event-mismatched",
+                "event-good-2",
+            ],
+            "order (created_at ASC, id ASC) must be preserved even with bad rows interleaved"
+        );
+
+        assert!(matches!(
+            events[0],
+            RunEventHistoryEntry::Decoded(ref record) if record.event == RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            RunEventHistoryEntry::Undecodable(ref event) if event.event_type == "cycle_started"
+        ));
+        assert!(matches!(
+            events[2],
+            RunEventHistoryEntry::Undecodable(ref event) if event.event_type == "run_finished"
+        ));
+        assert!(matches!(
+            events[3],
+            RunEventHistoryEntry::Decoded(ref record)
+                if record.event == RunEvent::CycleStarted { cycle_number: 2 }
+        ));
     }
 }

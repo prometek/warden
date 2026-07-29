@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
-use warden_core::RunEventRecord;
+use warden_core::{RunEventRecord, UndecodableEvent};
 use warden_tui::attach::{attach, Attachment};
 use warden_tui::capabilities::GraphicsCapability;
 use warden_tui::{capabilities, db, subscriber, ui};
@@ -99,7 +99,17 @@ async fn attach_cmd(
 /// live as it arrives. Used automatically when stdout isn't a terminal
 /// (piped/redirected) -- also what makes this crate's core replay/live
 /// behaviour scriptable and end-to-end testable without a real PTY.
+///
+/// Issue #58: a history row that couldn't be decoded is never silently
+/// dropped, but it also never joins the NDJSON stream itself -- every line
+/// on stdout stays a valid `warden_core::RunEventRecord` (the stable schema
+/// scripts consuming this stream already rely on); logged at `warn` on
+/// stderr instead, the same "not fatal but must not be silent" treatment
+/// `log_subscribe_failure` already gives a failed live-bus subscribe.
 async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
+    for event in attachment.model.undecodable_events() {
+        log_undecodable_event(event);
+    }
     for record in attachment.model.events() {
         println!("{}", serde_json::to_string(record)?);
     }
@@ -119,6 +129,19 @@ async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Surfaces one undecodable `events` history row at `warn` (issue #58) --
+/// never a silent drop, but also never mistaken for an actual event on
+/// stdout's NDJSON stream (see [`run_headless`]'s own docs).
+fn log_undecodable_event(event: &UndecodableEvent) {
+    tracing::warn!(
+        id = %event.id,
+        run_id = %event.run_id,
+        event_type = %event.event_type,
+        reason = %event.reason,
+        "events row could not be decoded; skipped from the replayed history"
+    );
 }
 
 /// Runs the full-screen ratatui app until the user quits (`q`/`Esc`) or the
