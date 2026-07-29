@@ -1504,6 +1504,204 @@ mod tests {
         .is_ok());
     }
 
+    /// Independent verification (issue #59 QA pass): a symlink whose *link
+    /// text* lives well outside every forbidden root, but that resolves to a
+    /// real file inside the coder's own worktree, must still be refused --
+    /// the coder can create a symlink anywhere it has write access (its own
+    /// worktree, e.g. via a checked-in symlink or something a build step
+    /// produces) pointing back at a script it controls; if the guard only
+    /// compared the *lexical* candidate string against the forbidden roots,
+    /// a symlink like this would sail through. `canonicalize_best_effort`
+    /// resolving via `std::fs::canonicalize` (which follows symlinks) is
+    /// what closes this -- this pins that behaviour down as a guarantee, not
+    /// an incidental property.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_outside_every_forbidden_root_that_resolves_into_the_coders_worktree_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let real_target = coder_worktree.join("real-tool.sh");
+        std::fs::write(&real_target, "#!/bin/sh\n").unwrap();
+        // The symlink itself lives in a directory unrelated to any of the
+        // three forbidden roots -- only its *target* is coder-controlled.
+        let elsewhere = TempDir::new().unwrap();
+        let link = elsewhere.path().join("innocuous-name.sh");
+        symlink(&real_target, &link).unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), link.to_str().unwrap().to_string()],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// The mirror image, and not a security concern: a symlink that lives
+    /// *inside* the role's own worktree but resolves to a real file genuinely
+    /// outside every forbidden root must still be allowed -- exactly as a
+    /// bare absolute path to that same external location already is
+    /// (`an_absolute_arg_outside_the_worktree_the_repo_and_the_run_worktrees_root_is_allowed`).
+    /// This exists to pin down that the containment check compares the
+    /// symlink's *resolved* location, not merely whether its literal path
+    /// string happens to start with `worktree_path` -- a lexical-only
+    /// comparison would wrongly refuse this.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_worktree_that_resolves_outside_every_forbidden_root_is_allowed() {
+        use std::os::unix::fs::symlink;
+
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let real_target = elsewhere.path().join("legit-tool.sh");
+        std::fs::write(&real_target, "#!/bin/sh\n").unwrap();
+        let link = reviewer_worktree.join("link-out.sh");
+        symlink(&real_target, &link).unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), link.to_str().unwrap().to_string(),],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .is_ok());
+    }
+
+    /// Independent verification (issue #59 QA pass): `..` traversal must be
+    /// resolved before the containment check runs, not compared lexically --
+    /// an absolute candidate whose *literal* prefix names the reviewer's own
+    /// (already-permitted) worktree, but that walks back out via `..` into
+    /// the coder's, must still be refused. Every segment here genuinely
+    /// exists on disk, so `canonicalize_best_effort` resolves the whole
+    /// thing via a single real `std::fs::canonicalize` call (the OS's own
+    /// `..` handling), not the best-effort ancestor-walking fallback --
+    /// see `path_util::canonicalize_best_effort`'s own docs for why a
+    /// not-yet-existing path is a materially different (and, for this
+    /// guard's purposes, inert -- see this crate's own test-derived
+    /// findings) case.
+    #[test]
+    fn a_dotdot_traversal_from_the_role_worktree_into_the_coders_worktree_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let tool = coder_worktree.join("tool.sh");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let traversal_arg = format!("{}/../coder/tool.sh", reviewer_worktree.display());
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), traversal_arg],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// Independent verification (issue #59 QA pass): [`strip_file_scheme`]'s
+    /// own docs claim case-insensitivity (`FILE://`) but no existing test
+    /// actually exercised anything but a lowercase `file://` -- a mixed-case
+    /// scheme must not launder a coder-controlled path past the
+    /// containment check.
+    #[test]
+    fn a_mixed_case_file_scheme_onto_the_coders_worktree_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let tool = coder_worktree.join("tool.sh");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        let arg = format!("FiLe://{}", tool.to_str().unwrap());
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), arg],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// **Independent verification, real defect found (issue #59 QA pass):**
+    /// `path_like_candidate`'s weak tier exempts *any* whitespace-containing
+    /// value unconditionally -- but the "strong evidence" tier that survives
+    /// whitespace only recognises `./`, `../`, `~`, or an absolute prefix
+    /// (see that function's own docs). A **relative** path that contains a
+    /// separator *and* whitespace but does not start with `./`/`../`/`~`
+    /// (e.g. `agents/evil script.sh`, mirroring `./sub dir/tool.sh` from
+    /// `a_relative_arg_with_a_space_is_still_refused` minus only the leading
+    /// `./`) falls into neither tier's protection: it is weak evidence
+    /// (has a separator, no unambiguous prefix) *and* contains whitespace,
+    /// so [`path_like_candidate`] returns `None` for it and it is never
+    /// containment-checked at all -- even though it is exactly the same
+    /// coder-controlled-relative-path hazard `check_containment`'s own docs
+    /// describe ("resolves against `worktree_path`, the role's own
+    /// worktree... which the coder can write to"). The coder can create a
+    /// file with a literal space in its own worktree via its `Bash` grant
+    /// (the same premise the whitespace exemption itself relies on), so a
+    /// future adapter emitting `--wrapper agents/evil script.sh` as a single
+    /// argv value would defeat this guard exactly as issue #59 set out to
+    /// prevent -- it merely needs to omit the `./` prefix.
+    ///
+    /// This assertion is what issue #59's intent actually demands (refusal);
+    /// it currently fails against `path_like_candidate`
+    /// (`crates/warden/src/process.rs`), which returns `Some`/`None` on
+    /// whitespace alone regardless of whether the value is a bare relative
+    /// path shape. Left failing deliberately (code-standards.md: never
+    /// weaken a test to make it pass) -- see the QA report for the fix this
+    /// is the acceptance criterion for.
+    #[test]
+    fn a_relative_path_with_a_separator_and_whitespace_but_no_dot_prefix_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(coder_worktree.join("agents")).unwrap();
+        std::fs::write(
+            coder_worktree.join("agents").join("evil script.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), "agents/evil script.sh".to_string()],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
     // -----------------------------------------------------------------
     // `trusted_arg_values` escape hatch (issue #59 review, MEDIUM 4)
     // -----------------------------------------------------------------
