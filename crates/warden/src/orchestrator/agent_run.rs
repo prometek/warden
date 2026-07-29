@@ -40,6 +40,14 @@ impl Orchestrator {
     /// e.g. `--wrapper ./reviewer.sh` -- for a gated step is refused here,
     /// before the sandbox ever runs it.
     ///
+    /// `trusted_arg_values` (issue #59 review, MEDIUM 4) is forwarded
+    /// verbatim to `validate_agent_program`'s own escape hatch --
+    /// `agents.rs` is the only caller that ever passes anything but `&[]`
+    /// here, and only `ResolvedAgent::trusted_arg_values`
+    /// (`trusted_arg_values_for_step`'s own docs), computed once per run
+    /// from a step's *own* `AgentDefinition`, never from anything a caller
+    /// constructs ad hoc at the call site.
+    ///
     /// **Issue #73 (trio-unification follow-up)**: `role`/`is_producer`
     /// replace the old `InvocationRole::Builtin`/`Custom` split -- every
     /// step, built-in or custom, goes through this exact same body now,
@@ -59,6 +67,7 @@ impl Orchestrator {
         cwd: &Path,
         repo_path: &Path,
         run_worktrees_root: &Path,
+        trusted_arg_values: &[String],
         stdin_payload: String,
         cancel: CancellationToken,
     ) -> Result<AgentOutcome> {
@@ -70,6 +79,7 @@ impl Orchestrator {
             cwd,
             repo_path,
             run_worktrees_root,
+            trusted_arg_values,
         )?;
 
         let sandbox_id = self
@@ -590,6 +600,7 @@ mod tests {
                 dir.path(),
                 repo.path(),
                 repo.path(),
+                &[],
                 "{}".to_string(),
                 CancellationToken::new(),
             )
@@ -644,6 +655,7 @@ mod tests {
                 worktree.path(),
                 repo.path(),
                 run_worktrees_root.path(),
+                &[],
                 "{}".to_string(),
                 CancellationToken::new(),
             )
@@ -694,6 +706,7 @@ mod tests {
                 dir.path(),
                 repo.path(),
                 repo.path(),
+                &[],
                 "{}".to_string(),
                 CancellationToken::new(),
             )
@@ -757,6 +770,7 @@ mod tests {
                 dir.path(),
                 repo.path(),
                 repo.path(),
+                &[],
                 "{}".to_string(),
                 cancel,
             )
@@ -822,6 +836,7 @@ mod tests {
                     &dir_path,
                     &repo_path,
                     &repo_path,
+                    &[],
                     "{}".to_string(),
                     CancellationToken::new(),
                 )

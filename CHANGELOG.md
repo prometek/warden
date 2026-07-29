@@ -7,6 +7,57 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Security — Issue #59 : garde de chemin de programme (#26) étendue aux `args`
+
+- **Le point 1 de l'issue #26 (« chemin `program`/`args` relatif ») est désormais couvert en
+  entier** : `process::validate_agent_program` refusait déjà `program`, jamais `args`. Un
+  futur `ToolAdapter` émettant quelque chose comme `claude --wrapper ./reviewer.sh`
+  réintroduirait exactement la même faille que `program`, puisque `./reviewer.sh` résout
+  contre le worktree du rôle — un checkout du dépôt sous revue que le coder contrôle.
+  Aucun adaptateur livré aujourd'hui n'émet un `args` de ce type ; garde ceinture-et-bretelles
+  comme celle sur `program`, même raisonnement.
+- **Règle conservatrice à base de séparateur, pas de déclaration par adaptateur** (choix de
+  conception assumé — une déclaration par adaptateur exigerait de faire évoluer l'API
+  `ToolAdapter`, hors périmètre) : une entrée `args` est candidate au contrôle de confinement
+  quand elle commence par `./`, `../`, `~`, est absolue, ou contient par ailleurs un
+  séparateur de chemin. `--flag=valeur` est géré (seule la valeur après le premier `=` est
+  jugée). Deux exemptions, restreintes à la preuve *faible* (contient un séparateur quelque
+  part, sans préfixe non ambigu) — une preuve *forte* (`./`, `../`, `~`, absolu) est toujours
+  vérifiée, espace ou non :
+  - une valeur contenant un espace (le prompt système complet, passé tel quel en un seul
+    argument par les trois adaptateurs livrés, contient toujours au moins un `/` — sans
+    cette exemption, tout reviewer/tester utilisant un prompt par défaut aurait été refusé) ;
+  - une URL sur liste blanche de schémas réseau (`http`, `https`, `ssh`, `git`, `ftp`, `ftps`,
+    `ws`, `wss`) — **pas** « n'importe quel schéma syntaxiquement valide » : un schéma
+    inventé devant un chemin relatif (`sh://../coder/tool.sh`) ne suffit pas à l'exempter,
+    et `file://` est explicitement résolu comme le chemin filesystem qu'il est (jamais
+    exempté), tous deux corrigés en cours de revue (voir plus bas).
+- **Trou résiduel assumé et documenté, pas silencieux** : une entrée `args` sans aucun
+  séparateur (`--wrapper reviewer.sh`) n'est pas détectée — contrairement à `program`, un
+  `args` nu n'a pas de sémantique `PATH` : il est interprété par l'outil que nomme `program`,
+  qui le résout typiquement contre son propre répertoire courant (le worktree du rôle).
+  Documenté explicitement dans le code plutôt que laissé impliquer une couverture qu'il n'a
+  pas.
+- **Échappatoire `trusted_arg_values`** : une valeur `model` d'un `AgentDefinition`
+  reviewer/tester (ex. `anthropic/claude-3-opus`, courant pour un routage style
+  OpenRouter/Mistral) ressemble à un chemin relatif pour la règle ci-dessus. L'appelant
+  (`orchestrator::trusted_arg_values_for_step`) ne vouche pour cette valeur que lorsque la
+  définition du rôle a été résolue depuis la configuration utilisateur **fiable** — jamais
+  quand elle provient du dépôt sous revue (`--trust-repo-agents`,
+  `RunConfig::untrusted_repo_agent_definitions`), jamais pour un rôle personnalisé (toujours
+  lu depuis `<repo>/.claude/agents/`, donc toujours contrôlé par le coder), jamais pour le
+  producteur (déjà exempté du garde-fou entier).
+- **Corrections trouvées en cours de revue** avant la première fusion sur `main` :
+  un contournement par un espace dans une valeur autrement non ambiguë (chemin absolu à
+  l'intérieur du worktree du coder), un contournement par `file://` (chemin filesystem
+  laissé passer comme s'il s'agissait d'une URL), et un contournement par schéma inventé
+  devant un chemin relatif (`sh://../coder/tool.sh` acceptait n'importe quel schéma
+  syntaxiquement valide selon la RFC 3986 sans regarder ce qui suit) — les trois désormais
+  couverts par la suite de tests de `process.rs`.
+- Amende l'entrée « Issue #26 / ADR-0018 » ci-dessous : sa mention « le point 1 de l'issue
+  #26 (`program`/`args` relatifs) était déjà rendu sans objet » ne concernait que `program` —
+  `args` restait un trou ouvert jusqu'à cette issue.
+
 ### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
 
 - **Régression introduite par l'issue #26** : `main.rs` résolvait
@@ -630,7 +681,9 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   lance toujours `claude` via `PATH`) — le point 1 de l'issue #26 (`program`/`args`
   relatifs) était déjà rendu sans objet par l'issue #24, qui a supprimé le schéma
   warden-natif `runner`/`program`/`args` ; cette garde est ajoutée en ceinture-et-bretelles
-  pour tout futur adaptateur.
+  pour tout futur adaptateur. **Amendement (issue #59, voir plus haut)** : cette garde ne
+  couvrait que `program` — `args` restait un trou ouvert, volontairement scopé hors de cette
+  issue-ci, jusqu'à ce que l'issue #59 le ferme.
 - **Limite assumée** : ceci n'est ni un sandbox filesystem ni un sandbox de credentials
   autour du coder — il tourne toujours avec un accès réel au dépôt et les grants par
   défaut de l'adaptateur sélectionné (`Bash` compris). L'isolation réelle reste suivie par

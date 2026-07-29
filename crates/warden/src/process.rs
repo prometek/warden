@@ -48,11 +48,12 @@
 //! decides which `args` entries even get the containment check (a
 //! conservative separator-based heuristic, not a per-adapter declaration of
 //! which args are paths -- that would need a `ToolAdapter` API change this
-//! issue deliberately avoids); see its own docs for the exact rule and why
-//! it must exclude whitespace-containing values (every shipped adapter's
-//! default system prompt -- the very thing `args` carries for every real
-//! reviewer/tester invocation today -- contains a `/`, and would otherwise
-//! be refused outright).
+//! issue deliberately avoids); see its own docs for the exact rule, and
+//! [`validate_agent_program`]'s own docs for the residual gap this
+//! heuristic does *not* close (a bare-name `args` entry with no separator
+//! at all, e.g. `--wrapper reviewer.sh`) and the `trusted_arg_values`
+//! escape hatch for a caller-vouched non-path value the heuristic would
+//! otherwise misjudge.
 
 use std::path::Path;
 
@@ -130,15 +131,34 @@ pub struct AgentOutcome {
 ///   only for the more specific error message when the program resolves
 ///   inside the checked role's *own* worktree specifically.
 ///
-/// A **bare program name with no path separator at all** (`"claude"`,
+/// A **bare `program` name with no path separator at all** (`"claude"`,
 /// `"echo"`) is always allowed: it resolves via `PATH`
 /// (`Command::new`/`execvp` semantics), never against `worktree_path`, so it
 /// carries none of the above hazard regardless of what the coder committed.
+///
 /// `args` entries follow the narrower [`path_like_candidate`] heuristic
-/// instead (see its own docs) -- unlike `program`, most `args` entries are
-/// ordinary values (`--model sonnet`, a whole system prompt), not paths at
-/// all, so the check only ever applies to the subset that look unambiguously
-/// like one.
+/// instead (see its own docs), and a bare-name `args` entry is a genuine,
+/// *undetected* gap, unlike a bare `program` (issue #59 review, MEDIUM):
+/// `program`'s `PATH` reasoning above does not transfer to `args` -- an
+/// `args` entry is interpreted by whatever tool `program` names, which
+/// typically resolves a bare filename against its own current directory
+/// (the role's own worktree, a checkout of the coder's commit), not `PATH`.
+/// A future `--wrapper reviewer.sh` (no `./`) is therefore **not** caught by
+/// this guard; only entries [`path_like_candidate`] judges path-like are
+/// checked at all -- most `args` entries are ordinary values (`--model
+/// sonnet`, a whole system prompt), never a path in the first place.
+///
+/// `trusted_arg_values` (issue #59 review, MEDIUM 4) is a caller-vouched
+/// escape hatch for the residual false positive [`path_like_candidate`]'s
+/// own docs describe: a value in this list is never subjected to the
+/// containment check at all, regardless of what it looks like. The caller
+/// (`orchestrator::agent_run`) is the only one who may vouch for a value,
+/// and only ever does so for a value that provably came from **trusted
+/// config**, never repo content -- see that call site's own docs for
+/// exactly which values that is and why. An empty slice (as every non-agent
+/// caller, and every test that isn't specifically exercising this hatch,
+/// passes) means every path-like candidate is checked, unchanged from
+/// before this hatch existed.
 ///
 /// `worktree_path`, `repo_path`, and `run_worktrees_root` are all
 /// canonicalized before each containment check (walking up to the nearest
@@ -150,6 +170,7 @@ pub struct AgentOutcome {
 /// closed naming that reason, rather than silently skipping the containment
 /// check it could no longer perform (code-standards.md: "no silent
 /// fallback").
+#[allow(clippy::too_many_arguments)]
 pub fn validate_agent_program(
     role_name: &str,
     is_producer: bool,
@@ -158,6 +179,7 @@ pub fn validate_agent_program(
     worktree_path: &Path,
     repo_path: &Path,
     run_worktrees_root: &Path,
+    trusted_arg_values: &[String],
 ) -> Result<(), ProcessError> {
     if is_producer {
         return Ok(());
@@ -181,6 +203,19 @@ pub fn validate_agent_program(
         let Some(candidate) = path_like_candidate(arg) else {
             continue;
         };
+        // Issue #59 review, MEDIUM 4: a value the caller has explicitly
+        // vouched for as trusted, non-path config (never repo content --
+        // see this function's own docs) bypasses the containment check
+        // entirely. Compared against the *extracted* candidate (post
+        // `--flag=` splitting), not the raw `arg`, so this works
+        // identically whether the caller's adapter emits `--model
+        // <value>` (two argv entries) or `--model=<value>` (one).
+        if trusted_arg_values
+            .iter()
+            .any(|trusted| trusted == candidate)
+        {
+            continue;
+        }
         check_containment(candidate, worktree_path, repo_path, run_worktrees_root).map_err(
             |reason| ProcessError::UntrustedAgentArg {
                 role: role_name.to_string(),
@@ -276,90 +311,132 @@ fn check_containment(
 }
 
 /// Issue #59: decides which `args` entries [`validate_agent_program`] even
-/// runs the containment check against, and -- for a `--flag=value` entry --
-/// which part of it. Returns `None` for anything not worth checking at all.
+/// runs the containment check against, and -- for a `--flag=value` entry or
+/// a `file://` URI -- which substring of it is actually the path to check.
+/// Returns `None` for anything not worth checking at all.
 ///
-/// `--flag=value` is split at the first `=` and only `value` is checked:
-/// `--wrapper=./reviewer.sh` is the same hazard as `--wrapper ./reviewer.sh`
-/// split across two argv entries, just packed into one. Only attempted when
-/// `arg` starts with `-` (the GNU-style long-flag convention every shipped
-/// adapter uses), so a plain positional value that happens to contain `=`
-/// isn't misread as a flag.
+/// `--flag=value` is split at the first `=` and only `value` is considered
+/// further: `--wrapper=./reviewer.sh` is the same hazard as `--wrapper
+/// ./reviewer.sh` split across two argv entries, just packed into one. Only
+/// attempted when `arg` starts with `-` (the GNU-style long-flag convention
+/// every shipped adapter uses), so a plain positional value that happens to
+/// contain `=` isn't misread as a flag.
 ///
-/// A value is judged path-like when it starts with `./`, `../`, or `~`, is
-/// itself absolute, or otherwise contains a path separator (`/` or this
-/// platform's own [`std::path::MAIN_SEPARATOR`]) -- the conservative rule
-/// the issue asks for, deliberately not a per-adapter declaration of which
-/// args are paths (that would need a [`crate::tool_adapter::ToolAdapter`]
-/// API change out of scope here).
+/// A `file://` URI is unwrapped to the path after the scheme
+/// ([`strip_file_scheme`]) before anything else is judged -- see that
+/// function's own docs on why `file` must never be treated as "just a URL".
 ///
-/// Two exceptions keep that rule from flagging real, shipped, non-path
-/// values:
-/// - **A value containing whitespace is never path-like.** Verified against
-///   every shipped adapter's `build_command`
-///   (`ClaudeAdapter`/`CodexAdapter`/`MistralAdapter` in `tool_adapter.rs`):
-///   each passes its role's entire system prompt as a single argv entry
-///   (`--append-system-prompt <prompt>`, positional after `--`, or `--system
-///   <prompt>`), and all three built-in default prompts
-///   (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`) contain at least
-///   one `/` (e.g. "reviewer/tester/CI"). Without this exception, *every*
-///   reviewer/tester invocation using a shipped adapter's default prompt
-///   would be refused outright as a relative path -- breaking the working
-///   product, not closing a hole. No real filesystem path any shipped
-///   adapter emits is ever whitespace-separated across a single argv entry,
-///   so this costs no real coverage.
-/// - **A `scheme://` value (any URL) is never path-like.** `://` contains a
-///   path separator but names a resource over a protocol, not a filesystem
-///   path -- the false positive the issue calls out by name.
+/// The rule is then evaluated in two tiers, deliberately asymmetric (issue
+/// #59 review, HIGH): a value can be a genuine filesystem path *with*
+/// whitespace in it (`./sub dir/tool.sh`, `my tool.sh` inside a worktree the
+/// coder wrote to via its `Bash` grant, ADR-0021 §3bis), so whitespace must
+/// never blanket-exempt a value that is otherwise unambiguous evidence of a
+/// path:
+/// - **Strong evidence, checked regardless of whitespace**: the value
+///   starts with `./`, `../`, or `~`, or is itself absolute. Nothing
+///   exempts a value that matches this tier -- not whitespace, not a
+///   `scheme://` prefix (`Path::is_absolute` is false for
+///   `sh://../coder/tool.sh`, so a value here never collides with the URL
+///   check below in practice).
+/// - **Weak evidence, exempted by whitespace or a non-filesystem URL
+///   scheme**: the value merely *contains* a path separator somewhere,
+///   with no unambiguous prefix (`agents/reviewer.sh`, or prose like
+///   "reviewer/tester/CI raised" from a system prompt). Two exemptions
+///   apply only here:
+///   - **Whitespace.** Verified against every shipped adapter's
+///     `build_command` (`ClaudeAdapter`/`CodexAdapter`/`MistralAdapter` in
+///     `tool_adapter.rs`): each passes its role's entire system prompt as a
+///     single argv entry, and all three built-in default prompts
+///     (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`, both starting
+///     with `"You are Warden's ... agent."`) contain at least one `/`.
+///     Without this exemption, restricted to this weak tier only, every
+///     reviewer/tester invocation using a shipped adapter's default prompt
+///     would be refused outright -- breaking the working product, not
+///     closing a hole.
+///   - [`has_non_filesystem_url_scheme`] -- a narrow, explicit allowlist of
+///     schemes that name a resource fetched over a network protocol, never
+///     a local filesystem path (see its own docs for why this must be an
+///     allowlist, not "anything with `://`").
 ///
-/// This intentionally accepts one residual, narrower false-positive risk
-/// (documented rather than special-cased further): a user-authored
-/// `model`/`tools` value in an agent definition's front matter (arbitrary
-/// text, e.g. `agent_def.rs`'s `AgentDefinition::model`) that happens to be
-/// a single path-shaped token with no whitespace (`anthropic/claude-3-opus`,
-/// `Bash(./script.sh)`) would be refused. No shipped adapter's *default*
-/// ever does this (verified above), and the resulting
-/// [`ProcessError::UntrustedAgentArg`] names the exact value and reason, so
-/// this fails closed with an actionable message rather than silently
-/// misjudging a value -- consistent with every other containment check in
-/// this crate.
+/// This intentionally accepts one residual, narrower false-positive risk on
+/// the weak tier, mitigated by [`validate_agent_program`]'s own
+/// `trusted_arg_values` escape hatch rather than special-cased further here:
+/// a `model`/`tools` value that happens to be a single path-shaped token
+/// with no whitespace (`anthropic/claude-3-opus`, `Bash(./script.sh)`) is
+/// still refused by this heuristic alone. No shipped adapter's *default*
+/// ever produces such a value (verified above); a caller with a genuine,
+/// trusted one vouches for it explicitly instead.
 fn path_like_candidate(arg: &str) -> Option<&str> {
     let candidate = if arg.starts_with('-') {
         arg.split_once('=').map_or(arg, |(_, value)| value)
     } else {
         arg
     };
+    let candidate = strip_file_scheme(candidate);
 
-    if candidate.is_empty() || candidate.contains(char::is_whitespace) {
-        return None;
-    }
-    if has_url_scheme(candidate) {
+    if candidate.is_empty() {
         return None;
     }
 
-    let looks_like_path = candidate.starts_with("./")
+    // Strong evidence: checked regardless of whitespace (issue #59 review,
+    // HIGH) -- see this function's own docs on why the whitespace exemption
+    // below must never reach this tier.
+    if candidate.starts_with("./")
         || candidate.starts_with("../")
         || candidate.starts_with('~')
         || Path::new(candidate).is_absolute()
-        || candidate.contains(std::path::MAIN_SEPARATOR)
-        || candidate.contains('/');
+    {
+        return Some(candidate);
+    }
 
-    looks_like_path.then_some(candidate)
+    // Weak evidence: only this tier gets the whitespace/URL-scheme
+    // exemptions -- see this function's own docs.
+    if candidate.contains(char::is_whitespace) {
+        return None;
+    }
+    if has_non_filesystem_url_scheme(candidate) {
+        return None;
+    }
+    let has_separator = candidate.contains(std::path::MAIN_SEPARATOR) || candidate.contains('/');
+    has_separator.then_some(candidate)
 }
 
-/// Whether `value` starts with a URI scheme (`scheme://...`), just enough of
-/// RFC 3986 §3.1's scheme grammar (`ALPHA *( ALPHA / DIGIT / "+" / "-" /
-/// "." )`) to recognize `https://`, `git://`, `ssh://`, etc., without a full
-/// URL-parsing dependency for a check this narrow.
-fn has_url_scheme(value: &str) -> bool {
+/// Unwraps a `file://` URI to the path after its scheme -- issue #59 review,
+/// MEDIUM 2: a `file://` value **is** a filesystem path (unlike a genuine
+/// network-protocol URL), so it must be resolved and containment-checked as
+/// one, not exempted for merely looking like a URL. Case-insensitive on the
+/// scheme itself (`FILE://`), matching real `file:` URI usage. Anything that
+/// isn't a `file://` value is returned unchanged.
+fn strip_file_scheme(value: &str) -> &str {
+    const FILE_SCHEME: &str = "file://";
+    match value.get(..FILE_SCHEME.len()) {
+        Some(prefix) if prefix.eq_ignore_ascii_case(FILE_SCHEME) => &value[FILE_SCHEME.len()..],
+        _ => value,
+    }
+}
+
+/// Schemes that name a resource fetched over a network protocol, never a
+/// local filesystem path -- the only schemes [`path_like_candidate`]'s weak
+/// tier treats as not-a-path. Deliberately an **allowlist**, not "anything
+/// with `://`" (issue #59 review, MEDIUM 2): the previous, broader rule
+/// accepted *any* syntactically valid scheme in front of a relative path,
+/// e.g. `sh://../coder/tool.sh` -- and a coder can `mkdir` a directory
+/// literally named `sh:` inside its own worktree (`:` is a valid POSIX
+/// filename character), making an invented scheme in front of a relative
+/// path name a real coder-written file. `file` is deliberately *not* on
+/// this list -- see [`strip_file_scheme`], which handles it before this is
+/// ever consulted.
+const NON_FILESYSTEM_URL_SCHEMES: &[&str] =
+    &["http", "https", "ssh", "git", "ftp", "ftps", "ws", "wss"];
+
+fn has_non_filesystem_url_scheme(value: &str) -> bool {
     let Some(scheme_end) = value.find("://") else {
         return false;
     };
     let scheme = &value[..scheme_end];
-    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    NON_FILESYSTEM_URL_SCHEMES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(scheme))
 }
 
 /// Spawns `command` with `cwd` set (code-standards.md: "Agent Subprocess
@@ -778,6 +855,7 @@ mod tests {
                 &worktree,
                 repo.path(),
                 layout.run_worktrees_root.path(),
+                &[],
             )
             .is_ok());
         }
@@ -797,6 +875,7 @@ mod tests {
                 &worktree,
                 repo.path(),
                 layout.run_worktrees_root.path(),
+                &[],
             )
             .unwrap_err();
             assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -820,6 +899,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -842,6 +922,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -871,6 +952,7 @@ mod tests {
             &reviewer_worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -894,6 +976,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -920,6 +1003,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
         assert!(validate_agent_program(
@@ -930,6 +1014,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -953,6 +1038,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
@@ -976,6 +1062,7 @@ mod tests {
                 &worktree,
                 repo.path(),
                 layout.run_worktrees_root.path(),
+                &[],
             )
             .unwrap_err();
             assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
@@ -1002,6 +1089,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
@@ -1027,6 +1115,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
@@ -1056,6 +1145,7 @@ mod tests {
             &reviewer_worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
@@ -1082,6 +1172,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -1103,6 +1194,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -1126,6 +1218,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -1153,6 +1246,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -1173,6 +1267,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
@@ -1196,6 +1291,7 @@ mod tests {
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
+            &[],
         )
         .is_ok());
     }
@@ -1242,6 +1338,7 @@ mod tests {
                     &worktree,
                     repo.path(),
                     layout.run_worktrees_root.path(),
+                    &[],
                 )
                 .is_ok(),
                 "{role_name} via {} was refused for its own default command: {:?}",
@@ -1258,6 +1355,276 @@ mod tests {
             check(&CodexAdapter, role, role_name, &layout, &repo);
             check(&MistralAdapter, role, role_name, &layout, &repo);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // `path_like_candidate` heuristic hardening (issue #59 review)
+    // -----------------------------------------------------------------
+
+    /// Issue #59 review, HIGH: a whitespace-containing value that is
+    /// otherwise unambiguous evidence of a path (absolute, inside the
+    /// coder's own worktree) must still be refused -- POSIX paths can
+    /// contain spaces, and the coder can write a file literally named
+    /// `my tool.sh` inside its own worktree via its `Bash` grant. Before
+    /// the fix this was a one-character bypass of the whole guard.
+    #[test]
+    fn an_absolute_arg_with_a_space_inside_the_coders_worktree_is_still_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let wrapper = coder_worktree.join("my tool.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string(),
+            ],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// Issue #59 review, HIGH: the relative-path counterpart -- an
+    /// unambiguous `./`-prefixed value with a space in it must be refused
+    /// exactly like one without a space.
+    #[test]
+    fn a_relative_arg_with_a_space_is_still_refused() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), "./sub dir/tool.sh".to_string()],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+        assert!(error.to_string().contains("./sub dir/tool.sh"), "{error}");
+    }
+
+    /// Issue #59 review, MEDIUM 2: a `file://` URI names a real filesystem
+    /// path and must be resolved and refused exactly like the equivalent
+    /// bare absolute path -- it must never be laundered through the
+    /// URL-scheme exemption just because it looks like a URL.
+    #[test]
+    fn a_file_url_onto_the_coders_worktree_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let wrapper = coder_worktree.join("tool.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        let file_url = format!("file://{}", wrapper.to_str().unwrap());
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), file_url],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// Issue #59 review, MEDIUM 2: an invented scheme in front of a
+    /// relative path must not be treated as a URL -- `://` alone is not
+    /// evidence of a genuine network-protocol URL (`has_url_scheme`'s
+    /// previous, over-broad RFC 3986 grammar check accepted any
+    /// syntactically valid scheme, including one the coder can `mkdir`
+    /// literally as a directory name, e.g. `sh:`).
+    #[test]
+    fn an_invented_scheme_in_front_of_a_relative_path_does_not_bypass_the_guard() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        // Mirrors the coder's own worktree in the arg text, the same way a
+        // real relative-path wrapper would resolve against it -- the exact
+        // value doesn't need to exist on disk for the relative-path branch.
+        let arg = format!(
+            "sh://../{}/tool.sh",
+            coder_worktree.file_name().unwrap().to_str().unwrap()
+        );
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper".to_string(), arg],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// A genuine network-protocol URL (on the allowlist) must still be
+    /// allowed -- the fix for finding 2 must not regress the original
+    /// false-positive fix it's built on top of.
+    #[test]
+    fn a_genuine_https_url_is_still_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--endpoint".to_string(),
+                "https://example.com/reviewer.sh".to_string()
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // `trusted_arg_values` escape hatch (issue #59 review, MEDIUM 4)
+    // -----------------------------------------------------------------
+
+    /// The concrete false positive the review demonstrated: a
+    /// vendor-prefixed model id looks exactly like a relative path to the
+    /// separator-based heuristic. Refused without the hatch, allowed once
+    /// the caller vouches for that exact value.
+    #[test]
+    fn a_vendor_prefixed_model_value_is_refused_without_the_hatch_and_allowed_with_it() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        let args = vec!["--model".to_string(), "anthropic/claude-3-opus".to_string()];
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &args,
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &args,
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &["anthropic/claude-3-opus".to_string()],
+        )
+        .is_ok());
+    }
+
+    /// End-to-end regression using the *real* `ClaudeAdapter::build_command`
+    /// (issue #59 review, MEDIUM 4's own ask): `model:
+    /// mistralai/mistral-large` in a reviewer's `AgentDefinition` must work
+    /// once the caller vouches for it, exactly as it would coming from
+    /// `orchestrator::mod::trusted_arg_values_for_step`.
+    #[test]
+    fn a_vendor_prefixed_model_from_a_real_adapter_command_works_with_the_hatch() {
+        use crate::tool_adapter::{ClaudeAdapter, ToolAdapter};
+        use warden_core::AgentDefinition;
+
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        let definition = AgentDefinition::new(
+            None,
+            None,
+            None,
+            Some("mistralai/mistral-large".to_string()),
+            "be a reviewer",
+        )
+        .unwrap();
+        let command = ClaudeAdapter.build_command(&definition).unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            &command.program,
+            &command.args,
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            &command.program,
+            &command.args,
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &["mistralai/mistral-large".to_string()],
+        )
+        .is_ok());
+    }
+
+    /// Issue #59 review, MEDIUM 4's own explicit ask: vouching for one
+    /// literal value must never smuggle a *different*, genuinely
+    /// coder-controlled path through. `trusted_arg_values` is compared by
+    /// exact value equality only -- an unrelated trusted entry must have no
+    /// effect on an actual containment violation.
+    #[test]
+    fn a_trusted_value_does_not_smuggle_an_unrelated_coder_controlled_path() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let wrapper = coder_worktree.join("tool.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string(),
+            ],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            // Vouches for an unrelated model string -- must not affect the
+            // unlisted, actually-malicious `--wrapper` value above.
+            &["anthropic/claude-3-opus".to_string()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
     }
 
     #[tokio::test]

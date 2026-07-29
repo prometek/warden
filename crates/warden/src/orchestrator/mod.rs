@@ -86,7 +86,7 @@ use uuid::Uuid;
 use warden_core::{
     decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, AgentRole, CiOutcome,
     CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, Role, RunEvent, RunState,
-    DIFF_TRUNCATED_MARKER,
+    WorkflowStep, DIFF_TRUNCATED_MARKER,
 };
 use warden_sandbox::{LocalSandbox, Sandbox};
 
@@ -133,6 +133,66 @@ struct ResolvedAgent {
     /// than borrowed from `RunConfig` purely to keep a lifetime out of every
     /// signature it's threaded through.
     system_prompt: String,
+    /// Issue #59 review, MEDIUM 4: values from this step's own
+    /// `AgentDefinition` that [`process::validate_agent_program`] treats as
+    /// vouched-safe non-paths, even though they would otherwise look
+    /// path-like (e.g. a vendor-prefixed `model: anthropic/claude-3-opus`).
+    /// Computed once, in [`trusted_arg_values_for_step`] -- **empty unless
+    /// this step is the built-in reviewer/tester *and* its definition was
+    /// actually resolved from trusted user config**, never from the repo
+    /// under review -- see that function's own docs for exactly why every
+    /// other case (the producer, any custom step, or a reviewer/tester
+    /// definition read from the repo under `--trust-repo-agents`) always
+    /// gets an empty list here.
+    trusted_arg_values: Vec<String>,
+}
+
+/// Issue #59 review, MEDIUM 4: decides which of `definition`'s own values
+/// `step`'s [`ResolvedAgent`] may later vouch for as non-paths to
+/// [`process::validate_agent_program`] -- today, only `definition.model`
+/// (the concrete false positive the review demonstrated: a vendor-prefixed
+/// model id like `anthropic/claude-3-opus` is indistinguishable from a
+/// relative path by the separator-based heuristic alone).
+///
+/// **The only case this ever returns anything**: `step.role` is
+/// `"reviewer"` or `"tester"` (the built-in gated pair -- never the
+/// producer, which the guard doesn't even check) *and* `untrusted_repo_agent_definitions`
+/// (issue #26, [`RunConfig::untrusted_repo_agent_definitions`]) contains no
+/// entry for that role. That list is non-empty for a role only when
+/// `agent_def::resolve_agent_definition` actually read that role's
+/// definition from the repo under review (`--trust-repo-agents`, no
+/// user-config file for that role) -- exactly the one case where `model`
+/// *is* coder-controlled. Every other shape of step gets an empty list,
+/// unconditionally:
+/// - **Any step whose role is not literally `"reviewer"`/`"tester"`** --
+///   most importantly any custom workflow step beyond the built-in trio
+///   (`techlead`, ...): `agent_def::resolve_custom_step_agent_definition`
+///   reads `<repo>/.claude/agents/<agent>.md` **unconditionally**, no
+///   trusted alternative exists for a custom role, so its `model` (if any)
+///   is always coder-controlled repo content. The producer step falls in
+///   here too, though it's moot -- `validate_agent_program` never checks a
+///   producer's `program`/`args` at all.
+/// - **A reviewer/tester step whose definition *was* sourced from the
+///   repo** (`untrusted_repo_agent_definitions` names that role): its
+///   `model`, along with the rest of that definition, is exactly the
+///   coder-controlled content this whole guard exists to distrust.
+fn trusted_arg_values_for_step(
+    step: &WorkflowStep,
+    definition: &AgentDefinition,
+    untrusted_repo_agent_definitions: &[UntrustedRepoAgentDefinition],
+) -> Vec<String> {
+    let role = match step.role.as_str() {
+        "reviewer" => AgentRole::Reviewer,
+        "tester" => AgentRole::Tester,
+        _ => return Vec::new(),
+    };
+    let sourced_from_the_repo_under_review = untrusted_repo_agent_definitions
+        .iter()
+        .any(|entry| entry.role == role);
+    if sourced_from_the_repo_under_review {
+        return Vec::new();
+    }
+    definition.model.iter().cloned().collect()
 }
 
 /// Issue #73 (trio-unification follow-up): every workflow step's resolved
@@ -166,15 +226,23 @@ impl ResolvedAgents {
                 step_agents: config.step_agents.len(),
             });
         }
-        let resolve_one = |definition: &AgentDefinition| -> Result<ResolvedAgent> {
-            Ok(ResolvedAgent {
-                command: runner.build_command(definition)?,
-                system_prompt: definition.system_prompt.clone(),
-            })
-        };
+        let resolve_one =
+            |(step, definition): (&WorkflowStep, &AgentDefinition)| -> Result<ResolvedAgent> {
+                Ok(ResolvedAgent {
+                    command: runner.build_command(definition)?,
+                    system_prompt: definition.system_prompt.clone(),
+                    trusted_arg_values: trusted_arg_values_for_step(
+                        step,
+                        definition,
+                        &config.untrusted_repo_agent_definitions,
+                    ),
+                })
+            };
         let steps = config
-            .step_agents
+            .workflow
+            .steps
             .iter()
+            .zip(config.step_agents.iter())
             .map(resolve_one)
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -645,5 +713,101 @@ impl Orchestrator {
                  mask the run's final state)"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use warden_core::Gate;
+
+    /// A minimal [`WorkflowStep`] naming `role_name` -- every field besides
+    /// `role` is irrelevant to [`trusted_arg_values_for_step`], which only
+    /// ever reads `step.role`.
+    fn step(role_name: &str) -> WorkflowStep {
+        WorkflowStep {
+            role: Role::new(role_name).unwrap(),
+            agent: role_name.to_string(),
+            gate: Gate::PassThrough,
+            budget: None,
+            captures_evidence: false,
+        }
+    }
+
+    fn definition_with_model(model: &str) -> AgentDefinition {
+        AgentDefinition::new(None, None, None, Some(model.to_string()), "be an agent").unwrap()
+    }
+
+    /// The only case that ever vouches for anything: a reviewer/tester step
+    /// whose role has no entry in `untrusted_repo_agent_definitions` (i.e.
+    /// its definition was resolved from trusted user config, never the repo
+    /// under review).
+    #[test]
+    fn a_reviewer_or_tester_step_sourced_from_trusted_config_vouches_for_its_model() {
+        for role_name in ["reviewer", "tester"] {
+            let definition = definition_with_model("anthropic/claude-3-opus");
+            let trusted = trusted_arg_values_for_step(&step(role_name), &definition, &[]);
+            assert_eq!(trusted, vec!["anthropic/claude-3-opus".to_string()]);
+        }
+    }
+
+    /// Issue #59 review, MEDIUM 4's own explicit ask: the vouching must
+    /// come from trusted config, never from repo content. A reviewer/tester
+    /// step whose definition *was* actually read from the repo under review
+    /// (`--trust-repo-agents`, tracked in `untrusted_repo_agent_definitions`)
+    /// must get an empty list -- its `model` is exactly the coder-controlled
+    /// content this whole guard exists to distrust, even though it's the
+    /// built-in reviewer/tester role.
+    #[test]
+    fn a_reviewer_step_sourced_from_the_repo_under_review_never_vouches_for_anything() {
+        let definition = definition_with_model("anthropic/claude-3-opus");
+        let untrusted = vec![UntrustedRepoAgentDefinition {
+            role: AgentRole::Reviewer,
+            path: PathBuf::from(".warden/agents/reviewer.md"),
+            canonical_path: PathBuf::from("/repo/.warden/agents/reviewer.md"),
+        }];
+
+        let trusted = trusted_arg_values_for_step(&step("reviewer"), &definition, &untrusted);
+        assert!(trusted.is_empty());
+
+        // The tester's own entry is untouched by the reviewer's -- proves
+        // this is looked up per-role, not a blanket "any untrusted entry
+        // exists" flag.
+        let tester_trusted = trusted_arg_values_for_step(&step("tester"), &definition, &untrusted);
+        assert_eq!(tester_trusted, vec!["anthropic/claude-3-opus".to_string()]);
+    }
+
+    /// Any step beyond the built-in reviewer/tester pair -- most
+    /// importantly a custom workflow step -- never vouches for anything,
+    /// regardless of `untrusted_repo_agent_definitions`: a custom step's
+    /// definition is always read from `<repo>/.claude/agents/<agent>.md`
+    /// (`agent_def::resolve_custom_step_agent_definition`), unconditionally
+    /// coder-controlled content, with no trusted alternative to fall back
+    /// to the way reviewer/tester have one.
+    #[test]
+    fn a_custom_step_never_vouches_for_anything() {
+        let definition = definition_with_model("anthropic/claude-3-opus");
+        let trusted = trusted_arg_values_for_step(&step("techlead"), &definition, &[]);
+        assert!(trusted.is_empty());
+    }
+
+    /// The producer step is also never vouched for -- moot in practice
+    /// (`validate_agent_program` never even checks a producer's `program`/
+    /// `args`), but this function must not special-case `"coder"` into
+    /// behaving like `"reviewer"`/`"tester"`.
+    #[test]
+    fn the_producer_step_never_vouches_for_anything() {
+        let definition = definition_with_model("anthropic/claude-3-opus");
+        let trusted = trusted_arg_values_for_step(&step("coder"), &definition, &[]);
+        assert!(trusted.is_empty());
+    }
+
+    /// A trusted reviewer/tester step with no `model` set vouches for
+    /// nothing -- there is no value to vouch for, not an error.
+    #[test]
+    fn a_trusted_step_with_no_model_set_vouches_for_nothing() {
+        let definition = AgentDefinition::new(None, None, None, None, "be an agent").unwrap();
+        let trusted = trusted_arg_values_for_step(&step("reviewer"), &definition, &[]);
+        assert!(trusted.is_empty());
     }
 }
