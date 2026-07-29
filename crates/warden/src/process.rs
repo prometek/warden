@@ -25,7 +25,7 @@
 //! half concurrently with draining stdout/stderr and awaiting exit — see its
 //! own docs for why writing stdin any other way can deadlock.
 //!
-//! # Issue #26: [`validate_agent_program`], a belt-and-braces guard on `program`
+//! # Issue #26: [`validate_agent_program`], a belt-and-braces guard on `program` (and, since #59, `args`)
 //!
 //! No built-in [`crate::tool_adapter::ToolAdapter`] shipped today ever names
 //! a `command.program` that resolves inside the repo under review --
@@ -39,6 +39,20 @@
 //! tester spawn in this codebase goes through
 //! (`orchestrator::Orchestrator::run_agent`), rather than trusted to stay
 //! true of every adapter forever.
+//!
+//! **Issue #59** scopes this same reasoning to `args`, deliberately left
+//! uncovered by #26: a future adapter naming something like `claude
+//! --wrapper ./reviewer.sh` would reintroduce the exact hole #26 closes,
+//! since `./reviewer.sh` still resolves against the role's own worktree --
+//! `program` being clean says nothing about `args`. [`path_like_candidate`]
+//! decides which `args` entries even get the containment check (a
+//! conservative separator-based heuristic, not a per-adapter declaration of
+//! which args are paths -- that would need a `ToolAdapter` API change this
+//! issue deliberately avoids); see its own docs for the exact rule and why
+//! it must exclude whitespace-containing values (every shipped adapter's
+//! default system prompt -- the very thing `args` carries for every real
+//! reviewer/tester invocation today -- contains a `/`, and would otherwise
+//! be refused outright).
 
 use std::path::Path;
 
@@ -75,15 +89,18 @@ pub struct AgentOutcome {
     pub stderr: String,
 }
 
-/// Guards a gated step's `program` against resolving to a path the producer
-/// step controls (issue #26, belt-and-braces): no adapter shipped today can
-/// actually trigger this (see this module's own docs), but nothing stops a
-/// future one from naming a script inside the repo under review, and that
-/// would defeat the entire point of running a gated step as an independent
-/// check. Always `Ok(())` for `is_producer` -- the producer step (the coder
-/// in the built-in default workflow) already runs with full repo access and
-/// is the repo's own untrusted step in the first place (`agent_def`'s own
-/// module docs), so there is nothing to protect it from here.
+/// Guards a gated step's `program` and path-like `args` entries against
+/// resolving to a path the producer step controls (issue #26, belt-and-
+/// braces; extended from `program` to `args` by issue #59): no adapter
+/// shipped today can actually trigger this (see this module's own docs),
+/// but nothing stops a future one from naming a script inside the repo
+/// under review -- as `program`, or tucked into `args` (e.g. `claude
+/// --wrapper ./reviewer.sh`) -- and that would defeat the entire point of
+/// running a gated step as an independent check. Always `Ok(())` for
+/// `is_producer` -- the producer step (the coder in the built-in default
+/// workflow) already runs with full repo access and is the repo's own
+/// untrusted step in the first place (`agent_def`'s own module docs), so
+/// there is nothing to protect it from here.
 ///
 /// **Issue #73 (trio-unification follow-up)**: takes `role_name`/
 /// `is_producer` rather than the closed `AgentRole` this used to -- every
@@ -93,7 +110,8 @@ pub struct AgentOutcome {
 /// `"coder"`/`"reviewer"`/`"tester"`. `role_name` is otherwise only used to
 /// name the offending role in the returned error.
 ///
-/// Refuses `program` when it is:
+/// Refuses `program`, and any `args` entry [`path_like_candidate`] judges
+/// path-like, when it is:
 /// - **a relative path** (contains a path separator and is not absolute):
 ///   resolves against `worktree_path` (the child chdirs there before exec)
 ///   -- exactly the `./reviewer.sh`-means-the-coder's-own-copy hazard
@@ -116,21 +134,27 @@ pub struct AgentOutcome {
 /// `"echo"`) is always allowed: it resolves via `PATH`
 /// (`Command::new`/`execvp` semantics), never against `worktree_path`, so it
 /// carries none of the above hazard regardless of what the coder committed.
+/// `args` entries follow the narrower [`path_like_candidate`] heuristic
+/// instead (see its own docs) -- unlike `program`, most `args` entries are
+/// ordinary values (`--model sonnet`, a whole system prompt), not paths at
+/// all, so the check only ever applies to the subset that look unambiguously
+/// like one.
 ///
 /// `worktree_path`, `repo_path`, and `run_worktrees_root` are all
-/// canonicalized before the containment check (walking up to the nearest
-/// existing ancestor for a `program` path that doesn't exist on disk -- see
+/// canonicalized before each containment check (walking up to the nearest
+/// existing ancestor for a candidate that doesn't exist on disk -- see
 /// `canonicalize_best_effort`), so a `..`-laden or symlink-relative
-/// `program` can't slip past a purely lexical comparison. If canonicalizing
-/// `program` itself fails for a reason other than "doesn't exist" (e.g. a
-/// permissions error walking its ancestors), this fails closed with
-/// [`ProcessError::UntrustedAgentProgram`] naming that reason, rather than
-/// silently skipping the containment check it could no longer perform
-/// (code-standards.md: "no silent fallback").
+/// `program`/arg can't slip past a purely lexical comparison. If
+/// canonicalizing a candidate itself fails for a reason other than "doesn't
+/// exist" (e.g. a permissions error walking its ancestors), this fails
+/// closed naming that reason, rather than silently skipping the containment
+/// check it could no longer perform (code-standards.md: "no silent
+/// fallback").
 pub fn validate_agent_program(
     role_name: &str,
     is_producer: bool,
     program: &str,
+    args: &[String],
     worktree_path: &Path,
     repo_path: &Path,
     run_worktrees_root: &Path,
@@ -139,112 +163,203 @@ pub fn validate_agent_program(
         return Ok(());
     }
 
-    if !program.contains(std::path::MAIN_SEPARATOR) && !program.contains('/') {
-        // No path separator at all (checked for both this platform's own
+    if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
+        // Any path separator at all (checked for both this platform's own
         // separator and `/`, since a Windows build must still refuse a
-        // Unix-style `agents/reviewer.sh` argument) -- a bare name, resolved
-        // via `PATH`, never against `worktree_path`.
-        return Ok(());
-    }
-
-    let candidate = Path::new(program);
-    if !candidate.is_absolute() {
-        return Err(ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "relative path -- would resolve against {}, the role's own worktree (a \
-                 checkout of the repo the coder can write to)",
-                worktree_path.display()
-            ),
-        });
-    }
-
-    let canonical_candidate = canonicalize_best_effort(candidate).map_err(|source| {
-        ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "cannot resolve its real location to verify it is outside the repo under \
-                 review: {source}"
-            ),
-        }
-    })?;
-    let canonical_worktree = canonicalize_best_effort(worktree_path).map_err(|source| {
-        ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "cannot resolve the role's own worktree ({}) to verify this program is outside \
-                 it: {source}",
-                worktree_path.display()
-            ),
-        }
-    })?;
-    let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
-        ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "cannot resolve the run's base repository ({}) to verify this program is \
-                 outside it: {source}",
-                repo_path.display()
-            ),
-        }
-    })?;
-    let canonical_run_worktrees_root =
-        canonicalize_best_effort(run_worktrees_root).map_err(|source| {
-            ProcessError::UntrustedAgentProgram {
+        // Unix-style `agents/reviewer.sh` argument) -- a bare name has
+        // neither, and resolves via `PATH`, never against `worktree_path`.
+        check_containment(program, worktree_path, repo_path, run_worktrees_root).map_err(
+            |reason| ProcessError::UntrustedAgentProgram {
                 role: role_name.to_string(),
                 program: program.to_string(),
-                reason: format!(
-                    "cannot resolve this run's own worktrees root ({}) to verify this program is \
-                 outside it: {source}",
-                    run_worktrees_root.display()
-                ),
-            }
-        })?;
+                reason,
+            },
+        )?;
+    }
 
-    if canonical_candidate.starts_with(&canonical_worktree) {
-        return Err(ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "resolves inside the role's own worktree ({}) -- a checkout of the repo the \
-                 coder can write to",
-                worktree_path.display()
-            ),
-        });
-    }
-    // Issue #26 review, MEDIUM: catches a program under *another* role's
-    // worktree for this same run (most importantly the coder's own,
-    // `<run_worktrees_root>/coder` -- the coder writes there freely via
-    // `Bash`, including files it never commits) -- the check above only
-    // ever covered the checked role's own worktree.
-    if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
-        return Err(ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
-                 coder writes to freely via Bash, including files it never commits",
-                run_worktrees_root.display()
-            ),
-        });
-    }
-    if canonical_candidate.starts_with(&canonical_repo) {
-        return Err(ProcessError::UntrustedAgentProgram {
-            role: role_name.to_string(),
-            program: program.to_string(),
-            reason: format!(
-                "resolves inside the run's base repository ({}), which the coder can write to \
-                 and commit into",
-                repo_path.display()
-            ),
-        });
+    for arg in args {
+        let Some(candidate) = path_like_candidate(arg) else {
+            continue;
+        };
+        check_containment(candidate, worktree_path, repo_path, run_worktrees_root).map_err(
+            |reason| ProcessError::UntrustedAgentArg {
+                role: role_name.to_string(),
+                arg: arg.clone(),
+                reason,
+            },
+        )?;
     }
 
     Ok(())
+}
+
+/// The containment check shared by `program` and path-like `args` entries
+/// (issue #59: previously duplicated per candidate inside
+/// [`validate_agent_program`] itself, back when `program` was the only
+/// candidate it ever checked). Returns `Ok(())` when `candidate` is outside
+/// `worktree_path`, `repo_path`, and `run_worktrees_root`; `Err(reason)`
+/// otherwise, whether because it resolves inside one of them or because
+/// canonicalizing any of the four paths involved failed -- the caller wraps
+/// `reason` into the typed error appropriate for what kind of candidate this
+/// was (`program` vs. an `args` entry).
+fn check_containment(
+    candidate: &str,
+    worktree_path: &Path,
+    repo_path: &Path,
+    run_worktrees_root: &Path,
+) -> Result<(), String> {
+    let candidate_path = Path::new(candidate);
+    if !candidate_path.is_absolute() {
+        return Err(format!(
+            "relative path -- would resolve against {}, the role's own worktree (a checkout of \
+             the repo the coder can write to)",
+            worktree_path.display()
+        ));
+    }
+
+    let canonical_candidate = canonicalize_best_effort(candidate_path).map_err(|source| {
+        format!(
+            "cannot resolve its real location to verify it is outside the repo under review: \
+             {source}"
+        )
+    })?;
+    let canonical_worktree = canonicalize_best_effort(worktree_path).map_err(|source| {
+        format!(
+            "cannot resolve the role's own worktree ({}) to verify this is outside it: {source}",
+            worktree_path.display()
+        )
+    })?;
+    let canonical_repo = canonicalize_best_effort(repo_path).map_err(|source| {
+        format!(
+            "cannot resolve the run's base repository ({}) to verify this is outside it: \
+             {source}",
+            repo_path.display()
+        )
+    })?;
+    let canonical_run_worktrees_root =
+        canonicalize_best_effort(run_worktrees_root).map_err(|source| {
+            format!(
+                "cannot resolve this run's own worktrees root ({}) to verify this is outside \
+                 it: {source}",
+                run_worktrees_root.display()
+            )
+        })?;
+
+    if canonical_candidate.starts_with(&canonical_worktree) {
+        return Err(format!(
+            "resolves inside the role's own worktree ({}) -- a checkout of the repo the coder \
+             can write to",
+            worktree_path.display()
+        ));
+    }
+    // Issue #26 review, MEDIUM: catches a candidate under *another* role's
+    // worktree for this same run (most importantly the coder's own,
+    // `<run_worktrees_root>/coder` -- the coder writes there freely via
+    // `Bash`, including files it never commits) -- the check above only
+    // ever covers the checked role's own worktree.
+    if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
+        return Err(format!(
+            "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
+             coder writes to freely via Bash, including files it never commits",
+            run_worktrees_root.display()
+        ));
+    }
+    if canonical_candidate.starts_with(&canonical_repo) {
+        return Err(format!(
+            "resolves inside the run's base repository ({}), which the coder can write to and \
+             commit into",
+            repo_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Issue #59: decides which `args` entries [`validate_agent_program`] even
+/// runs the containment check against, and -- for a `--flag=value` entry --
+/// which part of it. Returns `None` for anything not worth checking at all.
+///
+/// `--flag=value` is split at the first `=` and only `value` is checked:
+/// `--wrapper=./reviewer.sh` is the same hazard as `--wrapper ./reviewer.sh`
+/// split across two argv entries, just packed into one. Only attempted when
+/// `arg` starts with `-` (the GNU-style long-flag convention every shipped
+/// adapter uses), so a plain positional value that happens to contain `=`
+/// isn't misread as a flag.
+///
+/// A value is judged path-like when it starts with `./`, `../`, or `~`, is
+/// itself absolute, or otherwise contains a path separator (`/` or this
+/// platform's own [`std::path::MAIN_SEPARATOR`]) -- the conservative rule
+/// the issue asks for, deliberately not a per-adapter declaration of which
+/// args are paths (that would need a [`crate::tool_adapter::ToolAdapter`]
+/// API change out of scope here).
+///
+/// Two exceptions keep that rule from flagging real, shipped, non-path
+/// values:
+/// - **A value containing whitespace is never path-like.** Verified against
+///   every shipped adapter's `build_command`
+///   (`ClaudeAdapter`/`CodexAdapter`/`MistralAdapter` in `tool_adapter.rs`):
+///   each passes its role's entire system prompt as a single argv entry
+///   (`--append-system-prompt <prompt>`, positional after `--`, or `--system
+///   <prompt>`), and all three built-in default prompts
+///   (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`) contain at least
+///   one `/` (e.g. "reviewer/tester/CI"). Without this exception, *every*
+///   reviewer/tester invocation using a shipped adapter's default prompt
+///   would be refused outright as a relative path -- breaking the working
+///   product, not closing a hole. No real filesystem path any shipped
+///   adapter emits is ever whitespace-separated across a single argv entry,
+///   so this costs no real coverage.
+/// - **A `scheme://` value (any URL) is never path-like.** `://` contains a
+///   path separator but names a resource over a protocol, not a filesystem
+///   path -- the false positive the issue calls out by name.
+///
+/// This intentionally accepts one residual, narrower false-positive risk
+/// (documented rather than special-cased further): a user-authored
+/// `model`/`tools` value in an agent definition's front matter (arbitrary
+/// text, e.g. `agent_def.rs`'s `AgentDefinition::model`) that happens to be
+/// a single path-shaped token with no whitespace (`anthropic/claude-3-opus`,
+/// `Bash(./script.sh)`) would be refused. No shipped adapter's *default*
+/// ever does this (verified above), and the resulting
+/// [`ProcessError::UntrustedAgentArg`] names the exact value and reason, so
+/// this fails closed with an actionable message rather than silently
+/// misjudging a value -- consistent with every other containment check in
+/// this crate.
+fn path_like_candidate(arg: &str) -> Option<&str> {
+    let candidate = if arg.starts_with('-') {
+        arg.split_once('=').map_or(arg, |(_, value)| value)
+    } else {
+        arg
+    };
+
+    if candidate.is_empty() || candidate.contains(char::is_whitespace) {
+        return None;
+    }
+    if has_url_scheme(candidate) {
+        return None;
+    }
+
+    let looks_like_path = candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with('~')
+        || Path::new(candidate).is_absolute()
+        || candidate.contains(std::path::MAIN_SEPARATOR)
+        || candidate.contains('/');
+
+    looks_like_path.then_some(candidate)
+}
+
+/// Whether `value` starts with a URI scheme (`scheme://...`), just enough of
+/// RFC 3986 §3.1's scheme grammar (`ALPHA *( ALPHA / DIGIT / "+" / "-" /
+/// "." )`) to recognize `https://`, `git://`, `ssh://`, etc., without a full
+/// URL-parsing dependency for a check this narrow.
+fn has_url_scheme(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let scheme = &value[..scheme_end];
+    scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Spawns `command` with `cwd` set (code-standards.md: "Agent Subprocess
@@ -659,6 +774,7 @@ mod tests {
                 role,
                 false,
                 "claude",
+                &[],
                 &worktree,
                 repo.path(),
                 layout.run_worktrees_root.path(),
@@ -677,6 +793,7 @@ mod tests {
                 role,
                 false,
                 "./reviewer.sh",
+                &[],
                 &worktree,
                 repo.path(),
                 layout.run_worktrees_root.path(),
@@ -699,6 +816,7 @@ mod tests {
             "reviewer",
             false,
             program.to_str().unwrap(),
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -720,6 +838,7 @@ mod tests {
             "tester",
             false,
             program.to_str().unwrap(),
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -748,6 +867,7 @@ mod tests {
             "reviewer",
             false,
             program.to_str().unwrap(),
+            &[],
             &reviewer_worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -770,6 +890,7 @@ mod tests {
             "reviewer",
             false,
             program.to_str().unwrap(),
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -795,6 +916,7 @@ mod tests {
             "coder",
             true,
             program.to_str().unwrap(),
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -804,6 +926,7 @@ mod tests {
             "coder",
             true,
             "./coder.sh",
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
@@ -826,12 +949,315 @@ mod tests {
             "reviewer",
             false,
             program.to_str().unwrap(),
+            &[],
             &worktree,
             repo.path(),
             layout.run_worktrees_root.path(),
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentProgram { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // `validate_agent_program`, `args` coverage (issue #59)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_relative_path_arg_is_refused_for_reviewer_and_tester() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        for role in ["reviewer", "tester"] {
+            let error = validate_agent_program(
+                role,
+                false,
+                "claude",
+                &["--wrapper".to_string(), "./reviewer.sh".to_string()],
+                &worktree,
+                repo.path(),
+                layout.run_worktrees_root.path(),
+            )
+            .unwrap_err();
+            assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+            assert!(error.to_string().contains("./reviewer.sh"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_arg_inside_the_role_worktree_is_refused() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        let wrapper = worktree.join("reviewer.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string(),
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    #[test]
+    fn an_absolute_arg_inside_the_run_base_repo_is_refused() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("tester");
+        let repo = TempDir::new().unwrap();
+        let wrapper = repo.path().join(".warden/agents/reviewer.sh");
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            "tester",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string(),
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// Mirrors the `program` coverage (issue #26 review, MEDIUM): an `args`
+    /// entry resolving inside *another* role's worktree for this run --
+    /// most importantly the coder's own -- must be refused too, not just
+    /// the checked role's own worktree.
+    #[test]
+    fn an_absolute_arg_inside_the_coders_own_worktree_for_this_run_is_refused() {
+        let layout = WorktreeLayout::new();
+        let reviewer_worktree = layout.role_worktree("reviewer");
+        let coder_worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+        let wrapper = coder_worktree.join("tool.sh");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string(),
+            ],
+            &reviewer_worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+        assert!(error.to_string().contains("run's own worktrees"), "{error}");
+    }
+
+    #[test]
+    fn an_absolute_arg_outside_the_worktree_the_repo_and_the_run_worktrees_root_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let wrapper = elsewhere.path().join("some-tool");
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--wrapper".to_string(),
+                wrapper.to_str().unwrap().to_string()
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .is_ok());
+    }
+
+    /// The exact false positive the issue calls out by name: an ordinary
+    /// `--flag value` pair (no path separator anywhere) must never be
+    /// treated as path-like.
+    #[test]
+    fn an_ordinary_non_path_arg_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--model".to_string(), "sonnet".to_string()],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .is_ok());
+    }
+
+    /// The other false positive the issue calls out by name: a URL contains
+    /// a path separator (`://`) but is not a filesystem path.
+    #[test]
+    fn a_url_arg_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--endpoint".to_string(),
+                "https://example.com/reviewer.sh".to_string()
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .is_ok());
+    }
+
+    /// The false positive verified live against this codebase's own shipped
+    /// adapters: every one of them passes its role's entire system prompt as
+    /// a single argv entry, and all three built-in default prompts contain
+    /// at least one `/` -- without the whitespace exception, this would
+    /// refuse every reviewer/tester invocation using a shipped adapter's
+    /// default prompt.
+    #[test]
+    fn a_multi_word_value_containing_a_separator_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        assert!(validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &[
+                "--append-system-prompt".to_string(),
+                "issues a prior reviewer/tester/CI raised".to_string()
+            ],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .is_ok());
+    }
+
+    /// `--flag=value` packs the flag and its value into one argv entry --
+    /// the value after the first `=` must still be checked.
+    #[test]
+    fn a_flag_equals_relative_path_form_is_refused() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        let error = validate_agent_program(
+            "reviewer",
+            false,
+            "claude",
+            &["--wrapper=./reviewer.sh".to_string()],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+        assert!(error.to_string().contains("./reviewer.sh"), "{error}");
+    }
+
+    /// The `args` check is subject to the exact same `is_producer` exemption
+    /// as `program` -- the coder must never be refused an argument that
+    /// would be refused for a gated step.
+    #[test]
+    fn the_producer_step_is_never_subject_to_the_args_guard() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("coder");
+        let repo = TempDir::new().unwrap();
+
+        assert!(validate_agent_program(
+            "coder",
+            true,
+            "claude",
+            &["--wrapper".to_string(), "./coder.sh".to_string()],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+        )
+        .is_ok());
+    }
+
+    /// End-to-end regression for the false positive this guard must never
+    /// reintroduce (issue #59): every shipped `ToolAdapter`'s *real*
+    /// `build_command`, fed its own default reviewer/tester prompt (not a
+    /// hand-picked string), must still pass `validate_agent_program`. This
+    /// is what actually caught the system-prompt false positive during
+    /// implementation -- `path_like_candidate`'s whitespace exception exists
+    /// because this test failed without it.
+    #[test]
+    fn every_shipped_adapters_default_command_for_reviewer_and_tester_passes_the_guard() {
+        use crate::tool_adapter::{ClaudeAdapter, CodexAdapter, MistralAdapter, ToolAdapter};
+        use warden_core::{AgentDefinition, AgentRole};
+
+        let layout = WorktreeLayout::new();
+        let repo = TempDir::new().unwrap();
+
+        fn check(
+            adapter: &impl ToolAdapter,
+            role: AgentRole,
+            role_name: &str,
+            layout: &WorktreeLayout,
+            repo: &TempDir,
+        ) {
+            let worktree = layout.role_worktree(role_name);
+            let definition = AgentDefinition::new(
+                None,
+                None,
+                adapter.default_tools(role).map(str::to_string),
+                None,
+                adapter.default_prompt(role),
+            )
+            .unwrap();
+            let command = adapter.build_command(&definition).unwrap();
+
+            assert!(
+                validate_agent_program(
+                    role_name,
+                    false,
+                    &command.program,
+                    &command.args,
+                    &worktree,
+                    repo.path(),
+                    layout.run_worktrees_root.path(),
+                )
+                .is_ok(),
+                "{role_name} via {} was refused for its own default command: {:?}",
+                std::any::type_name_of_val(adapter),
+                command.args
+            );
+        }
+
+        for (role, role_name) in [
+            (AgentRole::Reviewer, "reviewer"),
+            (AgentRole::Tester, "tester"),
+        ] {
+            check(&ClaudeAdapter, role, role_name, &layout, &repo);
+            check(&CodexAdapter, role, role_name, &layout, &repo);
+            check(&MistralAdapter, role, role_name, &layout, &repo);
+        }
     }
 
     #[tokio::test]

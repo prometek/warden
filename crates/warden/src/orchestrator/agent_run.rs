@@ -32,11 +32,13 @@ impl Orchestrator {
     ///
     /// `repo_path` is the run's base repository; `run_worktrees_root` is
     /// this run's own `<warden_home>/worktrees/<run_id>`. Both are passed
-    /// through to [`process::validate_agent_program`] (issue #26), the one
+    /// through to [`process::validate_agent_program`] (issue #26, extended
+    /// from `program` to path-like `args` entries by issue #59), the one
     /// choke point every workflow step's spawn goes through, so a future
     /// `ToolAdapter` that names a repo-relative or in-worktree
-    /// `command.program` for a gated step is refused here, before the
-    /// sandbox ever runs it.
+    /// `command.program` -- or an `args` entry that resolves the same way,
+    /// e.g. `--wrapper ./reviewer.sh` -- for a gated step is refused here,
+    /// before the sandbox ever runs it.
     ///
     /// **Issue #73 (trio-unification follow-up)**: `role`/`is_producer`
     /// replace the old `InvocationRole::Builtin`/`Custom` split -- every
@@ -64,6 +66,7 @@ impl Orchestrator {
             role.as_str(),
             is_producer,
             &command.program,
+            &command.args,
             cwd,
             repo_path,
             run_worktrees_root,

@@ -95,6 +95,25 @@ pub enum ProcessError {
         program: String,
         reason: String,
     },
+
+    /// Issue #59 (extends #26's belt-and-braces guard from `program` to
+    /// `args`): a reviewer/tester `args` entry that looks like a path (see
+    /// `process::path_like_candidate`) and would resolve the same way
+    /// [`ProcessError::UntrustedAgentProgram`] refuses `program` for --
+    /// e.g. a future `ToolAdapter` emitting `claude --wrapper
+    /// ./reviewer.sh` would otherwise reintroduce the exact hole #26 closed
+    /// for `program`, since the wrapper path still resolves against the
+    /// role's own worktree. Never raised for the coder, same as
+    /// `UntrustedAgentProgram`.
+    #[error(
+        "refusing to spawn {role} agent with argument {arg:?}: {reason} -- this would let the \
+         coder control what an independent role executes"
+    )]
+    UntrustedAgentArg {
+        role: String,
+        arg: String,
+        reason: String,
+    },
 }
 
 /// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).
