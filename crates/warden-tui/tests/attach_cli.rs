@@ -460,3 +460,69 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
     assert!(stderr.contains("event-mismatched"), "{stderr}");
     assert!(stderr.contains("could not be decoded"), "{stderr}");
 }
+
+/// Issue #58 test gap: a run whose history is *entirely* undecodable rows
+/// (not merely one bad row among good ones) must still exit 0 and surface
+/// every row as its own tagged "undecodable" NDJSON line -- the degenerate
+/// case where `list_events_for_run` has nothing genuinely decodable to fall
+/// back on at all, which is exactly the scenario the ticket's motivating bug
+/// report describes ("one stale row poisoned an entire run's history").
+#[tokio::test]
+async fn attach_cli_headless_still_exits_0_when_every_row_in_history_is_undecodable() {
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-unknown-kind")
+    .bind("workflow_step_added")
+    .bind(r#"{"kind":"workflow_step_added"}"#)
+    .bind("2026-07-12T00:00:00+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-malformed")
+    .bind("cycle_started")
+    .bind("{ not json")
+    .bind("2026-07-12T00:00:01+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+    // Deliberately no socket bound -- history-only path.
+
+    let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
+
+    assert!(
+        status.success(),
+        "an all-undecodable history must never crash or exit non-zero: {stderr}"
+    );
+
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("malformed NDJSON line {line:?}: {error}"))
+        })
+        .collect();
+    assert_eq!(parsed.len(), 2, "{parsed:?}");
+    assert!(
+        parsed.iter().all(|line| line.get("undecodable").is_some()),
+        "every line must be tagged undecodable, none silently dropped nor mistaken for a \
+         decoded event: {parsed:?}"
+    );
+    assert_eq!(parsed[0]["undecodable"]["id"], "event-unknown-kind");
+    assert_eq!(
+        parsed[0]["undecodable"]["reason"]["kind"],
+        "unknown_event_type"
+    );
+    assert_eq!(parsed[1]["undecodable"]["id"], "event-malformed");
+}

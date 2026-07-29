@@ -717,6 +717,70 @@ mod tests {
         assert_eq!(model.run_id(), Some("run-1"));
     }
 
+    /// Issue #58 test gap: a run whose *every* history row is undecodable
+    /// still has a well-defined, non-panicking view -- no decoded events,
+    /// not "finished" (no `RunFinished` was ever decoded), empty workflow
+    /// tree, but every undecodable row still present in
+    /// [`RunModel::history`], in order.
+    #[test]
+    fn a_run_whose_entire_history_is_undecodable_still_reports_a_coherent_empty_view() {
+        let mut model = RunModel::new();
+        model.apply_undecodable(undecodable("e1", "2026-07-12T00:00:00+00:00"));
+        model.apply_undecodable(undecodable("e2", "2026-07-12T00:00:01+00:00"));
+        model.apply_undecodable(undecodable("e3", "2026-07-12T00:00:02+00:00"));
+
+        assert_eq!(model.run_id(), Some("run-1"));
+        assert!(model.events().is_empty(), "no row ever decoded");
+        assert_eq!(model.undecodable_events().len(), 3);
+        assert!(!model.is_finished(), "no RunFinished was ever decoded");
+        assert_eq!(model.final_state(), None);
+        assert!(model.workflow_tree().cycles.is_empty());
+        let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
+        assert_eq!(ids, vec!["e1", "e2", "e3"]);
+    }
+
+    /// Issue #58 test gap: the very first and very last rows of a run's
+    /// history can each individually be undecodable (not just an interior
+    /// row, as the other mixed-history tests exercise) -- `history()` must
+    /// still place them at the start/end respectively, with the decoded
+    /// events in between intact.
+    #[test]
+    fn history_keeps_a_leading_and_trailing_undecodable_row_in_their_chronological_place() {
+        let mut model = RunModel::new();
+        model.apply_undecodable(undecodable("e1-first", "2026-07-12T00:00:00+00:00"));
+        model.apply(record(
+            "e2",
+            RunEvent::RunStarted {
+                intent: "do the thing".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 5,
+                max_test_cycles: 5,
+            },
+        ));
+        model.apply(record(
+            "e3",
+            RunEvent::RunFinished {
+                final_state: "converged".to_string(),
+            },
+        ));
+        model.apply_undecodable(undecodable("e4-last", "2026-07-12T00:00:03+00:00"));
+
+        let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
+        assert_eq!(ids, vec!["e1-first", "e2", "e3", "e4-last"]);
+        assert!(
+            matches!(model.history()[0], HistoryItem::Undecodable(_)),
+            "the run's first row is undecodable"
+        );
+        assert!(
+            matches!(model.history()[3], HistoryItem::Undecodable(_)),
+            "the run's last row is undecodable"
+        );
+        // The decoded events in between are still fully usable despite the
+        // undecodable rows bracketing them on both sides.
+        assert!(model.is_finished());
+        assert_eq!(model.final_state(), Some("converged"));
+    }
+
     #[test]
     fn current_cycle_number_tracks_the_latest_cycle_started_event() {
         let mut model = RunModel::new();

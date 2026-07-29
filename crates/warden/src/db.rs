@@ -3014,4 +3014,293 @@ mod tests {
                 if record.event == RunEvent::CycleStarted { cycle_number: 2 }
         ));
     }
+
+    /// Issue #58 test gap: an `event_type` column this binary's own
+    /// [`EventKind::parse`] doesn't recognize at all (e.g. an older
+    /// `warden-tui`/`warden` reading a database a newer writer already
+    /// advanced with an event kind this binary predates) must decode as
+    /// [`UndecodableReason::UnknownEventType`] specifically -- distinct from
+    /// [`UndecodableReason::PayloadDeserialize`]/`KindMismatch`, which both
+    /// require `event_type` to parse successfully first. This branch of
+    /// `row_to_history_entry` had no covering test before this change.
+    #[tokio::test]
+    async fn unrecognized_event_type_column_is_an_unknown_event_type_undecodable_entry() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-unknown-kind",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-future-kind",
+            "run-unknown-kind",
+            "workflow_step_added",
+            r#"{"kind":"workflow_step_added","step":"techlead"}"#,
+            "2026-07-12T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-unknown-kind")
+            .await
+            .expect("an unrecognized event_type must never fail the whole query");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RunEventHistoryEntry::Undecodable(event) => {
+                assert_eq!(event.id, "event-future-kind");
+                assert_eq!(event.event_type, "workflow_step_added");
+                assert_eq!(event.reason, UndecodableReason::UnknownEventType);
+            }
+            RunEventHistoryEntry::Decoded(record) => {
+                panic!("expected an Undecodable entry, got a decoded record: {record:?}")
+            }
+        }
+    }
+
+    /// Issue #58's own motivating real-world scenario, issue #26's reshape:
+    /// a `UntrustedAgentDefinitionUsed` row persisted *before* that issue
+    /// added `canonical_path` has no such key in its `payload_json` at all
+    /// (unlike issue #53's `AgentFinished.usage`, `canonical_path` carries
+    /// no `#[serde(default)]` -- see `warden_core::event`'s own docs) -- this
+    /// must decode as `Undecodable`, not panic or silently invent a value.
+    #[tokio::test]
+    async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_path_is_undecodable(
+    ) {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-pre-26",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let pre_issue_26_payload = r#"{"kind":"untrusted_agent_definition_used","role":"reviewer","path":"/repo/.warden/agents/reviewer.md"}"#;
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-pre-26",
+            "run-pre-26",
+            "untrusted_agent_definition_used",
+            pre_issue_26_payload,
+            "2026-07-12T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-pre-26")
+            .await
+            .expect("a stale pre-issue-26 payload must never fail the whole query");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RunEventHistoryEntry::Undecodable(event) => {
+                assert_eq!(event.id, "event-pre-26");
+                assert_eq!(event.event_type, "untrusted_agent_definition_used");
+                assert_eq!(event.reason, UndecodableReason::PayloadDeserialize);
+            }
+            RunEventHistoryEntry::Decoded(record) => {
+                panic!("expected an Undecodable entry, got a decoded record: {record:?}")
+            }
+        }
+    }
+
+    /// Issue #58's own motivating real-world scenario, issue #43's reshape:
+    /// a `RunStarted` row persisted before that issue split the single
+    /// `max_cycles` field into `max_review_cycles`/`max_test_cycles` has
+    /// neither of the two new keys -- this must decode as `Undecodable`, not
+    /// be coerced into a fabricated budget.
+    #[tokio::test]
+    async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_undecodable() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-pre-43",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        let pre_issue_43_payload =
+            r#"{"kind":"run_started","intent":"do the thing","branch":"main","max_cycles":5}"#;
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-pre-43",
+            "run-pre-43",
+            "run_started",
+            pre_issue_43_payload,
+            "2026-07-12T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-pre-43")
+            .await
+            .expect("a stale pre-issue-43 payload must never fail the whole query");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RunEventHistoryEntry::Undecodable(event) => {
+                assert_eq!(event.id, "event-pre-43");
+                assert_eq!(event.event_type, "run_started");
+                assert_eq!(event.reason, UndecodableReason::PayloadDeserialize);
+            }
+            RunEventHistoryEntry::Decoded(record) => {
+                panic!("expected an Undecodable entry, got a decoded record: {record:?}")
+            }
+        }
+    }
+
+    /// Issue #58 test gap: a run whose *every* row is undecodable must still
+    /// return the full set (none dropped) rather than failing or returning
+    /// an empty history that looks indistinguishable from "no events at
+    /// all" (`list_events_for_run_is_empty_for_a_run_with_no_events`).
+    #[tokio::test]
+    async fn history_where_every_row_is_undecodable_returns_all_of_them() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-all-bad",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-1-unknown-kind",
+            "run-all-bad",
+            "workflow_step_added",
+            "{}",
+            "2026-07-12T00:00:00+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-2-malformed",
+            "run-all-bad",
+            "cycle_started",
+            "{ not json",
+            "2026-07-12T00:00:01+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mismatched_payload =
+            serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-3-mismatched",
+            "run-all-bad",
+            "run_finished",
+            mismatched_payload,
+            "2026-07-12T00:00:02+00:00",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-all-bad")
+            .await
+            .expect("an all-undecodable history must never fail the whole query");
+
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|entry| matches!(entry, RunEventHistoryEntry::Undecodable(_))),
+            "{events:?}"
+        );
+        let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "event-1-unknown-kind",
+                "event-2-malformed",
+                "event-3-mismatched",
+            ],
+            "order must still be created_at ASC even with no good rows at all"
+        );
+    }
+
+    /// Issue #58 test gap: two rows sharing the exact same `created_at`
+    /// (second-resolution timestamps collide easily) -- one decodable, one
+    /// not -- must still come back in a stable, deterministic order (`id`
+    /// ASC as the tiebreaker, per `list_events_for_run`'s own `ORDER BY`),
+    /// regardless of which of the two is undecodable.
+    #[tokio::test]
+    async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by_id() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(&pool, "run-tie", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
+            .await
+            .unwrap();
+
+        let same_timestamp = "2026-07-12T00:00:00+00:00";
+        // "event-a" (undecodable) sorts before "event-b" (decoded) by id --
+        // inserted in the opposite order here to prove the ordering comes
+        // from the SQL `ORDER BY`, not insertion order.
+        insert_event(
+            &pool,
+            "event-b",
+            "run-tie",
+            &RunEvent::CycleStarted { cycle_number: 1 },
+            same_timestamp,
+        )
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            "event-a",
+            "run-tie",
+            "cycle_started",
+            "{ not json",
+            same_timestamp,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let events = list_events_for_run(&pool, "run-tie").await.unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["event-a", "event-b"],
+            "a tied created_at must fall back to id ASC deterministically"
+        );
+        assert!(matches!(events[0], RunEventHistoryEntry::Undecodable(_)));
+        assert!(matches!(events[1], RunEventHistoryEntry::Decoded(_)));
+    }
 }
