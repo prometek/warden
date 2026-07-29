@@ -15,11 +15,11 @@ use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::Image;
-use warden_core::{RunEvent, RunEventRecord, TokenUsage};
+use warden_core::{RunEvent, RunEventRecord, TokenUsage, UndecodableEvent};
 
 use crate::capabilities::GraphicsCapability;
 use crate::evidence::{self, Evidence, EvidenceKind};
-use crate::model::{AgentNode, CycleNode, NodeStatus, ReloopCause, RunModel};
+use crate::model::{AgentNode, CycleNode, HistoryItem, NodeStatus, ReloopCause, RunModel};
 
 /// Fixed height of the one-line run header.
 const HEADER_HEIGHT: u16 = 3;
@@ -235,8 +235,30 @@ fn format_token_usage(usage: &Option<TokenUsage>) -> String {
 }
 
 fn events_widget(model: &RunModel) -> List<'static> {
-    let items: Vec<ListItem> = model.events().iter().map(event_list_item).collect();
+    let items: Vec<ListItem> = model
+        .history()
+        .into_iter()
+        .map(|item| match item {
+            HistoryItem::Event(record) => event_list_item(record),
+            HistoryItem::Undecodable(event) => undecodable_list_item(event),
+        })
+        .collect();
     List::new(items).block(Block::bordered().title(" events "))
+}
+
+/// Renders an `events` row that couldn't be decoded (issue #58) -- makes the
+/// gap explicit ("this event could not be decoded") instead of letting it
+/// silently disappear from the run's history, the same "no silent fallback"
+/// discipline `event_list_item` itself never has to think about (it only
+/// ever sees rows that already decoded cleanly).
+fn undecodable_list_item(event: &UndecodableEvent) -> ListItem<'static> {
+    ListItem::new(Line::styled(
+        format!(
+            "{} event {} could not be decoded (event_type {:?}): {}",
+            event.created_at, event.id, event.event_type, event.reason
+        ),
+        Style::default().fg(Color::Red),
+    ))
 }
 
 fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
@@ -516,6 +538,46 @@ mod tests {
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("run started"));
         assert!(content.contains("cycle 1 started"));
+    }
+
+    /// Issue #58: an `events` history row that couldn't be decoded must
+    /// still show up in the scrollable log, in its rightful chronological
+    /// place, rather than silently disappearing -- exactly what
+    /// `RunModel::history`/`undecodable_list_item` exist for.
+    #[test]
+    fn draw_lists_an_undecodable_history_row_in_its_chronological_place() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply_undecodable(warden_core::UndecodableEvent {
+            id: "e2".to_string(),
+            run_id: "run-1".to_string(),
+            event_type: "run_finished".to_string(),
+            reason: warden_core::UndecodableReason::KindMismatch {
+                payload_kind: "cycle_started".to_string(),
+            },
+            created_at: "2026-07-12T00:00:01+00:00".to_string(),
+        });
+        model.apply(record(
+            "e3",
+            RunEvent::RunFinished {
+                final_state: "converged".to_string(),
+            },
+        ));
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        let content = buffer_to_string(terminal.backend().buffer());
+        assert!(content.contains("cycle 1 started"), "{content}");
+        assert!(
+            content.contains("could not be decoded"),
+            "the undecodable row must be rendered explicitly: {content}"
+        );
+        assert!(content.contains("run_finished"), "{content}");
+        assert!(content.contains("run finished: converged"), "{content}");
     }
 
     /// Issue #33: the whole point of this event -- while a cycle is still

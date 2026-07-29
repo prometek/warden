@@ -1031,27 +1031,27 @@ mod tests {
         let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
         let run_started_index = persisted
             .iter()
-            .position(|record| matches!(record.event, RunEvent::RunStarted { .. }))
+            .position(|entry| matches!(entry.event(), Some(RunEvent::RunStarted { .. })))
             .expect("RunStarted must be persisted");
 
         assert!(
             matches!(
-                persisted[run_started_index + 1].event,
-                RunEvent::UntrustedAgentDefinitionUsed { .. }
+                persisted[run_started_index + 1].event(),
+                Some(RunEvent::UntrustedAgentDefinitionUsed { .. })
             ),
             "{persisted:?}"
         );
         assert!(
             matches!(
-                persisted[run_started_index + 2].event,
-                RunEvent::UntrustedAgentDefinitionUsed { .. }
+                persisted[run_started_index + 2].event(),
+                Some(RunEvent::UntrustedAgentDefinitionUsed { .. })
             ),
             "{persisted:?}"
         );
 
         let untrusted: Vec<&RunEvent> = persisted
             .iter()
-            .map(|record| &record.event)
+            .filter_map(|entry| entry.event())
             .filter(|event| matches!(event, RunEvent::UntrustedAgentDefinitionUsed { .. }))
             .collect();
         assert_eq!(untrusted.len(), 2, "{persisted:?}");
@@ -1387,7 +1387,7 @@ mod tests {
         assert!(
             persisted
                 .iter()
-                .all(|record| !matches!(record.event, RunEvent::AgentProgress { .. })),
+                .all(|entry| !matches!(entry.event(), Some(RunEvent::AgentProgress { .. }))),
             "AgentProgress must never be persisted to `events` (ADR-0008 amendment, issue #33): \
                  {persisted:?}"
         );
@@ -1739,12 +1739,12 @@ mod tests {
         let agent_finished_usages: std::collections::HashMap<String, warden_core::TokenUsage> =
             persisted
                 .iter()
-                .filter_map(|record| match &record.event {
-                    RunEvent::AgentFinished {
+                .filter_map(|entry| match entry.event() {
+                    Some(RunEvent::AgentFinished {
                         role,
                         usage: Some(usage),
                         ..
-                    } => Some((role.clone(), *usage)),
+                    }) => Some((role.clone(), *usage)),
                     _ => None,
                 })
                 .collect();

@@ -85,6 +85,7 @@
 - Migrations versionnées via `sqlx::migrate!` (dossier `migrations/`), appliquées au démarrage de `warden`. Migrations atomiques, jamais éditées après commit — toute correction = nouvelle migration.
 - `WAL` activé pour permettre la lecture concurrente (TUI/gated) pendant les writes de `warden`.
 - Validation à la frontière : toute ligne relue est reparsée en type Rust fort, jamais consommée en tuple brut au-delà de la couche d'accès.
+- Décodage tolérant en lecture pour les tables append-only comme `events` (issue #58) : une ligne persistée dont le payload ne décode plus (reshape livré sans migration de réécriture) ne doit jamais faire échouer toute une requête de replay — elle est surfacée comme un marqueur typé explicite (jamais silencieusement droppée), le reste de l'historique reste lisible. Les reshapes de payload d'événement restent volontairement sans migration de réécriture des lignes existantes ; c'est la lecture qui doit tolérer l'ancien format, pas la donnée qui doit être réécrite.
 
 ## Agent Subprocess Protocol
 
