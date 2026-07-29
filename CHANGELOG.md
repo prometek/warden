@@ -20,7 +20,7 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - **Décision retenue** (option 1 de l'issue, pas de migration de réécriture des lignes
   existantes) : tolérer la ligne non décodable plutôt que de faire échouer la requête ou de la
   faire disparaître silencieusement. `warden::db::list_events_for_run` et
-  `warden_tui::db::list_events_for_run` (mirroirs indépendants, ADR-0006) décodent désormais
+  `warden_tui::db::list_events_for_run` (miroirs indépendants, ADR-0006) décodent désormais
   chaque ligne en un `warden_core::RunEventHistoryEntry` : soit `Decoded(RunEventRecord)` pour
   une ligne qui décode et valide correctement, soit `Undecodable(UndecodableEvent { id, run_id,
   event_type, reason, created_at })` pour une ligne qui échoue — seule une vraie erreur de
