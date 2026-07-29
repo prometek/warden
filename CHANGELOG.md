@@ -7,6 +7,48 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Fixed — Issue #58 : une ligne `events` non décodable ne fait plus échouer tout `list_events_for_run`
+
+- **Constat** : une seule ligne `payload_json`/`event_type` ne correspondant plus à un variant
+  de `RunEvent` (un reshape de payload livré sans migration de réécriture — issue #43 pour
+  `RunStarted`, issue #26 pour `UntrustedAgentDefinitionUsed`) faisait échouer entièrement
+  `list_events_for_run`, aussi bien côté `warden::db` que `warden_tui::db` : une seule ligne
+  corrompue neutralisait tout l'historique du run et cassait `warden-tui attach` pour ce run.
+  Rien de publié n'est affecté (aucune version livrée n'a jamais écrit les nouveaux variants) —
+  l'exposition réelle se limite à un `warden_home` persistant utilisé contre des commits
+  intermédiaires.
+- **Décision retenue** (option 1 de l'issue, pas de migration de réécriture des lignes
+  existantes) : tolérer la ligne non décodable plutôt que de faire échouer la requête ou de la
+  faire disparaître silencieusement. `warden::db::list_events_for_run` et
+  `warden_tui::db::list_events_for_run` (mirroirs indépendants, ADR-0006) décodent désormais
+  chaque ligne en un `warden_core::RunEventHistoryEntry` : soit `Decoded(RunEventRecord)` pour
+  une ligne qui décode et valide correctement, soit `Undecodable(UndecodableEvent { id, run_id,
+  event_type, reason, created_at })` pour une ligne qui échoue — seule une vraie erreur de
+  requête/connexion SQLite fait encore échouer la fonction.
+- **`reason` est un type explicite, pas une string** : `warden_core::UndecodableReason`
+  distingue `UnknownEventType` (ce binaire ne connaît pas encore ce `event_type` — typiquement
+  un lecteur plus ancien qu'un `warden` qui a écrit la ligne), `PayloadDeserialize`
+  (`payload_json` invalide ou ne correspondant à aucun variant connu) et `KindMismatch {
+  payload_kind }` (le payload décode correctement mais son propre variant contredit la colonne
+  `event_type`) — un appelant/une UI peut distinguer ces trois causes sans parser un message.
+- **`warden-tui` rend le marqueur, ne le fait jamais disparaître** : `RunModel` expose
+  `undecodable_events()`/`history()` (fusion chronologique des deux); la vue interactive
+  (`ui::events_widget`) affiche "this event could not be decoded" à la place exacte de la ligne
+  dans le journal défilant. Le dump NDJSON headless (`main.rs::run_headless`, utilisé quand
+  stdout n'est pas un terminal) émet désormais deux formes de ligne distinctes sur stdout : un
+  `RunEventRecord` nu, inchangé, pour une ligne décodée ; une ligne balisée `{"undecodable":
+  {...}}` pour une ligne non décodable, dans son ordre chronologique — en plus d'un
+  `tracing::warn!` sur stderr, jamais à sa place. Un consommateur qui redirige stderr vers
+  `/dev/null` (ou relève son niveau de log) voit quand même l'écart sur stdout, le seul canal
+  qu'il consomme réellement.
+- **Nettoyage des variants d'erreur devenus morts** : `WardenError::EventKindMismatch`,
+  `TuiError::EventKindMismatch` et `TuiError::EventPayload` sont supprimés — plus rien ne les
+  construit, le chemin de décodage ne propage plus jamais d'erreur pour une ligne individuelle.
+- **Hors périmètre, explicitement** : aucune migration de réécriture des lignes `events`
+  existantes n'est ajoutée (décision de l'issue) — les lignes déjà écrites par un `warden`
+  intermédiaire restent non décodables pour toujours, seulement rendues visibles plutôt que
+  fatales.
+
 ### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
 
 - **Régression introduite par l'issue #26** : `main.rs` résolvait

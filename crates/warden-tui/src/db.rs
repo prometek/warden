@@ -15,6 +15,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
     EventKind, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState, UndecodableEvent,
+    UndecodableReason,
 };
 
 use crate::error::{Result, TuiError};
@@ -127,14 +128,12 @@ fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
                     created_at: row.created_at,
                 });
             }
-            Ok(event) => format!(
-                "event_type {:?} but payload's own kind is {:?}",
-                row.event_type,
-                event.kind().as_str()
-            ),
-            Err(error) => format!("payload_json failed to deserialize: {error}"),
+            Ok(event) => UndecodableReason::KindMismatch {
+                payload_kind: event.kind().as_str().to_string(),
+            },
+            Err(_) => UndecodableReason::PayloadDeserialize,
         },
-        Err(error) => format!("{error}"),
+        Err(_) => UndecodableReason::UnknownEventType,
     };
     RunEventHistoryEntry::Undecodable(UndecodableEvent {
         id: row.id,
@@ -359,7 +358,12 @@ mod tests {
             RunEventHistoryEntry::Undecodable(event) => {
                 assert_eq!(event.id, "event-corrupt");
                 assert_eq!(event.event_type, "run_finished");
-                assert!(!event.reason.is_empty());
+                assert_eq!(
+                    event.reason,
+                    UndecodableReason::KindMismatch {
+                        payload_kind: "cycle_started".to_string()
+                    }
+                );
             }
             RunEventHistoryEntry::Decoded(record) => {
                 panic!("expected an Undecodable entry, got a decoded record: {record:?}")

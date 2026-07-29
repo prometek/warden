@@ -552,7 +552,9 @@ mod tests {
             id: "e2".to_string(),
             run_id: "run-1".to_string(),
             event_type: "run_finished".to_string(),
-            reason: "payload's own kind is \"cycle_started\"".to_string(),
+            reason: warden_core::UndecodableReason::KindMismatch {
+                payload_kind: "cycle_started".to_string(),
+            },
             created_at: "2026-07-12T00:00:01+00:00".to_string(),
         });
         model.apply(record(
