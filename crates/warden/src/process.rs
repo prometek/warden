@@ -48,12 +48,15 @@
 //! decides which `args` entries even get the containment check (a
 //! conservative separator-based heuristic, not a per-adapter declaration of
 //! which args are paths -- that would need a `ToolAdapter` API change this
-//! issue deliberately avoids); see its own docs for the exact rule, and
-//! [`validate_agent_program`]'s own docs for the residual gap this
+//! issue deliberately avoids); see its own docs for the exact rule -- as of
+//! review round 2, judged from a value's first whitespace-delimited token
+//! only, and only when that token carries no shell syntax -- and
+//! [`validate_agent_program`]'s own docs for the residual gaps this
 //! heuristic does *not* close (a bare-name `args` entry with no separator
-//! at all, e.g. `--wrapper reviewer.sh`) and the `trusted_arg_values`
-//! escape hatch for a caller-vouched non-path value the heuristic would
-//! otherwise misjudge.
+//! at all; a path-shaped separator appearing after a value's first token; a
+//! path-shaped first token that itself contains shell metacharacters) and
+//! the `trusted_arg_values` escape hatch for a caller-vouched non-path
+//! value the heuristic would otherwise misjudge.
 
 use std::path::Path;
 
@@ -146,7 +149,13 @@ pub struct AgentOutcome {
 /// A future `--wrapper reviewer.sh` (no `./`) is therefore **not** caught by
 /// this guard; only entries [`path_like_candidate`] judges path-like are
 /// checked at all -- most `args` entries are ordinary values (`--model
-/// sonnet`, a whole system prompt), never a path in the first place.
+/// sonnet`, a whole system prompt), never a path in the first place. Two
+/// narrower gaps in the same spirit, added by review round 2's fix for a
+/// whitespace-containing value: a path-shaped separator appearing after the
+/// value's first whitespace-delimited token, and a path-shaped first token
+/// that itself contains shell metacharacters (a quoted assignment, a `$(...)`
+/// substitution) -- see [`path_like_candidate`]'s own docs for why both are
+/// accepted trade-offs rather than closed further.
 ///
 /// `trusted_arg_values` (issue #59 review, MEDIUM 4) is a caller-vouched
 /// escape hatch for the residual false positive [`path_like_candidate`]'s
@@ -327,39 +336,78 @@ fn check_containment(
 /// function's own docs on why `file` must never be treated as "just a URL".
 ///
 /// The rule is then evaluated in two tiers, deliberately asymmetric (issue
-/// #59 review, HIGH): a value can be a genuine filesystem path *with*
+/// #59 review round 2): a value can be a genuine filesystem path *with*
 /// whitespace in it (`./sub dir/tool.sh`, `my tool.sh` inside a worktree the
 /// coder wrote to via its `Bash` grant, ADR-0021 §3bis), so whitespace must
 /// never blanket-exempt a value that is otherwise unambiguous evidence of a
 /// path:
-/// - **Strong evidence, checked regardless of whitespace**: the value
-///   starts with `./`, `../`, or `~`, or is itself absolute. Nothing
-///   exempts a value that matches this tier -- not whitespace, not a
-///   `scheme://` prefix (`Path::is_absolute` is false for
-///   `sh://../coder/tool.sh`, so a value here never collides with the URL
-///   check below in practice).
-/// - **Weak evidence, exempted by whitespace or a non-filesystem URL
-///   scheme**: the value merely *contains* a path separator somewhere,
-///   with no unambiguous prefix (`agents/reviewer.sh`, or prose like
-///   "reviewer/tester/CI raised" from a system prompt). Two exemptions
-///   apply only here:
-///   - **Whitespace.** Verified against every shipped adapter's
-///     `build_command` (`ClaudeAdapter`/`CodexAdapter`/`MistralAdapter` in
-///     `tool_adapter.rs`): each passes its role's entire system prompt as a
-///     single argv entry, and all three built-in default prompts
-///     (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`, both starting
-///     with `"You are Warden's ... agent."`) contain at least one `/`.
-///     Without this exemption, restricted to this weak tier only, every
-///     reviewer/tester invocation using a shipped adapter's default prompt
-///     would be refused outright -- breaking the working product, not
-///     closing a hole.
-///   - [`has_non_filesystem_url_scheme`] -- a narrow, explicit allowlist of
-///     schemes that name a resource fetched over a network protocol, never
-///     a local filesystem path (see its own docs for why this must be an
-///     allowlist, not "anything with `://`").
+/// - **Strong evidence, checked regardless of whitespace, against the
+///   *whole* value**: the value starts with `./`, `../`, or `~`, or is
+///   itself absolute. Nothing exempts a value that matches this tier --
+///   not whitespace, not a `scheme://` prefix (`Path::is_absolute` is
+///   false for `sh://../coder/tool.sh`, so a value here never collides
+///   with the URL check below in practice).
+/// - **Weak evidence, judged from the value's *first whitespace-delimited
+///   token only* (issue #59 review round 2, HIGH)**: that first token
+///   alone -- not the rest of the value -- is what gets containment-checked
+///   when it merely *contains* a path separator with no unambiguous prefix
+///   (`agents/reviewer.sh`). This is deliberately narrower than "the whole
+///   value contains a separator somewhere": a relative path missing only
+///   its `./` prefix, packed into the same argv entry as unrelated trailing
+///   words (`agents/evil script.sh`, or a hypothetical future `--wrapper
+///   agents/reviewer.sh --verbose` collapsed into one string) still has
+///   that shape in its first token and is still caught -- `check_containment`
+///   refuses *any* relative candidate outright, so the first token alone is
+///   enough to trigger that refusal, without needing to be the literal real
+///   path on disk. A system prompt's first word essentially never looks
+///   like a path (verified against every shipped adapter's `build_command`,
+///   `ClaudeAdapter`/`CodexAdapter`/`MistralAdapter` in `tool_adapter.rs`:
+///   each passes its role's entire system prompt as a single argv entry,
+///   and all three built-in default prompts
+///   (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`) start with `"You
+///   are Warden's ... agent."` -- first token `"You"`), even though the
+///   prompt as a whole almost always contains a `/` somewhere later. A
+///   single-word value (no whitespace at all) is its own first token, so
+///   this subsumes the original single-word weak-tier rule exactly.
+///   [`has_non_filesystem_url_scheme`] (a narrow, explicit allowlist of
+///   schemes that name a resource fetched over a network protocol, never a
+///   local filesystem path -- see its own docs for why this must be an
+///   allowlist, not "anything with `://`") is checked against that same
+///   first token.
 ///
-/// This intentionally accepts one residual, narrower false-positive risk on
-/// the weak tier, mitigated by [`validate_agent_program`]'s own
+/// **Residual gap, deliberately accepted (issue #59 review round 2)**: a
+/// path-shaped separator anywhere *after* the first whitespace-delimited
+/// token is never detected (`"please run agents/evil.sh now"` is exempt --
+/// its first token, `"please"`, has no separator). Scanning every token
+/// instead of just the first would reopen the exact false positive this
+/// heuristic exists to avoid: real system prompts contain a `/` in
+/// running prose (e.g. "reviewer/tester/CI"), just essentially never as the
+/// *first* word. This is a narrower, harder-to-exploit variant of the
+/// pre-existing bare-filename gap ([`validate_agent_program`]'s own docs) --
+/// a future adapter would need to place its own wrapper path first in the
+/// argv value for this guard to see it at all.
+///
+/// **Second residual gap, also deliberately accepted (issue #59 review
+/// round 2)**: the first token is further required to contain none of
+/// [`SHELL_METACHARACTERS`] before it counts as weak evidence -- found live
+/// in this crate's own `orchestrator::convergence` test fixtures, which
+/// construct a gated step's `args` directly as multi-line `sh -c` script
+/// text (e.g. `"\n  dir='<temp path>'\n  n=$(cat \"$dir/count\" ...)\n..."`).
+/// That script's first whitespace-delimited token after leading indentation,
+/// `dir='<temp path>'`, contains a `/` (the embedded path is absolute) and
+/// was being refused as a relative path by round 2's first cut of this fix
+/// -- a real false positive, not a hypothetical one, on legitimate
+/// shell-script `args` this codebase's own test suite already exercised.
+/// The metacharacter check tells a bare relative path (`agents/evil.sh`:
+/// only alphanumerics, `.`, `_`, `-`, `/`) apart from a shell-syntax
+/// fragment that merely embeds one (a quoted assignment, a command
+/// substitution, ...). A future wrapper-path hazard using one of these
+/// characters in its literal filename (`agents/evil(1).sh`) would be missed
+/// by this narrowing -- an accepted, narrow trade-off for not refusing
+/// ordinary shell-script `args` wholesale.
+///
+/// This also still accepts the residual, narrower false-positive risk noted
+/// before round 2's fix, mitigated by [`validate_agent_program`]'s own
 /// `trusted_arg_values` escape hatch rather than special-cased further here:
 /// a `model`/`tools` value that happens to be a single path-shaped token
 /// with no whitespace (`anthropic/claude-3-opus`, `Bash(./script.sh)`) is
@@ -378,9 +426,9 @@ fn path_like_candidate(arg: &str) -> Option<&str> {
         return None;
     }
 
-    // Strong evidence: checked regardless of whitespace (issue #59 review,
-    // HIGH) -- see this function's own docs on why the whitespace exemption
-    // below must never reach this tier.
+    // Strong evidence: checked regardless of whitespace, against the whole
+    // value -- see this function's own docs on why the first-token
+    // narrowing below must never apply here.
     if candidate.starts_with("./")
         || candidate.starts_with("../")
         || candidate.starts_with('~')
@@ -389,17 +437,41 @@ fn path_like_candidate(arg: &str) -> Option<&str> {
         return Some(candidate);
     }
 
-    // Weak evidence: only this tier gets the whitespace/URL-scheme
-    // exemptions -- see this function's own docs.
-    if candidate.contains(char::is_whitespace) {
+    // Weak evidence: judged from the first whitespace-delimited token only
+    // (issue #59 review round 2) -- see this function's own docs. For a
+    // single-word `candidate` this token *is* `candidate`, unchanged from
+    // the original single-word rule. `unwrap_or(candidate)` only matters for
+    // a candidate that is entirely whitespace, which `candidate.is_empty()`
+    // above does not catch -- `split_whitespace` yields nothing for it, and
+    // falling back to `candidate` itself (whitespace, no separator) still
+    // correctly resolves to "not path-like" below.
+    let first_token = candidate.split_whitespace().next().unwrap_or(candidate);
+    if has_non_filesystem_url_scheme(first_token) {
         return None;
     }
-    if has_non_filesystem_url_scheme(candidate) {
+    let has_separator =
+        first_token.contains(std::path::MAIN_SEPARATOR) || first_token.contains('/');
+    if !has_separator {
         return None;
     }
-    let has_separator = candidate.contains(std::path::MAIN_SEPARATOR) || candidate.contains('/');
-    has_separator.then_some(candidate)
+    // Issue #59 review round 2: a bare relative path is built only from
+    // ordinary filename characters -- a token carrying shell syntax
+    // (a quoted assignment, `$(...)` substitution, ...) merely *embeds* a
+    // path, it isn't one itself. See this function's own docs for the real
+    // false positive this closes.
+    if first_token.contains(SHELL_METACHARACTERS) {
+        return None;
+    }
+    Some(first_token)
 }
+
+/// Characters that mark a whitespace-delimited token as shell syntax rather
+/// than a bare filename/path -- see [`path_like_candidate`]'s own docs on
+/// the real false positive (`dir='<temp path>'`, a quoted shell assignment)
+/// this excludes from its weak-evidence tier.
+const SHELL_METACHARACTERS: &[char] = &[
+    '=', '\'', '"', '$', '`', '(', ')', '{', '}', ';', '|', '&', '<', '>', '!', '*', '?', '[', ']',
+];
 
 /// Unwraps a `file://` URI to the path after its scheme -- issue #59 review,
 /// MEDIUM 2: a `file://` value **is** a filesystem path (unlike a genuine
@@ -1700,6 +1772,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ProcessError::UntrustedAgentArg { .. }));
+    }
+
+    /// Pins the real false positive found while fixing the test above
+    /// (issue #59 review round 2): a shell-script `args` value whose first
+    /// whitespace-delimited token is a quoted assignment embedding an
+    /// absolute path (`dir='<temp path>'`, exactly the shape
+    /// `orchestrator::convergence`'s own `sh -c` test fixtures construct)
+    /// must not be refused just because that token contains a `/` -- it is
+    /// shell syntax, not a bare relative path.
+    #[test]
+    fn a_shell_assignment_embedding_an_absolute_path_as_its_first_token_is_allowed() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("tester");
+        let repo = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let script = format!(
+            "\n                dir='{}'\n                n=$(cat \"$dir/count\" 2>/dev/null || echo 0)\n                echo \"$n\" > \"$dir/count\"\n                ",
+            elsewhere.path().display()
+        );
+
+        assert!(validate_agent_program(
+            "tester",
+            false,
+            "sh",
+            &["-c".to_string(), script],
+            &worktree,
+            repo.path(),
+            layout.run_worktrees_root.path(),
+            &[],
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------

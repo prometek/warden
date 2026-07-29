@@ -21,23 +21,30 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `ToolAdapter`, hors périmètre) : une entrée `args` est candidate au contrôle de confinement
   quand elle commence par `./`, `../`, `~`, est absolue, ou contient par ailleurs un
   séparateur de chemin. `--flag=valeur` est géré (seule la valeur après le premier `=` est
-  jugée). Deux exemptions, restreintes à la preuve *faible* (contient un séparateur quelque
-  part, sans préfixe non ambigu) — une preuve *forte* (`./`, `../`, `~`, absolu) est toujours
-  vérifiée, espace ou non :
-  - une valeur contenant un espace (le prompt système complet, passé tel quel en un seul
-    argument par les trois adaptateurs livrés, contient toujours au moins un `/` — sans
-    cette exemption, tout reviewer/tester utilisant un prompt par défaut aurait été refusé) ;
-  - une URL sur liste blanche de schémas réseau (`http`, `https`, `ssh`, `git`, `ftp`, `ftps`,
-    `ws`, `wss`) — **pas** « n'importe quel schéma syntaxiquement valide » : un schéma
-    inventé devant un chemin relatif (`sh://../coder/tool.sh`) ne suffit pas à l'exempter,
-    et `file://` est explicitement résolu comme le chemin filesystem qu'il est (jamais
-    exempté), tous deux corrigés en cours de revue (voir plus bas).
-- **Trou résiduel assumé et documenté, pas silencieux** : une entrée `args` sans aucun
-  séparateur (`--wrapper reviewer.sh`) n'est pas détectée — contrairement à `program`, un
-  `args` nu n'a pas de sémantique `PATH` : il est interprété par l'outil que nomme `program`,
-  qui le résout typiquement contre son propre répertoire courant (le worktree du rôle).
-  Documenté explicitement dans le code plutôt que laissé impliquer une couverture qu'il n'a
-  pas.
+  jugée). Deux tiers, asymétriques :
+  - **Preuve forte, vérifiée sur la valeur entière, espace ou non** : `./`, `../`, `~`,
+    absolu.
+  - **Preuve faible, jugée uniquement sur le premier token délimité par un espace de la
+    valeur** (issue #59, revue round 2 — voir plus bas) : ce premier token doit contenir un
+    séparateur *et* ne contenir aucun métacaractère shell (`=`, guillemets, `$`, `` ` ``,
+    parenthèses, ...) pour compter comme preuve. Une URL sur liste blanche de schémas réseau
+    (`http`, `https`, `ssh`, `git`, `ftp`, `ftps`, `ws`, `wss`) — **pas** « n'importe quel
+    schéma syntaxiquement valide » — exempte ce même premier token ; `file://` est
+    explicitement résolu comme le chemin filesystem qu'il est (jamais exempté).
+- **Trous résiduels assumés et documentés, pas silencieux** :
+  - une entrée `args` sans aucun séparateur (`--wrapper reviewer.sh`) n'est pas détectée —
+    contrairement à `program`, un `args` nu n'a pas de sémantique `PATH` : il est interprété
+    par l'outil que nomme `program`, qui le résout typiquement contre son propre répertoire
+    courant (le worktree du rôle) ;
+  - un séparateur de chemin apparaissant *après* le premier token d'une valeur multi-mots
+    n'est jamais détecté (`"please run agents/evil.sh now"` — premier token `"please"`, pas
+    de séparateur) : re-scanner tous les tokens rouvrirait exactement le faux positif que
+    cette règle existe pour éviter (un prompt système contient presque toujours un `/`,
+    juste jamais comme premier mot) ;
+  - un premier token qui ressemble à un chemin relatif mais contient lui-même un
+    métacaractère shell dans son propre nom de fichier (`agents/evil(1).sh`) n'est pas
+    détecté non plus — compromis accepté pour ne pas refuser en bloc tout `args` de type
+    script shell (voir plus bas).
 - **Échappatoire `trusted_arg_values`** : une valeur `model` d'un `AgentDefinition`
   reviewer/tester (ex. `anthropic/claude-3-opus`, courant pour un routage style
   OpenRouter/Mistral) ressemble à un chemin relatif pour la règle ci-dessus. L'appelant
@@ -47,13 +54,24 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `RunConfig::untrusted_repo_agent_definitions`), jamais pour un rôle personnalisé (toujours
   lu depuis `<repo>/.claude/agents/`, donc toujours contrôlé par le coder), jamais pour le
   producteur (déjà exempté du garde-fou entier).
-- **Corrections trouvées en cours de revue** avant la première fusion sur `main` :
+- **Corrections trouvées en cours de revue (round 1)** avant la première fusion sur `main` :
   un contournement par un espace dans une valeur autrement non ambiguë (chemin absolu à
   l'intérieur du worktree du coder), un contournement par `file://` (chemin filesystem
   laissé passer comme s'il s'agissait d'une URL), et un contournement par schéma inventé
   devant un chemin relatif (`sh://../coder/tool.sh` acceptait n'importe quel schéma
-  syntaxiquement valide selon la RFC 3986 sans regarder ce qui suit) — les trois désormais
-  couverts par la suite de tests de `process.rs`.
+  syntaxiquement valide selon la RFC 3986 sans regarder ce qui suit).
+- **Correction trouvée en cours de revue (round 2), après le premier passage « ready to
+  merge »** : la règle round 1 exemptait *toute* valeur contenant un espace dès la preuve
+  faible — donc `--wrapper agents/evil script.sh` (même hasard que `./reviewer.sh`, sans le
+  `./`) passait sans jamais être contrôlé. Corrigé en restreignant la preuve faible au
+  premier token uniquement (voir ci-dessus). Cette première correction a elle-même
+  introduit une régression, détectée par la suite de tests existante
+  (`orchestrator::convergence`) avant merge : plusieurs fixtures de test construisent un
+  `args` de type script shell (`sh -c "dir='<chemin temporaire>' ..."`), dont le premier
+  token après les espaces d'indentation, `dir='<chemin>'`, contient un `/` et se faisait
+  refuser comme chemin relatif alors qu'il s'agit de syntaxe shell, pas d'un chemin. Fermé
+  par le filtre de métacaractères shell sur le premier token (voir ci-dessus) plutôt qu'en
+  affaiblissant la règle round 1.
 - Amende l'entrée « Issue #26 / ADR-0018 » ci-dessous : sa mention « le point 1 de l'issue
   #26 (`program`/`args` relatifs) était déjà rendu sans objet » ne concernait que `program` —
   `args` restait un trou ouvert jusqu'à cette issue.
