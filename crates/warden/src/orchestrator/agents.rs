@@ -1916,4 +1916,89 @@ mod tests {
             "the sandbox created for the hook step's command must be destroyed exactly once"
         );
     }
+
+    /// Independently-derived gap (test review of the fix above): the
+    /// happy-path `create`/`execute`/`destroy` assertion in
+    /// [`a_hook_steps_sandbox_is_destroyed_after_its_command_completes`] is
+    /// also satisfied by the pre-fix, hand-paired `create`/`destroy` code
+    /// this function used to have -- it never pins the actual property the
+    /// `SandboxGuard` migration exists for, which is teardown when
+    /// `run_step_command`'s own future is dropped mid-`.await`, never
+    /// resolving to completion or to an early `?` return at all (run
+    /// cancellation via `warden run --tui` exit, a task abort). Mirrors
+    /// `agent_run`'s own
+    /// [`sandbox_is_destroyed_when_the_run_agent_future_itself_is_dropped_mid_flight`]:
+    /// aborts the task running `run_step_command` while it's parked on a
+    /// long `sleep 30`, then polls `sandbox.calls()` for `destroy`, since
+    /// `SandboxGuard::drop`'s backstop teardown runs on its own detached
+    /// task, not awaited by anything after the abort.
+    #[tokio::test]
+    async fn a_hook_steps_sandbox_is_destroyed_when_run_step_command_is_dropped_mid_flight() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "abort-hook-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::insert_cycle(&pool, "abort-hook-cycle", "abort-hook-run", 1)
+            .await
+            .unwrap();
+        let sandbox = Arc::new(RecordingSandbox::new(false));
+        let orchestrator = Arc::new(
+            Orchestrator::new(pool.clone()).with_sandbox(sandbox.clone() as Arc<dyn Sandbox>),
+        );
+        let orchestrator_for_task = Arc::clone(&orchestrator);
+        let cwd = TempDir::new().unwrap();
+        let cwd_path = cwd.path().to_path_buf();
+
+        let handle = tokio::spawn(async move {
+            let role = Role::new("lint").unwrap();
+            let _ = orchestrator_for_task
+                .run_step_command(
+                    "abort-hook-run",
+                    "abort-hook-cycle",
+                    &role,
+                    &cwd_path,
+                    "sleep 30",
+                    CancellationToken::new(),
+                )
+                .await;
+        });
+
+        // Best-effort delay to let the task get past `create` and into the
+        // long `execute`/`wait()` await before dropping it mid-flight --
+        // mirrors `agent_run`'s own equivalent test, and its own LOW E note:
+        // this is not a synchronization point, only the property under test
+        // (the sandbox created for this invocation is destroyed) is
+        // asserted below, not the exact call vector.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        for _ in 0..200 {
+            if sandbox.calls().contains(&"destroy") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let calls = sandbox.calls();
+        assert!(
+            calls.contains(&"create"),
+            "expected the sandbox to have been created before the abort, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&"destroy"),
+            "expected `SandboxGuard::drop`'s backstop to destroy the sandbox created for a \
+                 `type: hook` step's command whose future was dropped mid-flight, got {calls:?}"
+        );
+    }
 }
