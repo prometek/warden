@@ -127,6 +127,66 @@ impl Gate {
     }
 }
 
+/// A step's execution mechanism (issue #79, ADR-0020's own "an étape ne
+/// devrait pas toujours être un agent" deferral): whether the step spawns an
+/// **agent** subprocess (an LLM's own judgement) or runs a deterministic
+/// **hook** command (issue #55, ADR-0017 -- no LLM, no judgement call).
+/// Closed on purpose, mirroring [`Gate`]'s own "extensible by variant, never
+/// a free-form string" rationale: an unrecognized `type` in `workflow.yaml`
+/// must be a clear parse error naming the bad value, never silently treated
+/// as one of the two known kinds.
+///
+/// [`StepKind::Agent`] is the default -- the only kind that existed before
+/// this issue -- so a step that omits `type` entirely (every step in every
+/// `workflow.yaml` written before this issue) behaves exactly as it always
+/// has (strict retro-compat, [`Workflow::parse_yaml`]'s own contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// Spawns an agent subprocess resolved from `agent` -- the built-in
+    /// trio's own hardened, role-asymmetric resolution for `role: coder`/
+    /// `reviewer`/`tester` (ADR-0018), or `.claude/agents/<agent>.md`
+    /// (ADR-0013) for any other role. This is the *only* kind before issue
+    /// #79, and the default when `type` is omitted.
+    Agent,
+    /// Issue #79: a deterministic shell command (`run`), executed through
+    /// the same sandboxed, policy-gated mechanics a lifecycle
+    /// [`crate::hook`] hook already uses (issue #55/#51) -- reused, not
+    /// duplicated, against this step's own worktree instead of a
+    /// [`crate::hook::HookContext::repo_path`]. No LLM round-trip, no
+    /// judgement call: a non-zero exit (or a policy deny) is this step's own
+    /// blocking finding, a zero exit is a clean pass -- aggregated into the
+    /// convergence loop exactly like a `type: agent` step's findings
+    /// already are.
+    ///
+    /// Never legal for `steps[0]` (the pipeline's producer,
+    /// [`Workflow::parse_yaml`]'s own invariant): a hook authors no commit,
+    /// so it can only ever gate work an earlier `type: agent` producer has
+    /// already written. Cannot capture evidence either (`evidence: true` is
+    /// rejected for this kind) -- ADR-0009 evidence records an *agent's*
+    /// command session, which a hook step has none of.
+    Hook,
+}
+
+impl StepKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StepKind::Agent => "agent",
+            StepKind::Hook => "hook",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "agent" => Ok(StepKind::Agent),
+            "hook" => Ok(StepKind::Hook),
+            other => Err(CoreError::InvalidWorkflow(format!(
+                "unknown type {other:?} (expected \"agent\" or \"hook\", or omit the key for \
+                 \"agent\")"
+            ))),
+        }
+    }
+}
+
 /// Which run-level cycle budget a gated step's blocking findings are
 /// charged against, and how (issue #73 review, finding F3). Before this,
 /// the budget rule followed a step's *position* (`workflow.steps[1]` always
@@ -187,12 +247,22 @@ impl StepBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowStep {
     pub role: Role,
+    /// Issue #79: which mechanism this step runs through. `Some(agent)`/
+    /// `Some(run)` below track this invariant -- see their own docs.
+    pub kind: StepKind,
     /// The agent definition name this step resolves to -- not necessarily
     /// the same string as `role` (`workflow.yaml`'s own example: `role:
     /// reviewer` / `agent: code-reviewer`), since a workflow may want two
     /// steps sharing a role's *function* to still be told apart by name, or
-    /// simply prefer a differently-named agent file for a role.
-    pub agent: String,
+    /// simply prefer a differently-named agent file for a role. `Some` iff
+    /// `kind == StepKind::Agent` ([`Workflow::parse_yaml`]'s own invariant,
+    /// enforced at parse time, never left to a downstream caller to assume).
+    pub agent: Option<String>,
+    /// Issue #79: the shell command a `type: hook` step runs (`sh -c
+    /// "<run>"`, mirroring `crate::hook`'s own `CommandHook`). `Some` iff
+    /// `kind == StepKind::Hook` -- the same "declared invariant, enforced at
+    /// parse time" contract as `agent` above.
+    pub run: Option<String>,
     pub gate: Gate,
     /// See [`StepBudget`]'s own docs -- `None` only for `steps[0]`.
     pub budget: Option<StepBudget>,
@@ -224,12 +294,19 @@ pub struct Workflow {
 /// pass-through" (never "reject", never "assume loop-until-clean": an
 /// omitted key and a wrong one must not be conflated, see [`Gate::parse`]).
 /// `budget` absent means [`StepBudget::Extra`] (see [`Workflow::parse_yaml`]);
-/// `evidence` absent means `false`.
+/// `evidence` absent means `false`. `type` absent means [`StepKind::Agent`]
+/// (issue #79) -- `agent`/`run` are `Option` here (rather than one required
+/// `agent: String` as before issue #79) precisely so *which* of the two is
+/// required can depend on `type`, validated in [`Workflow::parse_yaml`]
+/// rather than by serde itself.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowStepWire {
     role: String,
-    agent: String,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    agent: Option<String>,
+    run: Option<String>,
     gate: Option<String>,
     budget: Option<String>,
     #[serde(default)]
@@ -283,21 +360,27 @@ impl Workflow {
             steps: vec![
                 WorkflowStep {
                     role: Role::new("coder").expect("literal role name is never blank"),
-                    agent: "coder".to_string(),
+                    kind: StepKind::Agent,
+                    agent: Some("coder".to_string()),
+                    run: None,
                     gate: Gate::PassThrough,
                     budget: None,
                     captures_evidence: false,
                 },
                 WorkflowStep {
                     role: Role::new("reviewer").expect("literal role name is never blank"),
-                    agent: "code-reviewer".to_string(),
+                    kind: StepKind::Agent,
+                    agent: Some("code-reviewer".to_string()),
+                    run: None,
                     gate: Gate::LoopUntilClean,
                     budget: Some(StepBudget::Review),
                     captures_evidence: false,
                 },
                 WorkflowStep {
                     role: Role::new("tester").expect("literal role name is never blank"),
-                    agent: "test-runner".to_string(),
+                    kind: StepKind::Agent,
+                    agent: Some("test-runner".to_string()),
+                    run: None,
                     gate: Gate::LoopUntilClean,
                     budget: Some(StepBudget::Test),
                     captures_evidence: true,
@@ -355,12 +438,68 @@ impl Workflow {
             }
             let role = Role::new(step.role)
                 .map_err(|error| CoreError::InvalidWorkflow(format!("step {index}: {error}")))?;
-            if step.agent.trim().is_empty() {
+
+            // Issue #79: `type` decides which of `agent`/`run` this step
+            // requires -- validated here rather than left to serde, since
+            // which one is required depends on a sibling field's value, not
+            // the wire shape alone.
+            let kind = match &step.kind {
+                None => StepKind::Agent,
+                Some(raw_kind) => StepKind::parse(raw_kind).map_err(|_| {
+                    CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}): unknown type {raw_kind:?} (expected \
+                         \"agent\" or \"hook\", or omit the key for \"agent\")"
+                    ))
+                })?,
+            };
+            if index == 0 && kind != StepKind::Agent {
                 return Err(CoreError::InvalidWorkflow(format!(
-                    "step {index} (role {role:?}): agent must not be blank"
+                    "the first step (role {role:?}) is the pipeline's producer and must be type: \
+                     agent -- it authors this cycle's commit, which a type: {} step cannot do",
+                    kind.as_str()
                 )));
             }
-            reject_path_like_value(index, "agent", &step.agent)?;
+            match kind {
+                StepKind::Agent => {
+                    let agent_name = step.agent.as_deref().unwrap_or("");
+                    if agent_name.trim().is_empty() {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): type: agent requires a non-blank \
+                             \"agent\" key naming the agent definition to resolve"
+                        )));
+                    }
+                    reject_path_like_value(index, "agent", agent_name)?;
+                    if step.run.is_some() {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): \"run\" is only valid for type: hook \
+                             -- this step is type: agent (the default)"
+                        )));
+                    }
+                }
+                StepKind::Hook => {
+                    let run_command = step.run.as_deref().unwrap_or("");
+                    if run_command.trim().is_empty() {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): type: hook requires a non-blank \
+                             \"run\" key naming the shell command to execute"
+                        )));
+                    }
+                    if step.agent.is_some() {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}): \"agent\" is only valid for type: \
+                             agent -- a type: hook step has no agent definition to resolve"
+                        )));
+                    }
+                    if step.evidence {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}) is type: hook and cannot capture \
+                             evidence -- evidence capture records an agent's command session, \
+                             which this step has none of"
+                        )));
+                    }
+                }
+            }
+
             if !seen_roles.insert(role.as_str().to_string()) {
                 return Err(CoreError::InvalidWorkflow(format!(
                     "duplicate role {role:?} at step {index} -- every step must have a unique role"
@@ -439,7 +578,9 @@ impl Workflow {
 
             steps.push(WorkflowStep {
                 role,
+                kind,
                 agent: step.agent,
+                run: step.run,
                 gate,
                 budget,
                 captures_evidence: step.evidence,
@@ -894,5 +1035,137 @@ steps:
         let error = Workflow::parse_yaml(yaml).unwrap_err();
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
         assert!(error.to_string().contains("already set"), "{error}");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #79: `type: agent | hook` -- non-agent workflow steps.
+    // -----------------------------------------------------------------
+
+    /// A step with no `type` key parses to [`StepKind::Agent`] -- strict
+    /// retro-compat, pinned explicitly (every other test in this module
+    /// already exercises this implicitly by never setting `type` at all).
+    #[test]
+    fn a_step_with_no_type_key_defaults_to_agent_kind() {
+        let workflow = Workflow::parse_yaml(DEFAULT_YAML).unwrap();
+        for step in &workflow.steps {
+            assert_eq!(step.kind, StepKind::Agent);
+            assert!(step.agent.is_some());
+            assert!(step.run.is_none());
+        }
+    }
+
+    #[test]
+    fn a_hook_step_parses_with_its_run_command_and_no_agent() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "cargo fmt --check"
+    gate: loop-until-clean
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].kind, StepKind::Hook);
+        assert_eq!(workflow.steps[1].run.as_deref(), Some("cargo fmt --check"));
+        assert_eq!(workflow.steps[1].agent, None);
+        assert_eq!(workflow.steps[1].gate, Gate::LoopUntilClean);
+    }
+
+    #[test]
+    fn rejects_an_unknown_type() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: policy\n    run: true\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("unknown type"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_hook_step_missing_run() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: hook\n    gate: loop-until-clean\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("\"run\""), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_hook_step_with_a_blank_run() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: hook\n    run: \"   \"\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+    }
+
+    #[test]
+    fn rejects_a_hook_step_that_also_declares_an_agent() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: hook\n    run: \"true\"\n    agent: coder\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("\"agent\""), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_agent_step_that_also_declares_run() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     agent: reviewer\n    run: \"true\"\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("\"run\""), "{error}");
+    }
+
+    /// The producer (`steps[0]`) authors this cycle's commit -- a
+    /// deterministic hook has nothing to author, so it must always be
+    /// `type: agent`, mirroring the existing "producer must be a plain
+    /// pass-through" invariant.
+    #[test]
+    fn rejects_a_hook_step_as_the_producer() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    type: hook\n    run: \"true\"\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
+    }
+
+    /// ADR-0009 evidence capture records an *agent's* command session -- a
+    /// `type: hook` step has none, so `evidence: true` on one is rejected at
+    /// parse time rather than silently captured as nothing.
+    #[test]
+    fn rejects_a_hook_step_declaring_evidence_capture() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: hook\n    run: \"true\"\n    evidence: true\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("evidence"), "{error}");
+    }
+
+    /// A hook step can still declare/share a `budget`, and still gates the
+    /// pipeline like any other step -- `type: hook` only changes *how* the
+    /// step runs, not the surrounding gate/budget machinery.
+    #[test]
+    fn a_hook_step_can_declare_a_budget_like_any_other_gated_step() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "cargo fmt --check"
+    gate: loop-until-clean
+    budget: extra
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Extra));
+    }
+
+    #[test]
+    fn step_kind_round_trips_through_its_string_form() {
+        for kind in [StepKind::Agent, StepKind::Hook] {
+            assert_eq!(StepKind::parse(kind.as_str()).unwrap(), kind);
+        }
+        assert!(StepKind::parse("ghost").is_err());
     }
 }

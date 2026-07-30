@@ -209,73 +209,24 @@ impl Hook for CommandHook {
     }
 
     async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
-        let description = format!("shell: {}", self.run);
-        if let PolicyOutcome::Blocked { reason } = self
-            .policy_gate
-            .decide(
-                ctx.run_id,
-                &description,
-                &warden_policy::Action::Shell {
-                    command: self.run.clone(),
-                },
-            )
-            .await
+        if let PolicyOutcome::Blocked { reason } =
+            evaluate_shell_policy(&self.policy_gate, ctx.run_id, &self.run).await
         {
             return Ok(HookOutcome::Block { reason });
         }
 
-        let id = self
-            .sandbox
-            .create(SandboxSpec {
-                cwd: ctx.repo_path.to_path_buf(),
-            })
-            .await?;
-
-        // The sandbox is always destroyed, on the error path as on the success
-        // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
-        // structural -- kept explicit and simpler here since there is no long
-        // streaming await to be dropped mid-flight). `execute` borrows `id`
-        // until the returned `Execution` is consumed by `wait`; collapsing both
-        // into one owned `Result<ExecutionResult>` here ends that borrow before
-        // `id` is moved into `destroy`.
-        let exec = self
-            .sandbox
-            .execute(
-                &id,
-                Command {
-                    program: "sh".to_string(),
-                    args: vec!["-c".to_string(), self.run.clone()],
-                    env_allowlist: Self::full_env_allowlist(),
-                    stdin: None,
-                },
-                ExecuteOptions::default(),
-            )
-            .await;
-        let waited = match exec {
-            Ok(execution) => execution.wait().await,
-            Err(err) => Err(err),
-        };
-        let _ = self.sandbox.destroy(id.clone()).await;
-        let output = waited?;
+        let output = run_sandboxed_shell(&self.sandbox, ctx.repo_path, &self.run).await?;
 
         if output.exit_code == 0 {
             return Ok(HookOutcome::Continue);
         }
 
-        // A trimmed stderr tail makes the reason actionable without dumping a
-        // whole build log into the event/log line.
-        let stderr_tail: String = output.stderr.trim_end().chars().rev().take(500).collect();
-        let stderr_tail: String = stderr_tail.chars().rev().collect();
         let reason = format!(
             "hook command `{}` at {} exited {}{}",
             self.run,
             ctx.point.as_str(),
             output.exit_code,
-            if stderr_tail.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr_tail}")
-            }
+            format_stderr_tail_suffix(&output.stderr_tail)
         );
 
         if self.block_on_failure {
@@ -291,6 +242,142 @@ impl Hook for CommandHook {
             Ok(HookOutcome::Continue)
         }
     }
+}
+
+/// The outcome of running one shell command through [`run_sandboxed_shell`].
+struct SandboxedCommandOutput {
+    exit_code: i32,
+    /// The last 500 characters of stderr, trimmed and reversed back into
+    /// reading order -- see [`run_sandboxed_shell`]'s own docs.
+    stderr_tail: String,
+}
+
+/// Runs `command` via `sh -c "<command>"` inside `sandbox`, cwd `cwd`,
+/// forwarding the operator's full environment ([`CommandHook::full_env_allowlist`]
+/// -- see [`CommandHook`]'s own "Environment" docs for why a deterministic
+/// action forwards everything where an agent forwards almost nothing). The
+/// sandboxed-shell-command mechanics shared by [`CommandHook::run`] (a
+/// lifecycle hook, issue #55) and [`run_workflow_step_command`] (a `type:
+/// hook` workflow step, issue #79) -- factored out here so neither
+/// duplicates the create/execute/destroy dance or the stderr-tail trimming.
+async fn run_sandboxed_shell(
+    sandbox: &Arc<dyn Sandbox>,
+    cwd: &std::path::Path,
+    command: &str,
+) -> Result<SandboxedCommandOutput> {
+    let id = sandbox
+        .create(SandboxSpec {
+            cwd: cwd.to_path_buf(),
+        })
+        .await?;
+
+    // The sandbox is always destroyed, on the error path as on the success
+    // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
+    // structural -- kept explicit and simpler here since there is no long
+    // streaming await to be dropped mid-flight). `execute` borrows `id`
+    // until the returned `Execution` is consumed by `wait`; collapsing both
+    // into one owned `Result<ExecutionResult>` here ends that borrow before
+    // `id` is moved into `destroy`.
+    let exec = sandbox
+        .execute(
+            &id,
+            Command {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), command.to_string()],
+                env_allowlist: CommandHook::full_env_allowlist(),
+                stdin: None,
+            },
+            ExecuteOptions::default(),
+        )
+        .await;
+    let waited = match exec {
+        Ok(execution) => execution.wait().await,
+        Err(err) => Err(err),
+    };
+    let _ = sandbox.destroy(id.clone()).await;
+    let output = waited?;
+
+    // A trimmed stderr tail makes the reason actionable without dumping a
+    // whole build log into the event/log line.
+    let reversed_tail: String = output.stderr.trim_end().chars().rev().take(500).collect();
+    let stderr_tail: String = reversed_tail.chars().rev().collect();
+
+    Ok(SandboxedCommandOutput {
+        exit_code: output.exit_code,
+        stderr_tail,
+    })
+}
+
+/// `": <tail>"` when `stderr_tail` is non-empty, otherwise an empty string --
+/// the shared suffix both [`CommandHook::run`]'s and
+/// [`run_workflow_step_command`]'s own failure reasons append.
+fn format_stderr_tail_suffix(stderr_tail: &str) -> String {
+    if stderr_tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr_tail}")
+    }
+}
+
+/// Evaluates `command` as a `warden_policy::Action::Shell` against
+/// `policy_gate` (issue #51, ADR-0016) -- the exact policy check
+/// [`CommandHook::run`] and [`run_workflow_step_command`] (issue #79) both
+/// apply before ever handing `command` to the sandbox.
+async fn evaluate_shell_policy(
+    policy_gate: &PolicyGate,
+    run_id: &str,
+    command: &str,
+) -> PolicyOutcome {
+    let description = format!("shell: {command}");
+    policy_gate
+        .decide(
+            run_id,
+            &description,
+            &warden_policy::Action::Shell {
+                command: command.to_string(),
+            },
+        )
+        .await
+}
+
+/// Runs a `type: hook` workflow step's command (issue #79, ADR-0020): the
+/// same policy-gated, sandboxed-shell-command mechanics a lifecycle
+/// [`CommandHook`] already applies (issue #55/#51), reused here rather than
+/// duplicated, against the step's own worktree (`cwd`) instead of a
+/// [`HookContext::repo_path`].
+///
+/// Returns `Ok(None)` on a clean run (policy-allowed, zero exit) -- this
+/// step raised nothing. Returns `Ok(Some(reason))` when the command was
+/// blocked by policy or exited non-zero; the caller
+/// (`warden::orchestrator::Orchestrator::run_gated_step`) turns that into
+/// this step's own blocking [`warden_core::Finding`], aggregated into the
+/// convergence loop exactly the way a `type: agent` step's own findings
+/// already are (`FindingSource::role`) -- never a run-aborting
+/// [`HookOutcome::Block`]: a `type: hook` step gates the pipeline like any
+/// other step, it does not abort the run outright.
+pub async fn run_workflow_step_command(
+    sandbox: &Arc<dyn Sandbox>,
+    policy_gate: &Arc<PolicyGate>,
+    run_id: &str,
+    cwd: &std::path::Path,
+    command: &str,
+) -> Result<Option<String>> {
+    if let PolicyOutcome::Blocked { reason } =
+        evaluate_shell_policy(policy_gate, run_id, command).await
+    {
+        return Ok(Some(reason));
+    }
+
+    let output = run_sandboxed_shell(sandbox, cwd, command).await?;
+    if output.exit_code == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(format!(
+        "step command `{command}` exited {}{}",
+        output.exit_code,
+        format_stderr_tail_suffix(&output.stderr_tail)
+    )))
 }
 
 #[cfg(test)]

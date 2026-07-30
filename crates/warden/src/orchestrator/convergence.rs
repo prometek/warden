@@ -266,7 +266,10 @@ impl Orchestrator {
                         cycle_number,
                         config: &config,
                         role: producer_role,
-                        agent: &agents.steps[0],
+                        agent: agents.steps[0].as_ref().expect(
+                            "the producer step is always StepKind::Agent -- \
+                             Workflow::parse_yaml enforces this",
+                        ),
                         env_allowlist: agents.env_allowlist,
                         worktree_manager: &worktree_manager,
                         base_commit: &base_commit,
@@ -367,7 +370,7 @@ impl Orchestrator {
             let mut entered_extra_budget_this_cycle = false;
             while let RunState::RunningStep(step_index) = next_state {
                 let step = &config.workflow.steps[step_index as usize];
-                let step_agent = &agents.steps[step_index as usize];
+                let step_agent = agents.steps[step_index as usize].as_ref();
 
                 let scope = if step_index == 1 && has_reviewed_once {
                     warden_core::ReviewScope::Correctif
@@ -403,7 +406,9 @@ impl Orchestrator {
                             cycle_number,
                             step_index,
                             role: &step.role,
+                            kind: step.kind,
                             agent: step_agent,
+                            run: step.run.as_deref(),
                             env_allowlist: agents.env_allowlist,
                             worktree_manager: &worktree_manager,
                             commit: &base_commit,
@@ -2345,6 +2350,251 @@ steps:
             run.current_review_cycle, 0,
             "\"sign-off\" (declared budget \"review\") never even ran -- the \"qa\" step ahead \
                  of it always reboucles first -- so the review counter must stay untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #79: `type: hook` -- a non-agent, deterministic workflow step.
+    // -----------------------------------------------------------------
+
+    /// A `type: hook` step drives a real run end to end and gates the
+    /// pipeline exactly like an agent step: `Workflow::parse_yaml` accepts
+    /// it, `ResolvedAgents::resolve` skips agent resolution for it (no
+    /// `.claude/agents/<agent>.md` involved at all), and
+    /// `Orchestrator::run_gated_step` dispatches to the sandboxed,
+    /// deterministic command path instead of spawning a subprocess. A clean
+    /// exit converges the run, and the marker file proves the shell command
+    /// actually ran (not merely "parsed").
+    #[tokio::test]
+    async fn a_hook_step_gates_the_pipeline_like_an_agent_step() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let marker_dir = TempDir::new().unwrap();
+        let marker_path = marker_dir.path().join("lint-ran");
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(&format!(
+            r#"
+name: with-lint-hook
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "touch '{}'"
+    gate: loop-until-clean
+"#,
+            marker_path.display()
+        ))
+        .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 79: a clean hook step converges the run".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow,
+            max_extra_step_cycles: 5,
+            // One entry only -- the "lint" step is `type: hook`, so it
+            // carries no agent definition at all (`ResolvedAgents::resolve`'s
+            // own "one entry per type: agent step" contract).
+            step_agents: vec![definition(noop_coder)],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::Converged);
+        assert!(
+            marker_path.exists(),
+            "the hook step's shell command actually ran"
+        );
+    }
+
+    /// A failing `type: hook` step (non-zero exit) raises exactly one
+    /// blocking finding sourced as its own role -- the same shape a crashed
+    /// agent step already produces -- and that finding gates the pipeline
+    /// through the exact same budget machinery: it reboucles to the
+    /// producer, and exhausts its declared budget just like an agent step's
+    /// own blocking finding would.
+    #[tokio::test]
+    async fn a_failing_hook_step_raises_exactly_one_blocking_finding_and_exhausts_its_budget() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-failing-lint-hook
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "echo boom >&2; exit 1"
+    gate: loop-until-clean
+"#,
+        )
+        .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 79: a failing hook step never converges".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow,
+            max_extra_step_cycles: 2,
+            step_agents: vec![definition(noop_coder)],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(1),
+            "the lint step's own budget (\"extra\", the default) is what exhausts"
+        );
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        let lint_findings: Vec<&RunEvent> = persisted
+            .iter()
+            .map(|record| &record.event)
+            .filter(
+                |event| matches!(event, RunEvent::FindingRaised { source, .. } if source == "lint"),
+            )
+            .collect();
+        assert_eq!(
+            lint_findings.len(),
+            2,
+            "one blocking finding per cycle (max_extra_step_cycles: 2): {persisted:?}"
+        );
+        for finding in lint_findings {
+            assert!(matches!(
+                finding,
+                RunEvent::FindingRaised { severity, description, .. }
+                    if severity == "blocking" && description.contains("exited 1") && description.contains("boom")
+            ));
+        }
+    }
+
+    /// Issue #51/ADR-0016 reuse: a `.warden/policy.yaml` rule denying a
+    /// `type: hook` step's exact shell command blocks it -- the command
+    /// never actually runs (the file it would create must not exist) -- and
+    /// the policy's own denial reason surfaces as this step's blocking
+    /// finding, gating the pipeline exactly like a non-zero exit would.
+    /// Proves the hook-step path really does reuse `warden::hook`'s
+    /// existing policy-gated mechanics rather than a separate, undurable
+    /// check.
+    #[tokio::test]
+    async fn a_policy_denied_hook_step_blocks_via_a_finding_not_a_run_abort() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let marker_dir = TempDir::new().unwrap();
+        let marker_path = marker_dir.path().join("denied.txt");
+
+        let rules =
+            warden_policy::RuleSet::from_yaml("rules:\n  - action: shell\n    deny: [\"touch\"]\n")
+                .unwrap();
+        let policy_gate = PolicyGate::new(warden_policy::Evaluator::new(rules));
+        let orchestrator = Orchestrator::new(pool.clone()).with_policy_gate(Arc::new(policy_gate));
+
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+        let workflow = warden_core::Workflow::parse_yaml(&format!(
+            r#"
+name: with-denied-lint-hook
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "touch '{}'"
+    gate: loop-until-clean
+"#,
+            marker_path.display()
+        ))
+        .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue 79: a policy-denied hook step never runs its command".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow,
+            max_extra_step_cycles: 1,
+            step_agents: vec![definition(noop_coder)],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(final_state, RunState::StepCyclesExceeded(1));
+        assert!(
+            !marker_path.exists(),
+            "a policy-denied command must never actually run"
+        );
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        assert!(
+            persisted.iter().any(|record| matches!(
+                &record.event,
+                RunEvent::FindingRaised { source, severity, description, .. }
+                    if source == "lint" && severity == "blocking" && description.contains("touch")
+            )),
+            "the policy's own denial reason must surface as the lint step's blocking finding: \
+                 {persisted:?}, run {run_id}"
         );
     }
 

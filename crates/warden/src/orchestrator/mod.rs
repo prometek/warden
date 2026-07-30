@@ -135,13 +135,17 @@ struct ResolvedAgent {
     system_prompt: String,
 }
 
-/// Issue #73 (trio-unification follow-up): every workflow step's resolved
-/// agent, in `config.workflow.steps` order -- `steps[0]` is always the
-/// producer's (the coder, in the built-in default workflow). No role is
-/// privileged here: the built-in coder/reviewer/tester and any custom step
-/// are resolved and stored identically.
+/// Issue #73 (trio-unification follow-up); issue #79: every workflow step's
+/// resolved agent, in `config.workflow.steps` order -- `steps[0]` is always
+/// the producer's (the coder in the built-in default workflow, always
+/// `StepKind::Agent`, `Workflow::parse_yaml`'s own invariant). No role is
+/// privileged here: the built-in coder/reviewer/tester and any custom `type:
+/// agent` step are resolved and stored identically. `None` at a `type: hook`
+/// step's own index (issue #79) -- there is no agent definition to resolve
+/// for it, and [`Orchestrator::run_gated_step`] never reads this entry for
+/// such a step.
 struct ResolvedAgents {
-    steps: Vec<ResolvedAgent>,
+    steps: Vec<Option<ResolvedAgent>>,
     /// This run's `--tool` adapter's own env allowlist (issue #24), resolved
     /// once here since it's a property of the tool, not of any one role --
     /// `--tool` is global for a run (issue #24, "Sélection d'outil par
@@ -150,19 +154,29 @@ struct ResolvedAgents {
 }
 
 impl ResolvedAgents {
-    /// Maps every step's definition up-front, before the loop spawns
-    /// anything: a definition the adapter cannot honour must fail the run at
-    /// its start, not several cycles in when that step first happens to run.
+    /// Maps every `type: agent` step's definition up-front, before the loop
+    /// spawns anything: a definition the adapter cannot honour must fail the
+    /// run at its start, not several cycles in when that step first happens
+    /// to run.
     ///
-    /// Issue #73 review (F5): `run_convergence_loop`'s per-cycle loop indexes
-    /// `self.steps` and `config.workflow.steps` in lockstep, by position,
-    /// with no further bounds check at each access -- so the one-time
-    /// length check below is what turns a would-be out-of-bounds panic deep
-    /// into a run into a fail-fast, typed error before the run even starts.
+    /// Issue #73 review (F5); issue #79: `config.step_agents` carries one
+    /// entry per `type: agent` step in `config.workflow.steps`, in that same
+    /// relative order -- **not** one entry per `workflow.steps` overall (a
+    /// `type: hook` step has no agent definition at all, so `main.rs`'s own
+    /// resolution loop never pushes one for it). The one-time count check
+    /// below is what turns a would-be out-of-bounds panic deep into a run
+    /// into a fail-fast, typed error before the run even starts, generalized
+    /// off "one per agent-kind step" rather than "one per step".
     fn resolve<R: ToolAdapter>(runner: &R, config: &RunConfig) -> Result<Self> {
-        if config.step_agents.len() != config.workflow.steps.len() {
+        let expected_agent_steps = config
+            .workflow
+            .steps
+            .iter()
+            .filter(|step| step.kind == warden_core::StepKind::Agent)
+            .count();
+        if config.step_agents.len() != expected_agent_steps {
             return Err(WardenError::MismatchedStepAgentCount {
-                workflow_steps: config.workflow.steps.len(),
+                agent_steps: expected_agent_steps,
                 step_agents: config.step_agents.len(),
             });
         }
@@ -172,11 +186,19 @@ impl ResolvedAgents {
                 system_prompt: definition.system_prompt.clone(),
             })
         };
-        let steps = config
-            .step_agents
-            .iter()
-            .map(resolve_one)
-            .collect::<Result<Vec<_>>>()?;
+        let mut definitions = config.step_agents.iter();
+        let mut steps = Vec::with_capacity(config.workflow.steps.len());
+        for step in &config.workflow.steps {
+            match step.kind {
+                warden_core::StepKind::Agent => {
+                    let definition = definitions
+                        .next()
+                        .expect("length checked against expected_agent_steps above");
+                    steps.push(Some(resolve_one(definition)?));
+                }
+                warden_core::StepKind::Hook => steps.push(None),
+            }
+        }
         Ok(Self {
             steps,
             env_allowlist: runner.env_allowlist(),
@@ -246,10 +268,10 @@ struct EvidenceCapture<'a> {
 }
 
 /// Parameters for a single **gated** workflow step invocation (issue #73,
-/// trio-unification follow-up) -- any step but the producer
-/// (`workflow.steps[0]`), whether that's the built-in reviewer/tester or a
-/// custom role like `techlead`. One uniform shape for every such step: no
-/// role is special-cased here.
+/// trio-unification follow-up; issue #79) -- any step but the producer
+/// (`workflow.steps[0]`), whether that's the built-in reviewer/tester, a
+/// custom `type: agent` role like `techlead`, or a `type: hook` step. One
+/// uniform shape for every such step: no role is special-cased here.
 struct GatedStepInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
@@ -260,10 +282,21 @@ struct GatedStepInvocation<'a> {
     /// (`run_convergence_loop`, via `decide_next_state_for_step`), not here.
     step_index: u32,
     role: &'a Role,
-    /// This step's command + system prompt (issue #24).
-    agent: &'a ResolvedAgent,
+    /// Issue #79: which mechanism this step runs through --
+    /// [`Orchestrator::run_gated_step`]'s own dispatch. Carried in from
+    /// `config.workflow.steps[step_index].kind` by the caller, exactly like
+    /// `captures_evidence` below.
+    kind: warden_core::StepKind,
+    /// This step's command + system prompt (issue #24). `Some` iff `kind ==
+    /// StepKind::Agent` -- `ResolvedAgents::resolve`'s own invariant.
+    agent: Option<&'a ResolvedAgent>,
+    /// Issue #79: the shell command a `type: hook` step runs. `Some` iff
+    /// `kind == StepKind::Hook` -- `warden_core::WorkflowStep::run`'s own
+    /// invariant, carried through unchanged.
+    run: Option<&'a str>,
     /// This run's `--tool` adapter's env allowlist (issue #24) --
-    /// `ResolvedAgents::env_allowlist`.
+    /// `ResolvedAgents::env_allowlist`. Unused for a `type: hook` step (it
+    /// spawns no agent subprocess).
     env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,

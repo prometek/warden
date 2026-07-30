@@ -206,7 +206,26 @@ impl Orchestrator {
 
     /// Invokes a single **gated** workflow step -- any step but the
     /// producer (`workflow.steps[0]`), whether that's the built-in
-    /// reviewer/tester or a custom role like `techlead`. One uniform body:
+    /// reviewer/tester, a custom `type: agent` role like `techlead`, or a
+    /// `type: hook` step (issue #79). Dispatches on
+    /// [`GatedStepInvocation::kind`]: an agent-kind step spawns a subprocess
+    /// ([`Orchestrator::run_gated_agent_step`]); a hook-kind step runs a
+    /// deterministic command instead
+    /// ([`Orchestrator::run_gated_hook_step`]). Both return the exact same
+    /// `Vec<Finding>` shape, aggregated into the convergence loop identically
+    /// regardless of which kind actually ran.
+    pub(super) async fn run_gated_step<R: ToolAdapter>(
+        &self,
+        runner: &R,
+        invocation: GatedStepInvocation<'_>,
+    ) -> Result<Vec<Finding>> {
+        match invocation.kind {
+            warden_core::StepKind::Agent => self.run_gated_agent_step(runner, invocation).await,
+            warden_core::StepKind::Hook => self.run_gated_hook_step(invocation).await,
+        }
+    }
+
+    /// The `type: agent` half of [`Orchestrator::run_gated_step`]'s dispatch:
     /// its own worktree, its own agent spawn, its own findings extraction,
     /// validated against its own open [`Role`] -- no role name ever
     /// branches this function's own behaviour.
@@ -228,7 +247,7 @@ impl Orchestrator {
     /// (`WorkflowStep::captures_evidence`) -- `true` for the built-in
     /// default's tester step (`Workflow::builtin_default`), for strict
     /// retro-compat, and opt-in for any custom workflow's own step.
-    pub(super) async fn run_gated_step<R: ToolAdapter>(
+    async fn run_gated_agent_step<R: ToolAdapter>(
         &self,
         runner: &R,
         invocation: GatedStepInvocation<'_>,
@@ -239,7 +258,9 @@ impl Orchestrator {
             cycle_number,
             step_index,
             role,
+            kind: _,
             agent,
+            run: _,
             env_allowlist,
             worktree_manager,
             commit,
@@ -250,6 +271,10 @@ impl Orchestrator {
             config,
             cancel,
         } = invocation;
+        let agent = agent.expect(
+            "run_gated_agent_step is only reached for StepKind::Agent, which always carries a \
+             resolved agent -- ResolvedAgents::resolve's own invariant",
+        );
 
         if scope == warden_core::ReviewScope::Correctif && step_index != 1 {
             return Err(WardenError::Core(
@@ -397,6 +422,83 @@ impl Orchestrator {
 
         Ok(findings)
     }
+
+    /// The `type: hook` half of [`Orchestrator::run_gated_step`]'s dispatch
+    /// (issue #79): no LLM, no subprocess -- runs `invocation.run`'s shell
+    /// command deterministically, through the exact sandboxed, policy-gated
+    /// mechanics a lifecycle hook already uses (`crate::hook::run_workflow_step_command`,
+    /// reusing issue #55/#51's infra rather than duplicating it), inside a
+    /// worktree checked out at `invocation.commit` -- the same isolation and
+    /// bookkeeping (`db::set_cycle_worktree_path`) any other gated step gets.
+    ///
+    /// A clean run (policy-allowed, zero exit) returns no findings at all;
+    /// a blocked/failing one returns exactly one blocking
+    /// [`warden_core::Finding`] sourced as `FindingSource::role(role)` --
+    /// the same shape [`Orchestrator::run_gated_agent_step`] already
+    /// produces for a crashed agent, so the convergence loop's own gating
+    /// (`decide_next_state_for_step`) treats a failing hook step identically
+    /// to a failing agent step, with no change needed there at all.
+    ///
+    /// Ignores `scope`/`diff`/`prior_findings`/`captures_evidence`: a
+    /// deterministic command takes no input payload and
+    /// [`warden_core::Workflow::parse_yaml`] already rejects `evidence: true`
+    /// on a `type: hook` step, so `captures_evidence` is always `false` here.
+    async fn run_gated_hook_step(
+        &self,
+        invocation: GatedStepInvocation<'_>,
+    ) -> Result<Vec<Finding>> {
+        let GatedStepInvocation {
+            run_id,
+            cycle_id,
+            role,
+            worktree_manager,
+            commit,
+            run,
+            ..
+        } = invocation;
+        let command = run.expect(
+            "run_gated_hook_step is only reached for StepKind::Hook, which always carries \
+             \"run\" -- Workflow::parse_yaml's own invariant",
+        );
+
+        let worktree = worktree_manager
+            .create(run_id, role.as_str(), commit)
+            .await?;
+        db::set_cycle_worktree_path(
+            &self.pool,
+            cycle_id,
+            role.as_str(),
+            &worktree.path().display().to_string(),
+        )
+        .await?;
+
+        let verdict = crate::hook::run_workflow_step_command(
+            &self.sandbox,
+            &self.policy_gate,
+            run_id,
+            worktree.path(),
+            command,
+        )
+        .await?;
+
+        if let Err(error) = worktree.remove().await {
+            tracing::warn!(%error, role = role.as_str(), "failed to clean up worktree after cycle");
+        }
+
+        Ok(match verdict {
+            None => Vec::new(),
+            Some(reason) => vec![Finding {
+                source: warden_core::FindingSource::role(role.as_str()),
+                severity: warden_core::Severity::Blocking,
+                file: None,
+                description: reason,
+                action: Some(
+                    "fix the failing deterministic check; the pipeline retries once corrected"
+                        .to_string(),
+                ),
+            }],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -522,7 +624,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 1,
                     role: &reviewer_role,
-                    agent: &agents.steps[1],
+                    agent: agents.steps[1].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -547,7 +651,9 @@ mod tests {
                         cycle_number: 1,
                         step_index: 2,
                         role: &tester_role,
-                        agent: &agents.steps[2],
+                        agent: agents.steps[2].as_ref(),
+                        kind: warden_core::StepKind::Agent,
+                        run: None,
                         env_allowlist: agents.env_allowlist,
                         worktree_manager: &worktree_manager,
                         commit: "HEAD",
@@ -666,7 +772,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 1,
                     role: &reviewer_role,
-                    agent: &agents.steps[1],
+                    agent: agents.steps[1].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -753,7 +861,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 2,
                     role: &tester_role,
-                    agent: &agents.steps[2],
+                    agent: agents.steps[2].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -863,7 +973,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 1,
                     role: &reviewer_role,
-                    agent: &agents.steps[1],
+                    agent: agents.steps[1].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -886,7 +998,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 2,
                     role: &tester_role,
-                    agent: &agents.steps[2],
+                    agent: agents.steps[2].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -993,7 +1107,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 1,
                     role: &reviewer_role,
-                    agent: &agents.steps[1],
+                    agent: agents.steps[1].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -1095,7 +1211,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 2,
                     role: &tester_role,
-                    agent: &agents.steps[2],
+                    agent: agents.steps[2].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -1196,7 +1314,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 2,
                     role: &tester_role,
-                    agent: &agents.steps[2],
+                    agent: agents.steps[2].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
@@ -1298,7 +1418,9 @@ mod tests {
                     cycle_number: 1,
                     step_index: 1,
                     role: &reviewer_role,
-                    agent: &agents.steps[1],
+                    agent: agents.steps[1].as_ref(),
+                    kind: warden_core::StepKind::Agent,
+                    run: None,
                     env_allowlist: agents.env_allowlist,
                     worktree_manager: &worktree_manager,
                     commit: "HEAD",
