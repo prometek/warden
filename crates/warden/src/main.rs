@@ -908,6 +908,14 @@ async fn run<R: ToolAdapter>(
     // once the run's own event log exists to carry it.
     let mut untrusted_repo_agent_definitions = Vec::new();
     for step in &workflow.steps {
+        // Issue #79: a `type: hook` step has no agent definition to resolve
+        // at all -- `Orchestrator::run_gated_step` never spawns anything for
+        // it, so `step_agents` carries no entry for this step's position
+        // (`ResolvedAgents::resolve`'s own contract: one entry per `type:
+        // agent` step, in workflow order, not one per `workflow.steps`).
+        if step.kind == warden_core::StepKind::Hook {
+            continue;
+        }
         let definition = match step.role.as_str() {
             "coder" => {
                 // Issue #57: `resolve_agent_definition`'s `Coder` arm never
@@ -983,19 +991,24 @@ async fn run<R: ToolAdapter>(
                 }
                 definition
             }
-            custom_role => warden::agent_def::resolve_custom_step_agent_definition(
-                &repo,
-                custom_role,
-                &step.agent,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to resolve the agent for custom workflow role {custom_role:?} (agent \
-                     {:?})",
-                    step.agent
+            custom_role => {
+                let agent_name = step.agent.as_deref().expect(
+                    "Workflow::parse_yaml guarantees a type: agent step always carries a \
+                     non-blank \"agent\"",
+                );
+                warden::agent_def::resolve_custom_step_agent_definition(
+                    &repo,
+                    custom_role,
+                    agent_name,
                 )
-            })?,
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to resolve the agent for custom workflow role {custom_role:?} \
+                         (agent {agent_name:?})"
+                    )
+                })?
+            }
         };
         step_agents.push(definition);
     }

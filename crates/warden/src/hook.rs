@@ -209,73 +209,24 @@ impl Hook for CommandHook {
     }
 
     async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome> {
-        let description = format!("shell: {}", self.run);
-        if let PolicyOutcome::Blocked { reason } = self
-            .policy_gate
-            .decide(
-                ctx.run_id,
-                &description,
-                &warden_policy::Action::Shell {
-                    command: self.run.clone(),
-                },
-            )
-            .await
+        if let PolicyOutcome::Blocked { reason } =
+            evaluate_shell_policy(&self.policy_gate, ctx.run_id, &self.run).await
         {
             return Ok(HookOutcome::Block { reason });
         }
 
-        let id = self
-            .sandbox
-            .create(SandboxSpec {
-                cwd: ctx.repo_path.to_path_buf(),
-            })
-            .await?;
-
-        // The sandbox is always destroyed, on the error path as on the success
-        // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
-        // structural -- kept explicit and simpler here since there is no long
-        // streaming await to be dropped mid-flight). `execute` borrows `id`
-        // until the returned `Execution` is consumed by `wait`; collapsing both
-        // into one owned `Result<ExecutionResult>` here ends that borrow before
-        // `id` is moved into `destroy`.
-        let exec = self
-            .sandbox
-            .execute(
-                &id,
-                Command {
-                    program: "sh".to_string(),
-                    args: vec!["-c".to_string(), self.run.clone()],
-                    env_allowlist: Self::full_env_allowlist(),
-                    stdin: None,
-                },
-                ExecuteOptions::default(),
-            )
-            .await;
-        let waited = match exec {
-            Ok(execution) => execution.wait().await,
-            Err(err) => Err(err),
-        };
-        let _ = self.sandbox.destroy(id.clone()).await;
-        let output = waited?;
+        let output = run_sandboxed_shell(&self.sandbox, ctx.repo_path, &self.run).await?;
 
         if output.exit_code == 0 {
             return Ok(HookOutcome::Continue);
         }
 
-        // A trimmed stderr tail makes the reason actionable without dumping a
-        // whole build log into the event/log line.
-        let stderr_tail: String = output.stderr.trim_end().chars().rev().take(500).collect();
-        let stderr_tail: String = stderr_tail.chars().rev().collect();
         let reason = format!(
             "hook command `{}` at {} exited {}{}",
             self.run,
             ctx.point.as_str(),
             output.exit_code,
-            if stderr_tail.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr_tail}")
-            }
+            format_tail_suffix(&output.stderr_tail)
         );
 
         if self.block_on_failure {
@@ -291,6 +242,120 @@ impl Hook for CommandHook {
             Ok(HookOutcome::Continue)
         }
     }
+}
+
+/// The last `max_chars` characters of `text`, trimmed of trailing
+/// whitespace -- shared tail-truncation so a reason/log line never dumps a
+/// whole build log, just its actionable end. `pub(crate)`: reused by
+/// `orchestrator::agents::run_gated_hook_step` (issue #79) for a `type:
+/// hook` workflow step's own failure reason, the same trimming
+/// [`run_sandboxed_shell`] already applies to a lifecycle hook's.
+pub(crate) fn trailing_chars(text: &str, max_chars: usize) -> String {
+    let reversed: String = text.trim_end().chars().rev().take(max_chars).collect();
+    reversed.chars().rev().collect()
+}
+
+/// The outcome of running one shell command through [`run_sandboxed_shell`].
+struct SandboxedCommandOutput {
+    exit_code: i32,
+    /// The last 500 characters of stderr -- see [`run_sandboxed_shell`]'s own
+    /// docs.
+    stderr_tail: String,
+}
+
+/// Runs `command` via `sh -c "<command>"` inside `sandbox`, cwd `cwd`,
+/// forwarding the operator's full environment ([`CommandHook::full_env_allowlist`]
+/// -- see [`CommandHook`]'s own "Environment" docs for why a deterministic
+/// action forwards everything where an agent forwards almost nothing). Used
+/// by [`CommandHook::run`] (a lifecycle hook, issue #55) only -- **not**
+/// shared with a `type: hook` workflow step's own command execution (issue
+/// #79 review, HIGH): a `type: hook` step runs against a worktree checked
+/// out at *this cycle's coder-authored commit* rather than the operator's
+/// own checkout, and needs a narrower, explicit allowlist, cancellation, and
+/// `agent_processes` bookkeeping this helper doesn't provide -- see
+/// `orchestrator::agents::run_gated_hook_step`'s and
+/// `orchestrator::agents::WORKFLOW_STEP_ENV_ALLOWLIST`'s own "Trust model"
+/// docs.
+async fn run_sandboxed_shell(
+    sandbox: &Arc<dyn Sandbox>,
+    cwd: &std::path::Path,
+    command: &str,
+) -> Result<SandboxedCommandOutput> {
+    let id = sandbox
+        .create(SandboxSpec {
+            cwd: cwd.to_path_buf(),
+        })
+        .await?;
+
+    // The sandbox is always destroyed, on the error path as on the success
+    // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
+    // structural -- kept explicit and simpler here since there is no long
+    // streaming await to be dropped mid-flight). `execute` borrows `id`
+    // until the returned `Execution` is consumed by `wait`; collapsing both
+    // into one owned `Result<ExecutionResult>` here ends that borrow before
+    // `id` is moved into `destroy`.
+    let exec = sandbox
+        .execute(
+            &id,
+            Command {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), command.to_string()],
+                env_allowlist: CommandHook::full_env_allowlist(),
+                stdin: None,
+            },
+            ExecuteOptions::default(),
+        )
+        .await;
+    let waited = match exec {
+        Ok(execution) => execution.wait().await,
+        Err(err) => Err(err),
+    };
+    let _ = sandbox.destroy(id.clone()).await;
+    let output = waited?;
+
+    // A trimmed stderr tail makes the reason actionable without dumping a
+    // whole build log into the event/log line.
+    Ok(SandboxedCommandOutput {
+        exit_code: output.exit_code,
+        stderr_tail: trailing_chars(&output.stderr, 500),
+    })
+}
+
+/// `": <tail>"` when `tail` is non-empty, otherwise an empty string -- the
+/// shared suffix [`CommandHook::run`]'s and
+/// `orchestrator::agents::run_gated_hook_step`'s (issue #79) own failure
+/// reasons append. `pub(crate)` for the latter.
+pub(crate) fn format_tail_suffix(tail: &str) -> String {
+    if tail.is_empty() {
+        String::new()
+    } else {
+        format!(": {tail}")
+    }
+}
+
+/// Evaluates `command` as a `warden_policy::Action::Shell` against
+/// `policy_gate` (issue #51, ADR-0016) -- the exact policy check
+/// [`CommandHook::run`] and `orchestrator::agents::run_gated_hook_step`
+/// (issue #79) both apply before ever handing `command` to the sandbox.
+/// `pub(crate)` for the latter, which is not itself part of this module (the
+/// sandbox lifecycle and `agent_processes` bookkeeping a `type: hook`
+/// workflow step needs live in `orchestrator::agents`, alongside every other
+/// step's own bookkeeping, rather than being duplicated here).
+pub(crate) async fn evaluate_shell_policy(
+    policy_gate: &PolicyGate,
+    run_id: &str,
+    command: &str,
+) -> PolicyOutcome {
+    let description = format!("shell: {command}");
+    policy_gate
+        .decide(
+            run_id,
+            &description,
+            &warden_policy::Action::Shell {
+                command: command.to_string(),
+            },
+        )
+        .await
 }
 
 #[cfg(test)]

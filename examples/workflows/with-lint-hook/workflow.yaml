@@ -1,0 +1,17 @@
+name: with-lint-hook
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: lint
+    type: hook
+    run: "cargo fmt --all -- --check"
+    gate: loop-until-clean
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+    budget: test
+    evidence: true

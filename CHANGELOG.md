@@ -41,6 +41,41 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - Nouvel exemple : `examples/workflows/with-scoped-review/` démontre `gate: scoped-re-review`
   et `max_cycles` sur une étape `secreview` distincte du reviewer/tester intégrés.
 
+### Added — Issue #79 : étapes de workflow non-agent (`type: hook`)
+
+- **Discriminant `type: agent | hook` sur une étape de `.warden/workflow.yaml`** :
+  `agent` (défaut, rétro-compatibilité stricte — une étape qui omet `type` se comporte
+  exactement comme avant) spawn un agent LLM ; `hook` exécute une commande shell
+  déterministe (`run: "<commande>"`), sans LLM, à travers le même sandbox/policy-gate
+  qu'un hook de cycle de vie (issue #55/#51, `warden::hook`) — réutilisé, jamais dupliqué.
+- **Verdict agrégé comme n'importe quelle étape** : un exit non nul (ou un refus de
+  `.warden/policy.yaml`) devient exactement une finding bloquante sourcée par le rôle de
+  l'étape, qui reboucle le pipeline vers le producteur dans son propre budget de cycle —
+  la boucle de convergence traite une étape `type: hook` en échec identiquement à une
+  étape `type: agent` en échec, sans changement à `decide_next_state_for_step`.
+- **Restrictions structurelles** : la première étape (le producteur) doit toujours être
+  `type: agent` (un hook n'écrit aucun commit) ; une étape `type: hook` ne peut pas
+  déclarer `evidence: true` (ADR-0009 capture la session d'une commande *agent*, qu'un
+  hook n'a pas) ; `agent`/`run` sont mutuellement exclusifs selon `type` — chaque erreur
+  de configuration est un message clair nommant l'étape et le champ fautif.
+- **Bookkeeping identique à une étape agent** : une étape `type: hook` obtient son propre
+  worktree, sa propre ligne `agent_processes` (pid, exit code) et sa propre paire
+  d'événements `AgentStarted`/`AgentFinished` — visible à `recover_crashed_runs` et à
+  `warden-tui` comme n'importe quel rôle.
+- **Modèle de confiance environnement, délibérément restreint** : une étape `type: hook`
+  s'exécute dans le worktree checké out sur le commit du cycle (potentiellement écrit par
+  le coder), jamais le checkout de l'opérateur — elle ne transmet donc qu'un allowlist
+  explicite (`HOME`/`LANG`/`TERM`/`CARGO_HOME`/`RUSTUP_HOME`), jamais l'environnement
+  complet de l'opérateur qu'un hook de cycle de vie (`.warden/hooks.toml`) transmet.
+- **Exemple** : `examples/workflows/with-lint-hook/` (un `cargo fmt --all -- --check`
+  inséré entre le reviewer et le tester).
+- **Hors périmètre, délibérément** : `type: policy` n'est pas livré par cette issue — rejeté
+  au parsing avec un message dédié (« not supported yet », voir issue #51) plutôt que
+  traité comme une valeur `type` inconnue. `warden-policy` (#51) reste consommé comme
+  l'infrastructure *interne* d'exécution d'une étape `type: hook` (le policy-gate qui
+  précède le sandbox), pas comme un type de step à part entière — cette dernière livraison
+  est un suivi séparé, non couvert ici.
+
 ### Security — Issue #59 : garde de chemin de programme (#26) étendue aux `args`
 
 - **Le point 1 de l'issue #26 (« chemin `program`/`args` relatif ») est désormais couvert en
