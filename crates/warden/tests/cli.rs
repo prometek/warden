@@ -4996,6 +4996,71 @@ printf '{{"type":"result","subtype":"success","is_error":false,"result":%s}}\n' 
     assert_eq!(techlead_finding.description, "needs another pass");
 }
 
+/// Issue #79: a `type: hook` workflow step -- no LLM, no fake `claude`
+/// invocation for it at all -- drives a real run end to end through the
+/// actual `warden` binary and gates the pipeline exactly like an agent step
+/// would. `write_fake_claude` here only ever answers for the `coder` role;
+/// the `lint` step never spawns a subprocess through it at all, proving
+/// `ResolvedAgents::resolve` really does skip agent resolution for a
+/// `type: hook` step end to end, not just in the orchestrator's own unit
+/// tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_a_type_hook_step_gates_the_pipeline_via_a_deterministic_command() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let lint_marker = bin_dir.path().join("lint-has-run");
+
+    let yaml = format!(
+        r#"
+name: with-lint-hook
+steps:
+  - role: coder
+    agent: coder
+  - role: lint
+    type: hook
+    run: "touch '{}'"
+    gate: loop-until-clean
+"#,
+        lint_marker.display()
+    );
+    write_workflow_yaml(repo.path(), &yaml);
+    write_fake_claude(
+        bin_dir.path(),
+        APPEND_NOTES_CODER_BODY,
+        NOOP_BODY,
+        NOOP_BODY,
+    );
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "exercise a type: hook workflow step",
+            "--max-cycles",
+            "3",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+
+    assert!(
+        lint_marker.exists(),
+        "the type: hook step's shell command must actually have run, as a real deterministic \
+         action -- not an agent subprocess"
+    );
+}
+
 /// Issue #73: a malformed `.warden/workflow.yaml` must fail the run with a
 /// clear, actionable error naming the file -- never silently fall back to
 /// the built-in default pipeline (code-standards.md: no silent fallback).
