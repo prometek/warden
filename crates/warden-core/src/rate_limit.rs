@@ -35,21 +35,78 @@
 //! `warden::tool_adapter::ToolAdapter::extract_rate_limit`'s own docs) -- a
 //! caller that has no [`RateLimitStatus`] for an invocation must render that
 //! as "n/a", never invent one.
+//!
+//! **Numeric range validation is not this module's job.** `utilization`/
+//! `surpassed_threshold`/`resets_at` are plain, unvalidated `f64`/`i64`
+//! here -- the boundary that must reject an implausible value (a unit
+//! regression, a non-finite float, a non-positive timestamp) is
+//! `warden::tool_adapter::ClaudeAdapter::extract_rate_limit`, the one place
+//! that actually reads untrusted agent stdout (code-standards.md: "valider
+//! toute entrée externe ... à la frontière"). This type only carries an
+//! already-validated value.
 use serde::{Deserialize, Serialize};
+
+/// Upper bound on an unrecognized [`RateLimitState`]/[`RateLimitWindow`]
+/// value's length (issue #84 review, finding 2): `status`/`rate_limit_type`
+/// are untrusted agent-CLI output that reaches the database, the `events`
+/// payload, and `warden-tui`'s rendering verbatim -- an unbounded
+/// `Other(String)` would let a buggy or compromised agent smuggle an
+/// arbitrarily large (or control-character-laden) string all the way to a
+/// terminal. Mirrors the truncation convention
+/// `warden::tool_adapter::summarize_progress_text` already uses for
+/// agent-reported text (issue #33) -- collapse to one line, cap the length
+/// -- applied here, at construction, so every caller downstream of
+/// `From<String>` gets it for free rather than each having to remember to.
+/// `64` is generous for an enum-like identifier (every value observed so far
+/// -- `"allowed_warning"`, `"seven_day"` -- is under 20 chars) while still
+/// bounding the damage a hostile/buggy report could do.
+const MAX_OTHER_VALUE_CHARS: usize = 64;
+
+/// Bounds an unrecognized wire value before it becomes a [`RateLimitState::Other`]/
+/// [`RateLimitWindow::Other`] payload -- see [`MAX_OTHER_VALUE_CHARS`]'s own
+/// docs. Replaces control characters (a raw terminal escape sequence, a
+/// stray newline) with a space and collapses whitespace, the same
+/// "one-line log entry, not a rendered blob" contract
+/// `summarize_progress_text` enforces, then truncates by character count
+/// (never by byte count, which could split a multi-byte UTF-8 sequence).
+fn sanitize_other_value(raw: String) -> String {
+    let control_free: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = control_free
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() <= MAX_OTHER_VALUE_CHARS {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_OTHER_VALUE_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
 
 /// `rate_limit_info.status` as reported by a CLI (observed value:
 /// `"allowed_warning"`). Kept tolerant of any value this crate hasn't
 /// observed yet -- [`RateLimitState::Other`] is the catch-all, so a future
 /// CLI value (or a status this adapter's author simply never triggered) is
-/// preserved verbatim rather than failing the whole parse (the same
-/// tolerance convention `warden::tool_adapter::ClaudeContentBlock::Other`
-/// already uses for an unrecognized wire variant).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// preserved (bounded, see [`sanitize_other_value`]) rather than failing the
+/// whole parse (the same tolerance convention
+/// `warden::tool_adapter::ClaudeContentBlock::Other` already uses for an
+/// unrecognized wire variant).
+///
+/// `#[serde(from = "String", into = "String")]`: serializes/deserializes as
+/// its plain string form (`as_str`/`From<String>`), the same wire shape a
+/// hand-written `Serialize`/`Deserialize` impl would produce -- no behaviour
+/// change, just less code to keep in sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum RateLimitState {
     /// Observed against the real CLI: quota consumption crossed a warning
     /// band but requests are still allowed.
     AllowedWarning,
-    /// Any value this crate hasn't specifically modeled, preserved verbatim.
+    /// Any value this crate hasn't specifically modeled, preserved
+    /// (bounded -- see [`sanitize_other_value`]).
     Other(String),
 }
 
@@ -66,7 +123,7 @@ impl From<String> for RateLimitState {
     fn from(raw: String) -> Self {
         match raw.as_str() {
             "allowed_warning" => RateLimitState::AllowedWarning,
-            _ => RateLimitState::Other(raw),
+            _ => RateLimitState::Other(sanitize_other_value(raw)),
         }
     }
 }
@@ -77,33 +134,18 @@ impl From<RateLimitState> for String {
     }
 }
 
-impl Serialize for RateLimitState {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for RateLimitState {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(RateLimitState::from(String::deserialize(deserializer)?))
-    }
-}
-
 /// `rate_limit_info.rateLimitType` as reported by a CLI (observed value:
 /// `"seven_day"`) -- which quota window this report describes. Same
-/// unknown-value tolerance as [`RateLimitState`], for the same reason: a
+/// unknown-value tolerance (and the same bounded `Other`, see
+/// [`sanitize_other_value`]) as [`RateLimitState`], for the same reason: a
 /// value this crate hasn't observed yet must still parse.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub enum RateLimitWindow {
     /// Observed against the real CLI: a rolling seven-day quota window.
     SevenDay,
-    /// Any value this crate hasn't specifically modeled, preserved verbatim.
+    /// Any value this crate hasn't specifically modeled, preserved
+    /// (bounded -- see [`sanitize_other_value`]).
     Other(String),
 }
 
@@ -120,7 +162,7 @@ impl From<String> for RateLimitWindow {
     fn from(raw: String) -> Self {
         match raw.as_str() {
             "seven_day" => RateLimitWindow::SevenDay,
-            _ => RateLimitWindow::Other(raw),
+            _ => RateLimitWindow::Other(sanitize_other_value(raw)),
         }
     }
 }
@@ -131,27 +173,12 @@ impl From<RateLimitWindow> for String {
     }
 }
 
-impl Serialize for RateLimitWindow {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for RateLimitWindow {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(RateLimitWindow::from(String::deserialize(deserializer)?))
-    }
-}
-
 /// One CLI's self-reported rate-limit/quota status for the account it's
 /// running as, as of one invocation (issue #84) -- see this module's own
-/// docs for the verbatim payload this is modeled from.
+/// docs for the verbatim payload this is modeled from, and for why the
+/// numeric fields below are assumed already-validated (the boundary check
+/// lives in `warden::tool_adapter::ClaudeAdapter::extract_rate_limit`, the
+/// one place that actually reads untrusted agent stdout).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateLimitStatus {
     pub status: RateLimitState,
@@ -159,11 +186,14 @@ pub struct RateLimitStatus {
     /// Fraction of quota consumed, in `0.0..=1.0` -- **not** a percentage
     /// (`0.93` means 93%, never 93). This is the figure issue #85's
     /// anticipation threshold is meant to compare against; this issue itself
-    /// implements no such comparison.
+    /// implements no such comparison. Can legitimately exceed `1.0` while
+    /// `is_using_overage` is `true` -- see `extract_rate_limit`'s own docs
+    /// for the validation bound this implies.
     pub utilization: f64,
     pub is_using_overage: bool,
-    /// The warning-band fraction (same `0.0..=1.0` unit as `utilization`)
-    /// that was crossed to produce this report.
+    /// The warning-band fraction (same `0.0..=1.0`-ish unit as
+    /// `utilization`, see that field's own docs) that was crossed to produce
+    /// this report.
     pub surpassed_threshold: f64,
     /// Unix epoch seconds (UTC) at which this window resets -- provided
     /// directly by the CLI, not derived from a window length plus a
@@ -215,10 +245,17 @@ mod tests {
         assert_eq!(decoded, status);
     }
 
-    /// The verbatim payload captured against the real CLI (issue #84) --
-    /// pins this type's shape against the real wire format, not a guess.
+    /// **Not** the production wire-format test -- this crate has no
+    /// dependency on `warden::tool_adapter::ClaudeRateLimitInfo` (the actual
+    /// camelCase struct the real CLI's `rate_limit_info` object decodes
+    /// into; that pinning test lives in `tool_adapter.rs`, against the
+    /// verbatim captured payload). This only proves
+    /// `RateLimitState`/`RateLimitWindow` behave correctly (tolerant enum,
+    /// camelCase-friendly rename) when embedded in *some* `rename_all =
+    /// "camelCase"` struct -- if production ever dropped its own
+    /// `rename_all`, this test would keep passing, since it defines its own.
     #[test]
-    fn rate_limit_info_decodes_from_the_real_captured_payload() {
+    fn rate_limit_state_and_window_deserialize_correctly_when_embedded_in_a_camel_case_struct() {
         let raw = r#"{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}"#;
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -271,5 +308,37 @@ mod tests {
             RateLimitWindow::Other("five_hour".to_string()).as_str(),
             "five_hour"
         );
+    }
+
+    /// Issue #84 review, finding 2: an unbounded unrecognized value must not
+    /// reach the DB/event bus/TUI verbatim -- truncated to
+    /// `MAX_OTHER_VALUE_CHARS`, with an ellipsis marking the cut.
+    #[test]
+    fn an_overly_long_unrecognized_status_is_truncated_not_stored_verbatim() {
+        let huge = "x".repeat(10_000);
+        let state = RateLimitState::from(huge.clone());
+        let RateLimitState::Other(stored) = state else {
+            panic!("expected Other for an unrecognized value");
+        };
+        assert!(
+            stored.chars().count() <= MAX_OTHER_VALUE_CHARS + 1,
+            "stored value must be bounded, got {} chars",
+            stored.chars().count()
+        );
+        assert!(stored.ends_with('…'));
+        assert_ne!(stored, huge);
+    }
+
+    /// Issue #84 review, finding 2: a control character (e.g. a raw
+    /// terminal escape sequence) in an unrecognized value must never reach
+    /// `warden-tui`'s rendering unescaped.
+    #[test]
+    fn control_characters_in_an_unrecognized_status_are_stripped() {
+        let hostile = "blocked\u{1b}[31mFAKE\u{1b}[0m\nmore".to_string();
+        let state = RateLimitState::from(hostile);
+        let RateLimitState::Other(stored) = state else {
+            panic!("expected Other for an unrecognized value");
+        };
+        assert!(!stored.chars().any(|c| c.is_control()), "{stored:?}");
     }
 }

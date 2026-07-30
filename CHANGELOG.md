@@ -7,6 +7,56 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #84 : fondation quota — cartographie `rate_limit_info` + `RateLimitStatus` + seam `extract_rate_limit`
+
+> **Fondation seulement** (sous-tâche de #83, bloque #85/#86/#87) : capte, type,
+> persiste et publie le signal de quota. **Rien ici** sur le seuil d'anticipation,
+> `RunState::AwaitingQuotaReset`, la suspension ou la reprise autonome — ce sont
+> les sous-tâches suivantes.
+
+- **Cartographie du format réel** (préalable explicite du ticket) : `claude
+  --output-format stream-json` émet, une fois par tour assistant, un événement
+  `rate_limit_event` jusqu'ici jeté comme bruit par `parse_progress_line`
+  (`tool_adapter.rs`). Capturé contre le vrai CLI (`claude` `2.1.220 (Claude
+  Code)`) :
+  `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},...}`.
+  Constat déterminant : **aucun champ `used`/`limit`/`remaining` n'existe** —
+  la forme `RateLimitStatus { used, limit, remaining, resets_at, scope }`
+  proposée par #83 ne correspond à rien de ce qu'émet un vrai CLI et n'est donc
+  pas implémentée ; `resetsAt` (epoch secondes) est en revanche fourni
+  **directement** par le CLI, réglant l'autre question ouverte de #83 (pas
+  besoin de dériver une heure de reset depuis une fenêtre + un horodatage).
+- **`warden_core::RateLimitStatus`** : `status`/`rate_limit_type` (enums tolérants
+  aux valeurs futures inconnues via `Other(String)`, jamais un échec de parse —
+  et bornés en longueur/caractères de contrôle à la construction, une sortie
+  d'agent CLI restant non fiable jusqu'à validation), `utilization`/
+  `surpassed_threshold` (fractions `0.0..=1.0`, jamais un pourcentage),
+  `is_using_overage` (bool), `resets_at` (unix secondes).
+- **Nouveau seam optionnel `ToolAdapter::extract_rate_limit(stdout) -> Option<RateLimitStatus>`**,
+  calqué sur `extract_usage` (#53) : défaut `None` → « n/a », jamais un statut
+  fabriqué. `ClaudeAdapter` l'implémente ; `CodexAdapter`/`MistralAdapter`
+  héritent du défaut. Contrairement à `extract_usage` (une seule ligne
+  terminale), `rate_limit_event` est répété à chaque tour — l'implémentation
+  parcourt tout le stdout capturé et ne garde que le rapport le plus récent.
+  `parse_progress_line` continue de traiter `rate_limit_event` à l'identique
+  (jeté pour un observateur en direct) — ce seam est additif, jamais un
+  détournement de cette méthode.
+- **Validation à la frontière** (`ClaudeAdapter::extract_rate_limit`, seul point
+  qui lit ce stdout non fiable) : `utilization`/`surpassed_threshold` rejetés
+  hors de `0.0..=2.0` (borne volontairement au-delà de `1.0` — `isUsingOverage`
+  prouve qu'un compte peut légitimement dépasser 100 % du quota — mais bien en
+  deçà d'un `93.0` qui trahirait un futur CLI passé au pourcentage) ou non
+  finis ; `resets_at` rejeté si `<= 0`. Rejet (`None` + `tracing::warn!`
+  nommant la valeur fautive), jamais de clamp silencieux. Un `rate_limit_event`
+  le plus récent qui échoue à décoder ou à valider ne retombe **jamais**
+  silencieusement sur un rapport plus ancien du même flux — verrouillé par test.
+- **Persistance du dernier statut connu + publication** : migration
+  `crates/warden/migrations/0011_rate_limit_status.sql` (six colonnes nullables
+  sur `runs`, écrasées — pas accumulées, contrairement au total de tokens — à
+  chaque nouveau rapport). Nouveau `RunEvent::RateLimitStatusUpdated { role,
+  status }` / `EventKind::RateLimitStatusUpdated`, publié par
+  `Orchestrator::run_agent` dès qu'une invocation rapporte un statut.
+
 ### Added — Issue #79 : étapes de workflow non-agent (`type: hook`)
 
 - **Discriminant `type: agent | hook` sur une étape de `.warden/workflow.yaml`** :
