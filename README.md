@@ -565,12 +565,13 @@ steps:
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
   (exactement comme le reviewer/tester aujourd'hui) ; `scoped-re-review` (issue #81) gate
   de la même façon, **plus** une optimisation de re-review scopée : le premier passage de
-  cette étape sur le run porte sur tout le diff du cycle, puis chaque réinvocation
-  suivante est scopée au seul correctif du coder (et aux findings qui l'ont motivé) — sauf
-  si l'étape a été sautée le temps d'un ou plusieurs cycles (une étape gatée plus tôt a
-  bloqué avant d'atteindre celle-ci), auquel cas elle reçoit à nouveau un passage complet,
-  puisqu'un scope correctif lui ferait ignorer les commits produits pendant les cycles
-  manqués. `workflow.steps[1]` (la première étape gatée) bénéficie de cette même
+  cette étape sur le run porte sur tout le diff du cycle, puis les réinvocations
+  suivantes sont scopées au seul correctif du coder (et aux findings qui l'ont motivé) —
+  à condition que l'invocation précédente de l'étape ait bien porté sur le commit de base
+  du diff de ce cycle. Si l'étape n'a pas vu ce commit de base (une étape gatée plus tôt
+  a bloqué avant de l'atteindre, pendant un ou plusieurs cycles), elle reçoit à nouveau un
+  passage complet : un scope correctif lui ferait ignorer les commits produits pendant les
+  cycles manqués. `workflow.steps[1]` (la première étape gatée) bénéficie de cette même
   optimisation sans le déclarer, quel que soit son propre `gate` (rétro-compatibilité) ;
   absent = simple pass-through.
 - `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :

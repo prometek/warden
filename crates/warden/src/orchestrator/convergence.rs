@@ -290,11 +290,15 @@ impl Orchestrator {
 
             // Issue #81 review, HIGH: captured before the producer call
             // below reassigns `base_commit` to this cycle's new commit --
-            // this is the commit this cycle's producer diff was computed
-            // *against* (see `agents.rs::run_producer`'s own `base_commit_sha`),
-            // and therefore the value a step's own `step_last_reviewed_commit`
-            // must match for a `Correctif` scope to be sound for it this
-            // cycle (see that vec's own docs above).
+            // from cycle 2 on, this is the commit this cycle's producer diff
+            // was computed *against* (see `agents.rs::run_producer`'s own
+            // `base_commit_sha`), and therefore the value a step's own
+            // `step_last_reviewed_commit` must match for a `Correctif` scope
+            // to be sound for it this cycle (see that vec's own docs above).
+            // On cycle 1 it is still the literal ref `"HEAD"` (this loop's
+            // initial `base_commit`) rather than a resolved SHA, which is
+            // harmless: every `step_last_reviewed_commit` entry is `None`
+            // then, so nothing can match it and every step gets `Full`.
             let producer_base_commit_this_cycle = base_commit.clone();
             let producer_role = &config.workflow.steps[0].role;
             let producer_result = self
@@ -3811,7 +3815,7 @@ steps:
         let repo = init_test_repo();
         let warden_home = TempDir::new().unwrap();
         let db_dir = TempDir::new().unwrap();
-        let db_dir_techlead_count = TempDir::new().unwrap();
+        let techlead_count_dir = TempDir::new().unwrap();
         let tester_invocations = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
@@ -3841,7 +3845,7 @@ steps:
                             echo '{{"source":"techlead","severity":"blocking","description":"now it is not happy"}}'
                         fi
                         "#,
-                    db_dir_techlead_count.path().display()
+                    techlead_count_dir.path().display()
                 ),
             ],
         );
@@ -3924,7 +3928,7 @@ steps:
                  and reboucle instead of exhausting"
         );
         let techlead_count =
-            std::fs::read_to_string(db_dir_techlead_count.path().join("count")).unwrap();
+            std::fs::read_to_string(techlead_count_dir.path().join("count")).unwrap();
         assert_eq!(techlead_count.trim(), "2");
     }
 

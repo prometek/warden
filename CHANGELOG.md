@@ -12,10 +12,16 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 - **Nouveau `gate: scoped-re-review`** (aux côtés de `loop-until-clean` et du pass-through
   implicite) : une étape déclarant ce gate reçoit un passage complet sur tout le diff du
   cycle la première fois qu'elle tourne dans le run, puis un scope `correctif` (juste le
-  correctif du coder + les findings qui l'ont motivé) à chaque réinvocation suivante — cette
-  optimisation (#37/ADR-0014, « re-review scopée ») n'était jusqu'ici câblée que sur la
-  *position* de la première étape gated (`workflow.steps[1]`, historiquement le reviewer).
-  Utilisable désormais par n'importe quelle étape, à n'importe quelle position.
+  correctif du coder + les findings qui l'ont motivé) sur les réinvocations suivantes —
+  cette optimisation (#37/ADR-0014, « re-review scopée ») n'était jusqu'ici câblée que sur
+  la *position* de la première étape gated (`workflow.steps[1]`, historiquement le
+  reviewer). Utilisable désormais par n'importe quelle étape, à n'importe quelle position.
+- Le scope `correctif` n'est accordé que si l'invocation précédente de l'étape portait
+  bien sur le commit de base du diff de ce cycle. Une étape qui n'a pas vu ce commit de
+  base (une étape gatée plus tôt a bloqué avant que le pipeline ne l'atteigne, pendant un
+  ou plusieurs cycles) reçoit à nouveau un passage complet : un payload correctif ne
+  transporte que le diff du cycle courant et lui ferait ignorer les commits produits
+  pendant les cycles manqués.
 - **Budget de cycles par étape (`max_cycles: N`)**, en alternative à
   `budget: review|test|extra` : une étape peut fixer son propre compteur de cycles
   indépendant plutôt que de partager l'un des trois buckets figés au niveau du run. Chargé

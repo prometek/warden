@@ -119,10 +119,24 @@ pub enum Gate {
     /// finding attributed to this step's own role reboucles within budget),
     /// **plus** a scoped-re-review optimization (#37/ADR-0014, "re-review
     /// scopée"): this step's very first pass over a run's body of work is
-    /// full (the whole cycle diff); every invocation that follows a producer
+    /// full (the whole cycle diff); an invocation that follows a producer
     /// correction is scoped to just that correctif plus the findings that
     /// motivated it ([`crate::agent_wire::ReviewScope::Correctif`]), instead
-    /// of the whole diff again. Before this, that optimization was wired
+    /// of the whole diff again.
+    ///
+    /// That scoping is conditional, not automatic on every re-invocation
+    /// (issue #81 review, HIGH): it applies only when this step's *previous*
+    /// invocation targeted the very commit this cycle's producer diff is
+    /// computed against. A step that never saw that base commit -- it was
+    /// skipped for one or more cycles because an earlier gated step blocked
+    /// before the pipeline reached it -- gets a full pass on its return
+    /// instead, since a correctif payload carries only the current cycle's
+    /// producer diff and would silently omit every commit produced during
+    /// the cycles it missed. (A cycle in which the producer committed
+    /// nothing leaves the base commit unchanged, so the scoping correctly
+    /// still applies: there was nothing for the step to miss.)
+    ///
+    /// Before this, the optimization was wired
     /// only into the built-in reviewer's own *position* (`workflow.steps[1]`,
     /// `warden::orchestrator::run_convergence_loop`'s `has_reviewed_once`) --
     /// this makes it a property any step can opt into, at any position,
