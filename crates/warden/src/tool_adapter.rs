@@ -1822,6 +1822,115 @@ mod tests {
         );
     }
 
+    /// Builds a `rate_limit_event` line with a chosen `utilization`, so the
+    /// accept/reject boundary can be probed exactly rather than only at the
+    /// far-apart values the other tests use (`1.05` accepted, `93.0`
+    /// rejected leave the actual cut-off unpinned).
+    fn rate_limit_line_with_utilization(utilization: &str) -> String {
+        format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":{utilization},"isUsingOverage":true,"surpassedThreshold":0.97}}}}"#
+        )
+    }
+
+    /// Pins the exact `MAX_PLAUSIBLE_QUOTA_FRACTION` cut-off. The bound is a
+    /// deliberate judgement call (see the constant's docs: high enough to
+    /// keep a legitimate overage report, low enough to catch a
+    /// fraction-to-percentage unit regression), so where it sits is a
+    /// behavioural contract worth a regression test, not an implementation
+    /// detail -- issue #85 will act on values right up against it.
+    #[test]
+    fn extract_rate_limit_accepts_up_to_the_plausible_ceiling_and_rejects_past_it() {
+        for accepted in ["0.0", "1.0", "1.9999", "2.0"] {
+            let stdout = rate_limit_line_with_utilization(accepted);
+            assert!(
+                ClaudeAdapter.extract_rate_limit(&stdout).is_some(),
+                "utilization {accepted} is within the plausible range and must be accepted"
+            );
+        }
+        for rejected in ["2.0001", "3.0", "93.0"] {
+            let stdout = rate_limit_line_with_utilization(rejected);
+            assert_eq!(
+                ClaudeAdapter.extract_rate_limit(&stdout),
+                None,
+                "utilization {rejected} is past the plausible ceiling and must be rejected"
+            );
+        }
+    }
+
+    /// `-0.0 < 0.0` is false in IEEE 754, so a negative-zero utilization
+    /// takes the accept path. Harmless (it *is* zero), but pinned so the
+    /// behaviour is a decision on record rather than an accident.
+    #[test]
+    fn extract_rate_limit_treats_negative_zero_utilization_as_zero() {
+        let stdout = rate_limit_line_with_utilization("-0.0");
+        let status = ClaudeAdapter.extract_rate_limit(&stdout).unwrap();
+        assert_eq!(status.utilization, 0.0);
+    }
+
+    /// The far end of `resets_at`'s accepted range. `i64::MAX` is absurd as a
+    /// timestamp but is not what this boundary exists to reject (that is
+    /// `<= 0`), and silently dropping it would be a surprise; `i64::MIN`
+    /// must be rejected like any other non-positive value.
+    #[test]
+    fn extract_rate_limit_accepts_a_far_future_resets_at_and_rejects_the_extreme_negative() {
+        let far_future = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":{},"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}}}"#,
+            i64::MAX
+        );
+        assert_eq!(
+            ClaudeAdapter
+                .extract_rate_limit(&far_future)
+                .unwrap()
+                .resets_at,
+            i64::MAX
+        );
+
+        let extreme_negative = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":{},"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}}}"#,
+            i64::MIN
+        );
+        assert_eq!(ClaudeAdapter.extract_rate_limit(&extreme_negative), None);
+    }
+
+    /// A CLI writing CRLF line endings must not defeat the scan. `str::lines`
+    /// strips the trailing `\r`, but a stray `\r` left on a JSON line would
+    /// make every decode fail and silently report n/a forever, so this is
+    /// worth pinning rather than assuming.
+    #[test]
+    fn extract_rate_limit_reads_the_event_through_crlf_line_endings() {
+        let stdout = format!(
+            "{}\r\n{}\r\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+            REAL_CAPTURED_RATE_LIMIT_EVENT_LINE
+        );
+        let status = ClaudeAdapter.extract_rate_limit(&stdout).unwrap();
+        assert_eq!(status.utilization, 0.93);
+    }
+
+    /// A trailing newline (what a real CLI actually emits) must not change
+    /// the outcome versus a buffer without one.
+    #[test]
+    fn extract_rate_limit_is_unaffected_by_a_trailing_newline() {
+        let with_newline = format!("{REAL_CAPTURED_RATE_LIMIT_EVENT_LINE}\n");
+        assert_eq!(
+            ClaudeAdapter.extract_rate_limit(&with_newline),
+            ClaudeAdapter.extract_rate_limit(REAL_CAPTURED_RATE_LIMIT_EVENT_LINE)
+        );
+    }
+
+    /// A buffer whose only `rate_limit_event` is malformed has no older
+    /// report to fall back to -- it must still resolve to n/a rather than
+    /// panicking or looping.
+    #[test]
+    fn extract_rate_limit_returns_none_when_the_only_event_present_is_malformed() {
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#,
+        );
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
     #[test]
     fn every_role_has_a_non_blank_default_prompt() {
         for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {

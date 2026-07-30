@@ -341,4 +341,91 @@ mod tests {
         };
         assert!(!stored.chars().any(|c| c.is_control()), "{stored:?}");
     }
+
+    /// Terminal escapes come in two flavours: the C0 `ESC` (U+001B) form the
+    /// test above covers, and the single-byte C1 `CSI` (U+009B), which some
+    /// terminals honour identically. `char::is_control` covers both ranges;
+    /// pinned here so a future hand-rolled "strip only ASCII controls"
+    /// rewrite can't quietly reopen the injection path into `warden-tui`.
+    #[test]
+    fn c1_control_characters_are_stripped_too_not_just_ascii_escapes() {
+        let hostile = "blocked\u{9b}31mFAKE".to_string();
+        let RateLimitState::Other(stored) = RateLimitState::from(hostile) else {
+            panic!("expected Other for an unrecognized value");
+        };
+        assert!(!stored.chars().any(|c| c.is_control()), "{stored:?}");
+        assert!(!stored.contains('\u{9b}'), "{stored:?}");
+    }
+
+    /// Truncation is by character count, never by byte index -- cutting a
+    /// multi-byte UTF-8 sequence mid-sequence would panic. The existing
+    /// length test uses single-byte ASCII, which cannot detect that class of
+    /// bug at all, so this exercises 2-byte and 4-byte code points landing
+    /// exactly on the cut.
+    #[test]
+    fn truncation_never_splits_a_multi_byte_character() {
+        for raw in ["é".repeat(10_000), "🚀".repeat(200)] {
+            let RateLimitState::Other(stored) = RateLimitState::from(raw) else {
+                panic!("expected Other for an unrecognized value");
+            };
+            assert_eq!(
+                stored.chars().count(),
+                MAX_OTHER_VALUE_CHARS + 1,
+                "expected {MAX_OTHER_VALUE_CHARS} chars plus the ellipsis, got {stored:?}"
+            );
+            assert!(stored.ends_with('…'));
+        }
+    }
+
+    /// `#[serde(from = "String")]` means deserialization re-runs the
+    /// sanitizer over an already-sanitized value. If that were not
+    /// idempotent, a status written to the `events` table would decode to a
+    /// *different* value on replay, drifting a little further on every
+    /// round-trip. Covers the awkward case too: a truncation landing on a
+    /// trailing space, which the whitespace collapse then has to re-handle.
+    #[test]
+    fn sanitizing_an_already_sanitized_value_is_stable() {
+        for raw in [
+            "x".repeat(10_000),
+            "🚀".repeat(200),
+            format!("{} tail", "y".repeat(63)),
+            "  spaced   out  ".to_string(),
+            "blocked\u{1b}[31m".to_string(),
+            String::new(),
+            "   ".to_string(),
+        ] {
+            let RateLimitState::Other(once) = RateLimitState::from(raw.clone()) else {
+                panic!("expected Other for an unrecognized value");
+            };
+            let RateLimitState::Other(twice) = RateLimitState::from(once.clone()) else {
+                panic!("expected Other for an unrecognized value");
+            };
+            assert_eq!(once, twice, "sanitizing {raw:?} is not idempotent");
+        }
+    }
+
+    /// The whole point of finding 2 is that nothing unbounded or
+    /// control-laden reaches the DB, the `events` payload, or the TUI. A
+    /// hostile value must therefore survive a full JSON round-trip
+    /// (serialize, deserialize) still bounded and still control-free.
+    #[test]
+    fn a_hostile_unrecognized_status_stays_bounded_across_a_json_round_trip() {
+        let hostile = format!("blocked\u{1b}[31m{}", "x".repeat(10_000));
+        let status = RateLimitStatus::new(
+            RateLimitState::from(hostile),
+            RateLimitWindow::SevenDay,
+            0.93,
+            false,
+            0.75,
+            1785686400,
+        );
+        let decoded: RateLimitStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(decoded, status, "a round-trip must not drift the value");
+        let RateLimitState::Other(stored) = decoded.status else {
+            panic!("expected Other for an unrecognized value");
+        };
+        assert!(stored.chars().count() <= MAX_OTHER_VALUE_CHARS + 1);
+        assert!(!stored.chars().any(|c| c.is_control()));
+    }
 }
