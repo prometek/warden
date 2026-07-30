@@ -1,0 +1,17 @@
+name: with-scoped-review
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: secreview
+    agent: security-reviewer
+    gate: scoped-re-review
+    max_cycles: 3
+  - role: tester
+    agent: test-runner
+    gate: loop-until-clean
+    budget: test
+    evidence: true
