@@ -867,6 +867,33 @@ retourne `None`) s'affiche « n/a », jamais un `0` fabriqué. `ClaudeAdapter` l
 envelope `result` déjà capturé pour les findings (`--output-format stream-json`), sans second
 parcours du flux ; persisté en base par la migration `crates/warden/migrations/0008_token_usage.sql`.
 
+**Statut de quota du CLI (issue #84 — fondation)** : distinct de la consommation de tokens
+ci-dessus (combien a été consommé) — il s'agit ici du **quota restant côté outil**. `claude
+--output-format stream-json` émet, une fois par tour assistant, un événement
+`rate_limit_event` que warden jetait jusqu'ici comme bruit. Il est désormais capté par un
+seam dédié (`ToolAdapter::extract_rate_limit`, même patron optionnel que `extract_usage` :
+un outil qui n'expose rien retourne `None` → « n/a », jamais un statut fabriqué ;
+`ClaudeAdapter` l'implémente, `CodexAdapter`/`MistralAdapter` héritent du défaut), typé en
+`warden_core::RateLimitStatus`, persisté par la migration
+`crates/warden/migrations/0011_rate_limit_status.sql` (dernier statut connu, écrasé à chaque
+rapport — un taux d'utilisation instantané ne s'additionne pas) et publié sur l'Event Bus
+(`RunEvent::RateLimitStatusUpdated`).
+
+Le format a été cartographié contre le vrai CLI plutôt que supposé, et le constat compte :
+le CLI **ne fournit aucun compteur absolu** (`used`/`limit`/`remaining` n'existent pas), mais
+une simple fraction `utilization` (`0.93` = 93 %, jamais un pourcentage) accompagnée de
+`status`, `rateLimitType`, `isUsingOverage`, `surpassedThreshold` et `resetsAt` (epoch
+secondes) — l'heure de réinitialisation est donc **donnée directement**, sans avoir à la
+dériver. Ces valeurs venant d'une sortie d'agent non fiable, elles sont validées à la
+frontière (fractions hors `0.0..=2.0` ou non finies, `resets_at <= 0` → rejet avec
+`tracing::warn!`, jamais de clamp silencieux) ; un `rate_limit_event` récent illisible fait
+tomber le statut à « n/a » et ne retombe jamais sur un rapport plus ancien du même flux.
+
+> **Fondation seulement.** Cette issue capte, type, persiste et publie le signal. Elle ne
+> change *aucun* comportement de run : rien n'anticipe encore l'épuisement du quota, ne
+> suspend un run, ni ne le reprend au reset — ce sont les issues #85/#86, et l'affichage
+> dédié en TUI est l'issue #87 (voir l'épique #83).
+
 **Vue arborescente du workflow (issue #54)** : entre le header et le journal d'événements,
 un panneau dédié projette le run sous forme d'arbre git-graph-like (rails `│`/`├─`/`╰─`) —
 une branche par cycle, portant ses nœuds d'invocation d'agent (coder/reviewer/tester, dans
