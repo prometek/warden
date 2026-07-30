@@ -377,14 +377,21 @@ struct GatedStepInvocation<'a> {
     /// cycle. Read as "the findings that prompted this correctif" instead
     /// when `scope` is `Correctif` (issue #40).
     prior_findings: &'a [Finding],
-    /// `ReviewScope::Full` for every step except the first gated one on a
-    /// cycle that follows the run's very first full pass;
-    /// `ReviewScope::Correctif` only then (issue #40, decision #37 Q2) --
-    /// see [`warden_core::ReviewScope`]. This is a **positional** pipeline
-    /// mechanic (`run_convergence_loop` only ever sets `Correctif` for
-    /// `step_index == 1`), never a role-name check -- see
-    /// [`Orchestrator::run_gated_step`]'s own docs for the defensive
-    /// re-check this struct's `step_index` backs.
+    /// `ReviewScope::Full` for every step except one following its own first
+    /// full pass over a run's body of work; `ReviewScope::Correctif` then
+    /// (issue #40, decision #37 Q2; generalized beyond the built-in reviewer
+    /// by issue #81) -- see [`warden_core::ReviewScope`]. Legal in exactly
+    /// two cases, both decided by `run_convergence_loop`, never by this
+    /// struct's own caller: the first gated step (`step_index == 1`,
+    /// positional, retained unchanged for retro-compat), or any step whose
+    /// own declared `gate` is [`warden_core::Gate::ScopedReReview`] --
+    /// [`Orchestrator::run_gated_step`]'s own docs describe the defensive
+    /// re-check this backs. That re-check derives the step's own declared
+    /// gate from `config.workflow.steps[step_index]` itself (issue #81
+    /// review, LOW) rather than trusting a separate field this same struct's
+    /// caller would otherwise supply -- a caller passing a mismatched
+    /// `step_index`/gate pair could otherwise defeat the very re-check meant
+    /// to catch it.
     scope: warden_core::ReviewScope,
     /// This step's own declared [`warden_core::WorkflowStep::captures_evidence`]
     /// (issue #73 review, finding F2) -- whether a clean run of *this* step
