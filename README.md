@@ -549,8 +549,28 @@ steps:
 - `role` — nom ouvert (pas une énumération fermée) : identifie l'étape et la source des
   findings qu'elle lève (`FindingSource::role(...)`). `ci` et `warden` sont réservés
   (ce sont les autres `FindingSource` non liées à un rôle) et rejetés au parsing.
-- `agent` — nom résolu vers `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013)
-  pour tout rôle au-delà des trois rôles intégrés.
+- `type` — optionnel, `agent` (défaut) ou `hook` (issue #79/ADR-0020) : `agent` spawn un
+  agent LLM (voir `agent` ci-dessous) ; `hook` exécute une commande shell déterministe
+  (voir `run` ci-dessous), sans LLM. La première étape (le producteur) doit toujours être
+  `type: agent` — un hook n'écrit aucun commit, il ne peut que juger un travail déjà écrit.
+  Une étape `type: hook` ne peut pas non plus déclarer `evidence: true` (ADR-0009 capture
+  la session d'une commande *agent*, qu'une étape hook n'a pas). Toute autre valeur est une
+  erreur de parsing claire nommant la valeur invalide.
+- `agent` — uniquement pour `type: agent` (le défaut) : nom résolu vers
+  `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013) pour tout rôle au-delà des
+  trois rôles intégrés.
+- `run` — uniquement pour `type: hook` : la ligne de commande shell exécutée (`sh -c
+  "<run>"`) à travers le même sandbox/policy-gate qu'un hook de cycle de vie
+  (`crate::hook::CommandHook`, issue #55/#51), mais dans le worktree de cette étape (checké
+  out sur le commit du cycle) plutôt que le checkout de l'opérateur. Un exit non nul (ou un
+  refus de `.warden/policy.yaml`) devient exactement une finding bloquante sourcée par
+  `role`, agrégée dans la boucle de convergence comme celle d'une étape `agent`. **Modèle de
+  confiance** : contrairement à un hook de cycle de vie (qui transmet l'environnement complet
+  de l'opérateur — voir la section `.warden/hooks.toml` ci-dessous), une étape `type: hook`
+  ne transmet qu'un allowlist restreint (`HOME`, `LANG`, `TERM`, `CARGO_HOME`, `RUSTUP_HOME`)
+  — c'est la première commande de ce projet qui exécute du code potentiellement écrit par le
+  coder (un `build.rs`, un script `npm test`, ...) avec *un* environnement, jamais l'accès
+  complet de l'opérateur (`SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/`ANTHROPIC_API_KEY`).
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
   (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
 - `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :
@@ -567,17 +587,19 @@ steps:
 identique à celui d'avant l'issue #73 — le pipeline intégré (`--max-review-cycles`/
 `--max-test-cycles`) n'est pas affecté.
 
-**Aucune restriction d'ordre.** Chaque étape — intégrée ou personnalisée — passe par
-exactement le même chemin d'exécution (worktree, sous-processus, validation des
-findings, `agent_processes`, suivi des tokens, récupération après crash). Un rôle
+**Aucune restriction d'ordre.** Chaque étape — intégrée, personnalisée `type: agent`, ou
+`type: hook` — passe par exactement le même chemin d'exécution (worktree, isolation
+sandbox, validation des findings, `agent_processes`, récupération après crash) et le même
+bookkeeping d'événements (`AgentStarted`/`AgentFinished`), même si une étape `type: hook`
+n'a ni sous-processus d'agent ni suivi de tokens (elle ne consomme aucun LLM). Un rôle
 littéralement nommé `coder`/`reviewer`/`tester` est toujours résolu via le chemin
 existant, renforcé et asymétrique en confiance (`resolve_agent_definition`) — ce
 modèle de confiance est inhérent à ce que ces trois noms *signifient*, pas à leur
-position — mais rien n'empêche d'insérer une étape personnalisée (ex. `techlead`)
-*entre* le reviewer et le tester plutôt qu'après les deux, ou de réordonner
+position — mais rien n'empêche d'insérer une étape personnalisée (ex. `techlead`, ou un
+hook `lint`) *entre* le reviewer et le tester plutôt qu'après les deux, ou de réordonner
 davantage. La seule règle structurelle imposée : la première étape est le
 producteur du pipeline (elle crée le commit/diff que les étapes suivantes
-examinent) et ne doit pas déclarer de `gate` (ni de `budget`).
+examinent), doit être `type: agent`, et ne doit déclarer ni `gate` ni `budget`.
 
 Quelle étape gatée est bornée par `--max-review-cycles`/`--max-test-cycles` suit sa
 propre déclaration `budget: review`/`budget: test` — jamais sa position dans le
@@ -590,7 +612,9 @@ est une erreur claire nommant le rôle et le chemin attendu, jamais une étape
 silencieusement ignorée.
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
-`workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.
+`workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo, et
+`examples/workflows/with-lint-hook/` pour un exemple `type: hook` (un `cargo fmt --check`
+déterministe inséré entre le reviewer et le tester, sans coût LLM).
 
 ### Gouverner les actions de warden (`.warden/policy.yaml`, issue #51/ADR-0016)
 

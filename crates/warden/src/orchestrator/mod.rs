@@ -680,3 +680,130 @@ impl Orchestrator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::test_support::*;
+
+    /// A minimal, filesystem-untouched `RunConfig` -- `ResolvedAgents::resolve`
+    /// only ever reads `workflow`/`step_agents`, never the filesystem, so
+    /// `repo_path`/`warden_home` need not exist.
+    fn config_with(
+        workflow: warden_core::Workflow,
+        step_agents: Vec<AgentDefinition>,
+    ) -> RunConfig {
+        RunConfig {
+            repo_path: PathBuf::from("/nonexistent/repo"),
+            warden_home: PathBuf::from("/nonexistent/warden-home"),
+            branch: "main".to_string(),
+            intent: "issue #79 review: ResolvedAgents::resolve coverage".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents,
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        }
+    }
+
+    fn workflow_with_two_hook_steps() -> warden_core::Workflow {
+        warden_core::Workflow::parse_yaml(
+            r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    type: hook
+    run: "true"
+    gate: loop-until-clean
+  - role: two
+    type: hook
+    run: "true"
+    gate: loop-until-clean
+"#,
+        )
+        .unwrap()
+    }
+
+    /// Issue #79 review, MEDIUM: `MismatchedStepAgentCount` changed
+    /// semantics from "one agent per step" to "one agent per `type: agent`
+    /// step" -- this is what makes every `.expect(...)` downstream of
+    /// `ResolvedAgents::resolve` (e.g. `definitions.next().expect(...)`,
+    /// `agents.steps[0].as_ref().expect(...)` in `convergence.rs`) sound.
+    /// Pins the new counting rule directly: a workflow with exactly one
+    /// `type: agent` step (the producer) and two `type: hook` steps must
+    /// reject anything but exactly one resolved agent definition.
+    #[tokio::test]
+    async fn mismatched_step_agent_count_counts_only_agent_kind_steps() {
+        let workflow = workflow_with_two_hook_steps();
+
+        let too_many = config_with(
+            workflow.clone(),
+            vec![
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
+        );
+        let error = match ResolvedAgents::resolve(&FakeCommandAdapter, &too_many) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a mismatched-count error"),
+        };
+        assert!(
+            matches!(
+                error,
+                WardenError::MismatchedStepAgentCount {
+                    agent_steps: 1,
+                    step_agents: 2,
+                }
+            ),
+            "expected agent_steps: 1 (only the producer is type: agent), step_agents: 2: {error:?}"
+        );
+
+        let too_few = config_with(workflow, Vec::new());
+        let error = match ResolvedAgents::resolve(&FakeCommandAdapter, &too_few) {
+            Err(error) => error,
+            Ok(_) => panic!("expected a mismatched-count error"),
+        };
+        assert!(
+            matches!(
+                error,
+                WardenError::MismatchedStepAgentCount {
+                    agent_steps: 1,
+                    step_agents: 0,
+                }
+            ),
+            "expected agent_steps: 1, step_agents: 0: {error:?}"
+        );
+    }
+
+    /// Issue #79 review, MEDIUM: pins the alignment invariant every
+    /// `agents.steps[i]` access relies on -- a `type: agent` step resolves
+    /// to `Some`, a `type: hook` step to `None`, at that step's own index in
+    /// `config.workflow.steps`, not merely "the right count".
+    #[tokio::test]
+    async fn resolved_agents_are_some_only_at_a_type_agent_steps_own_index() {
+        let workflow = workflow_with_two_hook_steps();
+        let config = config_with(workflow, vec![definition(always_passing_tester())]);
+
+        let resolved = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
+
+        assert_eq!(resolved.steps.len(), 3);
+        assert!(
+            resolved.steps[0].is_some(),
+            "steps[0] (\"coder\", type: agent) must resolve to Some"
+        );
+        assert!(
+            resolved.steps[1].is_none(),
+            "steps[1] (\"one\", type: hook) must resolve to None"
+        );
+        assert!(
+            resolved.steps[2].is_none(),
+            "steps[2] (\"two\", type: hook) must resolve to None"
+        );
+    }
+}

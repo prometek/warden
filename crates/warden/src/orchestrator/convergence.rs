@@ -2365,6 +2365,12 @@ steps:
     /// deterministic command path instead of spawning a subprocess. A clean
     /// exit converges the run, and the marker file proves the shell command
     /// actually ran (not merely "parsed").
+    ///
+    /// Issue #79 review, MEDIUM: also proves the step's `agent_processes`
+    /// bookkeeping and `AgentStarted`/`AgentFinished` event pair -- the same
+    /// crash-recovery visibility and observability every agent invocation
+    /// already gets -- so a hook step is never invisible to
+    /// `recover_crashed_runs` or a `warden-tui` observer.
     #[tokio::test]
     async fn a_hook_step_gates_the_pipeline_like_an_agent_step() {
         let repo = init_test_repo();
@@ -2417,7 +2423,7 @@ steps:
             untrusted_repo_agent_definitions: Vec::new(),
         };
 
-        let (_run_id, final_state) = orchestrator
+        let (run_id, final_state) = orchestrator
             .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
             .await
             .unwrap();
@@ -2426,6 +2432,31 @@ steps:
         assert!(
             marker_path.exists(),
             "the hook step's shell command actually ran"
+        );
+
+        // Issue #79 review, MEDIUM: no `agent_processes` row is left open --
+        // proving `mark_agent_process_ended` fired for the hook step's own
+        // process, not just for the coder's.
+        let open_processes = db::list_open_agent_processes_for_run(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(
+            open_processes.is_empty(),
+            "the hook step's agent_processes row must be marked ended, found {} still open",
+            open_processes.len()
+        );
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        let lint_started = persisted.iter().any(
+            |record| matches!(&record.event, RunEvent::AgentStarted { role } if role == "lint"),
+        );
+        let lint_finished = persisted.iter().any(|record| {
+            matches!(&record.event, RunEvent::AgentFinished { role, exit_code, .. }
+                if role == "lint" && *exit_code == 0)
+        });
+        assert!(
+            lint_started && lint_finished,
+            "expected an AgentStarted/AgentFinished pair for the \"lint\" hook step: {persisted:?}"
         );
     }
 
@@ -2512,6 +2543,28 @@ steps:
                     if severity == "blocking" && description.contains("exited 1") && description.contains("boom")
             ));
         }
+
+        // Issue #79 review, MEDIUM: every cycle's `agent_processes` row is
+        // still marked ended, and an `AgentFinished` with the real exit code
+        // is published, even though the step itself keeps failing -- a
+        // budget-exhausted run is not a crash.
+        let open_processes = db::list_open_agent_processes_for_run(&pool, &run_id)
+            .await
+            .unwrap();
+        assert!(
+            open_processes.is_empty(),
+            "found {} still-open agent_processes row(s) for a run that ran to budget \
+                 exhaustion, not a crash",
+            open_processes.len()
+        );
+        let lint_finished_nonzero = persisted.iter().any(|record| {
+            matches!(&record.event, RunEvent::AgentFinished { role, exit_code, .. }
+                if role == "lint" && *exit_code == 1)
+        });
+        assert!(
+            lint_finished_nonzero,
+            "expected an AgentFinished{{role: \"lint\", exit_code: 1}} event: {persisted:?}"
+        );
     }
 
     /// Issue #51/ADR-0016 reuse: a `.warden/policy.yaml` rule denying a

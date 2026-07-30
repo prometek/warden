@@ -445,6 +445,20 @@ impl Workflow {
             // the wire shape alone.
             let kind = match &step.kind {
                 None => StepKind::Agent,
+                // Issue #79 review (optional): `policy` is a real value from
+                // the ticket this issue shipped against (#79's own "agent |
+                // hook | policy" framing) -- a reader who tries it should be
+                // told it isn't supported *yet*, not that they made a typo.
+                // `warden-policy` (#51) is consumed as an execution
+                // mechanic's *infra* (`type: hook`'s own policy-gated
+                // command), but a step whose whole *identity* is a policy
+                // decision is intentionally out of scope for this delivery.
+                Some(raw_kind) if raw_kind == "policy" => {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "step {index} (role {role:?}): type: policy is not supported yet (see \
+                         issue #51) -- use type: agent or type: hook"
+                    )));
+                }
                 Some(raw_kind) => StepKind::parse(raw_kind).map_err(|_| {
                     CoreError::InvalidWorkflow(format!(
                         "step {index} (role {role:?}): unknown type {raw_kind:?} (expected \
@@ -1076,10 +1090,25 @@ steps:
     #[test]
     fn rejects_an_unknown_type() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
-                     type: policy\n    run: true\n";
+                     type: bogus\n    run: true\n";
         let error = Workflow::parse_yaml(yaml).unwrap_err();
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
         assert!(error.to_string().contains("unknown type"), "{error}");
+    }
+
+    /// Issue #79 review (optional): `type: policy` is a real value from the
+    /// ticket this issue shipped against, not a typo -- the error must say
+    /// "not supported yet", never lump it in with a genuinely unrecognized
+    /// string.
+    #[test]
+    fn a_type_policy_step_is_rejected_as_not_supported_yet_not_as_an_unknown_type() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
+                     type: policy\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        let message = error.to_string();
+        assert!(message.contains("not supported yet"), "{message}");
+        assert!(!message.contains("unknown type"), "{message}");
     }
 
     #[test]

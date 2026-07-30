@@ -7,6 +7,35 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #79 : étapes de workflow non-agent (`type: hook`)
+
+- **Discriminant `type: agent | hook` sur une étape de `.warden/workflow.yaml`** :
+  `agent` (défaut, rétro-compatibilité stricte — une étape qui omet `type` se comporte
+  exactement comme avant) spawn un agent LLM ; `hook` exécute une commande shell
+  déterministe (`run: "<commande>"`), sans LLM, à travers le même sandbox/policy-gate
+  qu'un hook de cycle de vie (issue #55/#51, `warden::hook`) — réutilisé, jamais dupliqué.
+- **Verdict agrégé comme n'importe quelle étape** : un exit non nul (ou un refus de
+  `.warden/policy.yaml`) devient exactement une finding bloquante sourcée par le rôle de
+  l'étape, qui reboucle le pipeline vers le producteur dans son propre budget de cycle —
+  la boucle de convergence traite une étape `type: hook` en échec identiquement à une
+  étape `type: agent` en échec, sans changement à `decide_next_state_for_step`.
+- **Restrictions structurelles** : la première étape (le producteur) doit toujours être
+  `type: agent` (un hook n'écrit aucun commit) ; une étape `type: hook` ne peut pas
+  déclarer `evidence: true` (ADR-0009 capture la session d'une commande *agent*, qu'un
+  hook n'a pas) ; `agent`/`run` sont mutuellement exclusifs selon `type` — chaque erreur
+  de configuration est un message clair nommant l'étape et le champ fautif.
+- **Bookkeeping identique à une étape agent** : une étape `type: hook` obtient son propre
+  worktree, sa propre ligne `agent_processes` (pid, exit code) et sa propre paire
+  d'événements `AgentStarted`/`AgentFinished` — visible à `recover_crashed_runs` et à
+  `warden-tui` comme n'importe quel rôle.
+- **Modèle de confiance environnement, délibérément restreint** : une étape `type: hook`
+  s'exécute dans le worktree checké out sur le commit du cycle (potentiellement écrit par
+  le coder), jamais le checkout de l'opérateur — elle ne transmet donc qu'un allowlist
+  explicite (`HOME`/`LANG`/`TERM`/`CARGO_HOME`/`RUSTUP_HOME`), jamais l'environnement
+  complet de l'opérateur qu'un hook de cycle de vie (`.warden/hooks.toml`) transmet.
+- **Exemple** : `examples/workflows/with-lint-hook/` (un `cargo fmt --all -- --check`
+  inséré entre le reviewer et le tester).
+
 ### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
 
 - **Régression introduite par l'issue #26** : `main.rs` résolvait

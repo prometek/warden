@@ -226,7 +226,7 @@ impl Hook for CommandHook {
             self.run,
             ctx.point.as_str(),
             output.exit_code,
-            format_stderr_tail_suffix(&output.stderr_tail)
+            format_tail_suffix(&output.stderr_tail)
         );
 
         if self.block_on_failure {
@@ -244,22 +244,38 @@ impl Hook for CommandHook {
     }
 }
 
+/// The last `max_chars` characters of `text`, trimmed of trailing
+/// whitespace -- shared tail-truncation so a reason/log line never dumps a
+/// whole build log, just its actionable end. `pub(crate)`: reused by
+/// `orchestrator::agents::run_gated_hook_step` (issue #79) for a `type:
+/// hook` workflow step's own failure reason, the same trimming
+/// [`run_sandboxed_shell`] already applies to a lifecycle hook's.
+pub(crate) fn trailing_chars(text: &str, max_chars: usize) -> String {
+    let reversed: String = text.trim_end().chars().rev().take(max_chars).collect();
+    reversed.chars().rev().collect()
+}
+
 /// The outcome of running one shell command through [`run_sandboxed_shell`].
 struct SandboxedCommandOutput {
     exit_code: i32,
-    /// The last 500 characters of stderr, trimmed and reversed back into
-    /// reading order -- see [`run_sandboxed_shell`]'s own docs.
+    /// The last 500 characters of stderr -- see [`run_sandboxed_shell`]'s own
+    /// docs.
     stderr_tail: String,
 }
 
 /// Runs `command` via `sh -c "<command>"` inside `sandbox`, cwd `cwd`,
 /// forwarding the operator's full environment ([`CommandHook::full_env_allowlist`]
 /// -- see [`CommandHook`]'s own "Environment" docs for why a deterministic
-/// action forwards everything where an agent forwards almost nothing). The
-/// sandboxed-shell-command mechanics shared by [`CommandHook::run`] (a
-/// lifecycle hook, issue #55) and [`run_workflow_step_command`] (a `type:
-/// hook` workflow step, issue #79) -- factored out here so neither
-/// duplicates the create/execute/destroy dance or the stderr-tail trimming.
+/// action forwards everything where an agent forwards almost nothing). Used
+/// by [`CommandHook::run`] (a lifecycle hook, issue #55) only -- **not**
+/// shared with a `type: hook` workflow step's own command execution (issue
+/// #79 review, HIGH): a `type: hook` step runs against a worktree checked
+/// out at *this cycle's coder-authored commit* rather than the operator's
+/// own checkout, and needs a narrower, explicit allowlist, cancellation, and
+/// `agent_processes` bookkeeping this helper doesn't provide -- see
+/// `orchestrator::agents::run_gated_hook_step`'s and
+/// `orchestrator::agents::WORKFLOW_STEP_ENV_ALLOWLIST`'s own "Trust model"
+/// docs.
 async fn run_sandboxed_shell(
     sandbox: &Arc<dyn Sandbox>,
     cwd: &std::path::Path,
@@ -299,31 +315,33 @@ async fn run_sandboxed_shell(
 
     // A trimmed stderr tail makes the reason actionable without dumping a
     // whole build log into the event/log line.
-    let reversed_tail: String = output.stderr.trim_end().chars().rev().take(500).collect();
-    let stderr_tail: String = reversed_tail.chars().rev().collect();
-
     Ok(SandboxedCommandOutput {
         exit_code: output.exit_code,
-        stderr_tail,
+        stderr_tail: trailing_chars(&output.stderr, 500),
     })
 }
 
-/// `": <tail>"` when `stderr_tail` is non-empty, otherwise an empty string --
-/// the shared suffix both [`CommandHook::run`]'s and
-/// [`run_workflow_step_command`]'s own failure reasons append.
-fn format_stderr_tail_suffix(stderr_tail: &str) -> String {
-    if stderr_tail.is_empty() {
+/// `": <tail>"` when `tail` is non-empty, otherwise an empty string -- the
+/// shared suffix [`CommandHook::run`]'s and
+/// `orchestrator::agents::run_gated_hook_step`'s (issue #79) own failure
+/// reasons append. `pub(crate)` for the latter.
+pub(crate) fn format_tail_suffix(tail: &str) -> String {
+    if tail.is_empty() {
         String::new()
     } else {
-        format!(": {stderr_tail}")
+        format!(": {tail}")
     }
 }
 
 /// Evaluates `command` as a `warden_policy::Action::Shell` against
 /// `policy_gate` (issue #51, ADR-0016) -- the exact policy check
-/// [`CommandHook::run`] and [`run_workflow_step_command`] (issue #79) both
-/// apply before ever handing `command` to the sandbox.
-async fn evaluate_shell_policy(
+/// [`CommandHook::run`] and `orchestrator::agents::run_gated_hook_step`
+/// (issue #79) both apply before ever handing `command` to the sandbox.
+/// `pub(crate)` for the latter, which is not itself part of this module (the
+/// sandbox lifecycle and `agent_processes` bookkeeping a `type: hook`
+/// workflow step needs live in `orchestrator::agents`, alongside every other
+/// step's own bookkeeping, rather than being duplicated here).
+pub(crate) async fn evaluate_shell_policy(
     policy_gate: &PolicyGate,
     run_id: &str,
     command: &str,
@@ -338,46 +356,6 @@ async fn evaluate_shell_policy(
             },
         )
         .await
-}
-
-/// Runs a `type: hook` workflow step's command (issue #79, ADR-0020): the
-/// same policy-gated, sandboxed-shell-command mechanics a lifecycle
-/// [`CommandHook`] already applies (issue #55/#51), reused here rather than
-/// duplicated, against the step's own worktree (`cwd`) instead of a
-/// [`HookContext::repo_path`].
-///
-/// Returns `Ok(None)` on a clean run (policy-allowed, zero exit) -- this
-/// step raised nothing. Returns `Ok(Some(reason))` when the command was
-/// blocked by policy or exited non-zero; the caller
-/// (`warden::orchestrator::Orchestrator::run_gated_step`) turns that into
-/// this step's own blocking [`warden_core::Finding`], aggregated into the
-/// convergence loop exactly the way a `type: agent` step's own findings
-/// already are (`FindingSource::role`) -- never a run-aborting
-/// [`HookOutcome::Block`]: a `type: hook` step gates the pipeline like any
-/// other step, it does not abort the run outright.
-pub async fn run_workflow_step_command(
-    sandbox: &Arc<dyn Sandbox>,
-    policy_gate: &Arc<PolicyGate>,
-    run_id: &str,
-    cwd: &std::path::Path,
-    command: &str,
-) -> Result<Option<String>> {
-    if let PolicyOutcome::Blocked { reason } =
-        evaluate_shell_policy(policy_gate, run_id, command).await
-    {
-        return Ok(Some(reason));
-    }
-
-    let output = run_sandboxed_shell(sandbox, cwd, command).await?;
-    if output.exit_code == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(format!(
-        "step command `{command}` exited {}{}",
-        output.exit_code,
-        format_stderr_tail_suffix(&output.stderr_tail)
-    )))
 }
 
 #[cfg(test)]

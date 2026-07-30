@@ -44,6 +44,68 @@ fn step_succeeded(role: &Role, findings: &[Finding]) -> bool {
     })
 }
 
+/// The environment variable *names* forwarded to a `type: hook` workflow
+/// step's command (issue #79 review, HIGH -- security).
+///
+/// # Trust model
+///
+/// Deliberately **narrow**, unlike a lifecycle `CommandHook`'s own
+/// `full_env_allowlist` (`crate::hook::CommandHook`'s own "Environment"
+/// docs, which forwards the operator's complete environment). The two
+/// differ because what each runs *against* differs: a `CommandHook` runs an
+/// operator-declared command against the operator's own checkout
+/// (`HookContext::repo_path`); a `type: hook` workflow step runs an
+/// operator-declared *command* but against a worktree checked out at
+/// **this cycle's coder-authored commit** -- the first path in this
+/// codebase where agent-authored code (a `build.rs`, an `npm test` script, a
+/// `Makefile` target, ...) executes with *some* environment at all, and
+/// (under `--isolation docker`) the first hook path that reaches
+/// `DockerSandbox`, which bind-mounts nothing beyond what `env_allowlist`
+/// forwards. Forwarding the operator's full environment here would hand
+/// coder-authored code `SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/
+/// `ANTHROPIC_API_KEY` -- exactly the exposure an agent subprocess is
+/// already denied via its own narrow `ToolAdapter::env_allowlist`. Mirrors
+/// `crate::hook_config`'s own "trust model" docs on `.warden/hooks.toml`,
+/// and generalizes ADR-0021's agent-subprocess-filesystem threat model to
+/// the *environment* an agent-authored command runs with, not just the
+/// filesystem it can reach.
+///
+/// Kept to what a deterministic build/lint/test command needs to run at all:
+/// `PATH` is always forwarded by every `Sandbox` backend regardless of any
+/// allowlist (`LocalSandbox::execute`'s own docs), so it is not repeated
+/// here. `HOME`/`LANG`/`TERM` cover a well-behaved POSIX toolchain;
+/// `CARGO_HOME`/`RUSTUP_HOME` cover a non-default Rust toolchain layout --
+/// harmless to list when unset, since an allowlisted-but-unset variable is
+/// simply never forwarded (`LocalSandbox::execute`'s own docs; a
+/// `DockerSandbox` backend applies the identical rule). Verified
+/// empirically against this crate's own shipped example
+/// (`examples/workflows/with-lint-hook/workflow.yaml`, `cargo fmt --all --
+/// --check`) with nothing but `PATH`/`HOME` set in the invoking shell.
+///
+/// No per-step `env:` override ships yet -- a workflow step whose command
+/// needs something beyond this list fails with a clear, actionable "command
+/// not found"/tool-specific error, not a silent misconfiguration;
+/// broadening what a step can forward is a future, explicit opt-in
+/// (a `workflow.yaml` `env:` key with the same parse-time validation rigour
+/// as `type`/`run`), never a default this list should silently grow into.
+const WORKFLOW_STEP_ENV_ALLOWLIST: &[&str] = &["HOME", "LANG", "TERM", "CARGO_HOME", "RUSTUP_HOME"];
+
+/// One blocking [`Finding`] sourced as `role`'s own `FindingSource` (issue
+/// #79) -- the shape both a policy-denied and a non-zero-exit `type: hook`
+/// step verdict reduce to, aggregated into the convergence loop exactly like
+/// a `type: agent` step's own findings already are.
+fn blocking_step_finding(role: &Role, reason: String) -> Finding {
+    Finding {
+        source: warden_core::FindingSource::role(role.as_str()),
+        severity: warden_core::Severity::Blocking,
+        file: None,
+        description: reason,
+        action: Some(
+            "fix the failing deterministic check; the pipeline retries once corrected".to_string(),
+        ),
+    }
+}
+
 impl Orchestrator {
     /// Invokes `workflow.steps[0]` -- the pipeline's producer (the coder in
     /// the built-in default workflow) -- for one cycle: its own worktree,
@@ -424,12 +486,10 @@ impl Orchestrator {
     }
 
     /// The `type: hook` half of [`Orchestrator::run_gated_step`]'s dispatch
-    /// (issue #79): no LLM, no subprocess -- runs `invocation.run`'s shell
-    /// command deterministically, through the exact sandboxed, policy-gated
-    /// mechanics a lifecycle hook already uses (`crate::hook::run_workflow_step_command`,
-    /// reusing issue #55/#51's infra rather than duplicating it), inside a
-    /// worktree checked out at `invocation.commit` -- the same isolation and
-    /// bookkeeping (`db::set_cycle_worktree_path`) any other gated step gets.
+    /// (issue #79): no LLM -- runs `invocation.run`'s shell command
+    /// deterministically inside a worktree checked out at
+    /// `invocation.commit`, the same isolation and bookkeeping
+    /// (`db::set_cycle_worktree_path`) any other gated step gets.
     ///
     /// A clean run (policy-allowed, zero exit) returns no findings at all;
     /// a blocked/failing one returns exactly one blocking
@@ -437,7 +497,10 @@ impl Orchestrator {
     /// the same shape [`Orchestrator::run_gated_agent_step`] already
     /// produces for a crashed agent, so the convergence loop's own gating
     /// (`decide_next_state_for_step`) treats a failing hook step identically
-    /// to a failing agent step, with no change needed there at all.
+    /// to a failing agent step, with no change needed there at all. The
+    /// sandboxed execution itself (`agent_processes` bookkeeping,
+    /// cancellation, start/finish events) is
+    /// [`Orchestrator::run_step_command`]'s job -- see its own docs.
     ///
     /// Ignores `scope`/`diff`/`prior_findings`/`captures_evidence`: a
     /// deterministic command takes no input payload and
@@ -454,6 +517,7 @@ impl Orchestrator {
             worktree_manager,
             commit,
             run,
+            cancel,
             ..
         } = invocation;
         let command = run.expect(
@@ -472,32 +536,185 @@ impl Orchestrator {
         )
         .await?;
 
-        let verdict = crate::hook::run_workflow_step_command(
-            &self.sandbox,
-            &self.policy_gate,
-            run_id,
-            worktree.path(),
-            command,
-        )
-        .await?;
+        let findings = self
+            .run_step_command(run_id, cycle_id, role, worktree.path(), command, cancel)
+            .await?;
 
         if let Err(error) = worktree.remove().await {
             tracing::warn!(%error, role = role.as_str(), "failed to clean up worktree after cycle");
         }
 
-        Ok(match verdict {
-            None => Vec::new(),
-            Some(reason) => vec![Finding {
-                source: warden_core::FindingSource::role(role.as_str()),
-                severity: warden_core::Severity::Blocking,
-                file: None,
-                description: reason,
-                action: Some(
-                    "fix the failing deterministic check; the pipeline retries once corrected"
-                        .to_string(),
-                ),
-            }],
+        Ok(findings)
+    }
+
+    /// The sandboxed execution of one `type: hook` step's command (issue
+    /// #79 review, MEDIUM), split out of
+    /// [`Orchestrator::run_gated_hook_step`] purely for readability. Mirrors
+    /// [`Orchestrator::run_agent`]'s own shape rather than routing through a
+    /// shared free function: a hook step needs the identical
+    /// `agent_processes` bookkeeping, cancellation, and start/finish event
+    /// pair every agent invocation already gets, which lives here, in the
+    /// orchestrator layer that owns `self.pool`/`self.publish_event` --
+    /// `crate::hook` stays scoped to lifecycle hooks plus the two small,
+    /// reusable pieces this borrows (`evaluate_shell_policy`, the policy
+    /// check; `trailing_chars`/`format_tail_suffix`, tail-trimming for the
+    /// failure reason).
+    ///
+    /// Policy-evaluated first (issue #51, ADR-0016) -- a denied command
+    /// never reaches the sandbox at all, so no `agent_processes` row is
+    /// recorded for it (there is no process to track). Otherwise records the
+    /// row and publishes [`RunEvent::AgentStarted`] right after the sandbox
+    /// reports a pid -- *before* awaiting completion, exactly like
+    /// [`Orchestrator::run_agent`] does for an agent subprocess -- so
+    /// [`crate::orchestrator::recover_crashed_runs`] can detect and reap a
+    /// hook step's orphaned process on restart instead of leaving it
+    /// invisible (issue #79 review, MEDIUM: before this, a `warden` crash
+    /// mid-hook-step left neither a database record nor an event trail).
+    /// Marks the row ended and publishes [`RunEvent::AgentFinished`]
+    /// (`usage: None` -- a deterministic command reports no LLM token usage)
+    /// once the command completes, whichever way.
+    ///
+    /// Full stdout/stderr are logged at `tracing::debug!` regardless of
+    /// outcome (mirrors [`Orchestrator::run_agent`]'s own L1 stderr
+    /// logging) -- otherwise the only durable record of a hook step's
+    /// output, since it is never itself an agent whose stdout a
+    /// `ToolAdapter` parses. On a non-zero exit, the returned finding's
+    /// description carries a trimmed **stderr** tail, falling back to a
+    /// **stdout** tail when stderr is empty (issue #79 review, MEDIUM: most
+    /// linters/formatters -- `rustfmt --check`, `eslint`, most test runners
+    /// -- write their diagnostics to stdout, not stderr; a reason that only
+    /// ever carried the exit code was not actionable).
+    async fn run_step_command(
+        &self,
+        run_id: &str,
+        cycle_id: &str,
+        role: &Role,
+        cwd: &Path,
+        command: &str,
+        cancel: CancellationToken,
+    ) -> Result<Vec<Finding>> {
+        if let PolicyOutcome::Blocked { reason } =
+            crate::hook::evaluate_shell_policy(&self.policy_gate, run_id, command).await
+        {
+            return Ok(vec![blocking_step_finding(role, reason)]);
+        }
+
+        let sandbox_id = self
+            .sandbox
+            .create(warden_sandbox::SandboxSpec {
+                cwd: cwd.to_path_buf(),
+            })
+            .await?;
+
+        let execution = match self
+            .sandbox
+            .execute(
+                &sandbox_id,
+                warden_sandbox::Command {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), command.to_string()],
+                    env_allowlist: WORKFLOW_STEP_ENV_ALLOWLIST
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect(),
+                    stdin: None,
+                },
+                warden_sandbox::ExecuteOptions {
+                    cancel,
+                    on_stdout_line: None,
+                },
+            )
+            .await
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                // `execution`'s `Result` (even the never-constructed `Err`
+                // arm) borrows `sandbox_id` for this whole `match`'s scope
+                // (`Sandbox::execute`'s `'a` ties `id`/`self`/the returned
+                // `Execution` together) -- `.clone()` here, rather than
+                // moving the original, so the two later destroy calls (on
+                // the other branches, once `execution` is actually consumed)
+                // still have an owned id to hand `Sandbox::destroy`.
+                let _ = self.sandbox.destroy(sandbox_id.clone()).await;
+                return Err(error.into());
+            }
+        };
+
+        // H1 (mirrors `run_agent`'s own invariant): never persist pid 0 or
+        // skip recording -- a missing pid right after the sandbox started
+        // the process is a typed error, not a silent fallback that would
+        // leave this step's process invisible to crash recovery.
+        let pid = match execution.pid {
+            Some(pid) => pid,
+            None => {
+                let _ = self.sandbox.destroy(sandbox_id.clone()).await;
+                return Err(ProcessError::MissingPid {
+                    command: command.to_string(),
+                }
+                .into());
+            }
+        };
+
+        let process_id = Uuid::new_v4().to_string();
+        db::insert_agent_process(
+            &self.pool,
+            &process_id,
+            cycle_id,
+            role.as_str(),
+            pid,
+            &cwd.display().to_string(),
+        )
+        .await?;
+        self.publish_event(RunEvent::AgentStarted {
+            role: role.as_str().to_string(),
         })
+        .await?;
+
+        let waited = execution.wait().await;
+        let _ = self.sandbox.destroy(sandbox_id).await;
+        let output = match waited {
+            Ok(output) => output,
+            Err(error) => {
+                db::mark_agent_process_ended(&self.pool, &process_id, -1).await?;
+                return Err(error.into());
+            }
+        };
+        db::mark_agent_process_ended(&self.pool, &process_id, output.exit_code).await?;
+
+        tracing::debug!(
+            cycle_id,
+            role = role.as_str(),
+            command,
+            exit_code = output.exit_code,
+            stdout = %output.stdout,
+            stderr = %output.stderr,
+            "workflow step command output"
+        );
+
+        self.publish_event(RunEvent::AgentFinished {
+            role: role.as_str().to_string(),
+            exit_code: output.exit_code,
+            usage: None,
+        })
+        .await?;
+
+        if output.exit_code == 0 {
+            return Ok(Vec::new());
+        }
+
+        let stderr_tail = crate::hook::trailing_chars(&output.stderr, 500);
+        let stdout_tail = crate::hook::trailing_chars(&output.stdout, 500);
+        let tail = if stderr_tail.is_empty() {
+            &stdout_tail
+        } else {
+            &stderr_tail
+        };
+        let reason = format!(
+            "step command `{command}` exited {}{}",
+            output.exit_code,
+            crate::hook::format_tail_suffix(tail)
+        );
+        Ok(vec![blocking_step_finding(role, reason)])
     }
 }
 
@@ -1444,6 +1661,110 @@ mod tests {
                 description: "looks mostly fine".to_string(),
                 action: None,
             }]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #79 review: `run_step_command` -- a `type: hook` step's own
+    // sandboxed execution (cancellation, env allowlist).
+    // -----------------------------------------------------------------
+
+    async fn orchestrator_with_run_and_cycle(
+        pool: &SqlitePool,
+        run_id: &str,
+        cycle_id: &str,
+    ) -> Orchestrator {
+        db::insert_run(pool, run_id, "/tmp/repo", "main", "intent", 3, 3, 3, 5)
+            .await
+            .unwrap();
+        db::insert_cycle(pool, cycle_id, run_id, 1).await.unwrap();
+        Orchestrator::new(pool.clone())
+    }
+
+    /// Issue #79 review, MEDIUM: the run's own `CancellationToken` must
+    /// actually reach a `type: hook` step's sandboxed command -- before this
+    /// fix it was silently dropped (`ExecuteOptions::default()`), so
+    /// Ctrl-C/TUI-exit never stopped a long-running hook command. Mirrors
+    /// `agent_run`'s own
+    /// `sandbox_is_destroyed_when_cancellation_resolves_the_future_normally`.
+    #[tokio::test]
+    async fn a_hook_steps_command_is_cancelled_when_the_run_cancellation_token_fires() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let orchestrator =
+            orchestrator_with_run_and_cycle(&pool, "cancel-hook-run", "cancel-hook-cycle").await;
+        let cwd = TempDir::new().unwrap();
+        let role = Role::new("lint").unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+
+        let result = orchestrator
+            .run_step_command(
+                "cancel-hook-run",
+                "cancel-hook-cycle",
+                &role,
+                cwd.path(),
+                "sleep 30",
+                cancel,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(WardenError::Sandbox(
+                    warden_sandbox::SandboxError::Cancelled { .. }
+                ))
+            ),
+            "expected the hook step's command to be cancelled, got {result:?}"
+        );
+    }
+
+    /// Issue #79 review, HIGH: a `type: hook` step's command must forward
+    /// only [`WORKFLOW_STEP_ENV_ALLOWLIST`], never the operator's full
+    /// environment (`crate::hook::CommandHook::full_env_allowlist`).
+    /// `CARGO_MANIFEST_DIR` -- reliably set by `cargo test` in this
+    /// process's own environment, read-only here -- stands in for "a
+    /// variable not on that list", the same technique
+    /// `warden_sandbox::local`'s own `env_clear_means_an_unallowlisted_variable_never_reaches_the_child`/
+    /// `env_allowlist_forwards_only_the_named_variables` tests use, rather
+    /// than `std::env::set_var` (`unsafe`, and cross-test interference risk
+    /// under a parallel test runner -- see those tests' own docs).
+    #[tokio::test]
+    async fn a_hook_steps_command_only_forwards_the_narrow_workflow_step_allowlist() {
+        assert!(
+            std::env::var("CARGO_MANIFEST_DIR").is_ok(),
+            "precondition: cargo test sets CARGO_MANIFEST_DIR"
+        );
+
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let orchestrator =
+            orchestrator_with_run_and_cycle(&pool, "env-hook-run", "env-hook-cycle").await;
+        let cwd = TempDir::new().unwrap();
+        let role = Role::new("lint").unwrap();
+
+        let findings = orchestrator
+            .run_step_command(
+                "env-hook-run",
+                "env-hook-cycle",
+                &role,
+                cwd.path(),
+                r#"if [ -n "$CARGO_MANIFEST_DIR" ]; then echo leaked; exit 1; fi"#,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            findings.is_empty(),
+            "CARGO_MANIFEST_DIR is not on WORKFLOW_STEP_ENV_ALLOWLIST and must never reach the \
+                 command's own environment: {findings:?}"
         );
     }
 }
