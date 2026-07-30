@@ -20,22 +20,6 @@ pub enum TuiError {
     #[error(transparent)]
     Core(#[from] warden_core::CoreError),
 
-    #[error("event payload (de)serialization failed: {0}")]
-    EventPayload(#[from] serde_json::Error),
-
-    /// Mirrors `warden::WardenError::EventKindMismatch` -- a row/wire
-    /// message whose declared kind disagrees with its own payload is never
-    /// silently trusted (code-standards.md: "toute ligne relue est
-    /// reparsée en type Rust fort").
-    #[error(
-        "event {id} has event_type {event_type:?} but its payload's own kind is {payload_kind:?}"
-    )]
-    EventKindMismatch {
-        id: String,
-        event_type: String,
-        payload_kind: &'static str,
-    },
-
     #[error("run {run_id} not found")]
     RunNotFound { run_id: String },
 

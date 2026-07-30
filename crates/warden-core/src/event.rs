@@ -228,6 +228,119 @@ pub struct RunEventRecord {
     pub created_at: String,
 }
 
+/// Why one `events` row couldn't be decoded (issue #58) -- kept as a typed
+/// enum rather than prose so a caller/UI can distinguish "this binary
+/// predates this event kind" ([`Self::UnknownEventType`]) from "this row is
+/// corrupted" ([`Self::PayloadDeserialize`]/[`Self::KindMismatch`]) without
+/// parsing a message (code-standards.md: "erreurs typées explicitement,
+/// jamais des strings").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UndecodableReason {
+    /// The row's `event_type` column doesn't match any [`EventKind`] this
+    /// binary knows about ([`EventKind::parse`] failed) -- typically an
+    /// older reader running against a database a newer `warden` wrote,
+    /// after it started emitting an event kind this binary predates. The
+    /// raw column value itself is already carried by
+    /// [`UndecodableEvent::event_type`], so it isn't duplicated here.
+    UnknownEventType,
+    /// `payload_json` isn't valid JSON, or doesn't match the shape of any
+    /// known [`RunEvent`] variant -- e.g. an event-payload reshape that
+    /// shipped without a migration rewriting already-persisted rows (issue
+    /// #43's `RunStarted`, issue #26's `UntrustedAgentDefinitionUsed`).
+    PayloadDeserialize,
+    /// `payload_json` decoded to a valid [`RunEvent`], but its own kind
+    /// ([`RunEvent::kind`]) disagrees with the row's declared `event_type`
+    /// column -- a corrupted row, or one written by something other than
+    /// `db::insert_event`. `payload_kind` is [`EventKind::as_str`]'s stable
+    /// string form (owned, rather than `&'static str`, so this type stays
+    /// `Deserialize` -- needed to round-trip through the headless NDJSON
+    /// dump, `warden_tui::main::run_headless`).
+    KindMismatch { payload_kind: String },
+}
+
+impl std::fmt::Display for UndecodableReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndecodableReason::UnknownEventType => write!(f, "unknown event_type"),
+            UndecodableReason::PayloadDeserialize => {
+                write!(f, "payload_json failed to deserialize")
+            }
+            UndecodableReason::KindMismatch { payload_kind } => {
+                write!(f, "payload's own kind is {payload_kind:?}")
+            }
+        }
+    }
+}
+
+/// One `events` row whose `payload_json`/`event_type` could not be turned
+/// into a [`RunEvent`] (issue #58) -- see [`UndecodableReason`] for why this
+/// happens. This is a real, if rare, possibility this codebase's migrations
+/// don't rule out today: nothing rewrites already-persisted rows when an
+/// event-payload reshape lands (e.g. issue #43's `RunStarted`, issue #26's
+/// `UntrustedAgentDefinitionUsed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndecodableEvent {
+    pub id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub reason: UndecodableReason,
+    pub created_at: String,
+}
+
+/// One row of `list_events_for_run`'s history (issue #58): a query that hit
+/// a row it can't fully decode must still return every other row in the
+/// run's history, with the bad row surfaced as an explicit
+/// [`UndecodableEvent`] rather than either being silently dropped or failing
+/// the whole query outright (code-standards.md: "no silent fallback, no
+/// symptom-masking guards"). Both `warden::db::list_events_for_run` and
+/// `warden_tui::db::list_events_for_run` (independently re-implemented, see
+/// that module's own docs) produce this as their per-row outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunEventHistoryEntry {
+    /// A row that decoded and validated cleanly.
+    Decoded(RunEventRecord),
+    /// A row that could not be decoded/validated -- see
+    /// [`UndecodableEvent`]'s own docs for why this happens.
+    Undecodable(UndecodableEvent),
+}
+
+impl RunEventHistoryEntry {
+    /// The row's own `id`, whichever variant this is -- used to key
+    /// deduplication/ordering the same way a [`RunEventRecord`]'s `id`
+    /// already does.
+    pub fn id(&self) -> &str {
+        match self {
+            RunEventHistoryEntry::Decoded(record) => &record.id,
+            RunEventHistoryEntry::Undecodable(event) => &event.id,
+        }
+    }
+
+    /// The row's own `created_at`, whichever variant this is.
+    pub fn created_at(&self) -> &str {
+        match self {
+            RunEventHistoryEntry::Decoded(record) => &record.created_at,
+            RunEventHistoryEntry::Undecodable(event) => &event.created_at,
+        }
+    }
+
+    /// The decoded [`RunEventRecord`], or `None` for an
+    /// [`RunEventHistoryEntry::Undecodable`] row.
+    pub fn decoded(&self) -> Option<&RunEventRecord> {
+        match self {
+            RunEventHistoryEntry::Decoded(record) => Some(record),
+            RunEventHistoryEntry::Undecodable(_) => None,
+        }
+    }
+
+    /// The decoded [`RunEvent`] itself, or `None` for an
+    /// [`RunEventHistoryEntry::Undecodable`] row -- a shorthand for callers
+    /// that only care about the event, not the surrounding row metadata.
+    pub fn event(&self) -> Option<&RunEvent> {
+        self.decoded().map(|record| &record.event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +450,84 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         let decoded: RunEventRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, record);
+    }
+
+    /// Issue #58: a [`RunEventHistoryEntry::Decoded`] row exposes its
+    /// `RunEventRecord`/`RunEvent` through the shared accessors, and never
+    /// through [`RunEventHistoryEntry::Undecodable`]'s own field.
+    #[test]
+    fn decoded_history_entry_exposes_its_record_and_event() {
+        let record = RunEventRecord {
+            id: "event-1".to_string(),
+            run_id: "run-1".to_string(),
+            event: RunEvent::CycleStarted { cycle_number: 1 },
+            created_at: "2026-07-12T00:00:00+00:00".to_string(),
+        };
+        let entry = RunEventHistoryEntry::Decoded(record.clone());
+
+        assert_eq!(entry.id(), "event-1");
+        assert_eq!(entry.created_at(), "2026-07-12T00:00:00+00:00");
+        assert_eq!(entry.decoded(), Some(&record));
+        assert_eq!(entry.event(), Some(&record.event));
+    }
+
+    /// Issue #58: an [`RunEventHistoryEntry::Undecodable`] row still exposes
+    /// its `id`/`created_at` (needed for ordering/dedup) but has no decoded
+    /// `RunEvent` to hand back.
+    #[test]
+    fn undecodable_history_entry_has_no_decoded_event() {
+        let entry = RunEventHistoryEntry::Undecodable(UndecodableEvent {
+            id: "event-2".to_string(),
+            run_id: "run-1".to_string(),
+            event_type: "run_finished".to_string(),
+            reason: UndecodableReason::KindMismatch {
+                payload_kind: "cycle_started".to_string(),
+            },
+            created_at: "2026-07-12T00:00:01+00:00".to_string(),
+        });
+
+        assert_eq!(entry.id(), "event-2");
+        assert_eq!(entry.created_at(), "2026-07-12T00:00:01+00:00");
+        assert_eq!(entry.decoded(), None);
+        assert_eq!(entry.event(), None);
+    }
+
+    /// [`UndecodableReason`]'s `Display` impl is what
+    /// `warden_tui::ui::undecodable_list_item` renders -- must produce a
+    /// distinct, non-empty string per variant so an operator can tell the
+    /// three causes apart at a glance.
+    #[test]
+    fn undecodable_reason_display_is_distinct_per_variant() {
+        let unknown = UndecodableReason::UnknownEventType.to_string();
+        let deserialize = UndecodableReason::PayloadDeserialize.to_string();
+        let mismatch = UndecodableReason::KindMismatch {
+            payload_kind: "cycle_started".to_string(),
+        }
+        .to_string();
+
+        assert_ne!(unknown, deserialize);
+        assert_ne!(deserialize, mismatch);
+        assert_ne!(unknown, mismatch);
+        assert!(mismatch.contains("cycle_started"), "{mismatch}");
+    }
+
+    /// Issue #58: `UndecodableEvent` must round-trip through JSON -- the
+    /// headless NDJSON dump (`warden_tui::main::run_headless`) serializes it
+    /// directly onto stdout.
+    #[test]
+    fn undecodable_event_round_trips_through_json() {
+        let event = UndecodableEvent {
+            id: "event-2".to_string(),
+            run_id: "run-1".to_string(),
+            event_type: "run_finished".to_string(),
+            reason: UndecodableReason::KindMismatch {
+                payload_kind: "cycle_started".to_string(),
+            },
+            created_at: "2026-07-12T00:00:01+00:00".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: UndecodableEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
     }
 
     /// Issue #53: a tool that reports no usage at all yields `usage: None`
