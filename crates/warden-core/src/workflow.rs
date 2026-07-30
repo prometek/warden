@@ -1040,6 +1040,77 @@ steps:
         assert_eq!(workflow.steps[2].budget, Some(StepBudget::Own(9)));
     }
 
+    /// Issue #81's two new axes are independent of each other, not just
+    /// independent of the pre-#81 shape: a step may declare `gate:
+    /// scoped-re-review` *and* `max_cycles` together -- the gate governs how
+    /// much of the diff this step is re-invoked against, `max_cycles` governs
+    /// how many times it may reboucle before exhausting, and neither key
+    /// constrains what the other may be. Regression coverage for a parser
+    /// that (incorrectly) treated `max_cycles` as only legal alongside
+    /// `loop-until-clean`.
+    #[test]
+    fn a_step_can_combine_the_scoped_re_review_gate_with_its_own_max_cycles() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+    gate: scoped-re-review
+    max_cycles: 4
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].gate, Gate::ScopedReReview);
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Own(4)));
+    }
+
+    /// A full round-trip through the real parser exercising every new key
+    /// issue #81 introduces at once, on a workflow shaped like a plausible
+    /// real one (producer, a named-bucket reviewer, and a custom step
+    /// combining both new axes) -- not just each key pinned in isolation
+    /// against a minimal two-step fixture, the shape every other test in
+    /// this section uses.
+    #[test]
+    fn a_workflow_combining_scoped_re_review_and_max_cycles_round_trips_through_the_real_parser() {
+        let yaml = r#"
+name: with-scoped-and-own-budget
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: code-reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: tech-lead-v2
+    gate: scoped-re-review
+    max_cycles: 3
+    evidence: true
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.name, "with-scoped-and-own-budget");
+        assert_eq!(workflow.steps.len(), 3);
+
+        assert_eq!(workflow.steps[0].role.as_str(), "coder");
+        assert_eq!(workflow.steps[0].gate, Gate::PassThrough);
+        assert_eq!(workflow.steps[0].budget, None);
+        assert!(!workflow.steps[0].captures_evidence);
+
+        assert_eq!(workflow.steps[1].role.as_str(), "reviewer");
+        assert_eq!(workflow.steps[1].agent, "code-reviewer");
+        assert_eq!(workflow.steps[1].gate, Gate::LoopUntilClean);
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Review));
+        assert!(!workflow.steps[1].captures_evidence);
+
+        assert_eq!(workflow.steps[2].role.as_str(), "techlead");
+        assert_eq!(workflow.steps[2].agent, "tech-lead-v2");
+        assert_eq!(workflow.steps[2].gate, Gate::ScopedReReview);
+        assert_eq!(workflow.steps[2].budget, Some(StepBudget::Own(3)));
+        assert!(workflow.steps[2].captures_evidence);
+        assert!(workflow.is_last_step(2));
+    }
+
     /// `budget` and `max_cycles` are mutually exclusive -- declaring both
     /// leaves it ambiguous which counter actually gates the step.
     #[test]
