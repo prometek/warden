@@ -520,6 +520,17 @@ la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML i
 > chemin relatif au worktree du rôle). Le risque « le coder committe un script que le
 > reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
 > donc plus aux adaptateurs intégrés.
+>
+> En ceinture-et-bretelles derrière ce constat, `process::validate_agent_program` refuse
+> quand même, juste avant le spawn d'un rôle jugeant (reviewer/tester et tout rôle
+> personnalisé — le producteur est exempté), un `program` **ou** une entrée `args` d'allure
+> chemin qui serait relative ou résoudrait dans le dépôt de base, le worktree du rôle ou
+> celui d'un autre rôle du run (issues #26 et #59). Aucun adaptateur livré n'émet un tel
+> argument : la garde existe pour qu'un futur adaptateur ne puisse pas rouvrir la faille
+> silencieusement. Une valeur légitime qui ressemble à un chemin relatif (un `model`
+> préfixé par son fournisseur, `anthropic/claude-3-opus`) n'est pas concernée : l'appelant
+> la déclare explicitement de confiance, et seulement lorsqu'elle vient de la configuration
+> utilisateur — jamais du dépôt sous revue.
 
 ### Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73/ADR-0020)
 
@@ -822,6 +833,20 @@ base, avant de fusionner les deux (déduplication par identifiant d'événement)
 attache tardive sur un run déjà en cours affiche donc l'historique complet puis bascule
 sur le direct, sans trou.
 
+**Une ligne `events` non décodable ne casse jamais le replay (issue #58)** : un reshape de
+payload livré sans migration de réécriture (issue #43 pour `RunStarted`, issue #26 pour
+`UntrustedAgentDefinitionUsed`) peut laisser une ligne `payload_json`/`event_type` que ce
+binaire ne sait plus décoder. `warden::db::list_events_for_run` et
+`warden_tui::db::list_events_for_run` (mirroirs indépendants, ADR-0006) ne font plus jamais
+échouer toute la requête pour une seule ligne pareille : chaque ligne devient un
+`warden_core::RunEventHistoryEntry`, soit `Decoded` soit `Undecodable` (avec une raison
+typée — `UnknownEventType`, `PayloadDeserialize` ou `KindMismatch`), et seule une vraie
+erreur SQLite fait encore échouer la fonction. La vue interactive affiche la ligne non
+décodable à sa place exacte dans le journal ; le mode headless en fait autant sur stdout
+(voir plus bas). Aucune migration de réécriture des lignes `events` existantes n'est
+prévue — la ligne reste non décodable pour toujours, seulement rendue visible plutôt que
+fatale.
+
 **Progression d'agent en direct (issue #33, amende ADR-0008)** : entre `AgentStarted` et
 `AgentFinished`, `warden-tui` affiche désormais ce que l'agent rapporte faire — dernier
 message assistant complet ou bloc `tool_use` — au fur et à mesure (`RunEvent::AgentProgress`),
@@ -857,6 +882,22 @@ du run, déjà affiché dans le header, y est désormais tronqué au-delà de 60
 Sur un terminal dont la sortie standard n'est pas un TTY (pipe, redirection), `warden-tui`
 bascule automatiquement sur un mode texte qui affiche un événement par ligne en NDJSON —
 pratique pour scripter/observer un run sans interface plein écran.
+
+**Schéma stdout NDJSON — deux formes de ligne (issue #58)** : chaque ligne est un objet
+JSON, et un consommateur distingue les deux formes par la clé présente au niveau racine,
+jamais par la position de la ligne (les deux peuvent être mêlées dans l'historique) :
+- un événement décodé : un `warden_core::RunEventRecord` nu, inchangé depuis avant
+  l'issue #58 (`{"id": ..., "run_id": ..., "event": {"kind": ..., ...}, "created_at":
+  ...}`) — un consommateur existant qui n'attend que cette forme continue de fonctionner
+  sans changement ;
+- une ligne `events` non décodable (uniquement produite par le replay de l'historique
+  initial, jamais par le flux en direct) : balisée sous une clé `"undecodable"` —
+  `{"undecodable": {"id": ..., "run_id": ..., "event_type": ..., "reason": {"kind": ...},
+  "created_at": ...}}`, où `reason.kind` vaut `unknown_event_type`, `payload_deserialize`
+  ou `kind_mismatch`. Cette ligne est aussi loguée en `warn` sur stderr, en plus de (jamais
+  à la place de) la ligne stdout — un consommateur qui redirige stderr vers `/dev/null` (ou
+  relève son niveau de log) voit quand même l'écart sur le seul canal qu'il consomme
+  réellement.
 
 **Rendu de l'evidence (ADR-0010)** : au démarrage (terminal plein écran uniquement),
 `warden-tui` détecte les capacités graphiques du terminal (Kitty, iTerm2, Sixel, via

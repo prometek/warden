@@ -13,9 +13,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
-use warden_core::RunEventRecord;
+use warden_core::{RunEventRecord, UndecodableEvent};
 use warden_tui::attach::{attach, Attachment};
 use warden_tui::capabilities::GraphicsCapability;
+use warden_tui::model::HistoryItem;
 use warden_tui::{capabilities, db, subscriber, ui};
 
 #[derive(Parser)]
@@ -99,9 +100,40 @@ async fn attach_cmd(
 /// live as it arrives. Used automatically when stdout isn't a terminal
 /// (piped/redirected) -- also what makes this crate's core replay/live
 /// behaviour scriptable and end-to-end testable without a real PTY.
+///
+/// **Stdout schema** (issue #58): two distinct line shapes, both plain JSON
+/// objects, one per line:
+///   - A decoded event: a bare `warden_core::RunEventRecord` --
+///     `{"id":..., "run_id":..., "event": {"kind": ..., ...}, "created_at":
+///     ...}`. Unchanged from before this issue, so an existing consumer that
+///     only ever expects this shape keeps working.
+///   - An undecodable history row (never produced by the live stream, only
+///     ever by the initial history replay -- see
+///     `warden_core::RunEventHistoryEntry`'s own docs): wrapped under a
+///     top-level `"undecodable"` key --
+///     `{"undecodable": {"id":..., "run_id":..., "event_type":..., "reason":
+///     {"kind": ...}, "created_at": ...}}`. A consumer discriminates the two
+///     shapes by which of `"event"`/`"undecodable"` is present at the top
+///     level -- never by line position, since a run's history can contain
+///     any mix of the two. This line is *also* logged at `warn` on stderr
+///     (see [`log_undecodable_event`]), the same "not fatal but must not be
+///     silent" treatment `log_subscribe_failure` already gives a failed
+///     live-bus subscribe -- but stdout is the channel a script actually
+///     consumes, so it must carry the marker too: a consumer that redirects
+///     stderr away (or filters it by level) must still be able to tell a
+///     truncated history from a complete one.
 async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
-    for record in attachment.model.events() {
-        println!("{}", serde_json::to_string(record)?);
+    for item in attachment.model.history() {
+        match item {
+            HistoryItem::Event(record) => println!("{}", serde_json::to_string(record)?),
+            HistoryItem::Undecodable(event) => {
+                log_undecodable_event(event);
+                println!(
+                    "{}",
+                    serde_json::to_string(&UndecodableLine { undecodable: event })?
+                );
+            }
+        }
     }
     if let Some(mut live) = attachment.live.take() {
         while let Some(record) = live.recv().await {
@@ -113,12 +145,40 @@ async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
             // printed here exactly the way it gates what the interactive
             // `app_loop` renders. Printing straight off the channel without
             // going through the model first would print duplicates.
+            //
+            // The live Event Bus only ever carries already-decoded
+            // `RunEventRecord`s (see `warden_core::RunEventHistoryEntry`'s
+            // own docs) -- an `undecodable` line can only ever come from the
+            // initial history replay above, never from here.
             if attachment.model.apply(record.clone()) {
                 println!("{}", serde_json::to_string(&record)?);
             }
         }
     }
     Ok(())
+}
+
+/// Wraps an [`UndecodableEvent`] under a distinguishing top-level
+/// `"undecodable"` key for [`run_headless`]'s NDJSON stream -- see that
+/// function's own doc comment for the resulting schema and why a plain,
+/// untagged serialization of `UndecodableEvent` wouldn't be safely
+/// distinguishable from a `RunEventRecord` line.
+#[derive(serde::Serialize)]
+struct UndecodableLine<'a> {
+    undecodable: &'a UndecodableEvent,
+}
+
+/// Surfaces one undecodable `events` history row at `warn` (issue #58) --
+/// never a silent drop. Logged here in addition to (not instead of) the
+/// tagged stdout line [`run_headless`] prints for the same row.
+fn log_undecodable_event(event: &UndecodableEvent) {
+    tracing::warn!(
+        id = %event.id,
+        run_id = %event.run_id,
+        event_type = %event.event_type,
+        reason = %event.reason,
+        "events row could not be decoded; emitted as an \"undecodable\" NDJSON line"
+    );
 }
 
 /// Runs the full-screen ratatui app until the user quits (`q`/`Esc`) or the

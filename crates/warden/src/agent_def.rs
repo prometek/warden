@@ -84,8 +84,9 @@
 //!
 //! # Owner's ruling: the same coder-writable-directory concern also covers a stale worktree (issue #26 review, escalated asymmetry)
 //!
-//! [`crate::process::validate_agent_program`]'s `program` containment check
-//! refuses a path resolving inside `worktree_path`, `repo_path`, *or*
+//! [`crate::process::validate_agent_program`]'s `program`/`args` (issue #59
+//! extended this from `program` alone) containment check refuses a path
+//! resolving inside `worktree_path`, `repo_path`, *or*
 //! `run_worktrees_root` (`<warden_home>/worktrees/<run_id>/`) -- the coder's
 //! own worktree for this run is exactly as coder-writable as the base repo
 //! itself (`Bash` included), so both are refused symmetrically. The HIGH fix
@@ -188,9 +189,10 @@
 //! even required. The reviewer judging the coder would be a prompt the coder
 //! itself wrote, with the audit trail asserting the opposite. This is
 //! exactly the asymmetry [`crate::process::validate_agent_program`]'s own
-//! containment check already closes for `command.program` -- the reviewer/
-//! tester's `program` is never trusted just because an adapter says so, it
-//! is canonicalized and checked against the repo/worktree roots first. The
+//! containment check already closes for `command.program` (and, since issue
+//! #59, path-like `command.args` entries) -- the reviewer/tester's
+//! `program`/`args` are never trusted just because an adapter says so, they
+//! are canonicalized and checked against the repo/worktree roots first. The
 //! same discipline belongs here.
 //!
 //! So [`resolve_agent_definition`] canonicalizes both
@@ -462,8 +464,8 @@ pub async fn resolve_agent_definition(
 /// ("the same coder-writable-directory concern also covers a stale
 /// worktree"): all four paths are canonicalized (resolving any symlink)
 /// before the comparison, exactly like
-/// [`crate::process::validate_agent_program`]'s own `command.program`
-/// containment check, so a coder-controlled `XDG_CONFIG_HOME` pointed at (or
+/// [`crate::process::validate_agent_program`]'s own `command.program`/
+/// `command.args` containment check, so a coder-controlled `XDG_CONFIG_HOME` pointed at (or
 /// symlinked into) the repo under review or a stale worktree can't slip past
 /// a purely lexical comparison. See this module's own "the trusted
 /// user-config directory is verified, not assumed" docs for why this

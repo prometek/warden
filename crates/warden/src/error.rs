@@ -95,6 +95,25 @@ pub enum ProcessError {
         program: String,
         reason: String,
     },
+
+    /// Issue #59 (extends #26's belt-and-braces guard from `program` to
+    /// `args`): a reviewer/tester `args` entry that looks like a path (see
+    /// `process::path_like_candidate`) and would resolve the same way
+    /// [`ProcessError::UntrustedAgentProgram`] refuses `program` for --
+    /// e.g. a future `ToolAdapter` emitting `claude --wrapper
+    /// ./reviewer.sh` would otherwise reintroduce the exact hole #26 closed
+    /// for `program`, since the wrapper path still resolves against the
+    /// role's own worktree. Never raised for the coder, same as
+    /// `UntrustedAgentProgram`.
+    #[error(
+        "refusing to spawn {role} agent with argument {arg:?}: {reason} -- this would let the \
+         coder control what an independent role executes"
+    )]
+    UntrustedAgentArg {
+        role: String,
+        arg: String,
+        reason: String,
+    },
 }
 
 /// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).
@@ -293,27 +312,14 @@ pub enum WardenError {
         source: sqlx::Error,
     },
 
-    /// `RunEvent` (de)serialization to/from `events.payload_json` failed --
-    /// covers both directions (encode on `insert_event`, decode on
-    /// `list_events_for_run`), since only one `#[from] serde_json::Error`
-    /// variant can exist per enum.
-    #[error("event payload (de)serialization failed: {0}")]
+    /// `RunEvent` serialization to `events.payload_json` failed on
+    /// `insert_event` (encode direction). The decode direction
+    /// (`list_events_for_run`) never propagates this: issue #58, a row that
+    /// fails to deserialize is surfaced as a
+    /// `warden_core::RunEventHistoryEntry::Undecodable` marker instead of
+    /// failing the whole query.
+    #[error("event payload serialization failed: {0}")]
     EventPayload(#[from] serde_json::Error),
-
-    /// An `events` row's `event_type` column disagrees with the
-    /// discriminant carried by its own `payload_json` (see
-    /// `warden_core::RunEvent::kind`) -- a corrupted row, or one written by
-    /// something other than `db::insert_event`, never silently trusted
-    /// (code-standards.md: "toute ligne relue est reparsée en type Rust
-    /// fort").
-    #[error(
-        "event {id} has event_type {event_type:?} but its payload's own kind is {payload_kind:?}"
-    )]
-    EventKindMismatch {
-        id: String,
-        event_type: String,
-        payload_kind: &'static str,
-    },
 
     /// [`crate::orchestrator::Orchestrator::run_convergence_loop`] sets up
     /// its Event Bus / run context exactly once per instance -- an

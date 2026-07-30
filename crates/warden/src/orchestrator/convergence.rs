@@ -1036,27 +1036,27 @@ mod tests {
         let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
         let run_started_index = persisted
             .iter()
-            .position(|record| matches!(record.event, RunEvent::RunStarted { .. }))
+            .position(|entry| matches!(entry.event(), Some(RunEvent::RunStarted { .. })))
             .expect("RunStarted must be persisted");
 
         assert!(
             matches!(
-                persisted[run_started_index + 1].event,
-                RunEvent::UntrustedAgentDefinitionUsed { .. }
+                persisted[run_started_index + 1].event(),
+                Some(RunEvent::UntrustedAgentDefinitionUsed { .. })
             ),
             "{persisted:?}"
         );
         assert!(
             matches!(
-                persisted[run_started_index + 2].event,
-                RunEvent::UntrustedAgentDefinitionUsed { .. }
+                persisted[run_started_index + 2].event(),
+                Some(RunEvent::UntrustedAgentDefinitionUsed { .. })
             ),
             "{persisted:?}"
         );
 
         let untrusted: Vec<&RunEvent> = persisted
             .iter()
-            .map(|record| &record.event)
+            .filter_map(|entry| entry.event())
             .filter(|event| matches!(event, RunEvent::UntrustedAgentDefinitionUsed { .. }))
             .collect();
         assert_eq!(untrusted.len(), 2, "{persisted:?}");
@@ -1392,7 +1392,7 @@ mod tests {
         assert!(
             persisted
                 .iter()
-                .all(|record| !matches!(record.event, RunEvent::AgentProgress { .. })),
+                .all(|entry| !matches!(entry.event(), Some(RunEvent::AgentProgress { .. }))),
             "AgentProgress must never be persisted to `events` (ADR-0008 amendment, issue #33): \
                  {persisted:?}"
         );
@@ -1744,12 +1744,12 @@ mod tests {
         let agent_finished_usages: std::collections::HashMap<String, warden_core::TokenUsage> =
             persisted
                 .iter()
-                .filter_map(|record| match &record.event {
-                    RunEvent::AgentFinished {
+                .filter_map(|entry| match entry.event() {
+                    Some(RunEvent::AgentFinished {
                         role,
                         usage: Some(usage),
                         ..
-                    } => Some((role.clone(), *usage)),
+                    }) => Some((role.clone(), *usage)),
                     _ => None,
                 })
                 .collect();
@@ -2448,10 +2448,10 @@ steps:
 
         let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
         let lint_started = persisted.iter().any(
-            |record| matches!(&record.event, RunEvent::AgentStarted { role } if role == "lint"),
+            |entry| matches!(entry.event(), Some(RunEvent::AgentStarted { role }) if role == "lint"),
         );
-        let lint_finished = persisted.iter().any(|record| {
-            matches!(&record.event, RunEvent::AgentFinished { role, exit_code, .. }
+        let lint_finished = persisted.iter().any(|entry| {
+            matches!(entry.event(), Some(RunEvent::AgentFinished { role, exit_code, .. })
                 if role == "lint" && *exit_code == 0)
         });
         assert!(
@@ -2526,7 +2526,7 @@ steps:
         let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
         let lint_findings: Vec<&RunEvent> = persisted
             .iter()
-            .map(|record| &record.event)
+            .filter_map(|entry| entry.event())
             .filter(
                 |event| matches!(event, RunEvent::FindingRaised { source, .. } if source == "lint"),
             )
@@ -2557,8 +2557,8 @@ steps:
                  exhaustion, not a crash",
             open_processes.len()
         );
-        let lint_finished_nonzero = persisted.iter().any(|record| {
-            matches!(&record.event, RunEvent::AgentFinished { role, exit_code, .. }
+        let lint_finished_nonzero = persisted.iter().any(|entry| {
+            matches!(entry.event(), Some(RunEvent::AgentFinished { role, exit_code, .. })
                 if role == "lint" && *exit_code == 1)
         });
         assert!(
@@ -2641,9 +2641,9 @@ steps:
 
         let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
         assert!(
-            persisted.iter().any(|record| matches!(
-                &record.event,
-                RunEvent::FindingRaised { source, severity, description, .. }
+            persisted.iter().any(|entry| matches!(
+                entry.event(),
+                Some(RunEvent::FindingRaised { source, severity, description, .. })
                     if source == "lint" && severity == "blocking" && description.contains("touch")
             )),
             "the policy's own denial reason must surface as the lint step's blocking finding: \

@@ -215,6 +215,7 @@ impl Orchestrator {
                 worktree.path(),
                 &config.repo_path,
                 &config.warden_home.join("worktrees").join(run_id),
+                &agent.trusted_arg_values,
                 stdin_payload,
                 cancel,
             )
@@ -414,6 +415,7 @@ impl Orchestrator {
                 worktree.path(),
                 &config.repo_path,
                 &config.warden_home.join("worktrees").join(run_id),
+                &agent.trusted_arg_values,
                 stdin_payload,
                 cancel.clone(),
             )

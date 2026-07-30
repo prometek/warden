@@ -59,8 +59,8 @@ pub async fn attach(pool: &SqlitePool, run_id: &str, socket_path: &Path) -> Resu
 
     let history = db::list_events_for_run(pool, run_id).await?;
     let mut model = RunModel::new();
-    for record in history {
-        model.apply(record);
+    for entry in history {
+        model.apply_history_entry(entry);
     }
 
     if let Some(rx) = live.as_mut() {

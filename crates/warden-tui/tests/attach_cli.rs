@@ -87,13 +87,13 @@ async fn insert_event(pool: &SqlitePool, id: &str, event: &RunEvent, created_at:
 /// waits for it to exit (via a blocking-thread `wait_with_output`, so the
 /// concurrently spawned mock Event Bus task in the test can keep making
 /// progress on the same runtime instead of the whole thread blocking on the
-/// child), and returns its parsed stdout as one [`RunEventRecord`] per
-/// NDJSON line, in the order printed.
-async fn run_attach_cli(
+/// child), and returns its exit status, raw stdout (one NDJSON line per
+/// `Vec` entry), and raw stderr.
+async fn run_attach_cli_raw(
     run_id: &str,
     db_path: &Path,
     warden_home: &Path,
-) -> (std::process::ExitStatus, Vec<RunEventRecord>) {
+) -> (std::process::ExitStatus, Vec<String>, String) {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_warden-tui"));
     command
         .args(["attach", "--run-id", run_id])
@@ -115,15 +115,34 @@ async fn run_attach_cli(
     .expect("wait_with_output");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let records: Vec<RunEventRecord> = stdout
+    let lines: Vec<String> = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    (output.status, lines, stderr)
+}
+
+/// [`run_attach_cli_raw`], with stdout further parsed as one
+/// [`RunEventRecord`] per NDJSON line -- the shape every line has *unless*
+/// the history includes an undecodable row (issue #58), which
+/// `run_attach_cli_raw` itself is used for instead (see
+/// `attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_and_stderr_warnings`).
+async fn run_attach_cli(
+    run_id: &str,
+    db_path: &Path,
+    warden_home: &Path,
+) -> (std::process::ExitStatus, Vec<RunEventRecord>) {
+    let (status, lines, _stderr) = run_attach_cli_raw(run_id, db_path, warden_home).await;
+    let records: Vec<RunEventRecord> = lines
+        .iter()
         .map(|line| {
             serde_json::from_str(line)
                 .unwrap_or_else(|error| panic!("malformed NDJSON line {line:?}: {error}"))
         })
         .collect();
-    (output.status, records)
+    (status, records)
 }
 
 /// Acceptance criterion 1 (issue #8), happy path: history is replayed in
@@ -315,4 +334,195 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
         "issue #8 acceptance criterion 1 (\"no duplicated events\") is violated if e1 \
          appears twice -- got: {ids:?}"
     );
+}
+
+/// Issue #58 (PR review): a run whose history includes one row with
+/// malformed `payload_json` and one row with a kind-mismatched `event_type`
+/// must still exit 0 and replay every good event -- the two bad rows must
+/// show up on stdout as their own tagged `"undecodable"` NDJSON lines, in
+/// their rightful chronological place, *and* be logged at `warn` on stderr.
+/// Covers `main.rs::run_headless`'s new branch and `log_undecodable_event`,
+/// previously untested.
+#[tokio::test]
+async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_and_stderr_warnings()
+{
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+
+    insert_event(
+        &pool,
+        "event-good-1",
+        &RunEvent::RunStarted {
+            intent: "intent".to_string(),
+            branch: "main".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+        },
+        "2026-07-12T00:00:00+00:00",
+    )
+    .await;
+
+    // Malformed `payload_json` -- not even valid JSON for any `RunEvent`
+    // variant (simulates a reshape that changed the payload shape without a
+    // rewrite migration, issue #58's own motivating scenario).
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-malformed")
+    .bind("cycle_started")
+    .bind("{ not json")
+    .bind("2026-07-12T00:00:01+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Kind-mismatched row: valid JSON, but for the wrong `event_type`.
+    let mismatched_payload =
+        serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-mismatched")
+    .bind("run_finished")
+    .bind(mismatched_payload)
+    .bind("2026-07-12T00:00:02+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    insert_event(
+        &pool,
+        "event-good-2",
+        &RunEvent::CycleStarted { cycle_number: 2 },
+        "2026-07-12T00:00:03+00:00",
+    )
+    .await;
+
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+    // Deliberately no socket bound -- history-only path, exactly like
+    // `attach_cli_to_a_finished_run_prints_history_only_and_exits` above.
+
+    let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
+
+    assert!(
+        status.success(),
+        "warden-tui attach must exit 0 even with undecodable rows in history: {stderr}"
+    );
+
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("malformed NDJSON line {line:?}: {error}"))
+        })
+        .collect();
+    assert_eq!(
+        parsed.len(),
+        4,
+        "every row (good and undecodable) must be represented on stdout: {parsed:?}"
+    );
+
+    // event-good-1: an ordinary, unchanged RunEventRecord line.
+    assert!(parsed[0].get("event").is_some(), "{:?}", parsed[0]);
+    assert_eq!(parsed[0]["id"], "event-good-1");
+
+    // event-malformed: a tagged "undecodable" line, in its rightful
+    // chronological place (not appended at the end).
+    assert!(parsed[1].get("undecodable").is_some(), "{:?}", parsed[1]);
+    assert_eq!(parsed[1]["undecodable"]["id"], "event-malformed");
+    assert_eq!(parsed[1]["undecodable"]["event_type"], "cycle_started");
+    assert_eq!(
+        parsed[1]["undecodable"]["reason"]["kind"],
+        "payload_deserialize"
+    );
+
+    // event-mismatched: also tagged, carrying the mismatched payload kind.
+    assert!(parsed[2].get("undecodable").is_some(), "{:?}", parsed[2]);
+    assert_eq!(parsed[2]["undecodable"]["id"], "event-mismatched");
+    assert_eq!(parsed[2]["undecodable"]["event_type"], "run_finished");
+    assert_eq!(parsed[2]["undecodable"]["reason"]["kind"], "kind_mismatch");
+    assert_eq!(
+        parsed[2]["undecodable"]["reason"]["payload_kind"],
+        "cycle_started"
+    );
+
+    // event-good-2: back to an ordinary line, after the two bad rows.
+    assert!(parsed[3].get("event").is_some(), "{:?}", parsed[3]);
+    assert_eq!(parsed[3]["id"], "event-good-2");
+
+    // Both bad rows must also be logged at `warn` on stderr (the default
+    // level with no `-v`, see `main.rs::init_tracing`) -- in addition to,
+    // never instead of, the stdout marker asserted above.
+    assert!(stderr.contains("event-malformed"), "{stderr}");
+    assert!(stderr.contains("event-mismatched"), "{stderr}");
+    assert!(stderr.contains("could not be decoded"), "{stderr}");
+}
+
+/// Issue #58 test gap: a run whose history is *entirely* undecodable rows
+/// (not merely one bad row among good ones) must still exit 0 and surface
+/// every row as its own tagged "undecodable" NDJSON line -- the degenerate
+/// case where `list_events_for_run` has nothing genuinely decodable to fall
+/// back on at all, which is exactly the scenario the ticket's motivating bug
+/// report describes ("one stale row poisoned an entire run's history").
+#[tokio::test]
+async fn attach_cli_headless_still_exits_0_when_every_row_in_history_is_undecodable() {
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-unknown-kind")
+    .bind("workflow_step_added")
+    .bind(r#"{"kind":"workflow_step_added"}"#)
+    .bind("2026-07-12T00:00:00+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+    )
+    .bind("event-malformed")
+    .bind("cycle_started")
+    .bind("{ not json")
+    .bind("2026-07-12T00:00:01+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+    // Deliberately no socket bound -- history-only path.
+
+    let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
+
+    assert!(
+        status.success(),
+        "an all-undecodable history must never crash or exit non-zero: {stderr}"
+    );
+
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("malformed NDJSON line {line:?}: {error}"))
+        })
+        .collect();
+    assert_eq!(parsed.len(), 2, "{parsed:?}");
+    assert!(
+        parsed.iter().all(|line| line.get("undecodable").is_some()),
+        "every line must be tagged undecodable, none silently dropped nor mistaken for a \
+         decoded event: {parsed:?}"
+    );
+    assert_eq!(parsed[0]["undecodable"]["id"], "event-unknown-kind");
+    assert_eq!(
+        parsed[0]["undecodable"]["reason"]["kind"],
+        "unknown_event_type"
+    );
+    assert_eq!(parsed[1]["undecodable"]["id"], "event-malformed");
 }

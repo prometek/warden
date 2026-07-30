@@ -42,6 +42,123 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   précède le sandbox), pas comme un type de step à part entière — cette dernière livraison
   est un suivi séparé, non couvert ici.
 
+### Security — Issue #59 : garde de chemin de programme (#26) étendue aux `args`
+
+- **Le point 1 de l'issue #26 (« chemin `program`/`args` relatif ») est désormais couvert en
+  entier** : `process::validate_agent_program` refusait déjà `program`, jamais `args`. Un
+  futur `ToolAdapter` émettant quelque chose comme `claude --wrapper ./reviewer.sh`
+  réintroduirait exactement la même faille que `program`, puisque `./reviewer.sh` résout
+  contre le worktree du rôle — un checkout du dépôt sous revue que le coder contrôle.
+  Aucun adaptateur livré aujourd'hui n'émet un `args` de ce type ; garde ceinture-et-bretelles
+  comme celle sur `program`, même raisonnement.
+- **Règle conservatrice à base de séparateur, pas de déclaration par adaptateur** (choix de
+  conception assumé — une déclaration par adaptateur exigerait de faire évoluer l'API
+  `ToolAdapter`, hors périmètre) : une entrée `args` est candidate au contrôle de confinement
+  quand elle commence par `./`, `../`, `~`, est absolue, ou contient par ailleurs un
+  séparateur de chemin. `--flag=valeur` est géré (seule la valeur après le premier `=` est
+  jugée). Deux tiers, asymétriques :
+  - **Preuve forte, vérifiée sur la valeur entière, espace ou non** : `./`, `../`, `~`,
+    absolu.
+  - **Preuve faible, jugée uniquement sur le premier token délimité par un espace de la
+    valeur** (issue #59, revue round 2 — voir plus bas) : ce premier token doit contenir un
+    séparateur *et* ne contenir aucun métacaractère shell (`=`, guillemets, `$`, `` ` ``,
+    parenthèses, ...) **avant son premier séparateur** pour compter comme preuve. Une URL sur
+    liste blanche de schémas réseau
+    (`http`, `https`, `ssh`, `git`, `ftp`, `ftps`, `ws`, `wss`) — **pas** « n'importe quel
+    schéma syntaxiquement valide » — exempte ce même premier token ; `file://` est
+    explicitement résolu comme le chemin filesystem qu'il est (jamais exempté).
+- **Trous résiduels assumés et documentés, pas silencieux** :
+  - une entrée `args` sans aucun séparateur (`--wrapper reviewer.sh`) n'est pas détectée —
+    contrairement à `program`, un `args` nu n'a pas de sémantique `PATH` : il est interprété
+    par l'outil que nomme `program`, qui le résout typiquement contre son propre répertoire
+    courant (le worktree du rôle) ;
+  - un séparateur de chemin apparaissant *après* le premier token d'une valeur multi-mots
+    n'est jamais détecté (`"please run agents/evil.sh now"` — premier token `"please"`, pas
+    de séparateur) : re-scanner tous les tokens rouvrirait exactement le faux positif que
+    cette règle existe pour éviter (un prompt système contient presque toujours un `/`,
+    juste jamais comme premier mot).
+- **Échappatoire `trusted_arg_values`** : une valeur `model` d'un `AgentDefinition`
+  reviewer/tester (ex. `anthropic/claude-3-opus`, courant pour un routage style
+  OpenRouter/Mistral) ressemble à un chemin relatif pour la règle ci-dessus. L'appelant
+  (`orchestrator::trusted_arg_values_for_step`) ne vouche pour cette valeur que lorsque la
+  définition du rôle a été résolue depuis la configuration utilisateur **fiable** — jamais
+  quand elle provient du dépôt sous revue (`--trust-repo-agents`,
+  `RunConfig::untrusted_repo_agent_definitions`), jamais pour un rôle personnalisé (toujours
+  lu depuis `<repo>/.claude/agents/`, donc toujours contrôlé par le coder), jamais pour le
+  producteur (déjà exempté du garde-fou entier).
+- **Corrections trouvées en cours de revue (round 1)** avant la première fusion sur `main` :
+  un contournement par un espace dans une valeur autrement non ambiguë (chemin absolu à
+  l'intérieur du worktree du coder), un contournement par `file://` (chemin filesystem
+  laissé passer comme s'il s'agissait d'une URL), et un contournement par schéma inventé
+  devant un chemin relatif (`sh://../coder/tool.sh` acceptait n'importe quel schéma
+  syntaxiquement valide selon la RFC 3986 sans regarder ce qui suit).
+- **Correction trouvée en cours de revue (round 2), après le premier passage « ready to
+  merge »** : la règle round 1 exemptait *toute* valeur contenant un espace dès la preuve
+  faible — donc `--wrapper agents/evil script.sh` (même hasard que `./reviewer.sh`, sans le
+  `./`) passait sans jamais être contrôlé. Corrigé en restreignant la preuve faible au
+  premier token uniquement (voir ci-dessus). Cette première correction a elle-même
+  introduit une régression, détectée par la suite de tests existante
+  (`orchestrator::convergence`) avant merge : plusieurs fixtures de test construisent un
+  `args` de type script shell (`sh -c "dir='<chemin temporaire>' ..."`), dont le premier
+  token après les espaces d'indentation, `dir='<chemin>'`, contient un `/` et se faisait
+  refuser comme chemin relatif alors qu'il s'agit de syntaxe shell, pas d'un chemin. Fermé
+  par le filtre de métacaractères shell sur le premier token (voir ci-dessus) plutôt qu'en
+  affaiblissant la règle round 1.
+- **Correction trouvée en cours de test indépendant (round 2), après le second passage
+  « ready to merge »** : le filtre de métacaractères ci-dessus s'appliquait au token entier,
+  ce qui en faisait à son tour un contournement à un caractère, exactement de la même classe
+  que celui de l'espace : `agents/evil.sh` était refusé, mais `agents/evil$.sh` passait —
+  et c'est le coder qui choisit les noms de fichiers de son propre worktree. Corrigé en
+  restreignant le filtre au segment *précédant le premier séparateur* : dans le vrai faux
+  positif (`dir='<chemin>'`, `$(pwd)/tool.sh`) la syntaxe shell précède le séparateur, parce
+  que le séparateur appartient à un chemin que le *shell* construit ; un nom de fichier
+  inhabituel après le séparateur n'exempte plus rien. Vérifié sur les deux tiers : `./`
+  et les chemins absolus étaient déjà refusés dans tous ces cas.
+- Amende l'entrée « Issue #26 / ADR-0018 » ci-dessous : sa mention « le point 1 de l'issue
+  #26 (`program`/`args` relatifs) était déjà rendu sans objet » ne concernait que `program` —
+  `args` restait un trou ouvert jusqu'à cette issue.
+### Fixed — Issue #58 : une ligne `events` non décodable ne fait plus échouer tout `list_events_for_run`
+
+- **Constat** : une seule ligne `payload_json`/`event_type` ne correspondant plus à un variant
+  de `RunEvent` (un reshape de payload livré sans migration de réécriture — issue #43 pour
+  `RunStarted`, issue #26 pour `UntrustedAgentDefinitionUsed`) faisait échouer entièrement
+  `list_events_for_run`, aussi bien côté `warden::db` que `warden_tui::db` : une seule ligne
+  corrompue neutralisait tout l'historique du run et cassait `warden-tui attach` pour ce run.
+  Rien de publié n'est affecté (aucune version livrée n'a jamais écrit les nouveaux variants) —
+  l'exposition réelle se limite à un `warden_home` persistant utilisé contre des commits
+  intermédiaires.
+- **Décision retenue** (option 1 de l'issue, pas de migration de réécriture des lignes
+  existantes) : tolérer la ligne non décodable plutôt que de faire échouer la requête ou de la
+  faire disparaître silencieusement. `warden::db::list_events_for_run` et
+  `warden_tui::db::list_events_for_run` (miroirs indépendants, ADR-0006) décodent désormais
+  chaque ligne en un `warden_core::RunEventHistoryEntry` : soit `Decoded(RunEventRecord)` pour
+  une ligne qui décode et valide correctement, soit `Undecodable(UndecodableEvent { id, run_id,
+  event_type, reason, created_at })` pour une ligne qui échoue — seule une vraie erreur de
+  requête/connexion SQLite fait encore échouer la fonction.
+- **`reason` est un type explicite, pas une string** : `warden_core::UndecodableReason`
+  distingue `UnknownEventType` (ce binaire ne connaît pas encore ce `event_type` — typiquement
+  un lecteur plus ancien qu'un `warden` qui a écrit la ligne), `PayloadDeserialize`
+  (`payload_json` invalide ou ne correspondant à aucun variant connu) et `KindMismatch {
+  payload_kind }` (le payload décode correctement mais son propre variant contredit la colonne
+  `event_type`) — un appelant/une UI peut distinguer ces trois causes sans parser un message.
+- **`warden-tui` rend le marqueur, ne le fait jamais disparaître** : `RunModel` expose
+  `undecodable_events()`/`history()` (fusion chronologique des deux); la vue interactive
+  (`ui::events_widget`) affiche "this event could not be decoded" à la place exacte de la ligne
+  dans le journal défilant. Le dump NDJSON headless (`main.rs::run_headless`, utilisé quand
+  stdout n'est pas un terminal) émet désormais deux formes de ligne distinctes sur stdout : un
+  `RunEventRecord` nu, inchangé, pour une ligne décodée ; une ligne balisée `{"undecodable":
+  {...}}` pour une ligne non décodable, dans son ordre chronologique — en plus d'un
+  `tracing::warn!` sur stderr, jamais à sa place. Un consommateur qui redirige stderr vers
+  `/dev/null` (ou relève son niveau de log) voit quand même l'écart sur stdout, le seul canal
+  qu'il consomme réellement.
+- **Nettoyage des variants d'erreur devenus morts** : `WardenError::EventKindMismatch`,
+  `TuiError::EventKindMismatch` et `TuiError::EventPayload` sont supprimés — plus rien ne les
+  construit, le chemin de décodage ne propage plus jamais d'erreur pour une ligne individuelle.
+- **Hors périmètre, explicitement** : aucune migration de réécriture des lignes `events`
+  existantes n'est ajoutée (décision de l'issue) — les lignes déjà écrites par un `warden`
+  intermédiaire restent non décodables pour toujours, seulement rendues visibles plutôt que
+  fatales.
+
 ### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
 
 - **Régression introduite par l'issue #26** : `main.rs` résolvait
@@ -665,7 +782,9 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   lance toujours `claude` via `PATH`) — le point 1 de l'issue #26 (`program`/`args`
   relatifs) était déjà rendu sans objet par l'issue #24, qui a supprimé le schéma
   warden-natif `runner`/`program`/`args` ; cette garde est ajoutée en ceinture-et-bretelles
-  pour tout futur adaptateur.
+  pour tout futur adaptateur. **Amendement (issue #59, voir plus haut)** : cette garde ne
+  couvrait que `program` — `args` restait un trou ouvert, volontairement scopé hors de cette
+  issue-ci, jusqu'à ce que l'issue #59 le ferme.
 - **Limite assumée** : ceci n'est ni un sandbox filesystem ni un sandbox de credentials
   autour du coder — il tourne toujours avec un accès réel au dépôt et les grants par
   défaut de l'adaptateur sélectionné (`Bash` compris). L'isolation réelle reste suivie par
