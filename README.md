@@ -555,7 +555,11 @@ steps:
   `type: agent` — un hook n'écrit aucun commit, il ne peut que juger un travail déjà écrit.
   Une étape `type: hook` ne peut pas non plus déclarer `evidence: true` (ADR-0009 capture
   la session d'une commande *agent*, qu'une étape hook n'a pas). Toute autre valeur est une
-  erreur de parsing claire nommant la valeur invalide.
+  erreur de parsing claire nommant la valeur invalide — `type: policy` reçoit son propre
+  message (« not supported yet », voir issue #51) plutôt que d'être confondu avec une valeur
+  simplement invalide : c'est un type délibérément non livré par l'issue #79 (une étape dont
+  l'identité entière serait une décision de politique, pas seulement un mécanisme
+  d'exécution *gated by* une politique), pas un oubli.
 - `agent` — uniquement pour `type: agent` (le défaut) : nom résolu vers
   `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013) pour tout rôle au-delà des
   trois rôles intégrés.
@@ -582,6 +586,12 @@ steps:
   worktree du rôle (rw), le `.git` du repo de base (rw) et `~/.claude` de l'hôte (ro), sans
   filtrage d'egress — exactement la même surface qu'une étape `type: agent` (le tester,
   par exemple) a déjà sous docker aujourd'hui, ni élargie ni fermée par cet allowlist.
+  `PATH` n'a pas besoin d'être dans cet allowlist : il est toujours transmis tel quel sous
+  `--isolation worktree` (le défaut), mais sous `--isolation docker` c'est le `PATH` de
+  l'image du conteneur qui s'applique, jamais celui de l'hôte. Un `CARGO_HOME`/`RUSTUP_HOME`
+  non standard, lui, reste une valeur de **chemin hôte** même sous docker — l'outillage Rust
+  peut donc échouer si ce chemin n'existe pas dans le conteneur ; aucune surcharge `env:`
+  par étape n'est livrée par cette issue pour corriger ce cas au coup par coup.
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
   (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
 - `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :

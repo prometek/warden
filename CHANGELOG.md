@@ -35,6 +35,12 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   complet de l'opérateur qu'un hook de cycle de vie (`.warden/hooks.toml`) transmet.
 - **Exemple** : `examples/workflows/with-lint-hook/` (un `cargo fmt --all -- --check`
   inséré entre le reviewer et le tester).
+- **Hors périmètre, délibérément** : `type: policy` n'est pas livré par cette issue — rejeté
+  au parsing avec un message dédié (« not supported yet », voir issue #51) plutôt que
+  traité comme une valeur `type` inconnue. `warden-policy` (#51) reste consommé comme
+  l'infrastructure *interne* d'exécution d'une étape `type: hook` (le policy-gate qui
+  précède le sandbox), pas comme un type de step à part entière — cette dernière livraison
+  est un suivi séparé, non couvert ici.
 
 ### Fixed — Issue #57 : `warden run` n'exige plus `HOME`/`XDG_CONFIG_HOME` pour un workflow sans reviewer/tester
 
