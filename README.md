@@ -620,7 +620,9 @@ est une erreur claire nommant le rôle et le chemin attendu, jamais une étape
 silencieusement ignorée.
 
 Voir `examples/workflows/with-techlead/` pour un exemple complet (fichier
-`workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo.
+`workflow.yaml` + définition `techlead.md`) prêt à copier dans un repo, et
+`examples/workflows/with-scoped-review/` pour un exemple dédié à
+`gate: scoped-re-review` et `max_cycles` (issue #81).
 
 ### Gouverner les actions de warden (`.warden/policy.yaml`, issue #51/ADR-0016)
 

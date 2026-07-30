@@ -38,6 +38,8 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   déclaré.
 - **Erreur claire** sur une valeur de `gate`/`budget` inconnue, nommant la valeur fautive et
   l'ensemble des valeurs acceptées.
+- Nouvel exemple : `examples/workflows/with-scoped-review/` démontre `gate: scoped-re-review`
+  et `max_cycles` sur une étape `secreview` distincte du reviewer/tester intégrés.
 
 ### Security — Issue #59 : garde de chemin de programme (#26) étendue aux `args`
 
