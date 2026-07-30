@@ -215,24 +215,43 @@ impl Orchestrator {
         // cycle, which has no prior cycle to report on).
         let mut previous_cycle_id: Option<String> = None;
         // Issue #37/#41, ADR-0014, decision #37 Q3 (generalized per-step by
-        // issue #81): `false` until a given step index has completed one
-        // full pass over this run's body of work; every invocation after
-        // that first one is scoped to just the coder's latest correctif, in
-        // Phase A as in Phase B -- tracked across cycles (not reset per
-        // cycle) because "first pass" means the run's very first one for
-        // that step, not each cycle's. `step_has_run_once[1]` plays exactly
-        // the role `has_reviewed_once` used to (the first gated step's own
-        // positional scoped-re-review, unconditional on its declared
-        // `gate` -- retro-compat, see the loop's own `scope` computation
-        // below); every other index only ever matters for a step whose own
-        // declared `gate` is [`warden_core::Gate::ScopedReReview`].
-        let mut step_has_run_once = vec![false; config.workflow.steps.len()];
+        // issue #81); revised by issue #81's own code review, HIGH: `None`
+        // until a given step index has completed a pass, then `Some(commit)`
+        // -- the commit that step was invoked against (this run loop's own
+        // `base_commit`, i.e. the producer's new commit for the cycle that
+        // ran it) -- tracked across cycles (not reset per cycle), same as
+        // before. What changed: the earlier `bool` ("has this step ever run
+        // once") granted `Correctif` to a step at `step_index >= 2` even
+        // after a cycle in which an earlier gated step blocked and this step
+        // was never reached -- that step's `diff` only ever carries the
+        // *current* cycle's producer diff (`agents.rs`'s own `read_diff`),
+        // so a step that missed one or more intervening cycles must not be
+        // told to look only at "this correctif": the correctif payload
+        // silently omits every commit produced during the cycles it missed.
+        // The fix: `Correctif` is legal only when this step's *last*
+        // recorded commit equals `producer_base_commit_this_cycle` (captured
+        // below, right before this cycle's producer runs) -- i.e. this step
+        // did see (as its own prior invocation's target commit) exactly the
+        // commit this cycle's producer diff was computed against, with
+        // nothing in between it never looked at.
+        //
+        // `step_index == 1` is retro-compat-critical (issue #81 non-
+        // negotiable) and unaffected: that step always runs every single
+        // cycle (it's the first entry into the gated-step `while` loop,
+        // never skipped), so its own last-recorded commit is always exactly
+        // last cycle's producer commit -- exactly `producer_base_commit_this_
+        // cycle` on every subsequent cycle. The new condition is therefore
+        // equivalent to the old `step_has_run_once[1]` at that index: neither
+        // ever diverges from the other because index 1 can never itself be
+        // the "skipped a cycle" case this fix targets.
+        let mut step_last_reviewed_commit: Vec<Option<String>> =
+            vec![None; config.workflow.steps.len()];
         // Issue #81: one independent cycle counter per step that declares
         // its own `max_cycles` budget ([`warden_core::StepBudget::Own`]),
         // instead of one of the three run-level buckets above -- tracked
         // purely in-memory (see `StepBudget::Own`'s own docs for why this
         // never touches the `runs` table), indexed by `step_index` exactly
-        // like `step_has_run_once`.
+        // like `step_last_reviewed_commit`.
         let mut own_step_cycle_numbers = vec![0u32; config.workflow.steps.len()];
 
         let final_state = loop {
@@ -269,6 +288,14 @@ impl Orchestrator {
                 select_prior_findings(&self.pool, ci_seeded_findings, previous_cycle_id.as_deref())
                     .await?;
 
+            // Issue #81 review, HIGH: captured before the producer call
+            // below reassigns `base_commit` to this cycle's new commit --
+            // this is the commit this cycle's producer diff was computed
+            // *against* (see `agents.rs::run_producer`'s own `base_commit_sha`),
+            // and therefore the value a step's own `step_last_reviewed_commit`
+            // must match for a `Correctif` scope to be sound for it this
+            // cycle (see that vec's own docs above).
+            let producer_base_commit_this_cycle = base_commit.clone();
             let producer_role = &config.workflow.steps[0].role;
             let producer_result = self
                 .run_producer(
@@ -388,17 +415,29 @@ impl Orchestrator {
                 // mechanic, independent of that step's own declared `gate`),
                 // and to any step whose own declared `gate` is
                 // `ScopedReReview` (issue #81's generalization, usable at any
-                // position). Either way, only once this step has already
-                // completed one full pass this run -- its very first
-                // invocation always sees the whole cycle diff.
+                // position).
                 let step_is_scoped_re_reviewable =
                     step_index == 1 || step.gate == warden_core::Gate::ScopedReReview;
-                let scope =
-                    if step_is_scoped_re_reviewable && step_has_run_once[step_index as usize] {
-                        warden_core::ReviewScope::Correctif
-                    } else {
-                        warden_core::ReviewScope::Full
-                    };
+                // Issue #81 review, HIGH: `Correctif` is legal only when this
+                // step's last recorded commit -- the target commit it was
+                // actually invoked against, last time it ran -- equals this
+                // cycle's producer base commit. A step skipped in one or more
+                // intervening cycles (an earlier gated step blocked before
+                // reaching it) fails this check and gets `Full` instead,
+                // since `Correctif` would otherwise tell it to ignore
+                // producer commits from cycles it never saw at all (see
+                // `step_last_reviewed_commit`'s own docs above). This
+                // strictly subsumes the old "has run at least once" `bool`
+                // check: a step that has never run has no recorded commit
+                // (`None`) and so never matches, exactly like before.
+                let already_saw_this_cycles_base = step_last_reviewed_commit[step_index as usize]
+                    .as_deref()
+                    == Some(producer_base_commit_this_cycle.as_str());
+                let scope = if step_is_scoped_re_reviewable && already_saw_this_cycles_base {
+                    warden_core::ReviewScope::Correctif
+                } else {
+                    warden_core::ReviewScope::Full
+                };
 
                 self.transition(&run_id, RunState::RunningStep(step_index))
                     .await?;
@@ -435,7 +474,6 @@ impl Orchestrator {
                             diff: &producer_result.diff,
                             prior_findings: &prior_findings,
                             scope,
-                            gate: step.gate,
                             captures_evidence: step.captures_evidence,
                             config: &config,
                             cancel: cancel.clone(),
@@ -443,7 +481,14 @@ impl Orchestrator {
                     )
                     .await?;
                 if step_is_scoped_re_reviewable {
-                    step_has_run_once[step_index as usize] = true;
+                    // This step's target commit *this* invocation was
+                    // `base_commit` (unchanged since the producer ran, above)
+                    // -- recorded so a future cycle's own base-commit check
+                    // can tell whether this step actually saw everything up
+                    // to that cycle's producer base, or missed one or more
+                    // cycles in between (see `step_last_reviewed_commit`'s
+                    // own docs above).
+                    step_last_reviewed_commit[step_index as usize] = Some(base_commit.clone());
                 }
 
                 for finding in &step_findings {
@@ -3339,6 +3384,548 @@ steps:
             "this workflow has no step using the \"test\" bucket at all -- it must stay \
                  untouched"
         );
+    }
+
+    /// Issue #81 code review, HIGH (Finding 1): a step at `step_index >= 2`
+    /// declaring `gate: scoped-re-review` must fall back to a `full` scope
+    /// on any invocation that follows a cycle it was skipped in -- never
+    /// `correctif`, which would silently tell it to ignore producer commits
+    /// from the cycle(s) it never saw at all.
+    ///
+    /// Shape: `techlead` (index 2) blocks on its very first invocation
+    /// (cycle 1), forcing a reboucle. In cycle 2 the *reviewer* (index 1)
+    /// blocks instead -- `techlead` is never reached that cycle at all,
+    /// exactly the shape the unresolved review finding calls out (an
+    /// earlier gated step's own blocking finding exits the inner
+    /// `RunState::RunningStep` loop before a later step is ever entered).
+    /// Cycle 3: the reviewer is clean again, `techlead` runs for the second
+    /// time ever -- its own last-recorded commit is cycle 1's, but this
+    /// cycle's producer diff is only computed against cycle 2's committed
+    /// state, so `techlead` must receive `full`, not `correctif`.
+    #[tokio::test]
+    async fn a_scoped_step_skipped_by_an_earlier_blocking_cycle_gets_a_full_scope_on_its_return() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // Increments an on-disk counter every invocation -- deterministic,
+        // git-tracked "which cycle is this" signal every other fixture in
+        // this cycle can gate on.
+        let counting_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                    if [ -f step.txt ]; then n=$(cat step.txt); else n=0; fi
+                    n=$((n + 1))
+                    echo "$n" > step.txt
+                    git add step.txt
+                    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                    "#,
+            ],
+        );
+
+        // Blocks only while `step.txt` reads "2" -- i.e. only cycle 2's own
+        // gated pass, exactly the cycle whose blocking finding must keep
+        // `techlead` from ever being reached.
+        let step_2_gated_reviewer = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                    if [ -f step.txt ] && [ "$(cat step.txt)" = "2" ]; then
+                        echo '{"source":"reviewer","severity":"blocking","description":"step 2 has a regression"}'
+                    fi
+                    "#,
+            ],
+        );
+
+        // Blocks only on its very first invocation ever (tracked by an
+        // on-disk counter *outside* the worktree, which is removed every
+        // cycle) -- forces exactly one reboucle after its first full pass,
+        // then stays clean on every invocation after that.
+        let blocks_once_then_clean_techlead = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        cat > "$dir/payload-$n.json"
+                        if [ "$n" = "1" ]; then
+                            echo '{{"source":"techlead","severity":"blocking","description":"first pass flags something"}}'
+                        fi
+                        "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-scoped-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: techlead
+    gate: scoped-re-review
+    budget: extra
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "exercise the skipped-cycle scope regression".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(counting_coder),
+                definition(step_2_gated_reviewer),
+                definition(blocks_once_then_clean_techlead),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let invocation_count = std::fs::read_to_string(payloads.path().join("count")).unwrap();
+        assert_eq!(
+            invocation_count.trim(),
+            "2",
+            "techlead must run exactly twice: cycle 1 (its first pass) and cycle 3 (once the \
+                 reviewer's cycle-2-only regression finding clears) -- never cycle 2, while the \
+                 reviewer's own blocking finding gated the pipeline before techlead was ever \
+                 reached"
+        );
+
+        let read_raw_payload = |n: u32| -> serde_json::Value {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("techlead payload {n} must have been captured: {error}")
+                });
+            serde_json::from_str(&raw).expect("valid JSON")
+        };
+
+        let first = read_raw_payload(1);
+        assert_eq!(
+            first["scope"], "full",
+            "techlead's very first invocation ever has no prior pass to scope against"
+        );
+
+        let second = read_raw_payload(2);
+        assert_eq!(
+            second["scope"], "full",
+            "techlead's second invocation (cycle 3) must NOT be scoped to a \"correctif\": it \
+                 was skipped entirely in cycle 2 (gated behind the reviewer's own blocking \
+                 finding there), so it never saw that cycle's producer commit at all -- a \
+                 \"correctif\" scope would silently tell it to ignore that missed work instead \
+                 of re-examining the whole tree. This is the exact regression the unresolved \
+                 code-review finding on `step_is_scoped_re_reviewable` describes: before the \
+                 fix, `step_has_run_once[2]` stayed `true` from cycle 1 onward regardless of \
+                 the skipped cycle, which incorrectly downgraded this invocation to \
+                 \"correctif\"."
+        );
+    }
+
+    /// Issue #81 code review, LOW (Finding 5b): a step at `step_index >= 2`
+    /// that does NOT declare `gate: scoped-re-review` must receive a `full`
+    /// scope on *every* invocation, even when it runs every single cycle
+    /// with no skips at all -- pinning `step_is_scoped_re_reviewable`'s own
+    /// `||` against a future change that (correctly) fixes the commit-
+    /// tracking condition but (incorrectly) loosens which steps it applies
+    /// to.
+    #[tokio::test]
+    async fn a_non_scoped_step_beyond_the_first_gated_one_always_gets_a_full_scope() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+        let always_passing_reviewer = AgentCommand::new("sh", ["-c", "true"]);
+        // Never clean, and captures its own raw payload every invocation --
+        // this step runs every cycle with no skips, which is exactly the
+        // scenario a loosened `step_is_scoped_re_reviewable` condition would
+        // wrongly start scoping.
+        let always_blocking_techlead = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        cat > "$dir/payload-$n.json"
+                        echo '{{"source":"techlead","severity":"blocking","description":"never happy"}}'
+                        "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-plain-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+    max_cycles: 2
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_passing_reviewer),
+                definition(always_blocking_techlead),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::StepCyclesExceeded(2));
+
+        let read_raw_payload = |n: u32| -> serde_json::Value {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("techlead payload {n} must have been captured: {error}")
+                });
+            serde_json::from_str(&raw).expect("valid JSON")
+        };
+
+        for n in 1..=2 {
+            assert_eq!(
+                read_raw_payload(n)["scope"],
+                "full",
+                "invocation {n}: a step whose own declared gate is \"loop-until-clean\" (not \
+                     \"scoped-re-review\") must never be scoped, whatever its position or how \
+                     many times it has already run"
+            );
+        }
+    }
+
+    /// Issue #81 code review, LOW (Finding 5c): two different steps each
+    /// declaring their own `max_cycles` back two fully independent
+    /// counters at runtime, not merely at parse time (`workflow.rs`'s own
+    /// `two_steps_may_each_declare_their_own_independent_max_cycles` only
+    /// pins the parsed shape) -- demonstrated by a shape where the two
+    /// counters visibly diverge: the first step (`max_cycles: 3`) blocks
+    /// only on its own first invocation, then stays clean, so the second
+    /// step (`max_cycles: 2`) is reached -- and invoked -- one cycle fewer
+    /// than the first.
+    #[tokio::test]
+    async fn two_own_budgeted_steps_count_independently_at_runtime() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let step_a_invocations = TempDir::new().unwrap();
+        let step_b_invocations = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+        let always_passing_reviewer = AgentCommand::new("sh", ["-c", "true"]);
+        // Blocks only on its very first invocation, then stays clean --
+        // reached (and counted) once more than `step_b` below.
+        let step_a = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        if [ "$n" = "1" ]; then
+                            echo '{{"source":"step_a","severity":"blocking","description":"first pass only"}}'
+                        fi
+                        "#,
+                    step_a_invocations.path().display()
+                ),
+            ],
+        );
+        // Always blocks -- its own `max_cycles` (2) is what must exhaust
+        // the run.
+        let step_b = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        echo '{{"source":"step_b","severity":"blocking","description":"never happy"}}'
+                        "#,
+                    step_b_invocations.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-two-own-budgets
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: step_a
+    agent: step_a
+    gate: loop-until-clean
+    max_cycles: 3
+  - role: step_b
+    agent: step_b
+    gate: loop-until-clean
+    max_cycles: 2
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "exercise two independent per-step budgets".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_passing_reviewer),
+                definition(step_a),
+                definition(step_b),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(3),
+            "step_b's own max_cycles (2) is what must exhaust (step_b is workflow.steps[3])"
+        );
+
+        let step_a_count =
+            std::fs::read_to_string(step_a_invocations.path().join("count")).unwrap();
+        let step_b_count =
+            std::fs::read_to_string(step_b_invocations.path().join("count")).unwrap();
+        assert_eq!(
+            step_a_count.trim(),
+            "3",
+            "step_a is invoked once per cycle (3 cycles total: it blocks alone in cycle 1, then \
+                 clean cycles 2-3 while step_b keeps reboucling)"
+        );
+        assert_eq!(
+            step_b_count.trim(),
+            "2",
+            "step_b is only reached from cycle 2 onward (once step_a stops blocking), and its \
+                 own max_cycles (2) exhausts on its second invocation -- one fewer than \
+                 step_a's own count, proving the two counters are independent rather than \
+                 sharing one"
+        );
+    }
+
+    /// Issue #81 code review, LOW (Finding 5d): `StepBudget::Own` is charged
+    /// unconditionally, once per invocation -- including a clean one, not
+    /// only a blocking one (unlike `StepBudget::Review`'s conditional rule).
+    /// Pinned here with a step that is clean on its first invocation (its
+    /// own counter still advances to 1) and blocking on its second -- which
+    /// must immediately exhaust a `max_cycles: 2` budget, rather than only
+    /// starting to count from the first *blocking* invocation.
+    #[tokio::test]
+    async fn an_own_budget_is_charged_on_a_clean_invocation_too() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let db_dir_techlead_count = TempDir::new().unwrap();
+        let tester_invocations = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+        let always_passing_reviewer = AgentCommand::new("sh", ["-c", "true"]);
+        // Clean on its first invocation (still charges the `Own` counter to
+        // 1), blocking on its second (charges it to 2, which must equal
+        // `max_cycles` and exhaust immediately -- not on some later, third,
+        // invocation).
+        let clean_once_then_blocking_techlead = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        if [ "$n" != "1" ]; then
+                            echo '{{"source":"techlead","severity":"blocking","description":"now it is not happy"}}'
+                        fi
+                        "#,
+                    db_dir_techlead_count.path().display()
+                ),
+            ],
+        );
+        // Blocks only on cycle 1, forcing the reboucle that lets techlead's
+        // clean cycle-1 invocation be followed by a second one at all.
+        let blocks_once_tester = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        if [ "$n" = "1" ]; then
+                            echo '{{"source":"tester","severity":"blocking","description":"first pass only"}}'
+                        fi
+                        "#,
+                    tester_invocations.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-own-budget-clean-then-blocking
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+    max_cycles: 2
+  - role: tester
+    agent: tester
+    gate: loop-until-clean
+    budget: test
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "own budget must charge a clean invocation too".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_passing_reviewer),
+                definition(clean_once_then_blocking_techlead),
+                definition(blocks_once_tester),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(2),
+            "techlead's own max_cycles (2) must exhaust on its second invocation (cycle 2) -- \
+                 its clean first invocation (cycle 1) already charged the counter to 1, so a \
+                 rule that only counted blocking invocations would instead still be at 1 here \
+                 and reboucle instead of exhausting"
+        );
+        let techlead_count =
+            std::fs::read_to_string(db_dir_techlead_count.path().join("count")).unwrap();
+        assert_eq!(techlead_count.trim(), "2");
     }
 
     #[tokio::test]

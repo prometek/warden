@@ -563,13 +563,29 @@ steps:
 - `agent` — nom résolu vers `.claude/agents/<agent>.md` (convention Claude Code, ADR-0013)
   pour tout rôle au-delà des trois rôles intégrés.
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
-  (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
+  (exactement comme le reviewer/tester aujourd'hui) ; `scoped-re-review` (issue #81) gate
+  de la même façon, **plus** une optimisation de re-review scopée : le premier passage de
+  cette étape sur le run porte sur tout le diff du cycle, puis chaque réinvocation
+  suivante est scopée au seul correctif du coder (et aux findings qui l'ont motivé) — sauf
+  si l'étape a été sautée le temps d'un ou plusieurs cycles (une étape gatée plus tôt a
+  bloqué avant d'atteindre celle-ci), auquel cas elle reçoit à nouveau un passage complet,
+  puisqu'un scope correctif lui ferait ignorer les commits produits pendant les cycles
+  manqués. `workflow.steps[1]` (la première étape gatée) bénéficie de cette même
+  optimisation sans le déclarer, quel que soit son propre `gate` (rétro-compatibilité) ;
+  absent = simple pass-through.
 - `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :
   `review` (`--max-review-cycles`, compté seulement quand cette étape elle-même bloque),
   `test` (`--max-test-cycles`, compté à chaque invocation), ou `extra` (`--max-cycles`,
   budget partagé — c'est la valeur par défaut si la clé est omise). Suit la déclaration de
   l'étape, jamais sa position : réordonner le pipeline n'inverse jamais la règle de
   budget. `review`/`test` ne peuvent être revendiqués que par une seule étape chacun.
+- `max_cycles` — optionnel (issue #81), en alternative à `budget` (les deux sont
+  **mutuellement exclusifs** sur une même étape) : cette étape fixe son propre compteur
+  de cycles indépendant (minimum 1) plutôt que de partager l'un des trois buckets
+  ci-dessus. Chargé inconditionnellement à chaque invocation (comme `test`), y compris
+  sur une invocation propre — pas seulement la première fois que l'étape bloque. Suivi
+  entièrement en mémoire pour la durée du run (aucune colonne dédiée dans `runs`).
+  Interdit sur la première étape (le producteur), exactement comme `budget`.
 - `evidence` — optionnel, `true`/`false` (défaut `false`) : déclare que cette étape
   déclenche la capture de preuve ADR-0009 sur un cycle propre. Une seule étape peut le
   déclarer par workflow.
@@ -594,8 +610,10 @@ Quelle étape gatée est bornée par `--max-review-cycles`/`--max-test-cycles` s
 propre déclaration `budget: review`/`budget: test` — jamais sa position dans le
 pipeline (réordonner le reviewer/tester ne bascule plus la règle de l'un vers
 l'autre). Toute étape déclarant `budget: extra` (ou omettant la clé) partage un
-unique budget, contrôlé par `--max-cycles` (défaut 5). Tout rôle autre que
-`coder`/`reviewer`/`tester` est résolu depuis `.claude/agents/<agent>.md`
+unique budget, contrôlé par `--max-cycles` (défaut 5). Une étape peut aussi
+déclarer `max_cycles: N` (issue #81) au lieu de `budget` pour un compteur de
+cycles qui lui est propre, indépendant des trois buckets ci-dessus. Tout rôle
+autre que `coder`/`reviewer`/`tester` est résolu depuis `.claude/agents/<agent>.md`
 (convention Claude Code, ADR-0013), sans prompt par défaut : un fichier manquant
 est une erreur claire nommant le rôle et le chemin attendu, jamais une étape
 silencieusement ignorée.

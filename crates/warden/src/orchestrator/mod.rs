@@ -355,14 +355,13 @@ struct GatedStepInvocation<'a> {
     /// positional, retained unchanged for retro-compat), or any step whose
     /// own declared `gate` is [`warden_core::Gate::ScopedReReview`] --
     /// [`Orchestrator::run_gated_step`]'s own docs describe the defensive
-    /// re-check this struct's `step_index`/`gate` fields back.
+    /// re-check this backs. That re-check derives the step's own declared
+    /// gate from `config.workflow.steps[step_index]` itself (issue #81
+    /// review, LOW) rather than trusting a separate field this same struct's
+    /// caller would otherwise supply -- a caller passing a mismatched
+    /// `step_index`/gate pair could otherwise defeat the very re-check meant
+    /// to catch it.
     scope: warden_core::ReviewScope,
-    /// This step's own declared [`warden_core::WorkflowStep::gate`] (issue
-    /// #81) -- consulted only by [`Orchestrator::run_gated_step`]'s
-    /// defensive re-check on `scope`; the actual gating decision (reboucle
-    /// vs. advance/converge) is still made by the caller via
-    /// `decide_next_state_for_step`, exactly as before.
-    gate: warden_core::Gate,
     /// This step's own declared [`warden_core::WorkflowStep::captures_evidence`]
     /// (issue #73 review, finding F2) -- whether a clean run of *this* step
     /// triggers ADR-0009 evidence capture. Before this, `run_gated_step`

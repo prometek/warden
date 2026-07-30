@@ -221,7 +221,8 @@ impl StepBudget {
             "extra" => Ok(StepBudget::Extra),
             other => Err(CoreError::InvalidWorkflow(format!(
                 "unknown budget {other:?} (expected \"review\", \"test\", \"extra\", or omit the \
-                 key for \"extra\")"
+                 key for \"extra\"; for this step's own independent cycle budget, use \
+                 \"max_cycles: N\" instead of \"budget\")"
             ))),
         }
     }
@@ -483,7 +484,8 @@ impl Workflow {
                         CoreError::InvalidWorkflow(format!(
                             "step {index} (role {role:?}): unknown budget {raw_budget:?} \
                              (expected \"review\", \"test\", \"extra\", or omit the key for \
-                             \"extra\")"
+                             \"extra\"; for this step's own independent cycle budget, use \
+                             \"max_cycles: N\" instead of \"budget\")"
                         ))
                     })?,
                     (None, None) => StepBudget::Extra,
@@ -933,7 +935,12 @@ steps:
                      agent: reviewer\n    gate: loop-until-clean\n    budget: whenever\n";
         let error = Workflow::parse_yaml(yaml).unwrap_err();
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
-        assert!(error.to_string().contains("unknown budget"), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("unknown budget"), "{message}");
+        // Issue #81 code review, LOW: a step-specific budget uses a
+        // DIFFERENT key (`max_cycles: N`, not `budget`) -- the error must
+        // point there too, not just at the three named buckets.
+        assert!(message.contains("max_cycles"), "{message}");
     }
 
     /// Issue #73 review, F3: two steps can't both claim `review` (or both
@@ -1036,9 +1043,11 @@ steps:
         );
     }
 
-    /// A budget of zero cycles could never let this step's own reboucle
-    /// happen even once -- a clear, actionable error rather than a
-    /// degenerate always-exhausted step.
+    /// A zero budget is exhausted before the step ever runs -- unlike
+    /// `max_cycles: 1` (accepted: the step gets exactly one pass before its
+    /// budget is spent), zero could never let it run even that once. A
+    /// clear, actionable error rather than a degenerate always-exhausted
+    /// step.
     #[test]
     fn rejects_a_zero_max_cycles() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \

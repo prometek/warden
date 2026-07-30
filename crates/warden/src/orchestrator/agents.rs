@@ -222,7 +222,12 @@ impl Orchestrator {
     /// is the only caller that ever sets `Correctif`, and this is a
     /// defensive re-check against a future caller doing so incorrectly,
     /// mirroring this crate's existing "constructor invariant == defensive
-    /// re-check" convention.
+    /// re-check" convention. Issue #81 review, LOW: this step's own declared
+    /// gate is read straight off `invocation.config.workflow.steps[step_index]`
+    /// -- not a separate field on [`GatedStepInvocation`] -- so the re-check
+    /// stays independent of whatever the caller passes in for `step_index`/
+    /// `scope`; a field supplied by that same caller could never actually
+    /// catch that caller getting the two out of sync.
     ///
     /// Evidence capture (ADR-0009, issue #7) no longer keys on a literal
     /// role name either (issue #73 review, finding F2): it fires whenever
@@ -249,12 +254,17 @@ impl Orchestrator {
             diff,
             prior_findings,
             scope,
-            gate,
             captures_evidence,
             config,
             cancel,
         } = invocation;
 
+        // Issue #81 review, LOW: derived from `config` (this step's own
+        // declared `WorkflowStep::gate`) rather than trusted from a field
+        // `GatedStepInvocation` used to carry -- see this function's own
+        // docs above for why a caller-supplied value couldn't back this
+        // defensive re-check at all.
+        let gate = config.workflow.steps[step_index as usize].gate;
         let scoping_is_legal_for_this_step =
             step_index == 1 || gate == warden_core::Gate::ScopedReReview;
         if scope == warden_core::ReviewScope::Correctif && !scoping_is_legal_for_this_step {
@@ -537,7 +547,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -563,7 +572,6 @@ mod tests {
                         diff: "",
                         prior_findings: &[],
                         scope: warden_core::ReviewScope::Full,
-                        gate: warden_core::Gate::LoopUntilClean,
                         captures_evidence: true,
                         config: &config,
                         cancel: CancellationToken::new(),
@@ -683,7 +691,6 @@ mod tests {
                     diff: "diff --git a/x b/x\n+fixed the unwrap\n",
                     prior_findings: std::slice::from_ref(&originating_finding),
                     scope: warden_core::ReviewScope::Correctif,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -771,7 +778,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Correctif,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -882,7 +888,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -906,7 +911,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1014,7 +1018,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1117,7 +1120,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1219,7 +1221,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1322,7 +1323,6 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
-                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
