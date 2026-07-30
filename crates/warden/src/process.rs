@@ -401,10 +401,18 @@ fn check_containment(
 /// The metacharacter check tells a bare relative path (`agents/evil.sh`:
 /// only alphanumerics, `.`, `_`, `-`, `/`) apart from a shell-syntax
 /// fragment that merely embeds one (a quoted assignment, a command
-/// substitution, ...). A future wrapper-path hazard using one of these
-/// characters in its literal filename (`agents/evil(1).sh`) would be missed
-/// by this narrowing -- an accepted, narrow trade-off for not refusing
-/// ordinary shell-script `args` wholesale.
+/// substitution, ...).
+///
+/// That check applies **only to the part of the token before its first
+/// separator** (issue #59 test round 2). Applying it to the whole token was
+/// itself a one-character bypass of exactly the kind round 2 closed for
+/// whitespace: `agents/evil.sh` was refused but `agents/evil$.sh` was not,
+/// and a coder picks the filenames in its own worktree, so evading the
+/// guard cost it one character. Restricting the check to the leading
+/// segment keeps the real false positive exempt -- in `dir='<temp path>'`
+/// and `$(pwd)/tool.sh` the shell syntax sits before the separator, because
+/// the separator belongs to a path the *shell* builds -- while an unusual
+/// filename after the separator no longer buys anything.
 ///
 /// This also still accepts the residual, narrower false-positive risk noted
 /// before round 2's fix, mitigated by [`validate_agent_program`]'s own
@@ -454,12 +462,18 @@ fn path_like_candidate(arg: &str) -> Option<&str> {
     if !has_separator {
         return None;
     }
-    // Issue #59 review round 2: a bare relative path is built only from
-    // ordinary filename characters -- a token carrying shell syntax
-    // (a quoted assignment, `$(...)` substitution, ...) merely *embeds* a
-    // path, it isn't one itself. See this function's own docs for the real
-    // false positive this closes.
-    if first_token.contains(SHELL_METACHARACTERS) {
+    // Issue #59 test round 2: a token carrying shell syntax *before* its
+    // first separator (`dir='/tmp/x'`, `$(pwd)/tool.sh`) merely embeds a
+    // path -- the separator belongs to something the shell builds, not to a
+    // path this argv entry names. A metacharacter *after* the first
+    // separator is just an unusual filename (`agents/evil$.sh`), and a
+    // coder picks its own filenames, so exempting those would hand back the
+    // one-character bypass this round exists to close. See this function's
+    // own docs.
+    let separator_at = first_token
+        .find([std::path::MAIN_SEPARATOR, '/'])
+        .expect("has_separator checked above");
+    if first_token[..separator_at].contains(SHELL_METACHARACTERS) {
         return None;
     }
     Some(first_token)
@@ -1803,6 +1817,44 @@ mod tests {
             &[],
         )
         .is_ok());
+    }
+
+    /// The shell-metacharacter carve-out must not become the same
+    /// one-character bypass the whitespace exemption was: the coder names
+    /// the files in its own worktree, so if an odd character in the
+    /// *filename* exempted the value, evading the guard would cost it one
+    /// keystroke. `agents/evil.sh` and `agents/evil$.sh` must be refused
+    /// alike -- only shell syntax *before* the first separator exempts.
+    #[test]
+    fn a_metacharacter_after_the_first_separator_does_not_exempt_a_relative_path() {
+        let layout = WorktreeLayout::new();
+        let worktree = layout.role_worktree("reviewer");
+        let repo = TempDir::new().unwrap();
+
+        for name in [
+            "agents/evil$.sh",
+            "agents/evil(1).sh",
+            "agents/evil;.sh",
+            "agents/evil*.sh",
+            "agents/evil script.sh",
+        ] {
+            let error = validate_agent_program(
+                "reviewer",
+                false,
+                "claude",
+                &["--wrapper".to_string(), name.to_string()],
+                &worktree,
+                repo.path(),
+                layout.run_worktrees_root.path(),
+                &[],
+            )
+            .expect_err("a relative wrapper path must be refused whatever its filename contains");
+
+            assert!(
+                matches!(error, ProcessError::UntrustedAgentArg { ref arg, .. } if arg == name),
+                "expected UntrustedAgentArg naming {name}, got {error:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

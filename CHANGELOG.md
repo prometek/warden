@@ -27,7 +27,8 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   - **Preuve faible, jugée uniquement sur le premier token délimité par un espace de la
     valeur** (issue #59, revue round 2 — voir plus bas) : ce premier token doit contenir un
     séparateur *et* ne contenir aucun métacaractère shell (`=`, guillemets, `$`, `` ` ``,
-    parenthèses, ...) pour compter comme preuve. Une URL sur liste blanche de schémas réseau
+    parenthèses, ...) **avant son premier séparateur** pour compter comme preuve. Une URL sur
+    liste blanche de schémas réseau
     (`http`, `https`, `ssh`, `git`, `ftp`, `ftps`, `ws`, `wss`) — **pas** « n'importe quel
     schéma syntaxiquement valide » — exempte ce même premier token ; `file://` est
     explicitement résolu comme le chemin filesystem qu'il est (jamais exempté).
@@ -40,11 +41,7 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
     n'est jamais détecté (`"please run agents/evil.sh now"` — premier token `"please"`, pas
     de séparateur) : re-scanner tous les tokens rouvrirait exactement le faux positif que
     cette règle existe pour éviter (un prompt système contient presque toujours un `/`,
-    juste jamais comme premier mot) ;
-  - un premier token qui ressemble à un chemin relatif mais contient lui-même un
-    métacaractère shell dans son propre nom de fichier (`agents/evil(1).sh`) n'est pas
-    détecté non plus — compromis accepté pour ne pas refuser en bloc tout `args` de type
-    script shell (voir plus bas).
+    juste jamais comme premier mot).
 - **Échappatoire `trusted_arg_values`** : une valeur `model` d'un `AgentDefinition`
   reviewer/tester (ex. `anthropic/claude-3-opus`, courant pour un routage style
   OpenRouter/Mistral) ressemble à un chemin relatif pour la règle ci-dessus. L'appelant
@@ -72,6 +69,16 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   refuser comme chemin relatif alors qu'il s'agit de syntaxe shell, pas d'un chemin. Fermé
   par le filtre de métacaractères shell sur le premier token (voir ci-dessus) plutôt qu'en
   affaiblissant la règle round 1.
+- **Correction trouvée en cours de test indépendant (round 2), après le second passage
+  « ready to merge »** : le filtre de métacaractères ci-dessus s'appliquait au token entier,
+  ce qui en faisait à son tour un contournement à un caractère, exactement de la même classe
+  que celui de l'espace : `agents/evil.sh` était refusé, mais `agents/evil$.sh` passait —
+  et c'est le coder qui choisit les noms de fichiers de son propre worktree. Corrigé en
+  restreignant le filtre au segment *précédant le premier séparateur* : dans le vrai faux
+  positif (`dir='<chemin>'`, `$(pwd)/tool.sh`) la syntaxe shell précède le séparateur, parce
+  que le séparateur appartient à un chemin que le *shell* construit ; un nom de fichier
+  inhabituel après le séparateur n'exempte plus rien. Vérifié sur les deux tiers : `./`
+  et les chemins absolus étaient déjà refusés dans tous ces cas.
 - Amende l'entrée « Issue #26 / ADR-0018 » ci-dessous : sa mention « le point 1 de l'issue
   #26 (`program`/`args` relatifs) était déjà rendu sans objet » ne concernait que `program` —
   `args` restait un trou ouvert jusqu'à cette issue.
