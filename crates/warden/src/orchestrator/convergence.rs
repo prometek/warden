@@ -214,13 +214,26 @@ impl Orchestrator {
         // "prior-cycle findings" context below (`None` on a run's first
         // cycle, which has no prior cycle to report on).
         let mut previous_cycle_id: Option<String> = None;
-        // Issue #37/#41, ADR-0014, decision #37 Q3: `false` until the
-        // reviewer has completed one full pass over this run's body of
-        // work; every reviewer invocation after that first one is scoped to
-        // just the coder's latest correctif, in Phase A as in Phase B --
-        // tracked across cycles (not reset per cycle) because "first
-        // review" means the run's very first one, not each cycle's.
-        let mut has_reviewed_once = false;
+        // Issue #37/#41, ADR-0014, decision #37 Q3 (generalized per-step by
+        // issue #81): `false` until a given step index has completed one
+        // full pass over this run's body of work; every invocation after
+        // that first one is scoped to just the coder's latest correctif, in
+        // Phase A as in Phase B -- tracked across cycles (not reset per
+        // cycle) because "first pass" means the run's very first one for
+        // that step, not each cycle's. `step_has_run_once[1]` plays exactly
+        // the role `has_reviewed_once` used to (the first gated step's own
+        // positional scoped-re-review, unconditional on its declared
+        // `gate` -- retro-compat, see the loop's own `scope` computation
+        // below); every other index only ever matters for a step whose own
+        // declared `gate` is [`warden_core::Gate::ScopedReReview`].
+        let mut step_has_run_once = vec![false; config.workflow.steps.len()];
+        // Issue #81: one independent cycle counter per step that declares
+        // its own `max_cycles` budget ([`warden_core::StepBudget::Own`]),
+        // instead of one of the three run-level buckets above -- tracked
+        // purely in-memory (see `StepBudget::Own`'s own docs for why this
+        // never touches the `runs` table), indexed by `step_index` exactly
+        // like `step_has_run_once`.
+        let mut own_step_cycle_numbers = vec![0u32; config.workflow.steps.len()];
 
         let final_state = loop {
             let cycle_id = Uuid::new_v4().to_string();
@@ -306,15 +319,13 @@ impl Orchestrator {
             // every gated step (`workflow.steps[1..]`) -- the built-in
             // reviewer/tester and any custom step (e.g. `techlead`) are
             // driven through the exact same `run_gated_step` call, never
-            // branched on role name. Only one thing still varies by
-            // **position**, not by name (the "genuine invariant" issue #73
-            // asks to keep, generalized off step semantics rather than role
-            // names): `step_index == 1` (the first gated step) is the only
-            // one ever offered `ReviewScope::Correctif` (decision #37 Q2 was
-            // never really "the reviewer specifically", just "whichever
-            // step reviews the cycle's full body of work first, before
-            // later steps see it") -- gated on the run's own
-            // `has_reviewed_once`, exactly like before.
+            // branched on role name. `step_index == 1` (the first gated
+            // step) always gets `ReviewScope::Correctif` after its own first
+            // pass, whatever its own declared `gate` (retro-compat: this is
+            // the pre-#81 positional mechanic, decision #37 Q2, unchanged);
+            // issue #81 additionally offers the same scoping to any step
+            // whose own declared `gate` is `warden_core::Gate::ScopedReReview`,
+            // at any position -- see `step_is_scoped_re_reviewable` below.
             //
             // Which cycle-budget flag charges a step's own counter is *not*
             // positional (issue #73 review, finding F3: reordering the
@@ -327,10 +338,13 @@ impl Orchestrator {
             // [`warden_core::StepBudget::Extra`] shares `max_extra_step_cycles`
             // (charged once per cycle for the whole remaining chain, the
             // first time any such step is entered -- tracked below by
-            // `entered_extra_budget_this_cycle`). `Workflow::builtin_default`
-            // declares its reviewer/tester steps' budgets explicitly
-            // (`Review`/`Test`), so this is byte-for-byte the same rule the
-            // pre-review code applied by position.
+            // `entered_extra_budget_this_cycle`); [`warden_core::StepBudget::Own`]
+            // (issue #81) charges this step's own `max_cycles`, unconditionally,
+            // tracked by `own_step_cycle_numbers` rather than a run-level
+            // column. `Workflow::builtin_default` declares its reviewer/
+            // tester steps' budgets explicitly (`Review`/`Test`), so this is
+            // byte-for-byte the same rule the pre-review code applied by
+            // position.
             let mut next_state = if total_steps <= 1 {
                 // Issue #73 review, finding F4: a degenerate one-step
                 // workflow (producer only, no gates at all) has no later
@@ -369,11 +383,22 @@ impl Orchestrator {
                 let step = &config.workflow.steps[step_index as usize];
                 let step_agent = &agents.steps[step_index as usize];
 
-                let scope = if step_index == 1 && has_reviewed_once {
-                    warden_core::ReviewScope::Correctif
-                } else {
-                    warden_core::ReviewScope::Full
-                };
+                // Issue #81: scoped re-review applies to `step_index == 1`
+                // unconditionally (retro-compat -- the pre-#81 positional
+                // mechanic, independent of that step's own declared `gate`),
+                // and to any step whose own declared `gate` is
+                // `ScopedReReview` (issue #81's generalization, usable at any
+                // position). Either way, only once this step has already
+                // completed one full pass this run -- its very first
+                // invocation always sees the whole cycle diff.
+                let step_is_scoped_re_reviewable =
+                    step_index == 1 || step.gate == warden_core::Gate::ScopedReReview;
+                let scope =
+                    if step_is_scoped_re_reviewable && step_has_run_once[step_index as usize] {
+                        warden_core::ReviewScope::Correctif
+                    } else {
+                        warden_core::ReviewScope::Full
+                    };
 
                 self.transition(&run_id, RunState::RunningStep(step_index))
                     .await?;
@@ -410,14 +435,15 @@ impl Orchestrator {
                             diff: &producer_result.diff,
                             prior_findings: &prior_findings,
                             scope,
+                            gate: step.gate,
                             captures_evidence: step.captures_evidence,
                             config: &config,
                             cancel: cancel.clone(),
                         },
                     )
                     .await?;
-                if step_index == 1 {
-                    has_reviewed_once = true;
+                if step_is_scoped_re_reviewable {
+                    step_has_run_once[step_index as usize] = true;
                 }
 
                 for finding in &step_findings {
@@ -470,6 +496,15 @@ impl Orchestrator {
                     }
                     Some(warden_core::StepBudget::Extra) => {
                         (extra_step_cycle_number, config.max_extra_step_cycles)
+                    }
+                    Some(warden_core::StepBudget::Own(max_cycles)) => {
+                        // Issue #81: charged unconditionally, once per
+                        // invocation, exactly like `Test` -- this counter is
+                        // this step's own, with no sibling budget it needs
+                        // to stay independent from (see `StepBudget::Own`'s
+                        // own docs).
+                        own_step_cycle_numbers[step_index as usize] += 1;
+                        (own_step_cycle_numbers[step_index as usize], max_cycles)
                     }
                     None => unreachable!(
                         "workflow steps at index >= 1 always carry Some(budget) -- \
@@ -3058,6 +3093,251 @@ steps:
         assert_eq!(
             third.findings[0].description,
             "half-fixed introduces a regression"
+        );
+    }
+
+    // ---- issue #81: `Gate::ScopedReReview` and `StepBudget::Own` ----------
+
+    /// Issue #81's core `scoped-re-review` acceptance criterion: a step
+    /// beyond the built-in reviewer (here, a third, custom `techlead` step
+    /// at `step_index == 2`) that declares `gate: scoped-re-review` gets a
+    /// full pass over the whole cycle diff the first time it ever runs, and
+    /// a `Correctif`-scoped re-invocation (just the correctif plus the
+    /// finding that motivated it) on every reboucle after that -- exactly
+    /// the mechanic the built-in reviewer has always had at `step_index ==
+    /// 1`, now usable at any position via an explicit `workflow.yaml`
+    /// declaration instead of being wired to that one position.
+    ///
+    /// `techlead`'s payload is read back as raw JSON, not through
+    /// `warden_core::parse_agent_input_message` -- that parser only
+    /// recognizes the closed `AgentRole` trio (see
+    /// `build_finding_agent_input_json_round_trips_for_a_custom_role` in
+    /// `warden-core`), and a custom role's own wire payload is exactly what
+    /// this test exercises.
+    #[tokio::test]
+    async fn a_step_declaring_the_scoped_re_review_gate_scopes_its_re_invocations() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let payloads = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        // Always passes -- isolates the reboucle to `techlead`'s own
+        // finding, so `max_review_cycles` never gets charged.
+        let always_passing_reviewer = AgentCommand::new("sh", ["-c", "true"]);
+
+        // Same "flip status, capture own payload" shape as
+        // `a_re_review_after_a_correction_is_scoped_while_the_first_review_is_full`'s
+        // `capturing_reviewer`, but sourced as `"techlead"` and gated on
+        // `status.txt` exactly like `status_gated_reviewer`.
+        let capturing_techlead = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        cat > "$dir/payload-$n.json"
+                        if [ -f status.txt ] && [ "$(cat status.txt)" = "broken" ]; then
+                            echo '{{"source":"techlead","severity":"blocking","description":"status is broken"}}'
+                        fi
+                        "#,
+                    payloads.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-scoped-techlead
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: techlead
+    gate: scoped-re-review
+    budget: extra
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "flip status to fixed".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(flip_status_coder()),
+                definition(always_passing_reviewer),
+                definition(capturing_techlead),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (_run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let read_raw_payload = |n: u32| -> serde_json::Value {
+            let raw = std::fs::read_to_string(payloads.path().join(format!("payload-{n}.json")))
+                .unwrap_or_else(|error| {
+                    panic!("techlead payload {n} must have been captured: {error}")
+                });
+            serde_json::from_str(&raw).expect("valid JSON")
+        };
+
+        // Cycle 1: techlead's very first pass ever -- full, no originating
+        // findings yet.
+        let first = read_raw_payload(1);
+        assert_eq!(first["role"], "techlead");
+        assert_eq!(first["scope"], "full");
+        assert_eq!(
+            first["findings"].as_array().unwrap().len(),
+            0,
+            "the first pass has no originating findings: {first:?}"
+        );
+
+        // Cycle 2: a re-invocation following the coder's correction for
+        // cycle 1's blocking finding -- scoped to that correctif, exactly
+        // like `Gate::ScopedReReview`'s docs describe.
+        let second = read_raw_payload(2);
+        assert_eq!(second["role"], "techlead");
+        assert_eq!(second["scope"], "correctif");
+        let second_findings = second["findings"].as_array().unwrap();
+        assert_eq!(second_findings.len(), 1);
+        assert_eq!(second_findings[0]["source"], "techlead");
+        assert_eq!(second_findings[0]["description"], "status is broken");
+    }
+
+    /// Issue #81's per-step budget acceptance criterion: a step declares its
+    /// own cycle budget via `max_cycles` instead of one of the three named
+    /// buckets, and the loop honours it -- reboucling within budget, then
+    /// exhausting to `StepCyclesExceeded` at exactly that step's own
+    /// `max_cycles`, entirely independently of `max_review_cycles`/
+    /// `max_test_cycles` (which stay untouched at 0: this workflow's
+    /// reviewer always passes, and has no step using the `test` bucket at
+    /// all).
+    #[tokio::test]
+    async fn a_steps_own_max_cycles_budget_is_respected_independently_of_the_named_buckets() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let invocations = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let noop_coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"echo change >> notes.txt && git add notes.txt && git -c user.email=t@w.local -c user.name=w commit -q -m cycle"#,
+            ],
+        );
+        let always_passing_reviewer = AgentCommand::new("sh", ["-c", "true"]);
+        // Never clean -- counts its own invocations via a side-channel file
+        // (outside the worktree, which is removed every cycle) so the test
+        // can assert the loop actually stopped invoking it at its own
+        // declared `max_cycles`, not some other budget.
+        let always_blocking_techlead = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    r#"
+                        dir='{}'
+                        n=$(cat "$dir/count" 2>/dev/null || echo 0)
+                        n=$((n + 1))
+                        echo "$n" > "$dir/count"
+                        echo '{{"source":"techlead","severity":"blocking","description":"never happy"}}'
+                        "#,
+                    invocations.path().display()
+                ),
+            ],
+        );
+
+        let workflow = warden_core::Workflow::parse_yaml(
+            r#"
+name: with-own-budget
+steps:
+  - role: coder
+    agent: coder
+  - role: reviewer
+    agent: reviewer
+    gate: loop-until-clean
+    budget: review
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+    max_cycles: 2
+"#,
+        )
+        .unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "never converges".to_string(),
+            max_review_cycles: 5,
+            max_test_cycles: 5,
+            workflow,
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(noop_coder),
+                definition(always_passing_reviewer),
+                definition(always_blocking_techlead),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: true,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, FakeCommandAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            final_state,
+            RunState::StepCyclesExceeded(2),
+            "techlead's own max_cycles (2) is what must exhaust"
+        );
+        let invocation_count = std::fs::read_to_string(invocations.path().join("count")).unwrap();
+        assert_eq!(
+            invocation_count.trim(),
+            "2",
+            "the loop must stop reboucling to techlead once its own declared max_cycles (2) is \
+                 reached, neither before nor after"
+        );
+
+        let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
+        assert_eq!(
+            run.current_review_cycle, 0,
+            "the reviewer always passes clean -- techlead's own budget must exhaust without \
+                 ever charging the review bucket"
+        );
+        assert_eq!(
+            run.current_test_cycle, 0,
+            "this workflow has no step using the \"test\" bucket at all -- it must stay \
+                 untouched"
         );
     }
 

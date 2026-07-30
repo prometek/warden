@@ -212,15 +212,17 @@ impl Orchestrator {
     /// validated against its own open [`Role`] -- no role name ever
     /// branches this function's own behaviour.
     ///
-    /// **One narrow, documented exception, positional/functional rather
-    /// than a role-name check:** `scope` may only be
+    /// **Two narrow, documented exceptions:** `scope` may only be
     /// [`warden_core::ReviewScope::Correctif`] for `invocation.step_index
-    /// == 1` (the first gated step) -- decision #37 Q2's scoped-re-review
-    /// optimization is a pipeline mechanic tied to *position*, not to a role
-    /// named `"reviewer"`; `run_convergence_loop` is the only caller that
-    /// ever sets it, and this is a defensive re-check against a future
-    /// caller doing so incorrectly, mirroring this crate's existing
-    /// "constructor invariant == defensive re-check" convention.
+    /// == 1` (the first gated step, positional -- decision #37 Q2's original
+    /// scoped-re-review optimization, tied to *position*, not to a role
+    /// named `"reviewer"`), or for a step whose own declared `gate` is
+    /// [`warden_core::Gate::ScopedReReview`] (functional -- issue #81's
+    /// generalization, usable by any step at any position). `run_convergence_loop`
+    /// is the only caller that ever sets `Correctif`, and this is a
+    /// defensive re-check against a future caller doing so incorrectly,
+    /// mirroring this crate's existing "constructor invariant == defensive
+    /// re-check" convention.
     ///
     /// Evidence capture (ADR-0009, issue #7) no longer keys on a literal
     /// role name either (issue #73 review, finding F2): it fires whenever
@@ -247,16 +249,20 @@ impl Orchestrator {
             diff,
             prior_findings,
             scope,
+            gate,
             captures_evidence,
             config,
             cancel,
         } = invocation;
 
-        if scope == warden_core::ReviewScope::Correctif && step_index != 1 {
+        let scoping_is_legal_for_this_step =
+            step_index == 1 || gate == warden_core::Gate::ScopedReReview;
+        if scope == warden_core::ReviewScope::Correctif && !scoping_is_legal_for_this_step {
             return Err(WardenError::Core(
                 warden_core::CoreError::MalformedAgentInput(format!(
                     "step {step_index} ({role}) cannot be invoked with a scoped (\"correctif\") \
-                     review -- only the first gated step (index 1) can be scoped"
+                     review -- only the first gated step (index 1), or a step whose own gate is \
+                     \"scoped-re-review\", can be scoped"
                 )),
             ));
         }
@@ -531,6 +537,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -556,6 +563,7 @@ mod tests {
                         diff: "",
                         prior_findings: &[],
                         scope: warden_core::ReviewScope::Full,
+                        gate: warden_core::Gate::LoopUntilClean,
                         captures_evidence: true,
                         config: &config,
                         cancel: CancellationToken::new(),
@@ -675,6 +683,7 @@ mod tests {
                     diff: "diff --git a/x b/x\n+fixed the unwrap\n",
                     prior_findings: std::slice::from_ref(&originating_finding),
                     scope: warden_core::ReviewScope::Correctif,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -762,6 +771,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Correctif,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -872,6 +882,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -895,6 +906,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1002,6 +1014,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1104,6 +1117,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1205,6 +1219,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: true,
                     config: &config,
                     cancel: CancellationToken::new(),
@@ -1307,6 +1322,7 @@ mod tests {
                     diff: "",
                     prior_findings: &[],
                     scope: warden_core::ReviewScope::Full,
+                    gate: warden_core::Gate::LoopUntilClean,
                     captures_evidence: false,
                     config: &config,
                     cancel: CancellationToken::new(),

@@ -40,6 +40,16 @@
 //! crate parses (`agent_def`, `ci_channel`, `evidence_wire`): reading
 //! `.warden/workflow.yaml` off disk lives in `warden::agent_def` (I/O), this
 //! module only knows the schema and its invariants.
+//!
+//! Issue #81 extends both axes issue #73 deliberately left minimal:
+//! [`Gate::ScopedReReview`] is a second gate kind (alongside
+//! [`Gate::LoopUntilClean`]) that scopes a step's re-invocations to just the
+//! producer's latest correctif instead of the whole cycle diff, usable by
+//! any step rather than only the built-in reviewer's own position; a step
+//! may also declare `max_cycles: N` instead of `budget: review|test|extra`
+//! for its own independent cycle budget ([`StepBudget::Own`]). Both are
+//! additive: every value/shape issue #73 shipped keeps parsing to the exact
+//! same [`WorkflowStep`], unchanged.
 
 use serde::Deserialize;
 
@@ -88,10 +98,10 @@ impl std::fmt::Display for Role {
 /// How a step's findings gate the pipeline. Deliberately a closed enum, not
 /// a free-form string: an unknown gate name in `workflow.yaml` must be a
 /// clear parse error naming the bad value, never silently treated as one of
-/// the two known kinds. Extensible in principle (issue #73: "conçu pour
-/// être extensible") -- a future kind is a new variant plus two match arms
-/// here (`as_str`/`parse`), not a change to [`WorkflowStep`]'s shape or to
-/// any caller's signature.
+/// the known kinds. Extensible in principle (issue #73: "conçu pour être
+/// extensible") -- a future kind is a new variant plus two match arms here
+/// (`as_str`/`parse`), not a change to [`WorkflowStep`]'s shape or to any
+/// caller's signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
     /// No gate at all: the step runs once per cycle and never reboucles the
@@ -105,6 +115,23 @@ pub enum Gate {
     /// role reboucles the whole pipeline back to the first step (within this
     /// step's own cycle budget), instead of letting the pipeline advance.
     LoopUntilClean,
+    /// Issue #81: gates exactly like [`Gate::LoopUntilClean`] (a blocking
+    /// finding attributed to this step's own role reboucles within budget),
+    /// **plus** a scoped-re-review optimization (#37/ADR-0014, "re-review
+    /// scopée"): this step's very first pass over a run's body of work is
+    /// full (the whole cycle diff); every invocation that follows a producer
+    /// correction is scoped to just that correctif plus the findings that
+    /// motivated it ([`crate::agent_wire::ReviewScope::Correctif`]), instead
+    /// of the whole diff again. Before this, that optimization was wired
+    /// only into the built-in reviewer's own *position* (`workflow.steps[1]`,
+    /// `warden::orchestrator::run_convergence_loop`'s `has_reviewed_once`) --
+    /// this makes it a property any step can opt into, at any position,
+    /// declared in `workflow.yaml` rather than hardcoded. The pre-existing
+    /// positional behaviour at `workflow.steps[1]` is untouched (issue #81's
+    /// retro-compat requirement): a `workflow.steps[1]` step still gets
+    /// scoped re-review even when it declares `loop-until-clean`, exactly as
+    /// it always has.
+    ScopedReReview,
 }
 
 impl Gate {
@@ -112,6 +139,7 @@ impl Gate {
         match self {
             Gate::PassThrough => "pass-through",
             Gate::LoopUntilClean => "loop-until-clean",
+            Gate::ScopedReReview => "scoped-re-review",
         }
     }
 
@@ -119,9 +147,10 @@ impl Gate {
         match raw {
             "pass-through" => Ok(Gate::PassThrough),
             "loop-until-clean" => Ok(Gate::LoopUntilClean),
+            "scoped-re-review" => Ok(Gate::ScopedReReview),
             other => Err(CoreError::InvalidWorkflow(format!(
-                "unknown gate {other:?} (expected \"loop-until-clean\", or omit the key for a \
-                 plain pass-through)"
+                "unknown gate {other:?} (expected \"loop-until-clean\" or \"scoped-re-review\", \
+                 or omit the key for a plain pass-through)"
             ))),
         }
     }
@@ -156,14 +185,32 @@ pub enum StepBudget {
     /// that isn't `Review` or `Test`, charged once per cycle the first time
     /// any such step is entered (never once per individual extra step).
     Extra,
+    /// Issue #81: this step's own, independent cycle budget (`max_cycles: N`
+    /// in `workflow.yaml`), instead of one of the three run-level buckets
+    /// above. Charged unconditionally, once per invocation, exactly like
+    /// [`StepBudget::Test`] -- there is no sibling budget this one needs to
+    /// stay independent from (unlike `Review`, whose conditional-on-blocking
+    /// rule exists specifically to keep it independent from `Test`), so the
+    /// simpler unconditional rule applies. Tracked entirely in-memory by the
+    /// convergence loop (never persisted to the `runs` table, unlike
+    /// `Review`/`Test`/`Extra`'s `current_*_cycle` columns) -- a step's own
+    /// budget is a property of *that* step alone, and the `runs` table has
+    /// no generic per-step-index column to store an arbitrary number of
+    /// these in.
+    Own(u32),
 }
 
 impl StepBudget {
+    /// A label for this budget kind -- **not** a round-trippable wire form
+    /// for [`StepBudget::Own`] (its `u32` payload isn't representable in a
+    /// `&'static str`); only [`Self::parse`] input ("review"/"test"/"extra")
+    /// round-trips through this and back. Used for error messages/debugging.
     pub fn as_str(self) -> &'static str {
         match self {
             StepBudget::Review => "review",
             StepBudget::Test => "test",
             StepBudget::Extra => "extra",
+            StepBudget::Own(_) => "own",
         }
     }
 
@@ -224,7 +271,11 @@ pub struct Workflow {
 /// pass-through" (never "reject", never "assume loop-until-clean": an
 /// omitted key and a wrong one must not be conflated, see [`Gate::parse`]).
 /// `budget` absent means [`StepBudget::Extra`] (see [`Workflow::parse_yaml`]);
-/// `evidence` absent means `false`.
+/// `evidence` absent means `false`. Issue #81: `max_cycles` is mutually
+/// exclusive with `budget` -- at most one of the two may be present (see
+/// [`Workflow::parse_yaml`]); when present it's this step's own
+/// [`StepBudget::Own`] cycle budget instead of one of the three named
+/// buckets.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowStepWire {
@@ -232,6 +283,7 @@ struct WorkflowStepWire {
     agent: String,
     gate: Option<String>,
     budget: Option<String>,
+    max_cycles: Option<u32>,
     #[serde(default)]
     evidence: bool,
 }
@@ -370,7 +422,8 @@ impl Workflow {
                 Some(raw_gate) => Gate::parse(&raw_gate).map_err(|_| {
                     CoreError::InvalidWorkflow(format!(
                         "step {index} (role {role:?}): unknown gate {raw_gate:?} (expected \
-                         \"loop-until-clean\", or omit the key for a plain pass-through)"
+                         \"loop-until-clean\" or \"scoped-re-review\", or omit the key for a \
+                         plain pass-through)"
                     ))
                 })?,
                 None => Gate::PassThrough,
@@ -397,24 +450,52 @@ impl Workflow {
                          cycle budget of its own -- remove its \"budget\" key"
                     )));
                 }
+                if step.max_cycles.is_some() {
+                    return Err(CoreError::InvalidWorkflow(format!(
+                        "the first step (role {role:?}) is the pipeline's producer and has no \
+                         cycle budget of its own -- remove its \"max_cycles\" key"
+                    )));
+                }
                 None
             } else {
-                let budget = match &step.budget {
-                    Some(raw_budget) => StepBudget::parse(raw_budget).map_err(|_| {
+                // Issue #81: `budget` (a named, run-level bucket) and
+                // `max_cycles` (this step's own, independent budget) are
+                // mutually exclusive -- a step declaring both would leave it
+                // ambiguous which counter actually gates it.
+                let budget = match (&step.budget, step.max_cycles) {
+                    (Some(_), Some(_)) => {
+                        return Err(CoreError::InvalidWorkflow(format!(
+                            "step {index} (role {role:?}) declares both \"budget\" and \
+                             \"max_cycles\" -- pick one: a named run-level bucket via \"budget\", \
+                             or this step's own cycle budget via \"max_cycles\""
+                        )));
+                    }
+                    (None, Some(max_cycles)) => {
+                        if max_cycles == 0 {
+                            return Err(CoreError::InvalidWorkflow(format!(
+                                "step {index} (role {role:?}): max_cycles must be at least 1, \
+                                 got 0"
+                            )));
+                        }
+                        StepBudget::Own(max_cycles)
+                    }
+                    (Some(raw_budget), None) => StepBudget::parse(raw_budget).map_err(|_| {
                         CoreError::InvalidWorkflow(format!(
                             "step {index} (role {role:?}): unknown budget {raw_budget:?} \
                              (expected \"review\", \"test\", \"extra\", or omit the key for \
                              \"extra\")"
                         ))
                     })?,
-                    None => StepBudget::Extra,
+                    (None, None) => StepBudget::Extra,
                 };
                 let duplicate_of = match budget {
                     StepBudget::Review => &mut review_budget_step,
                     StepBudget::Test => &mut test_budget_step,
                     // `Extra` is the shared bucket -- no single-claimant
-                    // invariant applies, so there's nothing to check.
-                    StepBudget::Extra => &mut None,
+                    // invariant applies, so there's nothing to check. `Own`
+                    // is this step's own independent budget -- by
+                    // definition, no other step could ever conflict with it.
+                    StepBudget::Extra | StepBudget::Own(_) => &mut None,
                 };
                 if let Some(prior_index) = *duplicate_of {
                     return Err(CoreError::InvalidWorkflow(format!(
@@ -748,10 +829,48 @@ steps:
 
     #[test]
     fn gate_round_trips_through_its_string_form() {
-        for gate in [Gate::PassThrough, Gate::LoopUntilClean] {
+        for gate in [
+            Gate::PassThrough,
+            Gate::LoopUntilClean,
+            Gate::ScopedReReview,
+        ] {
             assert_eq!(Gate::parse(gate.as_str()).unwrap(), gate);
         }
         assert!(Gate::parse("ghost").is_err());
+    }
+
+    /// Issue #81: a step can declare the new `scoped-re-review` gate value,
+    /// just like it already could `loop-until-clean` -- parses to
+    /// [`Gate::ScopedReReview`], not rejected as unknown.
+    #[test]
+    fn a_step_can_declare_the_scoped_re_review_gate() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+    gate: scoped-re-review
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].gate, Gate::ScopedReReview);
+    }
+
+    /// Issue #81 acceptance criterion: an unknown gate value's error message
+    /// must name both accepted values, not just the pre-#81 one.
+    #[test]
+    fn unknown_gate_error_names_both_accepted_values() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
+                     agent: reviewer\n    gate: whenever-it-feels-like-it\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("loop-until-clean"), "{message}");
+        assert!(message.contains("scoped-re-review"), "{message}");
+        assert!(
+            message.contains("\"whenever-it-feels-like-it\""),
+            "{message}"
+        );
     }
 
     #[test]
@@ -854,6 +973,89 @@ steps:
     budget: extra
 "#;
         assert!(Workflow::parse_yaml(yaml).is_ok());
+    }
+
+    // ---- issue #81: per-step `max_cycles` (`StepBudget::Own`) --------------
+
+    /// The acceptance criterion's core case: a step declares its own cycle
+    /// budget via `max_cycles` instead of one of the three named buckets.
+    #[test]
+    fn a_step_can_declare_its_own_max_cycles_budget() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: techlead
+    agent: techlead
+    gate: loop-until-clean
+    max_cycles: 7
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Own(7)));
+    }
+
+    /// Unlike `review`/`test`, two different steps may each declare their
+    /// own `max_cycles` -- each backs a fully independent counter, so there
+    /// is no shared-bucket conflict to reject.
+    #[test]
+    fn two_steps_may_each_declare_their_own_independent_max_cycles() {
+        let yaml = r#"
+name: x
+steps:
+  - role: coder
+    agent: coder
+  - role: one
+    agent: one
+    gate: loop-until-clean
+    max_cycles: 2
+  - role: two
+    agent: two
+    gate: loop-until-clean
+    max_cycles: 9
+"#;
+        let workflow = Workflow::parse_yaml(yaml).unwrap();
+        assert_eq!(workflow.steps[1].budget, Some(StepBudget::Own(2)));
+        assert_eq!(workflow.steps[2].budget, Some(StepBudget::Own(9)));
+    }
+
+    /// `budget` and `max_cycles` are mutually exclusive -- declaring both
+    /// leaves it ambiguous which counter actually gates the step.
+    #[test]
+    fn rejects_a_step_declaring_both_budget_and_max_cycles() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
+                     agent: reviewer\n    gate: loop-until-clean\n    budget: review\n    \
+                     max_cycles: 3\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("both \"budget\" and \"max_cycles\""),
+            "{error}"
+        );
+    }
+
+    /// A budget of zero cycles could never let this step's own reboucle
+    /// happen even once -- a clear, actionable error rather than a
+    /// degenerate always-exhausted step.
+    #[test]
+    fn rejects_a_zero_max_cycles() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
+                     agent: reviewer\n    gate: loop-until-clean\n    max_cycles: 0\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("max_cycles"), "{error}");
+    }
+
+    /// The producer has no cycle budget of its own -- `max_cycles` on it is
+    /// rejected exactly like `budget` on it already is.
+    #[test]
+    fn rejects_a_max_cycles_declared_on_the_first_step() {
+        let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    max_cycles: 3\n";
+        let error = Workflow::parse_yaml(yaml).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidWorkflow(_)));
+        assert!(error.to_string().contains("producer"), "{error}");
     }
 
     /// Issue #73 review, F2: evidence capture is a declared per-step

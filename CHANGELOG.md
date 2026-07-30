@@ -7,6 +7,32 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #81 : gates étendus — re-review scopée généralisée + budget de cycles par étape (`max_cycles`)
+
+- **Nouveau `gate: scoped-re-review`** (aux côtés de `loop-until-clean` et du pass-through
+  implicite) : une étape déclarant ce gate reçoit un passage complet sur tout le diff du
+  cycle la première fois qu'elle tourne dans le run, puis un scope `correctif` (juste le
+  correctif du coder + les findings qui l'ont motivé) à chaque réinvocation suivante — cette
+  optimisation (#37/ADR-0014, « re-review scopée ») n'était jusqu'ici câblée que sur la
+  *position* de la première étape gated (`workflow.steps[1]`, historiquement le reviewer).
+  Utilisable désormais par n'importe quelle étape, à n'importe quelle position.
+- **Budget de cycles par étape (`max_cycles: N`)**, en alternative à
+  `budget: review|test|extra` : une étape peut fixer son propre compteur de cycles
+  indépendant plutôt que de partager l'un des trois buckets figés au niveau du run. Chargé
+  inconditionnellement à chaque invocation (comme `test`), suivi entièrement en mémoire par
+  la boucle de convergence (`StepBudget::Own` — pas de colonne dédiée dans `runs`, à la
+  différence de `review`/`test`/`extra`).
+- `budget` et `max_cycles` sont **mutuellement exclusifs** sur une même étape ;
+  `max_cycles: 0` est rejeté (un budget toujours épuisé dès la première évaluation) ; ni
+  `budget` ni `max_cycles` ne sont autorisés sur la première étape (le producteur, qui n'a
+  aucun budget propre).
+- **Rétro-compatibilité stricte** : le workflow par défaut et tout `gate: loop-until-clean`/
+  `budget: review|test|extra` existant se comportent à l'identique — la re-review scopée
+  positionnelle de `workflow.steps[1]` reste inchangée, indépendamment de son propre `gate`
+  déclaré.
+- **Erreur claire** sur une valeur de `gate`/`budget` inconnue, nommant la valeur fautive et
+  l'ensemble des valeurs acceptées.
+
 ### Security — Issue #59 : garde de chemin de programme (#26) étendue aux `args`
 
 - **Le point 1 de l'issue #26 (« chemin `program`/`args` relatif ») est désormais couvert en
