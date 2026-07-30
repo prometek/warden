@@ -32,10 +32,13 @@ means). Declaring `type: hook` instead:
 - Replaces `agent: <name>` with `run: "<shell command>"` -- `agent` and
   `run` are mutually exclusive, and the wrong one for a step's declared
   `type` is a parse error naming the problem.
-- Runs that command via `sh -c` inside the run's sandbox (issue #55,
-  ADR-0017's own `CommandHook` mechanics, reused rather than duplicated),
-  checked out at this cycle's commit, in its own isolated worktree -- the
-  same isolation and worktree/token bookkeeping any other step gets.
+- Runs that command via `sh -c` inside the run's sandbox, checked out at
+  this cycle's commit, in its own isolated worktree -- the same worktree
+  isolation, `agent_processes` bookkeeping (pid, exit code), and
+  `AgentStarted`/`AgentFinished` event pair any other step gets, so it is
+  just as visible to crash recovery and `warden-tui`. Unlike a `type: agent`
+  step, it reports no *token* usage (`usage: None` on its `AgentFinished`
+  event) -- a deterministic command consumes no LLM.
 - Is evaluated against `.warden/policy.yaml` first (issue #51, ADR-0016) --
   a `deny`-matched command is blocked before it ever reaches the sandbox,
   exactly like a `.warden/hooks.toml` lifecycle hook's own command already
@@ -45,6 +48,14 @@ means). Declaring `type: hook` instead:
   Cannot capture evidence either (`evidence: true` on a `type: hook` step is
   a parse error) -- ADR-0009 evidence records an *agent's* command session,
   which a hook step has none of.
+
+**Trust model**: `run` is declared in `.warden/workflow.yaml`, a file that
+lives in (and can be committed by) the repo under review -- the same trust
+class as `.warden/hooks.toml`. It runs with a deliberately narrow, explicit
+environment allowlist (`HOME`/`LANG`/`TERM`/`CARGO_HOME`/`RUSTUP_HOME`),
+never the operator's full environment -- see
+`warden::orchestrator::agents::WORKFLOW_STEP_ENV_ALLOWLIST`'s own doc
+comment for the full rationale and the `--isolation docker` caveats.
 
 ## The verdict
 

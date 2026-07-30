@@ -459,11 +459,14 @@ impl Workflow {
                          issue #51) -- use type: agent or type: hook"
                     )));
                 }
-                Some(raw_kind) => StepKind::parse(raw_kind).map_err(|_| {
-                    CoreError::InvalidWorkflow(format!(
-                        "step {index} (role {role:?}): unknown type {raw_kind:?} (expected \
-                         \"agent\" or \"hook\", or omit the key for \"agent\")"
-                    ))
+                // Issue #79 review (cycle 3): wraps `StepKind::parse`'s own
+                // message with step/role context instead of re-hand-writing
+                // it here -- the two could otherwise drift (a future new
+                // `StepKind` variant, or a wording tweak to `parse`'s own
+                // message, would leave this duplicate stale). Mirrors
+                // `Role::new`'s own call site a few lines above.
+                Some(raw_kind) => StepKind::parse(raw_kind).map_err(|error| {
+                    CoreError::InvalidWorkflow(format!("step {index} (role {role:?}): {error}"))
                 })?,
             };
             if index == 0 && kind != StepKind::Agent {

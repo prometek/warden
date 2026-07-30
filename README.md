@@ -564,13 +564,24 @@ steps:
   (`crate::hook::CommandHook`, issue #55/#51), mais dans le worktree de cette étape (checké
   out sur le commit du cycle) plutôt que le checkout de l'opérateur. Un exit non nul (ou un
   refus de `.warden/policy.yaml`) devient exactement une finding bloquante sourcée par
-  `role`, agrégée dans la boucle de convergence comme celle d'une étape `agent`. **Modèle de
-  confiance** : contrairement à un hook de cycle de vie (qui transmet l'environnement complet
-  de l'opérateur — voir la section `.warden/hooks.toml` ci-dessous), une étape `type: hook`
-  ne transmet qu'un allowlist restreint (`HOME`, `LANG`, `TERM`, `CARGO_HOME`, `RUSTUP_HOME`)
-  — c'est la première commande de ce projet qui exécute du code potentiellement écrit par le
-  coder (un `build.rs`, un script `npm test`, ...) avec *un* environnement, jamais l'accès
-  complet de l'opérateur (`SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/`ANTHROPIC_API_KEY`).
+  `role`, agrégée dans la boucle de convergence comme celle d'une étape `agent`.
+  **Modèle de confiance** : `run` est déclaré dans `.warden/workflow.yaml`, un fichier du
+  *repo* sous revue (qu'un coder d'un run précédent peut committer) — la même classe de
+  confiance que `.warden/hooks.toml` (voir `crate::hook_config`, dont ceci reprend le
+  modèle) : avant l'issue #79, `workflow.yaml` ne pouvait que *nommer* une définition
+  d'agent, il peut désormais porter du shell arbitraire, honoré par défaut, sans flag
+  d'opt-in — la même posture que « vous exécutez déjà le coder de ce repo, vous exécutez
+  déjà les commandes d'un `Makefile`/`npm postinstall` ». Contrairement à un hook de cycle
+  de vie (`crate::hook::CommandHook`, qui transmet l'environnement complet de l'opérateur),
+  une étape `type: hook` ne transmet qu'un allowlist restreint (`HOME`, `LANG`, `TERM`,
+  `CARGO_HOME`, `RUSTUP_HOME`) — c'est la première commande de ce projet qui exécute du
+  code potentiellement écrit par le coder (un `build.rs`, un script `npm test`, ...) avec
+  *un* environnement, jamais l'accès complet de l'opérateur
+  (`SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/`ANTHROPIC_API_KEY`). Sous `--isolation docker`, cet
+  allowlist ne borne que les variables d'environnement : le conteneur monte quand même le
+  worktree du rôle (rw), le `.git` du repo de base (rw) et `~/.claude` de l'hôte (ro), sans
+  filtrage d'egress — exactement la même surface qu'une étape `type: agent` (le tester,
+  par exemple) a déjà sous docker aujourd'hui, ni élargie ni fermée par cet allowlist.
 - `gate` — optionnel : `loop-until-clean` reboucle vers le coder sur un finding bloquant
   (exactement comme le reviewer/tester aujourd'hui) ; absent = simple pass-through.
 - `budget` — optionnel, uniquement pour une étape gatée (jamais la première) :
