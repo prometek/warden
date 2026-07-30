@@ -48,6 +48,12 @@ pub enum EventKind {
     /// so the run's own permanent event log carries a record of which
     /// role(s) ran under a definition the coder can write to.
     UntrustedAgentDefinitionUsed,
+    /// Issue #84: a run's `--tool` adapter reported a rate-limit/quota
+    /// status for one invocation (`ToolAdapter::extract_rate_limit`) --
+    /// published (and persisted as the run's last-known status) whenever
+    /// that seam returns `Some`, never for a tool that reports nothing at
+    /// all.
+    RateLimitStatusUpdated,
     RunFinished,
 }
 
@@ -62,6 +68,7 @@ impl EventKind {
             EventKind::FindingRaised => "finding_raised",
             EventKind::EvidenceCaptured => "evidence_captured",
             EventKind::UntrustedAgentDefinitionUsed => "untrusted_agent_definition_used",
+            EventKind::RateLimitStatusUpdated => "rate_limit_status_updated",
             EventKind::RunFinished => "run_finished",
         }
     }
@@ -76,6 +83,7 @@ impl EventKind {
             "finding_raised" => Ok(EventKind::FindingRaised),
             "evidence_captured" => Ok(EventKind::EvidenceCaptured),
             "untrusted_agent_definition_used" => Ok(EventKind::UntrustedAgentDefinitionUsed),
+            "rate_limit_status_updated" => Ok(EventKind::RateLimitStatusUpdated),
             "run_finished" => Ok(EventKind::RunFinished),
             other => Err(CoreError::UnknownEventKind(other.to_string())),
         }
@@ -183,6 +191,16 @@ pub enum RunEvent {
         path: String,
         canonical_path: String,
     },
+    /// Issue #84: the rate-limit/quota status one invocation's `--tool`
+    /// adapter reported, via `warden::tool_adapter::ToolAdapter::extract_rate_limit`
+    /// -- published only when that seam returns `Some` (a tool that reports
+    /// nothing never produces this event at all, rather than one carrying a
+    /// fabricated/empty status). `role` is whichever role's invocation
+    /// reported it, the same convention as `AgentFinished::role`.
+    RateLimitStatusUpdated {
+        role: String,
+        status: crate::RateLimitStatus,
+    },
     RunFinished {
         final_state: String,
     },
@@ -206,6 +224,7 @@ impl RunEvent {
             RunEvent::UntrustedAgentDefinitionUsed { .. } => {
                 EventKind::UntrustedAgentDefinitionUsed
             }
+            RunEvent::RateLimitStatusUpdated { .. } => EventKind::RateLimitStatusUpdated,
             RunEvent::RunFinished { .. } => EventKind::RunFinished,
         }
     }
@@ -355,6 +374,7 @@ mod tests {
             EventKind::FindingRaised,
             EventKind::EvidenceCaptured,
             EventKind::UntrustedAgentDefinitionUsed,
+            EventKind::RateLimitStatusUpdated,
             EventKind::RunFinished,
         ]
     }
@@ -413,6 +433,17 @@ mod tests {
                 role: "reviewer".to_string(),
                 path: "/repo/.warden/agents/reviewer.md".to_string(),
                 canonical_path: "/repo/.warden/agents/reviewer.md".to_string(),
+            },
+            EventKind::RateLimitStatusUpdated => RunEvent::RateLimitStatusUpdated {
+                role: "coder".to_string(),
+                status: crate::RateLimitStatus::new(
+                    crate::RateLimitState::AllowedWarning,
+                    crate::RateLimitWindow::SevenDay,
+                    0.93,
+                    false,
+                    0.75,
+                    1785686400,
+                ),
             },
             EventKind::RunFinished => RunEvent::RunFinished {
                 final_state: "converged".to_string(),

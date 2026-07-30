@@ -1770,6 +1770,134 @@ mod tests {
         );
     }
 
+    /// Test-only adapter pairing the real, shipped
+    /// `crate::tool_adapter::ClaudeAdapter::extract_rate_limit` with a fake
+    /// `build_command`/`extract_findings` -- same shape as
+    /// `RealClaudeParsingAdapter` above (issue #33), for issue #84: lets a
+    /// test drive stdout that is genuinely parsed by the production
+    /// `rate_limit_event` extractor, without needing the real `claude`
+    /// binary.
+    struct RealClaudeRateLimitAdapter;
+
+    impl ToolAdapter for RealClaudeRateLimitAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            warden_core::parse_findings(stdout)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test using this adapter provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+
+        fn extract_rate_limit(&self, stdout: &str) -> Option<warden_core::RateLimitStatus> {
+            crate::tool_adapter::ClaudeAdapter.extract_rate_limit(stdout)
+        }
+    }
+
+    /// End-to-end proof for issue #84, through the real orchestrator (not
+    /// just a unit test against `ClaudeAdapter::extract_rate_limit` in
+    /// isolation, see `tool_adapter.rs`'s own fixture test): a coder
+    /// invocation whose captured stdout is the exact `rate_limit_event` line
+    /// captured against a real `claude` CLI (version `2.1.220 (Claude
+    /// Code)`) is extracted by the real, shipped
+    /// `ClaudeAdapter::extract_rate_limit` (via [`RealClaudeRateLimitAdapter`]),
+    /// persisted as the run's last-known status, and published on the Event
+    /// Bus as a `RunEvent::RateLimitStatusUpdated` -- proving the whole
+    /// `agent_run.rs` wiring this issue adds, not just the extraction
+    /// function alone.
+    #[tokio::test]
+    async fn a_real_captured_rate_limit_event_is_persisted_and_published_end_to_end() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+
+        let orchestrator = Orchestrator::new(pool.clone());
+        // The coder is judged by exit code alone (`extract_findings` is
+        // never called for it -- ADR-0012), so its stdout needs no NDJSON
+        // shape at all -- just the real captured `rate_limit_event` line.
+        let coder = AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                r#"
+                    echo '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"21c05092-e021-402f-bee8-df86ed81af44","session_id":"cc97c92a-3093-421b-a6f1-ecb2b3546855"}'
+                    echo done > work.txt
+                    git add work.txt
+                    git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder cycle"
+                    "#,
+            ],
+        );
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue #84: rate limit status is persisted and published".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(coder),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+
+        let (run_id, final_state) = orchestrator
+            .run_convergence_loop(config, RealClaudeRateLimitAdapter, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(final_state, RunState::Converged);
+
+        let expected_status = warden_core::RateLimitStatus::new(
+            warden_core::RateLimitState::AllowedWarning,
+            warden_core::RateLimitWindow::SevenDay,
+            0.93,
+            false,
+            0.75,
+            1785686400,
+        );
+
+        let persisted_status = db::get_run_rate_limit_status(&pool, &run_id)
+            .await
+            .unwrap()
+            .expect("the coder's real captured rate_limit_event must be persisted");
+        assert_eq!(persisted_status, expected_status);
+
+        let persisted = db::list_events_for_run(&pool, &run_id).await.unwrap();
+        let rate_limit_events: Vec<(&str, &warden_core::RateLimitStatus)> = persisted
+            .iter()
+            .filter_map(|entry| match entry.event() {
+                Some(RunEvent::RateLimitStatusUpdated { role, status }) => {
+                    Some((role.as_str(), status))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rate_limit_events,
+            vec![("coder", &expected_status)],
+            "expected exactly one RateLimitStatusUpdated event, from the coder: {persisted:?}"
+        );
+    }
+
     /// Issue #30: every throwaway worktree `AgentDefinitionSnapshot::capture`
     /// creates (the run-start baseline, plus this cycle's own re-resolution
     /// check) must be gone by the time the run returns, on the ordinary

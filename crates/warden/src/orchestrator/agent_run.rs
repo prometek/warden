@@ -218,6 +218,31 @@ impl Orchestrator {
                         usage,
                     })
                     .await?;
+
+                    // Issue #84: same seam-grafting convention as `extract_usage`
+                    // just above -- reads the exact same captured stdout, no
+                    // second stream read. `extract_rate_limit` is infallible
+                    // (`Option`, "n/a" for a tool that reports nothing) by
+                    // design, so this never fails an otherwise-successful
+                    // invocation, and a run's last-known status is simply
+                    // overwritten (not accumulated, unlike token usage) with
+                    // whatever this invocation most recently reported.
+                    if let Some(rate_limit) = runner.extract_rate_limit(&outcome.stdout) {
+                        // Same "no run id to attribute this to" guard
+                        // `add_run_token_usage` uses above: a test that calls
+                        // `run_agent` directly without going through
+                        // `run_convergence_loop` has no run to persist this
+                        // status onto.
+                        if let Some(context) = self.run_context.get() {
+                            db::set_run_rate_limit_status(&self.pool, &context.run_id, &rate_limit)
+                                .await?;
+                        }
+                        self.publish_event(RunEvent::RateLimitStatusUpdated {
+                            role: role.as_str().to_string(),
+                            status: rate_limit,
+                        })
+                        .await?;
+                    }
                 }
 
                 outcome_result
