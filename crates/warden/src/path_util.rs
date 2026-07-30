@@ -22,7 +22,8 @@
 //!
 //! One function, one fixed algorithm, used everywhere a containment check in
 //! this crate needs to resolve a path that may not exist yet:
-//! [`crate::process::validate_agent_program`]'s `program` vs.
+//! [`crate::process::validate_agent_program`]'s `program`/`args` (issue #59
+//! extended this from `program` alone) vs.
 //! `worktree_path`/`repo_path`/`run_worktrees_root` check,
 //! [`crate::agent_def::user_config_resolves_inside_repo_or_worktrees`]'s
 //! `user_config_agents_dir` vs. `repo_path`/`<warden_home>/worktrees/` check,
