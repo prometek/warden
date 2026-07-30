@@ -53,7 +53,7 @@
 //!   `warden run --repo ... --intent ... --tool claude` zero-`.md` UX issue
 //!   #24 exists to enable.
 
-use warden_core::{AgentDefinition, AgentRole, Finding, TokenUsage};
+use warden_core::{AgentDefinition, AgentRole, Finding, RateLimitStatus, TokenUsage};
 
 use crate::error::Result;
 use crate::process::AgentCommand;
@@ -159,6 +159,31 @@ pub trait ToolAdapter: Sync {
     /// d'autres CLI que claude" is out of scope, the seam is simply ready for
     /// a future adapter to fill in).
     fn extract_usage(&self, _stdout: &str) -> Option<TokenUsage> {
+        None
+    }
+
+    /// Extracts the rate-limit/quota status this invocation's underlying
+    /// tool CLI reported for it (issue #84), from the exact same captured
+    /// stdout [`extract_findings`](ToolAdapter::extract_findings)/
+    /// [`extract_usage`](ToolAdapter::extract_usage) parse -- no second read
+    /// of the stream. Unlike usage (reported once, in the terminal `result`
+    /// envelope), a CLI that exposes this signal at all may report it
+    /// **repeatedly** over one invocation's stdout (e.g. `claude`'s
+    /// `rate_limit_event`, once per assistant turn) -- an implementation
+    /// must scan the whole buffer and keep the **most recent** report, not
+    /// just the last line, so a caller always sees this invocation's
+    /// up-to-date status.
+    ///
+    /// `None` is a legitimate answer, exactly like
+    /// [`extract_usage`](ToolAdapter::extract_usage): a tool whose CLI never
+    /// reports quota at all (or a malformed invocation this adapter can't
+    /// make sense of) yields "n/a" to a caller, never a fabricated status.
+    ///
+    /// Defaults to `None` for every adapter that doesn't override it --
+    /// rate-limit extraction is optional per tool, the same convention
+    /// [`extract_usage`](ToolAdapter::extract_usage) already established for
+    /// issue #53.
+    fn extract_rate_limit(&self, _stdout: &str) -> Option<RateLimitStatus> {
         None
     }
 }
@@ -290,6 +315,121 @@ struct ClaudeUsage {
     cache_read_input_tokens: Option<u64>,
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
+}
+
+/// Stage one of `extract_rate_limit`'s two-stage parse (issue #84 review,
+/// finding 3): decodes *only* the `type` discriminant every
+/// `--output-format stream-json` line carries. Deliberately minimal on
+/// purpose -- this must succeed for any well-formed line regardless of its
+/// actual event kind, so `extract_rate_limit`'s backward scan can tell "this
+/// line isn't JSON at all / carries no `type`" (benign noise -- an
+/// `assistant` message, a truncated line, ... -- keep scanning further back)
+/// apart from "this line's `type` is `rate_limit_event`" (a real candidate:
+/// whatever happens decoding it next, the scan must not fall through to an
+/// older line -- see [`ClaudeAdapter::extract_rate_limit`]'s own docs).
+#[derive(Debug, serde::Deserialize)]
+struct ClaudeLineKind {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// Stage two of `extract_rate_limit`'s two-stage parse -- only attempted
+/// once [`ClaudeLineKind`] has already confirmed a line's `type` is
+/// `rate_limit_event`. `rate_limit_info` is **required** (not `Option`):
+/// verified directly against the real CLI, captured as this exact JSON line
+/// (`ClaudeAdapter::extract_rate_limit`'s own docs quote it verbatim):
+/// `{"type":"rate_limit_event","rate_limit_info":{...},"uuid":...,
+/// "session_id":...}`. A `rate_limit_event` line whose own `rate_limit_info`
+/// doesn't decode (missing entirely, or malformed) is exactly the "no longer
+/// decodes" regression finding 3 covers -- treated as one and the same
+/// failure by making the whole struct fail to deserialize, rather than
+/// separately handling "key absent" (`None`) vs. "key present but wrong
+/// shape" (a serde error).
+#[derive(Debug, serde::Deserialize)]
+struct ClaudeRateLimitEnvelope {
+    rate_limit_info: ClaudeRateLimitInfo,
+}
+
+/// `claude`'s own `rate_limit_info` object, nested in
+/// [`ClaudeRateLimitEnvelope`] -- verified directly against the real CLI
+/// (issue #84, see [`ClaudeAdapter::extract_rate_limit`]'s own docs for the
+/// captured payload this is modelled from). **Fields are camelCase on the
+/// wire** (`resetsAt`, `rateLimitType`, `isUsingOverage`,
+/// `surpassedThreshold`), unlike every other `claude` struct in this module
+/// -- `rename_all = "camelCase"` reflects that real, observed asymmetry
+/// rather than normalizing it away. `status`/`rate_limit_type` deserialize
+/// straight into `warden_core`'s own tolerant enums (`RateLimitState`/
+/// `RateLimitWindow`), so an unrecognized value never fails this line's
+/// parse -- but the numeric fields below are taken on faith by serde alone
+/// (any finite `f64`/`i64` decodes); [`validate_rate_limit_info`] is the
+/// boundary check that catches an implausible *value* serde itself has no
+/// opinion on (issue #84 review, finding 1).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeRateLimitInfo {
+    status: warden_core::RateLimitState,
+    resets_at: i64,
+    rate_limit_type: warden_core::RateLimitWindow,
+    /// Fraction in `0.0..=1.0`, **not** a percentage -- observed `0.93` for
+    /// 93% utilization. See `warden_core::RateLimitStatus::utilization`'s own
+    /// docs for why this unit is never silently converted, and
+    /// [`validate_rate_limit_info`] for the range this is checked against.
+    utilization: f64,
+    is_using_overage: bool,
+    surpassed_threshold: f64,
+}
+
+/// Upper bound on `utilization`/`surpassed_threshold` (issue #84 review,
+/// finding 1): both are fractions of a quota, normally `0.0..=1.0`, but
+/// `is_using_overage` in the very same payload proves a CLI can legitimately
+/// report utilization *past* 100% while an account is over quota (plausibly
+/// somewhere around `1.05`-`1.5`) -- so a hard `<= 1.0` ceiling would
+/// silently discard exactly the reports that matter most, the over-quota
+/// ones. `2.0` (200% of quota) is chosen instead: generous enough that no
+/// plausible legitimate overage report is ever rejected, while still well
+/// below the failure mode this bound exists to catch -- a future CLI
+/// switching this field to a percentage, which would land at roughly `93.0`,
+/// not `0.93`. A value beyond this bound is rejected outright (`None` +
+/// `tracing::warn!`), never clamped -- clamping would silently misreport a
+/// unit regression as a plausible-looking in-range value instead of
+/// surfacing it.
+const MAX_PLAUSIBLE_QUOTA_FRACTION: f64 = 2.0;
+
+/// Boundary validation for [`ClaudeRateLimitInfo`]'s numeric fields (issue
+/// #84 review, finding 1) -- untrusted agent-CLI output, checked here before
+/// [`ClaudeAdapter::extract_rate_limit`] ever turns it into a
+/// [`RateLimitStatus`]. `Err` names the offending field and value, for the
+/// `tracing::warn!` the caller logs before treating the whole line as
+/// unusable (finding 3: this must behave exactly like a decode failure --
+/// warn, and never fall through to an older, stale report).
+fn validate_rate_limit_info(info: &ClaudeRateLimitInfo) -> std::result::Result<(), String> {
+    if !info.utilization.is_finite()
+        || info.utilization < 0.0
+        || info.utilization > MAX_PLAUSIBLE_QUOTA_FRACTION
+    {
+        return Err(format!(
+            "utilization {} is outside the plausible 0.0..={MAX_PLAUSIBLE_QUOTA_FRACTION} \
+             fraction range",
+            info.utilization
+        ));
+    }
+    if !info.surpassed_threshold.is_finite()
+        || info.surpassed_threshold < 0.0
+        || info.surpassed_threshold > MAX_PLAUSIBLE_QUOTA_FRACTION
+    {
+        return Err(format!(
+            "surpassed_threshold {} is outside the plausible 0.0..={MAX_PLAUSIBLE_QUOTA_FRACTION} \
+             fraction range",
+            info.surpassed_threshold
+        ));
+    }
+    if info.resets_at <= 0 {
+        return Err(format!(
+            "resets_at {} is not a plausible positive unix timestamp",
+            info.resets_at
+        ));
+    }
+    Ok(())
 }
 
 /// Env vars `claude` needs beyond `PATH` to find its own configuration and
@@ -460,6 +600,99 @@ impl ToolAdapter for ClaudeAdapter {
             usage.cache_read_input_tokens,
             usage.cache_creation_input_tokens,
         ))
+    }
+
+    /// Issue #84: captures `rate_limit_event` -- verified directly against
+    /// the real CLI (`claude` version `2.1.220 (Claude Code)`,
+    /// `--output-format stream-json --verbose`) to emit exactly this line
+    /// (`uuid`/`session_id` values are one real, captured sample -- not
+    /// stable identifiers this adapter depends on):
+    ///
+    /// ```json
+    /// {"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"21c05092-e021-402f-bee8-df86ed81af44","session_id":"cc97c92a-3093-421b-a6f1-ecb2b3546855"}
+    /// ```
+    ///
+    /// Previously discarded entirely as noise by
+    /// [`parse_progress_line`](ClaudeAdapter::parse_progress_line) (its own
+    /// `if parsed.kind != "assistant"` guard, unchanged by this method) --
+    /// this is the seam that actually reads it, not a repurposing of that
+    /// method.
+    ///
+    /// Unlike [`extract_usage`](ClaudeAdapter::extract_usage), which reads
+    /// only the terminal `result` line, `claude` emits one `rate_limit_event`
+    /// **per assistant turn** (verified directly: `utilization` observed
+    /// advancing turn over turn, e.g. `0.93` then `0.94` in a two-turn run),
+    /// so this scans the whole captured buffer looking for the **last** one
+    /// seen -- the most recent status, the same "scan everything, keep the
+    /// last match" shape [`CodexAdapter::extract_usage`] already uses for its
+    /// own repeatedly-reported `token_count` event.
+    ///
+    /// # Two-stage parse, and why the scan aborts rather than falls back
+    /// (issue #84 review, finding 3)
+    ///
+    /// Each line is decoded twice: first as [`ClaudeLineKind`] (`type`
+    /// only), to tell "not a `rate_limit_event` at all" (benign -- keep
+    /// scanning further back) apart from "this line's `type` *is*
+    /// `rate_limit_event`". The moment a line's `type` matches, it is this
+    /// scan's one and only candidate: whatever happens next --
+    /// [`ClaudeRateLimitEnvelope`] fails to decode, or
+    /// [`validate_rate_limit_info`] rejects an implausible numeric value --
+    /// is logged (`tracing::warn!`) and this method returns `None`
+    /// immediately, **never** continuing the backward scan to an older
+    /// line. Silently substituting an older report for a newer one that
+    /// failed to parse would be worse than reporting "n/a": it would look
+    /// like a fresh status while actually being stale, with nothing in the
+    /// logs to say so -- exactly the "catch-and-ignore" code-standards.md
+    /// forbids, and a real correctness risk once issue #85 starts comparing
+    /// `utilization` against a suspend threshold.
+    fn extract_rate_limit(&self, stdout: &str) -> Option<RateLimitStatus> {
+        for line in stdout.lines().rev() {
+            let Ok(kind) = serde_json::from_str::<ClaudeLineKind>(line) else {
+                // Not JSON at all, or no `type` field -- benign noise
+                // (a truncated line, a stray non-JSON diagnostic, ...),
+                // unrelated to whether a real `rate_limit_event` exists
+                // further back.
+                continue;
+            };
+            if kind.kind != "rate_limit_event" {
+                continue;
+            }
+            // The newest `rate_limit_event` in the scanned range -- from
+            // here on, always return (`Some` or `None`), never `continue`.
+            let envelope = match serde_json::from_str::<ClaudeRateLimitEnvelope>(line) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        line,
+                        "claude rate_limit_event line's rate_limit_info failed to decode -- \
+                         treating this invocation's rate-limit status as n/a rather than \
+                         falling back to an older, stale report"
+                    );
+                    return None;
+                }
+            };
+            let info = envelope.rate_limit_info;
+            if let Err(reason) = validate_rate_limit_info(&info) {
+                tracing::warn!(
+                    reason,
+                    line,
+                    "claude rate_limit_event line failed numeric range validation -- \
+                     treating this invocation's rate-limit status as n/a rather than \
+                     falling back to an older, stale report"
+                );
+                return None;
+            }
+            return Some(RateLimitStatus::new(
+                info.status,
+                info.rate_limit_type,
+                info.utilization,
+                info.is_using_overage,
+                info.surpassed_threshold,
+                info.resets_at,
+            ));
+        }
+        None
     }
 }
 
@@ -1391,6 +1624,313 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_usage(stdout), None);
     }
 
+    // -----------------------------------------------------------------
+    // `extract_rate_limit` (issue #84)
+    // -----------------------------------------------------------------
+
+    /// The exact `rate_limit_event` line captured against a real `claude`
+    /// CLI (version `2.1.220 (Claude Code)`,
+    /// `--output-format stream-json --verbose`) -- the fixture this issue's
+    /// own acceptance criteria ask for ("payload d'exemple en test"), used
+    /// verbatim, not a hand-written approximation.
+    const REAL_CAPTURED_RATE_LIMIT_EVENT_LINE: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"21c05092-e021-402f-bee8-df86ed81af44","session_id":"cc97c92a-3093-421b-a6f1-ecb2b3546855"}"#;
+
+    #[test]
+    fn extract_rate_limit_reads_every_field_from_the_real_captured_event_line() {
+        let status = ClaudeAdapter
+            .extract_rate_limit(REAL_CAPTURED_RATE_LIMIT_EVENT_LINE)
+            .unwrap();
+        assert_eq!(status.status, warden_core::RateLimitState::AllowedWarning);
+        assert_eq!(
+            status.rate_limit_type,
+            warden_core::RateLimitWindow::SevenDay
+        );
+        assert_eq!(status.utilization, 0.93);
+        assert!(!status.is_using_overage);
+        assert_eq!(status.surpassed_threshold, 0.75);
+        assert_eq!(status.resets_at, 1785686400);
+    }
+
+    /// `parse_progress_line` must keep discarding `rate_limit_event` as noise
+    /// (unchanged since before issue #84 -- see
+    /// `parse_progress_line_ignores_non_assistant_event_types`), while this
+    /// separate seam is what actually reads the exact same line -- proving
+    /// the two don't interfere with each other on the same input.
+    #[test]
+    fn extract_rate_limit_and_parse_progress_line_both_see_the_same_real_line_differently() {
+        assert_eq!(
+            ClaudeAdapter.parse_progress_line(REAL_CAPTURED_RATE_LIMIT_EVENT_LINE),
+            None
+        );
+        assert!(ClaudeAdapter
+            .extract_rate_limit(REAL_CAPTURED_RATE_LIMIT_EVENT_LINE)
+            .is_some());
+    }
+
+    /// A CLI whose stdout never carries a `rate_limit_event` at all (e.g. a
+    /// transcript with only `assistant`/`result` lines) must yield "n/a"
+    /// (`None`), never an error and never a fabricated status --
+    /// `extract_rate_limit` is infallible by design, exactly like
+    /// `extract_usage`.
+    #[test]
+    fn extract_rate_limit_returns_none_when_no_rate_limit_event_is_present() {
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        );
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
+    #[test]
+    fn extract_rate_limit_returns_none_for_output_that_is_not_json_at_all() {
+        assert_eq!(ClaudeAdapter.extract_rate_limit("not json at all"), None);
+    }
+
+    #[test]
+    fn extract_rate_limit_returns_none_for_completely_empty_output() {
+        assert_eq!(ClaudeAdapter.extract_rate_limit(""), None);
+    }
+
+    /// Verified directly against the real CLI: `utilization` advances
+    /// turn-over-turn (`0.93` then `0.94` observed across a two-turn run) --
+    /// unlike `extract_usage`'s single terminal report, this scans the whole
+    /// buffer and must keep the **most recent** report, not the first one it
+    /// finds scanning forward.
+    #[test]
+    fn extract_rate_limit_keeps_the_last_event_when_several_are_reported_across_turns() {
+        let stdout = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.94,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+        );
+        let status = ClaudeAdapter.extract_rate_limit(stdout).unwrap();
+        assert_eq!(status.utilization, 0.94);
+    }
+
+    /// A future/unobserved `status`/`rateLimitType` value must not fail this
+    /// line's parse at all -- `warden_core::RateLimitState`/`RateLimitWindow`
+    /// tolerate any string, see those types' own docs.
+    #[test]
+    fn extract_rate_limit_tolerates_an_unrecognized_status_and_rate_limit_type() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"blocked","resetsAt":1785686400,"rateLimitType":"five_hour","utilization":1.0,"isUsingOverage":true,"surpassedThreshold":0.97}}"#;
+        let status = ClaudeAdapter.extract_rate_limit(stdout).unwrap();
+        assert_eq!(
+            status.status,
+            warden_core::RateLimitState::Other("blocked".to_string())
+        );
+        assert_eq!(
+            status.rate_limit_type,
+            warden_core::RateLimitWindow::Other("five_hour".to_string())
+        );
+    }
+
+    /// A legitimate overage report (issue #84 review, finding 1):
+    /// `isUsingOverage: true` with `utilization` past `1.0` must not be
+    /// rejected by the numeric range check -- that is exactly the case
+    /// `MAX_PLAUSIBLE_QUOTA_FRACTION` is chosen generously enough to still
+    /// accept.
+    #[test]
+    fn extract_rate_limit_accepts_a_legitimate_overage_utilization_past_1_0() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":1.05,"isUsingOverage":true,"surpassedThreshold":0.97}}"#;
+        let status = ClaudeAdapter.extract_rate_limit(stdout).unwrap();
+        assert_eq!(status.utilization, 1.05);
+        assert!(status.is_using_overage);
+    }
+
+    /// Issue #84 review, finding 1: a `utilization` that looks like it was
+    /// reported as a percentage rather than a fraction (a future CLI unit
+    /// regression) must be rejected outright, not silently accepted and
+    /// later misrendered as "9300%".
+    #[test]
+    fn extract_rate_limit_rejects_a_utilization_that_looks_like_a_percentage() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":93.0,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
+    #[test]
+    fn extract_rate_limit_rejects_a_negative_utilization() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":-0.1,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
+    /// `serde_json` has no literal syntax for `NaN`/`Infinity` (standard
+    /// JSON doesn't either), so a wire value can never directly produce a
+    /// non-finite `f64` -- `validate_rate_limit_info`'s own `is_finite()`
+    /// check is a defensive belt-and-braces regardless. What a malformed
+    /// wire value *can* do is fail to deserialize into `f64` at all (e.g.
+    /// `null`, a string) -- covered by the decode-failure path, not the
+    /// range check, but must still resolve to `None` either way.
+    #[test]
+    fn extract_rate_limit_rejects_a_utilization_that_is_not_a_number_at_all() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":null,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
+    #[test]
+    fn extract_rate_limit_rejects_an_out_of_range_surpassed_threshold() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":75.0}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
+    #[test]
+    fn extract_rate_limit_rejects_a_non_positive_resets_at() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":0,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+
+        let stdout_negative = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":-100,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout_negative), None);
+    }
+
+    /// Issue #84 review, finding 3 (the most consequential one): a malformed
+    /// or invalid **newest** `rate_limit_event` must never make this method
+    /// silently fall through to an older, valid one earlier in the same
+    /// transcript -- that would persist/publish a stale status as if it were
+    /// current, with no diagnostic trail. Covers both failure shapes finding
+    /// 3 asks to be made coherent: a `rate_limit_info` that doesn't decode at
+    /// all, and one that decodes but fails range validation (finding 1).
+    #[test]
+    fn a_malformed_newest_rate_limit_event_does_not_fall_back_to_an_older_valid_one() {
+        let stdout_undecodable = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}"#,
+            "\n",
+            // The newest report's own `rate_limit_info` is missing entirely.
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#,
+        );
+        assert_eq!(
+            ClaudeAdapter.extract_rate_limit(stdout_undecodable),
+            None,
+            "an undecodable newest rate_limit_event must yield n/a, not the older 0.93 report"
+        );
+
+        let stdout_out_of_range = concat!(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
+            "\n",
+            // The newest report decodes fine but is out of the plausible range.
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":93.0,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
+        );
+        assert_eq!(
+            ClaudeAdapter.extract_rate_limit(stdout_out_of_range),
+            None,
+            "an out-of-range newest rate_limit_event must yield n/a, not the older 0.93 report"
+        );
+    }
+
+    /// Builds a `rate_limit_event` line with a chosen `utilization`, so the
+    /// accept/reject boundary can be probed exactly rather than only at the
+    /// far-apart values the other tests use (`1.05` accepted, `93.0`
+    /// rejected leave the actual cut-off unpinned).
+    fn rate_limit_line_with_utilization(utilization: &str) -> String {
+        format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":{utilization},"isUsingOverage":true,"surpassedThreshold":0.97}}}}"#
+        )
+    }
+
+    /// Pins the exact `MAX_PLAUSIBLE_QUOTA_FRACTION` cut-off. The bound is a
+    /// deliberate judgement call (see the constant's docs: high enough to
+    /// keep a legitimate overage report, low enough to catch a
+    /// fraction-to-percentage unit regression), so where it sits is a
+    /// behavioural contract worth a regression test, not an implementation
+    /// detail -- issue #85 will act on values right up against it.
+    #[test]
+    fn extract_rate_limit_accepts_up_to_the_plausible_ceiling_and_rejects_past_it() {
+        for accepted in ["0.0", "1.0", "1.9999", "2.0"] {
+            let stdout = rate_limit_line_with_utilization(accepted);
+            assert!(
+                ClaudeAdapter.extract_rate_limit(&stdout).is_some(),
+                "utilization {accepted} is within the plausible range and must be accepted"
+            );
+        }
+        for rejected in ["2.0001", "3.0", "93.0"] {
+            let stdout = rate_limit_line_with_utilization(rejected);
+            assert_eq!(
+                ClaudeAdapter.extract_rate_limit(&stdout),
+                None,
+                "utilization {rejected} is past the plausible ceiling and must be rejected"
+            );
+        }
+    }
+
+    /// `-0.0 < 0.0` is false in IEEE 754, so a negative-zero utilization
+    /// takes the accept path. Harmless (it *is* zero), but pinned so the
+    /// behaviour is a decision on record rather than an accident.
+    #[test]
+    fn extract_rate_limit_treats_negative_zero_utilization_as_zero() {
+        let stdout = rate_limit_line_with_utilization("-0.0");
+        let status = ClaudeAdapter.extract_rate_limit(&stdout).unwrap();
+        assert_eq!(status.utilization, 0.0);
+    }
+
+    /// The far end of `resets_at`'s accepted range. `i64::MAX` is absurd as a
+    /// timestamp but is not what this boundary exists to reject (that is
+    /// `<= 0`), and silently dropping it would be a surprise; `i64::MIN`
+    /// must be rejected like any other non-positive value.
+    #[test]
+    fn extract_rate_limit_accepts_a_far_future_resets_at_and_rejects_the_extreme_negative() {
+        let far_future = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":{},"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}}}"#,
+            i64::MAX
+        );
+        assert_eq!(
+            ClaudeAdapter
+                .extract_rate_limit(&far_future)
+                .unwrap()
+                .resets_at,
+            i64::MAX
+        );
+
+        let extreme_negative = format!(
+            r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":{},"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}}}"#,
+            i64::MIN
+        );
+        assert_eq!(ClaudeAdapter.extract_rate_limit(&extreme_negative), None);
+    }
+
+    /// A CLI writing CRLF line endings must not defeat the scan. `str::lines`
+    /// strips the trailing `\r`, but a stray `\r` left on a JSON line would
+    /// make every decode fail and silently report n/a forever, so this is
+    /// worth pinning rather than assuming.
+    #[test]
+    fn extract_rate_limit_reads_the_event_through_crlf_line_endings() {
+        let stdout = format!(
+            "{}\r\n{}\r\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+            REAL_CAPTURED_RATE_LIMIT_EVENT_LINE
+        );
+        let status = ClaudeAdapter.extract_rate_limit(&stdout).unwrap();
+        assert_eq!(status.utilization, 0.93);
+    }
+
+    /// A trailing newline (what a real CLI actually emits) must not change
+    /// the outcome versus a buffer without one.
+    #[test]
+    fn extract_rate_limit_is_unaffected_by_a_trailing_newline() {
+        let with_newline = format!("{REAL_CAPTURED_RATE_LIMIT_EVENT_LINE}\n");
+        assert_eq!(
+            ClaudeAdapter.extract_rate_limit(&with_newline),
+            ClaudeAdapter.extract_rate_limit(REAL_CAPTURED_RATE_LIMIT_EVENT_LINE)
+        );
+    }
+
+    /// A buffer whose only `rate_limit_event` is malformed has no older
+    /// report to fall back to -- it must still resolve to n/a rather than
+    /// panicking or looping.
+    #[test]
+    fn extract_rate_limit_returns_none_when_the_only_event_present_is_malformed() {
+        let stdout = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#,
+        );
+        assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
+    }
+
     #[test]
     fn every_role_has_a_non_blank_default_prompt() {
         for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
@@ -1650,6 +2190,16 @@ mod tests {
         assert_eq!(CodexAdapter.extract_usage(""), None);
     }
 
+    /// Issue #84 scope: no rate-limit event is documented for this CLI --
+    /// no override, so this degrades to the trait's own legitimate `None`
+    /// default, exactly like `parse_progress_line`'s equivalent case for an
+    /// unmodeled line.
+    #[test]
+    fn codex_extract_rate_limit_uses_the_trait_default_of_none() {
+        assert_eq!(CodexAdapter.extract_rate_limit("anything at all"), None);
+        assert_eq!(CodexAdapter.extract_rate_limit(""), None);
+    }
+
     #[test]
     fn every_role_has_a_non_blank_codex_default_prompt() {
         for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
@@ -1779,6 +2329,16 @@ mod tests {
         // degrades to the pre-issue-#33 silence, the trait's own
         // legitimate default.
         assert_eq!(MistralAdapter.parse_progress_line("anything at all"), None);
+    }
+
+    /// Issue #84 scope: no rate-limit signal is known for this CLI -- no
+    /// override, so this degrades to the trait's own legitimate `None`
+    /// default, the same convention `extract_usage`/`parse_progress_line`
+    /// already use above.
+    #[test]
+    fn mistral_extract_rate_limit_uses_the_trait_default_of_none() {
+        assert_eq!(MistralAdapter.extract_rate_limit("anything at all"), None);
+        assert_eq!(MistralAdapter.extract_rate_limit(""), None);
     }
 
     #[test]

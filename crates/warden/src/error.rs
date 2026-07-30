@@ -395,6 +395,15 @@ pub enum WardenError {
     #[error("token count {value} for column `{column}` does not fit in the column's numeric type")]
     TokenCountOverflow { column: &'static str, value: u64 },
 
+    /// Issue #84: a `runs` row's six `rate_limit_*` columns
+    /// (`set_run_rate_limit_status` always writes all of them together) came
+    /// back with some, but not all, of them `NULL` -- a row written by
+    /// something other than this code, or a corrupted database
+    /// (code-standards.md: "no silent fallback"). A genuinely absent status
+    /// (every column `NULL`) is `Ok(None)`, never this error.
+    #[error("run {run_id} has a partially-populated rate_limit_* row (expected all six columns NULL or all six present)")]
+    CorruptRateLimitStatusRow { run_id: String },
+
     /// Issue #73 review (F5); issue #79: [`crate::orchestrator::run_convergence_loop`]
     /// indexes `RunConfig::step_agents` against `RunConfig::workflow`'s own
     /// `type: agent` steps in lockstep, by relative position (a `type: hook`

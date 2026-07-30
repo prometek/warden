@@ -18,6 +18,7 @@ mod evidence;
 mod evidence_wire;
 mod hook;
 mod pr_body;
+mod rate_limit;
 mod socket;
 mod state;
 mod token_usage;
@@ -44,6 +45,7 @@ pub use evidence::{
 pub use evidence_wire::{parse_evidence_rows, serialize_evidence_rows};
 pub use hook::{HookContext, HookOutcome, HookPoint};
 pub use pr_body::{format_evidence_section, EvidenceRow};
+pub use rate_limit::{RateLimitState, RateLimitStatus, RateLimitWindow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
 pub use state::{AgentRole, RunState};
 pub use token_usage::TokenUsage;

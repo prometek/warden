@@ -12,8 +12,9 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    EventKind, EvidenceType, Finding, FindingSource, RunEvent, RunEventHistoryEntry,
-    RunEventRecord, RunState, Severity, TokenUsage, UndecodableEvent, UndecodableReason,
+    EventKind, EvidenceType, Finding, FindingSource, RateLimitState, RateLimitStatus,
+    RateLimitWindow, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState, Severity,
+    TokenUsage, UndecodableEvent, UndecodableReason,
 };
 
 use crate::error::{Result, WardenError};
@@ -514,6 +515,126 @@ pub async fn get_run_token_usage(pool: &SqlitePool, run_id: &str) -> Result<Opti
         row.total_cache_read_tokens,
         row.total_cache_creation_tokens,
     )
+}
+
+/// Issue #84: overwrites `run_id`'s last-known rate-limit/quota status with
+/// `status` -- a snapshot, not a running total (unlike
+/// [`add_run_token_usage`]'s accumulation): each new report from
+/// `ToolAdapter::extract_rate_limit` simply supersedes whatever was recorded
+/// before, the same "most recent wins" contract that seam's own docs
+/// describe for scanning a single invocation's own stdout.
+pub async fn set_run_rate_limit_status(
+    pool: &SqlitePool,
+    run_id: &str,
+    status: &RateLimitStatus,
+) -> Result<()> {
+    let status_str = status.status.as_str();
+    let rate_limit_type_str = status.rate_limit_type.as_str();
+    let is_using_overage = i64::from(status.is_using_overage);
+    let now = now_rfc3339();
+    sqlx::query!(
+        r#"
+        UPDATE runs SET
+            rate_limit_status = ?,
+            rate_limit_type = ?,
+            rate_limit_utilization = ?,
+            rate_limit_is_using_overage = ?,
+            rate_limit_surpassed_threshold = ?,
+            rate_limit_resets_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+        status_str,
+        rate_limit_type_str,
+        status.utilization,
+        is_using_overage,
+        status.surpassed_threshold,
+        status.resets_at,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The status last written by [`set_run_rate_limit_status`], or `None` if
+/// this run's tool never reported a rate-limit/quota signal at all
+/// (rendered "n/a" by every caller, never a fabricated status -- see
+/// [`row_to_rate_limit_status`]).
+pub async fn get_run_rate_limit_status(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<RateLimitStatus>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT rate_limit_status, rate_limit_type, rate_limit_utilization, rate_limit_is_using_overage, rate_limit_surpassed_threshold, rate_limit_resets_at
+        FROM runs WHERE id = ?
+        "#,
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    row_to_rate_limit_status(
+        run_id,
+        row.rate_limit_status,
+        row.rate_limit_type,
+        row.rate_limit_utilization,
+        row.rate_limit_is_using_overage,
+        row.rate_limit_surpassed_threshold,
+        row.rate_limit_resets_at,
+    )
+}
+
+/// Converts the six possibly-`NULL` `rate_limit_*` columns read back from
+/// `runs` (issue #84) into `Option<RateLimitStatus>`. Unlike
+/// [`row_to_token_usage`]'s partial optionality (cache fields are
+/// independently optional from input/output), these six columns are always
+/// written together as one unit by [`set_run_rate_limit_status`] -- so `None`
+/// only when *every* column is `NULL` (never reported), and any other
+/// combination is a corrupted row, surfaced as a typed error rather than
+/// silently reconstructed from whatever happened to be present
+/// (code-standards.md: "no silent fallback").
+fn row_to_rate_limit_status(
+    run_id: &str,
+    status: Option<String>,
+    rate_limit_type: Option<String>,
+    utilization: Option<f64>,
+    is_using_overage: Option<i64>,
+    surpassed_threshold: Option<f64>,
+    resets_at: Option<i64>,
+) -> Result<Option<RateLimitStatus>> {
+    match (
+        status,
+        rate_limit_type,
+        utilization,
+        is_using_overage,
+        surpassed_threshold,
+        resets_at,
+    ) {
+        (None, None, None, None, None, None) => Ok(None),
+        (
+            Some(status),
+            Some(rate_limit_type),
+            Some(utilization),
+            Some(is_using_overage),
+            Some(surpassed_threshold),
+            Some(resets_at),
+        ) => Ok(Some(RateLimitStatus::new(
+            RateLimitState::from(status),
+            RateLimitWindow::from(rate_limit_type),
+            utilization,
+            is_using_overage != 0,
+            surpassed_threshold,
+            resets_at,
+        ))),
+        _ => Err(WardenError::CorruptRateLimitStatusRow {
+            run_id: run_id.to_string(),
+        }),
+    }
 }
 
 /// Converts a `u64` [`TokenUsage`] field into the `i64` SQLite's native
@@ -1706,6 +1827,172 @@ mod tests {
         assert!(matches!(
             result,
             Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // `set_run_rate_limit_status` / `get_run_rate_limit_status` (issue #84)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_rate_limit_status_is_none_until_something_is_recorded_then_overwritten() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-rate-limit",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_run_rate_limit_status(&pool, "run-rate-limit")
+                .await
+                .unwrap(),
+            None
+        );
+
+        set_run_rate_limit_status(
+            &pool,
+            "run-rate-limit",
+            &RateLimitStatus::new(
+                RateLimitState::AllowedWarning,
+                RateLimitWindow::SevenDay,
+                0.93,
+                false,
+                0.75,
+                1785686400,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let status = get_run_rate_limit_status(&pool, "run-rate-limit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, RateLimitState::AllowedWarning);
+        assert_eq!(status.rate_limit_type, RateLimitWindow::SevenDay);
+        assert_eq!(status.utilization, 0.93);
+        assert!(!status.is_using_overage);
+        assert_eq!(status.surpassed_threshold, 0.75);
+        assert_eq!(status.resets_at, 1785686400);
+
+        // Issue #84: this is a snapshot, not a running total (unlike token
+        // usage) -- a second report must overwrite the first, not merge with
+        // it.
+        set_run_rate_limit_status(
+            &pool,
+            "run-rate-limit",
+            &RateLimitStatus::new(
+                RateLimitState::AllowedWarning,
+                RateLimitWindow::SevenDay,
+                0.94,
+                false,
+                0.75,
+                1785686400,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let status = get_run_rate_limit_status(&pool, "run-rate-limit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.utilization, 0.94);
+    }
+
+    /// An unrecognized `status`/`rate_limit_type` value must round-trip
+    /// through the database unharmed -- both columns are plain `TEXT`, and
+    /// `RateLimitState`/`RateLimitWindow`'s own tolerance for unknown values
+    /// applies just as much on the read-back side as on the wire.
+    #[tokio::test]
+    async fn run_rate_limit_status_round_trips_an_unrecognized_status_and_type() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-rate-limit-unknown",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        set_run_rate_limit_status(
+            &pool,
+            "run-rate-limit-unknown",
+            &RateLimitStatus::new(
+                RateLimitState::Other("blocked".to_string()),
+                RateLimitWindow::Other("five_hour".to_string()),
+                1.0,
+                true,
+                0.97,
+                1785686400,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let status = get_run_rate_limit_status(&pool, "run-rate-limit-unknown")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.status, RateLimitState::Other("blocked".to_string()));
+        assert_eq!(
+            status.rate_limit_type,
+            RateLimitWindow::Other("five_hour".to_string())
+        );
+        assert!(status.is_using_overage);
+    }
+
+    /// A row with some, but not all, of the six `rate_limit_*` columns set
+    /// is corrupted -- `set_run_rate_limit_status` never writes a partial
+    /// row, so this can only happen from something other than this code
+    /// (code-standards.md: "no silent fallback"). Must surface as a typed
+    /// error, never silently reconstructed from whichever columns happen to
+    /// be present.
+    #[tokio::test]
+    async fn a_partially_populated_rate_limit_row_is_a_typed_error_not_a_silent_guess() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-rate-limit-corrupt",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "UPDATE runs SET rate_limit_status = ? WHERE id = ?",
+            "allowed_warning",
+            "run-rate-limit-corrupt",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = get_run_rate_limit_status(&pool, "run-rate-limit-corrupt").await;
+        assert!(matches!(
+            result,
+            Err(WardenError::CorruptRateLimitStatusRow { run_id }) if run_id == "run-rate-limit-corrupt"
         ));
     }
 

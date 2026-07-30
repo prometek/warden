@@ -356,6 +356,18 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
                 )
             },
         ),
+        // Issue #84: a bare, factual projection of the reported status --
+        // no threshold/suspension interpretation here (that's issue #85/#87's
+        // own scope, not this rendering layer's).
+        RunEvent::RateLimitStatusUpdated { role, status } => (
+            Style::default().fg(Color::Gray),
+            format!(
+                "{role}: rate limit status {} (utilization {:.0}%, resets at unix {})",
+                status.status.as_str(),
+                status.utilization * 100.0,
+                status.resets_at
+            ),
+        ),
         RunEvent::RunFinished { final_state } => (
             Style::default().fg(Color::Green),
             format!("run finished: {final_state}"),
