@@ -520,6 +520,17 @@ la discussion complète, y compris pourquoi le schéma warden-natif `+++`/TOML i
 > chemin relatif au worktree du rôle). Le risque « le coder committe un script que le
 > reviewer exécute ensuite », réel avec l'ancien runner `command` (ADR-0013), ne s'applique
 > donc plus aux adaptateurs intégrés.
+>
+> En ceinture-et-bretelles derrière ce constat, `process::validate_agent_program` refuse
+> quand même, juste avant le spawn d'un rôle jugeant (reviewer/tester et tout rôle
+> personnalisé — le producteur est exempté), un `program` **ou** une entrée `args` d'allure
+> chemin qui serait relative ou résoudrait dans le dépôt de base, le worktree du rôle ou
+> celui d'un autre rôle du run (issues #26 et #59). Aucun adaptateur livré n'émet un tel
+> argument : la garde existe pour qu'un futur adaptateur ne puisse pas rouvrir la faille
+> silencieusement. Une valeur légitime qui ressemble à un chemin relatif (un `model`
+> préfixé par son fournisseur, `anthropic/claude-3-opus`) n'est pas concernée : l'appelant
+> la déclare explicitement de confiance, et seulement lorsqu'elle vient de la configuration
+> utilisateur — jamais du dépôt sous revue.
 
 ### Personnaliser le pipeline (`.warden/workflow.yaml`, issue #73/ADR-0020)
 
