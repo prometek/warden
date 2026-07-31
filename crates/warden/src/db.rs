@@ -671,14 +671,24 @@ pub async fn suspend_run_with_quota_continuation(
     Ok(())
 }
 
-/// Atomically claims every quota continuation due as of `now_unix`.
-///
-/// Each candidate is changed from its exact persisted
-/// `awaiting_quota_reset:<timestamp>` generation to `resuming_quota` with a
-/// compare-and-swap update. Concurrent Warden startups can materialize the
-/// same candidates, but only one update can affect each row; only that
-/// process receives the run id and may decode or execute its checkpoint.
-pub async fn claim_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result<Vec<String>> {
+/// One exact generation of a quota wait observed by a startup recovery pass.
+/// The private comparison fields prevent callers from claiming a later
+/// re-suspension through a stale candidate.
+#[derive(Debug, Clone)]
+pub struct DueQuotaContinuation {
+    pub run_id: String,
+    expected_state: String,
+    expected_resets_at: i64,
+    expected_updated_at: String,
+}
+
+/// Materializes quota continuations due as of `now_unix` without claiming
+/// them. Recovery claims each candidate immediately before processing it, so
+/// a long or failed resume never strands later runs in `resuming_quota`.
+pub async fn list_due_quota_continuations(
+    pool: &SqlitePool,
+    now_unix: i64,
+) -> Result<Vec<DueQuotaContinuation>> {
     let rows = sqlx::query!(
         r#"
         SELECT id as "id!", state as "state!", quota_resets_at as "quota_resets_at!", updated_at as "updated_at!"
@@ -692,36 +702,48 @@ pub async fn claim_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result
     )
     .fetch_all(pool)
     .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DueQuotaContinuation {
+            run_id: row.id,
+            expected_state: row.state,
+            expected_resets_at: row.quota_resets_at,
+            expected_updated_at: row.updated_at,
+        })
+        .collect())
+}
 
+/// Atomically changes one exact quota-wait generation to `resuming_quota`.
+/// Concurrent callers may hold the same candidate, but the compare-and-swap
+/// can affect one row once; only the caller receiving `true` owns the resume.
+pub async fn claim_due_quota_continuation(
+    pool: &SqlitePool,
+    candidate: &DueQuotaContinuation,
+    now_unix: i64,
+) -> Result<bool> {
     let claimed_state = RunState::ResumingQuota.as_str();
     let claimed_at = now_rfc3339();
-    let mut claimed = Vec::with_capacity(rows.len());
-    for row in rows {
-        let result = sqlx::query!(
-            r#"
-            UPDATE runs
-            SET state = ?, quota_resets_at = NULL, updated_at = ?
-            WHERE id = ?
-              AND state = ?
-              AND quota_resets_at = ?
-              AND quota_resets_at <= ?
-              AND updated_at = ?
-            "#,
-            claimed_state,
-            claimed_at,
-            row.id,
-            row.state,
-            row.quota_resets_at,
-            now_unix,
-            row.updated_at,
-        )
-        .execute(pool)
-        .await?;
-        if result.rows_affected() == 1 {
-            claimed.push(row.id);
-        }
-    }
-    Ok(claimed)
+    let result = sqlx::query!(
+        r#"
+        UPDATE runs
+        SET state = ?, quota_resets_at = NULL, updated_at = ?
+        WHERE id = ?
+          AND state = ?
+          AND quota_resets_at = ?
+          AND quota_resets_at <= ?
+          AND updated_at = ?
+        "#,
+        claimed_state,
+        claimed_at,
+        candidate.run_id,
+        candidate.expected_state,
+        candidate.expected_resets_at,
+        now_unix,
+        candidate.expected_updated_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn get_quota_continuation(

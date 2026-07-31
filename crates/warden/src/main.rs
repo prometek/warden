@@ -760,6 +760,80 @@ async fn run(
         }
     });
 
+    // Start quota recovery before any foreground repository preflight. The
+    // foreground work is captured as a result below so every early `?` still
+    // reaches the join point after this block.
+    let quota_resume_pool = pool.clone();
+    let quota_resume_handle =
+        tokio::spawn(
+            async move { orchestrator::resume_quota_suspended_runs(quota_resume_pool).await },
+        );
+    let foreground_result = run_foreground(
+        pool,
+        db_path,
+        repo,
+        intent,
+        branch,
+        max_review_cycles,
+        max_test_cycles,
+        max_cycles,
+        quota_anticipation_threshold,
+        warden_home,
+        adapter,
+        trust_repo_agents,
+        evidence_tool,
+        evidence_store_in_repo,
+        gate,
+        tui_launch,
+        isolation_config,
+        cancel,
+    )
+    .await;
+
+    let quota_resume_result: anyhow::Result<Vec<String>> = match quota_resume_handle.await {
+        Ok(result) => result.context("failed to resume runs awaiting a quota reset"),
+        Err(error) => Err(error).context("quota-resume supervision task failed"),
+    };
+    match &quota_resume_result {
+        Ok(resumed) => {
+            for run_id in resumed {
+                tracing::warn!(
+                    run_id,
+                    "resumed a run after its quota reset (crash recovery)"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "supervised quota recovery failed");
+        }
+    }
+
+    foreground_result?;
+    quota_resume_result?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_foreground(
+    pool: sqlx::SqlitePool,
+    db_path: PathBuf,
+    repo: PathBuf,
+    intent: String,
+    branch: String,
+    max_review_cycles: u32,
+    max_test_cycles: u32,
+    max_cycles: u32,
+    quota_anticipation_threshold: f64,
+    warden_home: PathBuf,
+    adapter: ToolName,
+    trust_repo_agents: TrustRepoAgents,
+    evidence_tool: Option<warden_core::EvidenceTool>,
+    evidence_store_in_repo: bool,
+    gate: Option<orchestrator::GateConfig>,
+    tui_launch: Option<TuiLaunchConfig>,
+    isolation_config: IsolationConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     // Issue #15/ADR-0011 crash-recovery counterpart: any run left stuck in
     // `AwaitingCi` needs its watch re-requested, not treated as a crashed
     // agent process (see `recover_crashed_runs`'s own doc comment) --
@@ -1197,30 +1271,9 @@ async fn run(
                 }
             }
         });
-    // Due quota continuations run concurrently with this newly requested
-    // run, but the handle is retained and joined below. The process may not
-    // exit successfully while a claimed `resuming_quota` checkpoint is
-    // still executing.
-    let quota_resume_pool = pool.clone();
-    let quota_resume_handle =
-        tokio::spawn(
-            async move { orchestrator::resume_quota_suspended_runs(quota_resume_pool).await },
-        );
     let convergence_result = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await;
-    let quota_resume_result: anyhow::Result<Vec<String>> = match quota_resume_handle.await {
-        Ok(result) => result.context("failed to resume runs awaiting a quota reset"),
-        Err(error) => Err(error).context("quota-resume supervision task failed"),
-    };
-    if let Ok(resumed) = &quota_resume_result {
-        for run_id in resumed {
-            tracing::warn!(
-                run_id,
-                "resumed a run after its quota reset (crash recovery)"
-            );
-        }
-    }
 
     // Issue #32 review (HIGH, then re-review): whether to wait here for a
     // still-attached `warden-tui` to exit before deciding this run's own
@@ -1263,7 +1316,6 @@ async fn run(
         return Err(spawn_error).context("failed to spawn warden-tui for --tui; aborted the run");
     }
 
-    quota_resume_result?;
     let (run_id, final_state) = convergence_result.context("convergence loop failed")?;
 
     tracing::info!(run_id, ?final_state, "run finished");

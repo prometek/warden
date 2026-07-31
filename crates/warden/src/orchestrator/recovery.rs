@@ -180,10 +180,14 @@ pub async fn resume_quota_suspended_runs(pool: SqlitePool) -> Result<Vec<String>
 }
 
 async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Result<Vec<String>> {
-    let due_run_ids = db::claim_due_quota_run_ids(&pool, now_unix).await?;
+    let due_continuations = db::list_due_quota_continuations(&pool, now_unix).await?;
     let mut resumed_run_ids = Vec::new();
 
-    for run_id in due_run_ids {
+    for candidate in due_continuations {
+        if !db::claim_due_quota_continuation(&pool, &candidate, now_unix).await? {
+            continue;
+        }
+        let run_id = candidate.run_id;
         let Some(run) = db::get_run(&pool, &run_id).await? else {
             tracing::warn!(run_id, "due quota continuation has no run row; skipping");
             continue;
@@ -216,17 +220,8 @@ async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Resu
                 }
             };
 
-        if restored.config.workflow.steps.len() != run.total_steps as usize {
-            fail_quota_continuation_recovery(
-                &pool,
-                &run,
-                format!(
-                    "checkpoint workflow has {} steps but run records {}",
-                    restored.config.workflow.steps.len(),
-                    run.total_steps
-                ),
-            )
-            .await?;
+        if let Err(reason) = validate_restored_run_config(&run, &restored.config) {
+            fail_quota_continuation_recovery(&pool, &run, reason).await?;
             continue;
         }
 
@@ -307,6 +302,53 @@ async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Resu
     }
 
     Ok(resumed_run_ids)
+}
+
+/// Binds checkpoint JSON back to the immutable values independently stored
+/// in `runs`. A structurally valid checkpoint with an altered repository,
+/// target, intent, or budget must fail before hooks/sandboxes are built.
+fn validate_restored_run_config(
+    run: &db::Run,
+    config: &RunConfig,
+) -> std::result::Result<(), String> {
+    let mismatch = if config.repo_path != Path::new(&run.repo_path) {
+        Some(format!(
+            "repo_path {:?} does not match run row {:?}",
+            config.repo_path, run.repo_path
+        ))
+    } else if config.branch != run.branch {
+        Some(format!(
+            "branch {:?} does not match run row {:?}",
+            config.branch, run.branch
+        ))
+    } else if config.intent != run.intent {
+        Some("intent does not match run row".to_string())
+    } else if config.max_review_cycles != run.max_review_cycles {
+        Some(format!(
+            "max_review_cycles {} does not match run row {}",
+            config.max_review_cycles, run.max_review_cycles
+        ))
+    } else if config.max_test_cycles != run.max_test_cycles {
+        Some(format!(
+            "max_test_cycles {} does not match run row {}",
+            config.max_test_cycles, run.max_test_cycles
+        ))
+    } else if config.workflow.steps.len() != run.total_steps as usize {
+        Some(format!(
+            "workflow has {} steps but run row records {}",
+            config.workflow.steps.len(),
+            run.total_steps
+        ))
+    } else if config.max_extra_step_cycles != run.max_extra_step_cycles {
+        Some(format!(
+            "max_extra_step_cycles {} does not match run row {}",
+            config.max_extra_step_cycles, run.max_extra_step_cycles
+        ))
+    } else {
+        None
+    };
+
+    mismatch.map_or(Ok(()), Err)
 }
 
 /// Makes an unusable quota checkpoint explicit and terminal. There is no
