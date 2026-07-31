@@ -74,6 +74,21 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   invocation. La reprise automatique au reset n'est pas incluse : elle reste l'issue
   #86.
 
+### Added — Issue #87 : statut de quota et suspension visible dans `warden-tui`
+
+- Le panneau « workflow tree » de `warden-tui` affiche le dernier statut de quota :
+  pourcentage utilisé, reste dérivé de `utilization`, et heure de réinitialisation en UTC.
+  Sans rapport de l'outil, l'affichage reste explicitement `quota: n/a` ; aucun zéro ou
+  compteur absolu n'est inventé.
+- Un `RunFinished` dont l'état est `AwaitingQuotaReset { resets_at }` est rendu comme une
+  suspension repriseable — « SUSPENDED for quota (not failed) » avec heure de reprise — dans
+  le header et le journal, et non comme un échec ou une fin définitive. Les événements qui
+  suivent une reprise remplacent immédiatement cet état courant tout en conservant
+  l'événement de suspension dans l'historique.
+- Le rendu reste une projection lecture seule du flux d'événements : l'arrivée en direct de
+  `RateLimitStatusUpdated` ou de la suspension actualise la TUI sans écriture en SQLite ni
+  polling de l'orchestrateur.
+
 ### Added — Issue #81 : gates étendus — re-review scopée généralisée + budget de cycles par étape (`max_cycles`)
 
 - **Nouveau `gate: scoped-re-review`** (aux côtés de `loop-until-clean` et du pass-through

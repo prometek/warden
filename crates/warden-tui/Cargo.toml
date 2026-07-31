@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 image = { version = "0.25", default-features = false, features = ["png"] }
