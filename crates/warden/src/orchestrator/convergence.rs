@@ -494,6 +494,20 @@ impl Orchestrator {
                     .await?;
                 }
 
+                // This is the last boundary before this particular step can
+                // create its worktree or spawn its agent. A prior gated step
+                // can have updated the run's last-known quota, so checking
+                // only after the producer would let a later step start even
+                // though the threshold was already crossed.
+                if self.suspend_for_anticipated_quota(&run_id).await? {
+                    break 'convergence RunState::AwaitingQuotaReset {
+                        resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                            .await?
+                            .expect("quota suspension requires a stored rate-limit status")
+                            .resets_at,
+                    };
+                }
+
                 let step_findings = match self
                     .run_gated_step(
                         &runner,
