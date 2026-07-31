@@ -921,17 +921,19 @@ invocation, le signal typé est traité comme la même suspension et le worktree
 invocation est conservé. Les outils dont `extract_rate_limit` renvoie `None` gardent le
 comportement historique.
 
-**Reprise automatique au reset (issue #86).** Au prochain démarrage de `warden`, chaque
-continuation arrivée à `resets_at` est revendiquée atomiquement en `ResumingQuota`, puis reprise
-sans intervention à l'étape exacte où elle s'était arrêtée. Le checkpoint conserve le workflow,
-les définitions d'agents, le cycle et les findings en cours, ainsi que l'outil et le contexte
-d'exécution/sécurité d'origine (isolation, hooks et policy résolus) : le `--tool` ou la
-configuration du nouveau run ne peuvent donc pas modifier la reprise. Un canal d'approbation
-interactif n'étant pas durable, toute décision `RequireApproval` est refusée à la reprise ; un
-checkpoint absent, corrompu ou incohérent fait de même échouer explicitement le run en `Failed`.
-Si le quota est de nouveau atteint, le checkpoint actualisé est conservé et le run retourne en
-`AwaitingQuotaReset`. Cette récupération démarre avant le préflight du nouveau run et est
-attendue avant la sortie du processus, y compris si ce preflight échoue. L'affichage TUI dédié
+**Reprise automatique au reset (issue #86).** Au démarrage d'une prochaine commande
+`warden run`, chaque continuation dont `resets_at` est déjà arrivé est revendiquée atomiquement
+en `ResumingQuota`, puis reprise sans intervention à l'étape exacte où elle s'était arrêtée.
+Il n'existe pas de surveillant permanent ni de minuteur : une continuation devenue éligible
+pendant qu'aucune commande `warden run` ne démarre attend ce prochain démarrage. Le checkpoint
+conserve le workflow, les définitions d'agents, le cycle et les findings en cours, ainsi que
+l'outil et le contexte d'exécution/sécurité d'origine (isolation, hooks et policy résolus) : le
+`--tool` ou la configuration du nouveau run ne peuvent donc pas modifier la reprise. Un canal
+d'approbation interactif n'étant pas durable, toute décision `RequireApproval` est refusée à la
+reprise ; un checkpoint absent, corrompu ou incohérent fait de même échouer explicitement le run
+en `Failed`. Si le quota est de nouveau atteint, le checkpoint actualisé est conservé et le run
+retourne en `AwaitingQuotaReset`. Cette récupération démarre avant le préflight du nouveau run
+et est attendue avant la sortie du processus, y compris si ce preflight échoue. L'affichage TUI
 reste l'issue #87 (voir l'épique #83).
 
 **Vue arborescente du workflow (issue #54)** : entre le header et le journal d'événements,
