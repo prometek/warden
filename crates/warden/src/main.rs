@@ -113,6 +113,12 @@ enum Commands {
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_cycles: u32,
 
+        /// Fraction of a CLI-reported quota consumed at which Warden pauses
+        /// before starting the next workflow step. Defaults to 90%; tools
+        /// that report no quota keep their existing behavior.
+        #[arg(long, default_value_t = 0.90, value_parser = parse_quota_anticipation_threshold)]
+        quota_anticipation_threshold: f64,
+
         /// Warden's own state directory (SQLite db + worktrees). Defaults
         /// to `~/.warden`.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
@@ -285,6 +291,17 @@ fn parse_tool(raw: &str) -> Result<ToolName, String> {
     }
 }
 
+fn parse_quota_anticipation_threshold(raw: &str) -> Result<f64, String> {
+    let threshold = raw
+        .parse::<f64>()
+        .map_err(|_| "quota anticipation threshold must be a number in 0.0..=1.0".to_string())?;
+    if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+        Ok(threshold)
+    } else {
+        Err("quota anticipation threshold must be a finite number in 0.0..=1.0".to_string())
+    }
+}
+
 /// Reverses [`parse_tool`] (issue #72's batch mode): renders `tool` back into
 /// the exact `--tool` value a batch child subprocess needs to reproduce it,
 /// so a batch inherits the same adapter selection as a single-intent run.
@@ -331,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
             max_review_cycles,
             max_test_cycles,
             max_cycles,
+            quota_anticipation_threshold,
             warden_home,
             tool,
             trust_repo_agents,
@@ -440,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
                             max_review_cycles,
                             max_test_cycles,
                             max_cycles,
+                            quota_anticipation_threshold,
                             warden_home,
                             ClaudeAdapter,
                             TrustRepoAgents(trust_repo_agents),
@@ -459,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
                             max_review_cycles,
                             max_test_cycles,
                             max_cycles,
+                            quota_anticipation_threshold,
                             warden_home,
                             CodexAdapter,
                             TrustRepoAgents(trust_repo_agents),
@@ -478,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
                             max_review_cycles,
                             max_test_cycles,
                             max_cycles,
+                            quota_anticipation_threshold,
                             warden_home,
                             MistralAdapter,
                             TrustRepoAgents(trust_repo_agents),
@@ -499,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
                     max_review_cycles,
                     max_test_cycles,
                     max_cycles,
+                    quota_anticipation_threshold,
                     warden_home,
                     verbose,
                     trust_repo_agents,
@@ -741,6 +763,7 @@ async fn run<R: ToolAdapter>(
     max_review_cycles: u32,
     max_test_cycles: u32,
     max_cycles: u32,
+    quota_anticipation_threshold: f64,
     warden_home: Option<PathBuf>,
     adapter: R,
     trust_repo_agents: TrustRepoAgents,
@@ -1137,7 +1160,8 @@ async fn run<R: ToolAdapter>(
     // Issue #49's agent-isolation sandbox: `None` => the orchestrator's own
     // default `LocalSandbox` (unchanged `--isolation worktree` behaviour);
     // `Some` => the `DockerSandbox` that `--isolation docker` selected above.
-    let mut orchestrator = Orchestrator::new(pool);
+    let mut orchestrator =
+        Orchestrator::new(pool).with_quota_anticipation_threshold(quota_anticipation_threshold);
     if let Some(sandbox) = sandbox {
         orchestrator = orchestrator.with_sandbox(sandbox);
     }
@@ -1352,6 +1376,7 @@ async fn run_batch(
     max_review_cycles: u32,
     max_test_cycles: u32,
     max_cycles: u32,
+    quota_anticipation_threshold: f64,
     warden_home: Option<PathBuf>,
     verbose: u8,
     trust_repo_agents: bool,
@@ -1431,6 +1456,7 @@ async fn run_batch(
         max_review_cycles,
         max_test_cycles,
         max_cycles,
+        quota_anticipation_threshold,
         warden_home: warden_home_str,
         tool,
         trust_repo_agents,

@@ -505,6 +505,7 @@ pub struct Orchestrator {
     /// ([`PolicyGate::empty`]), so this check is a strict no-op until a
     /// caller installs one via [`Orchestrator::with_policy_gate`].
     policy_gate: Arc<PolicyGate>,
+    quota_anticipation_threshold: f64,
 }
 
 /// See the `on_run_started` field docs on [`Orchestrator`]. Named alias
@@ -520,6 +521,7 @@ impl Orchestrator {
             sandbox: Arc::new(LocalSandbox::new()),
             hooks: HookRegistry::new(),
             policy_gate: Arc::new(PolicyGate::empty()),
+            quota_anticipation_threshold: 0.90,
         }
     }
 
@@ -564,6 +566,53 @@ impl Orchestrator {
     pub fn with_policy_gate(mut self, policy_gate: Arc<PolicyGate>) -> Self {
         self.policy_gate = policy_gate;
         self
+    }
+
+    /// Sets the fraction of consumed CLI quota at which the next workflow
+    /// step is withheld. The CLI validates this public configuration value;
+    /// keeping the default here preserves API callers' historical behavior.
+    pub fn with_quota_anticipation_threshold(mut self, threshold: f64) -> Self {
+        debug_assert!((0.0..=1.0).contains(&threshold));
+        self.quota_anticipation_threshold = threshold;
+        self
+    }
+
+    async fn suspend_for_quota_if(
+        &self,
+        run_id: &str,
+        predicate: impl FnOnce(&warden_core::RateLimitStatus) -> bool,
+    ) -> Result<bool> {
+        let Some(status) = db::get_run_rate_limit_status(&self.pool, run_id).await? else {
+            return Ok(false);
+        };
+        if !predicate(&status) {
+            return Ok(false);
+        }
+        self.transition(
+            run_id,
+            RunState::AwaitingQuotaReset {
+                resets_at: status.resets_at,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn suspend_for_anticipated_quota(&self, run_id: &str) -> Result<bool> {
+        self.suspend_for_quota_if(run_id, |status| {
+            !status.is_using_overage && status.utilization >= self.quota_anticipation_threshold
+        })
+        .await
+    }
+
+    async fn suspend_for_exhausted_quota(&self, run_id: &str) -> Result<bool> {
+        self.suspend_for_quota_if(run_id, |status| {
+            !status.is_using_overage
+                && (status.utilization >= 1.0
+                    || matches!(status.status, warden_core::RateLimitState::Other(ref value)
+                        if matches!(value.as_str(), "blocked" | "exhausted" | "rate_limited")))
+        })
+        .await
     }
 
     /// Persists `event` to `events` and broadcasts it on the active run's

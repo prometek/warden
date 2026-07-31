@@ -318,9 +318,14 @@ pub async fn insert_run(
 pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunState) -> Result<()> {
     let now = now_rfc3339();
     let state = new_state.as_str();
+    let quota_resets_at = match new_state {
+        RunState::AwaitingQuotaReset { resets_at } => Some(resets_at),
+        _ => None,
+    };
     sqlx::query!(
-        "UPDATE runs SET state = ?, updated_at = ? WHERE id = ?",
+        "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
         state,
+        quota_resets_at,
         now,
         run_id,
     )

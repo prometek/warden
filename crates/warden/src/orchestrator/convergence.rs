@@ -254,7 +254,18 @@ impl Orchestrator {
         // like `step_last_reviewed_commit`.
         let mut own_step_cycle_numbers = vec![0u32; config.workflow.steps.len()];
 
-        let final_state = loop {
+        let final_state = 'convergence: loop {
+            // Issue #85: only inspect a CLI quota report at this boundary,
+            // before a new workflow step/cycle starts. A tool that exposes no
+            // report leaves the database value absent and this is a no-op.
+            if self.suspend_for_anticipated_quota(&run_id).await? {
+                break RunState::AwaitingQuotaReset {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                };
+            }
             let cycle_id = Uuid::new_v4().to_string();
             db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
@@ -301,7 +312,7 @@ impl Orchestrator {
             // then, so nothing can match it and every step gets `Full`.
             let producer_base_commit_this_cycle = base_commit.clone();
             let producer_role = &config.workflow.steps[0].role;
-            let producer_result = self
+            let producer_result = match self
                 .run_producer(
                     &runner,
                     ProducerInvocation {
@@ -322,8 +333,26 @@ impl Orchestrator {
                         cancel: cancel.clone(),
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(WardenError::QuotaSuspended { resets_at }) => {
+                    break RunState::AwaitingQuotaReset { resets_at };
+                }
+                Err(error) => return Err(error),
+            };
             base_commit = producer_result.commit;
+
+            // The producer has completed; do not start the first gated step
+            // when its report says the configured quota threshold is reached.
+            if self.suspend_for_anticipated_quota(&run_id).await? {
+                break RunState::AwaitingQuotaReset {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                };
+            }
 
             let mut findings: Vec<Finding> = Vec::new();
             // Issue #24 review, M4: folded in alongside the first gated
@@ -465,7 +494,7 @@ impl Orchestrator {
                     .await?;
                 }
 
-                let step_findings = self
+                let step_findings = match self
                     .run_gated_step(
                         &runner,
                         GatedStepInvocation {
@@ -488,7 +517,14 @@ impl Orchestrator {
                             cancel: cancel.clone(),
                         },
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(findings) => findings,
+                    Err(WardenError::QuotaSuspended { resets_at }) => {
+                        break 'convergence RunState::AwaitingQuotaReset { resets_at };
+                    }
+                    Err(error) => return Err(error),
+                };
                 if step_is_scoped_re_reviewable {
                     // This step's target commit *this* invocation was
                     // `base_commit` (unchanged since the producer ran, above)
@@ -1907,7 +1943,9 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        let orchestrator = Orchestrator::new(pool.clone());
+        // Keep this #84 plumbing test below #85's default anticipation
+        // threshold; the suspension behavior is covered separately.
+        let orchestrator = Orchestrator::new(pool.clone()).with_quota_anticipation_threshold(0.95);
         // The coder is judged by exit code alone (`extract_findings` is
         // never called for it -- ADR-0012), so its stdout needs no NDJSON
         // shape at all -- just the real captured `rate_limit_event` line.
