@@ -82,33 +82,35 @@ fn hooks_file_path(repo_path: &Path) -> std::path::PathBuf {
     repo_path.join(".warden").join("hooks.toml")
 }
 
-/// Loads `<repo_path>/.warden/hooks.toml` into a [`HookRegistry`], one
-/// [`CommandHook`] per entry (file order preserved). An absent file yields an
-/// empty registry; a malformed one is a [`WardenError::HookConfig`]. Every
-/// hook runs through `sandbox` (shared with the orchestrator's own so a single
-/// backend choice covers both -- see `crate::main`), and is gated by
-/// `policy_gate` (issue #51, ADR-0016) -- see [`CommandHook`]'s own "Policy"
-/// docs.
-pub fn load_repo_hooks(
+/// Reads the exact hook document selected for a run so quota recovery can
+/// persist it instead of re-reading a repository that agents may have
+/// changed since the run started.
+pub fn read_repo_hooks(repo_path: &Path) -> Result<Option<String>> {
+    let path = hooks_file_path(repo_path);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(WardenError::HookConfig {
+            path,
+            reason: format!("could not read the file: {err}"),
+        }),
+    }
+}
+
+/// Builds a hook registry from an already-resolved document. `None` is the
+/// durable representation of an absent file.
+pub fn parse_repo_hooks(
     repo_path: &Path,
+    contents: Option<&str>,
     sandbox: Arc<dyn Sandbox>,
     policy_gate: Arc<PolicyGate>,
 ) -> Result<HookRegistry> {
     let path = hooks_file_path(repo_path);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(HookRegistry::new());
-        }
-        Err(err) => {
-            return Err(WardenError::HookConfig {
-                path,
-                reason: format!("could not read the file: {err}"),
-            });
-        }
+    let Some(contents) = contents else {
+        return Ok(HookRegistry::new());
     };
 
-    let parsed: HooksFile = toml::from_str(&contents).map_err(|err| WardenError::HookConfig {
+    let parsed: HooksFile = toml::from_str(contents).map_err(|err| WardenError::HookConfig {
         path: path.clone(),
         reason: err.to_string(),
     })?;
@@ -137,6 +139,19 @@ pub fn load_repo_hooks(
         )));
     }
     Ok(registry)
+}
+
+/// Loads `<repo_path>/.warden/hooks.toml` into a [`HookRegistry`], one
+/// [`CommandHook`] per entry (file order preserved). An absent file yields an
+/// empty registry; a malformed one is a [`WardenError::HookConfig`]. Every
+/// hook runs through `sandbox` and is gated by `policy_gate`.
+pub fn load_repo_hooks(
+    repo_path: &Path,
+    sandbox: Arc<dyn Sandbox>,
+    policy_gate: Arc<PolicyGate>,
+) -> Result<HookRegistry> {
+    let contents = read_repo_hooks(repo_path)?;
+    parse_repo_hooks(repo_path, contents.as_deref(), sandbox, policy_gate)
 }
 
 #[cfg(test)]

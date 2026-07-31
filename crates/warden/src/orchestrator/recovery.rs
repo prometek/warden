@@ -62,6 +62,7 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
         run.state
             .validate_transition(RunState::Failed, run.total_steps)?;
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
+        db::delete_quota_continuation(pool, &run.id).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
         reclaim_orphan_resources(pool, &run).await;
@@ -166,19 +167,20 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
 ///
 /// This deliberately runs independently of [`recover_crashed_runs`]: an
 /// `AwaitingQuotaReset` run is a stable, intentional stop rather than a
-/// crashed intermediate state. Callers should spawn it during startup, as a
-/// resumed agent invocation may take as long as any ordinary convergence
-/// loop and must not delay a new `warden run`.
+/// crashed intermediate state. A caller may run it concurrently with a new
+/// command, but must retain and await that task before process exit because
+/// every returned id has already been durably claimed as `ResumingQuota`.
 ///
 /// Returns the ids successfully handed back to the convergence loop. A run
 /// with a missing or invalid checkpoint is transitioned to `Failed`, its
 /// checkpoint is deleted, and recovery proceeds with the remaining due
 /// runs. Database or resumed-loop failures are returned to the caller.
-pub async fn resume_quota_suspended_runs<R: ToolAdapter>(
-    pool: SqlitePool,
-    runner: R,
-) -> Result<Vec<String>> {
-    let due_run_ids = db::list_due_quota_run_ids(&pool, Utc::now().timestamp()).await?;
+pub async fn resume_quota_suspended_runs(pool: SqlitePool) -> Result<Vec<String>> {
+    resume_quota_suspended_runs_at(pool, Utc::now().timestamp()).await
+}
+
+async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Result<Vec<String>> {
+    let due_run_ids = db::claim_due_quota_run_ids(&pool, now_unix).await?;
     let mut resumed_run_ids = Vec::new();
 
     for run_id in due_run_ids {
@@ -187,12 +189,10 @@ pub async fn resume_quota_suspended_runs<R: ToolAdapter>(
             continue;
         };
 
-        // The due-id query is intentionally materialized before resumption.
-        // A concurrently resumed run may therefore have left the stable wait
-        // state by the time this pass reaches it; never overwrite that newer
-        // state with an old checkpoint.
-        if !matches!(run.state, RunState::AwaitingQuotaReset { .. }) {
-            tracing::warn!(run_id = %run.id, state = run.state.as_str(), "due quota continuation no longer awaits a quota reset; skipping");
+        // Only the process whose compare-and-swap wrote this durable claim
+        // receives the id from `claim_due_quota_run_ids`.
+        if run.state != RunState::ResumingQuota {
+            tracing::warn!(run_id = %run.id, state = run.state.as_str(), "claimed quota continuation no longer has its resuming state; skipping");
             continue;
         }
 
@@ -245,13 +245,50 @@ pub async fn resume_quota_suspended_runs<R: ToolAdapter>(
             }
         }
 
-        // The stored rate-limit observation caused the previous stop. It is
-        // stale after `resets_at`; clearing it before restoring the boundary
-        // lets the next invocation publish a fresh CLI observation rather
-        // than immediately suspending on yesterday's report.
-        db::clear_run_rate_limit_status(&pool, &run.id).await?;
-
+        let policy_rules = match crate::policy_config::parse_repo_policy(
+            &restored.config.repo_path,
+            restored.execution_context.policy_yaml.as_deref(),
+        ) {
+            Ok(rules) => rules,
+            Err(error) => {
+                fail_quota_continuation_recovery(&pool, &run, error.to_string()).await?;
+                continue;
+            }
+        };
+        // Interactive terminal approval is process-local and cannot be
+        // resumed safely in a supervised background task. Installing no
+        // approval gate makes every persisted `RequireApproval` decision
+        // deny explicitly while ordinary Allow/Deny rules remain identical.
+        if restored.execution_context.approval == ApprovalConfig::InteractiveTty {
+            tracing::warn!(
+                run_id = %run.id,
+                "original policy used a non-durable interactive approval channel; resumed \
+                 approvals will be denied fail-closed"
+            );
+        }
+        let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(policy_rules)));
+        let hooks = match crate::hook_config::parse_repo_hooks(
+            &restored.config.repo_path,
+            restored.execution_context.hooks_toml.as_deref(),
+            Arc::new(LocalSandbox::new()),
+            Arc::clone(&policy_gate),
+        ) {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                fail_quota_continuation_recovery(&pool, &run, error.to_string()).await?;
+                continue;
+            }
+        };
+        let runner = restored.execution_context.tool;
+        let sandbox = restored
+            .execution_context
+            .sandbox
+            .build(&restored.config.repo_path);
         let orchestrator = Orchestrator::new(pool.clone())
+            .with_sandbox(sandbox)
+            .with_hooks(hooks)
+            .with_policy_gate(policy_gate)
+            .with_run_execution_context(restored.execution_context)
             .with_quota_anticipation_threshold(restored.quota_anticipation_threshold);
         let (_, final_state) = orchestrator
             .resume_convergence_loop(

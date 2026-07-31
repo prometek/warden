@@ -46,8 +46,16 @@ impl Orchestrator {
                 })?;
         let state = RunState::AwaitingQuotaReset { resets_at };
         run.state.validate_transition(state, run.total_steps)?;
-        let config_json =
-            super::continuation::encode_run_config(config, self.quota_anticipation_threshold)?;
+        let execution_context = self.run_execution_context.as_ref().ok_or_else(|| {
+            WardenError::MissingQuotaExecutionContext {
+                run_id: run_id.to_string(),
+            }
+        })?;
+        let config_json = super::continuation::encode_run_config(
+            config,
+            execution_context,
+            self.quota_anticipation_threshold,
+        )?;
         let state_json = super::continuation::encode_convergence_state(continuation)?;
         db::suspend_run_with_quota_continuation(
             &self.pool,
@@ -2201,6 +2209,16 @@ mod tests {
         )
     }
 
+    fn quota_test_execution_context() -> RunExecutionContext {
+        RunExecutionContext {
+            tool: crate::tool_adapter::ToolName::Claude,
+            sandbox: SandboxConfig::Worktree,
+            hooks_toml: None,
+            policy_yaml: None,
+            approval: ApprovalConfig::FailClosed,
+        }
+    }
+
     fn quota_test_config(
         repo: &TempDir,
         warden_home: &TempDir,
@@ -2254,6 +2272,7 @@ mod tests {
         let (adapter, gated_roles) = quota_test_adapter();
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,
@@ -2292,6 +2311,7 @@ mod tests {
         let (adapter, gated_roles) = quota_test_adapter();
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,
@@ -2331,6 +2351,7 @@ mod tests {
         let exhausted_coder = AgentCommand::new("sh", ["-c", "echo RATE:1.0; exit 1"]);
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,

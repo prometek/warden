@@ -12,11 +12,13 @@ use tokio_util::sync::CancellationToken;
 use warden::agent_def::resolve_agent_definition;
 use warden::db;
 use warden::gate_trigger;
-use warden::hook_config::load_repo_hooks;
-use warden::orchestrator::{self, Orchestrator, RunConfig};
-use warden::policy_config::load_repo_policy;
+use warden::hook_config::{parse_repo_hooks, read_repo_hooks};
+use warden::orchestrator::{
+    self, ApprovalConfig, Orchestrator, RunConfig, RunExecutionContext, SandboxConfig,
+};
+use warden::policy_config::{parse_repo_policy, read_repo_policy};
 use warden::policy_gate::PolicyGate;
-use warden::tool_adapter::{ClaudeAdapter, CodexAdapter, MistralAdapter, ToolAdapter};
+use warden::tool_adapter::ToolName;
 use warden_core::AgentRole;
 use warden_sandbox::{LocalSandbox, Sandbox};
 
@@ -264,31 +266,11 @@ fn isolation_as_str(isolation: Isolation) -> &'static str {
 /// exists only to override it.
 const DEFAULT_DOCKER_IMAGE: &str = "warden-agent:latest";
 
-/// The closed set of `--tool` values this build understands (issue #24,
-/// extended to `codex`/`mistral` by issue #71): each variant owns exactly
-/// one [`ToolAdapter`] impl, resolved at compile time -- not a
-/// config-declared registry, mirroring `warden_core::AgentRole`/`RunState`
-/// string parsing. Other CLIs are meant to gain their own variant + adapter
-/// later, never by adding a runtime lookup table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolName {
-    Claude,
-    Codex,
-    Mistral,
-}
-
-/// clap `value_parser` for `--tool`: validated against the closed set above
+/// clap `value_parser` for `--tool`: validated against [`ToolName`]'s closed set
 /// at the CLI boundary (code-standards.md: "valider toute entrée externe...
 /// à la frontière"), mirroring `parse_evidence_tool`.
 fn parse_tool(raw: &str) -> Result<ToolName, String> {
-    match raw {
-        "claude" => Ok(ToolName::Claude),
-        "codex" => Ok(ToolName::Codex),
-        "mistral" => Ok(ToolName::Mistral),
-        other => Err(format!(
-            "unknown --tool {other:?} (supported: \"claude\", \"codex\", \"mistral\")"
-        )),
-    }
+    ToolName::parse(raw).map_err(|reason| reason.replacen("unknown tool", "unknown --tool", 1))
 }
 
 fn parse_quota_anticipation_threshold(raw: &str) -> Result<f64, String> {
@@ -306,11 +288,7 @@ fn parse_quota_anticipation_threshold(raw: &str) -> Result<f64, String> {
 /// the exact `--tool` value a batch child subprocess needs to reproduce it,
 /// so a batch inherits the same adapter selection as a single-intent run.
 fn tool_as_str(tool: ToolName) -> &'static str {
-    match tool {
-        ToolName::Claude => "claude",
-        ToolName::Codex => "codex",
-        ToolName::Mistral => "mistral",
-    }
+    tool.as_str()
 }
 
 /// Issue #49: `--isolation`/`--isolation-image` bundled into one config,
@@ -444,76 +422,24 @@ async fn main() -> anyhow::Result<()> {
                     image: isolation_image,
                 };
 
-                // Three arms today (`ToolName::{Claude,Codex,Mistral}`, issue
-                // #71); a future adapter gets its own arm here rather than a
-                // runtime lookup, so the concrete `R: ToolAdapter`
-                // `run_convergence_loop` needs stays resolved at compile time
-                // (see `ToolName`'s own docs).
-                match tool {
-                    ToolName::Claude => {
-                        run(
-                            repo,
-                            intent,
-                            branch,
-                            max_review_cycles,
-                            max_test_cycles,
-                            max_cycles,
-                            quota_anticipation_threshold,
-                            warden_home,
-                            ClaudeAdapter,
-                            ClaudeAdapter,
-                            TrustRepoAgents(trust_repo_agents),
-                            evidence_tool,
-                            evidence_store_in_repo,
-                            gate,
-                            tui_launch,
-                            isolation_config,
-                        )
-                        .await
-                    }
-                    ToolName::Codex => {
-                        run(
-                            repo,
-                            intent,
-                            branch,
-                            max_review_cycles,
-                            max_test_cycles,
-                            max_cycles,
-                            quota_anticipation_threshold,
-                            warden_home,
-                            CodexAdapter,
-                            CodexAdapter,
-                            TrustRepoAgents(trust_repo_agents),
-                            evidence_tool,
-                            evidence_store_in_repo,
-                            gate,
-                            tui_launch,
-                            isolation_config,
-                        )
-                        .await
-                    }
-                    ToolName::Mistral => {
-                        run(
-                            repo,
-                            intent,
-                            branch,
-                            max_review_cycles,
-                            max_test_cycles,
-                            max_cycles,
-                            quota_anticipation_threshold,
-                            warden_home,
-                            MistralAdapter,
-                            MistralAdapter,
-                            TrustRepoAgents(trust_repo_agents),
-                            evidence_tool,
-                            evidence_store_in_repo,
-                            gate,
-                            tui_launch,
-                            isolation_config,
-                        )
-                        .await
-                    }
-                }
+                run(
+                    repo,
+                    intent,
+                    branch,
+                    max_review_cycles,
+                    max_test_cycles,
+                    max_cycles,
+                    quota_anticipation_threshold,
+                    warden_home,
+                    tool,
+                    TrustRepoAgents(trust_repo_agents),
+                    evidence_tool,
+                    evidence_store_in_repo,
+                    gate,
+                    tui_launch,
+                    isolation_config,
+                )
+                .await
             } else {
                 run_batch(
                     repo,
@@ -759,7 +685,7 @@ fn parse_approval_answer(line: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run<R: ToolAdapter + Send + 'static>(
+async fn run(
     repo: PathBuf,
     intent: String,
     branch: String,
@@ -768,8 +694,7 @@ async fn run<R: ToolAdapter + Send + 'static>(
     max_cycles: u32,
     quota_anticipation_threshold: f64,
     warden_home: Option<PathBuf>,
-    adapter: R,
-    recovery_adapter: R,
+    adapter: ToolName,
     trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
@@ -832,29 +757,6 @@ async fn run<R: ToolAdapter + Send + 'static>(
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("received Ctrl-C, cancelling run");
             cancel_on_ctrl_c.cancel();
-        }
-    });
-
-    // Issue #86: a due quota continuation resumes from its durable workflow
-    // boundary in the background. It gets a distinct, same-kind adapter
-    // value because the foreground convergence loop consumes `adapter` by
-    // value; all built-in adapters are stateless unit structs. This task is
-    // intentionally not awaited: a resumed agent may run for a long time
-    // and must never delay this command's freshly requested run.
-    let quota_resume_pool = pool.clone();
-    tokio::spawn(async move {
-        match orchestrator::resume_quota_suspended_runs(quota_resume_pool, recovery_adapter).await {
-            Ok(resumed) => {
-                for run_id in &resumed {
-                    tracing::warn!(
-                        run_id,
-                        "resumed a run after its quota reset (crash recovery)"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::error!(%error, "failed to resume runs awaiting a quota reset");
-            }
         }
     });
 
@@ -1136,20 +1038,14 @@ async fn run<R: ToolAdapter + Send + 'static>(
     // `warden_sandbox`, so a missing `HOME` is this same "pass
     // `--warden-home` explicitly"-style error `default_warden_home` already
     // uses, not a sandbox-layer one).
-    let sandbox: Option<std::sync::Arc<dyn warden_sandbox::Sandbox>> =
-        match isolation_config.isolation {
-            Isolation::Worktree => None,
-            Isolation::Docker => {
-                let claude_config_dir = default_claude_config_dir()?;
-                Some(std::sync::Arc::new(warden_sandbox::DockerSandbox::new(
-                    warden_sandbox::DockerConfig {
-                        image: isolation_config.image,
-                        repo_path: config.repo_path.clone(),
-                        claude_config_dir,
-                    },
-                )))
-            }
-        };
+    let sandbox_config = match isolation_config.isolation {
+        Isolation::Worktree => SandboxConfig::Worktree,
+        Isolation::Docker => SandboxConfig::Docker {
+            image: isolation_config.image,
+            claude_config_dir: default_claude_config_dir()?,
+        },
+    };
+    let sandbox = sandbox_config.build(&config.repo_path);
 
     let cancel_on_tui_exit = cancel.clone();
 
@@ -1184,14 +1080,12 @@ async fn run<R: ToolAdapter + Send + 'static>(
     // docs) -- lowercase hex and hyphens only, never containing shell
     // metacharacters -- so, unlike `attach_warden_home_quoted` above, it
     // does not need its own `shlex::try_quote` pass.
-    // Issue #49's agent-isolation sandbox: `None` => the orchestrator's own
-    // default `LocalSandbox` (unchanged `--isolation worktree` behaviour);
-    // `Some` => the `DockerSandbox` that `--isolation docker` selected above.
-    let mut orchestrator =
-        Orchestrator::new(pool).with_quota_anticipation_threshold(quota_anticipation_threshold);
-    if let Some(sandbox) = sandbox {
-        orchestrator = orchestrator.with_sandbox(sandbox);
-    }
+    // Issue #49's agent-isolation choice is built once above and installed
+    // here. The same `SandboxConfig` is persisted in a quota checkpoint so a
+    // later startup cannot silently fall back from Docker to LocalSandbox.
+    let orchestrator = Orchestrator::new(pool.clone())
+        .with_sandbox(sandbox)
+        .with_quota_anticipation_threshold(quota_anticipation_threshold);
 
     // Lifecycle hooks run on the HOST, never inside an agent's isolation
     // container: they are the operator's own infra prep (`docker compose up`,
@@ -1215,8 +1109,15 @@ async fn run<R: ToolAdapter + Send + 'static>(
     // (see `NoTuiApprovalGate`'s own docs). `tui_launch` already reflects
     // `--tui` for this invocation, batch child or not (`run_one_batch_intent`
     // re-parses argv fresh in the child, forwarding the flag verbatim).
-    let policy_rules =
-        load_repo_policy(&config.repo_path).context("failed to load .warden/policy.yaml")?;
+    let policy_yaml =
+        read_repo_policy(&config.repo_path).context("failed to load .warden/policy.yaml")?;
+    let policy_rules = parse_repo_policy(&config.repo_path, policy_yaml.as_deref())
+        .context("failed to parse .warden/policy.yaml")?;
+    let approval = if tui_launch.is_none() {
+        ApprovalConfig::InteractiveTty
+    } else {
+        ApprovalConfig::FailClosed
+    };
     let approval_gate: Arc<dyn warden::policy_gate::ApprovalGate> = if tui_launch.is_none() {
         Arc::new(TtyApprovalGate)
     } else {
@@ -1228,12 +1129,27 @@ async fn run<R: ToolAdapter + Send + 'static>(
     );
 
     let hook_sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new());
-    let hooks = load_repo_hooks(&config.repo_path, hook_sandbox, Arc::clone(&policy_gate))
-        .context("failed to load .warden/hooks.toml")?;
+    let hooks_toml =
+        read_repo_hooks(&config.repo_path).context("failed to load .warden/hooks.toml")?;
+    let hooks = parse_repo_hooks(
+        &config.repo_path,
+        hooks_toml.as_deref(),
+        hook_sandbox,
+        Arc::clone(&policy_gate),
+    )
+    .context("failed to parse .warden/hooks.toml")?;
+    let execution_context = RunExecutionContext {
+        tool: adapter,
+        sandbox: sandbox_config,
+        hooks_toml,
+        policy_yaml,
+        approval,
+    };
 
     let orchestrator = orchestrator
         .with_hooks(hooks)
         .with_policy_gate(policy_gate)
+        .with_run_execution_context(execution_context)
         .on_run_started(move |run_id| {
             print_run_started_hint(run_id, &attach_warden_home_quoted);
 
@@ -1281,9 +1197,30 @@ async fn run<R: ToolAdapter + Send + 'static>(
                 }
             }
         });
+    // Due quota continuations run concurrently with this newly requested
+    // run, but the handle is retained and joined below. The process may not
+    // exit successfully while a claimed `resuming_quota` checkpoint is
+    // still executing.
+    let quota_resume_pool = pool.clone();
+    let quota_resume_handle =
+        tokio::spawn(
+            async move { orchestrator::resume_quota_suspended_runs(quota_resume_pool).await },
+        );
     let convergence_result = orchestrator
         .run_convergence_loop(config, adapter, cancel)
         .await;
+    let quota_resume_result: anyhow::Result<Vec<String>> = match quota_resume_handle.await {
+        Ok(result) => result.context("failed to resume runs awaiting a quota reset"),
+        Err(error) => Err(error).context("quota-resume supervision task failed"),
+    };
+    if let Ok(resumed) = &quota_resume_result {
+        for run_id in resumed {
+            tracing::warn!(
+                run_id,
+                "resumed a run after its quota reset (crash recovery)"
+            );
+        }
+    }
 
     // Issue #32 review (HIGH, then re-review): whether to wait here for a
     // still-attached `warden-tui` to exit before deciding this run's own
@@ -1326,6 +1263,7 @@ async fn run<R: ToolAdapter + Send + 'static>(
         return Err(spawn_error).context("failed to spawn warden-tui for --tui; aborted the run");
     }
 
+    quota_resume_result?;
     let (run_id, final_state) = convergence_result.context("convergence loop failed")?;
 
     tracing::info!(run_id, ?final_state, "run finished");

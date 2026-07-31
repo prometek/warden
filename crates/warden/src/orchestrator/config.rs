@@ -2,8 +2,63 @@
 //! by the CLI (`main.rs`) and handed to [`super::Orchestrator::run_convergence_loop`].
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use warden_core::{AgentDefinition, AgentRole, EvidenceTool, Workflow};
+use warden_sandbox::{DockerConfig, DockerSandbox, LocalSandbox, Sandbox};
+
+use crate::tool_adapter::ToolName;
+
+/// Durable execution and security inputs required to resume a run without
+/// consulting a later CLI invocation or mutable repository configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunExecutionContext {
+    pub tool: ToolName,
+    pub sandbox: SandboxConfig,
+    /// Exact `.warden/hooks.toml` contents resolved for the original run.
+    /// `None` preserves the distinction between an absent and an empty file.
+    pub hooks_toml: Option<String>,
+    /// Exact `.warden/policy.yaml` contents resolved for the original run.
+    pub policy_yaml: Option<String>,
+    pub approval: ApprovalConfig,
+}
+
+/// Agent-isolation backend selected for the original run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxConfig {
+    Worktree,
+    Docker {
+        image: String,
+        claude_config_dir: PathBuf,
+    },
+}
+
+impl SandboxConfig {
+    pub fn build(&self, repo_path: &std::path::Path) -> Arc<dyn Sandbox> {
+        match self {
+            Self::Worktree => Arc::new(LocalSandbox::new()),
+            Self::Docker {
+                image,
+                claude_config_dir,
+            } => Arc::new(DockerSandbox::new(DockerConfig {
+                image: image.clone(),
+                repo_path: repo_path.to_path_buf(),
+                claude_config_dir: claude_config_dir.clone(),
+            })),
+        }
+    }
+}
+
+/// Approval channel used by the original process.
+///
+/// Neither current variant is durable across process restarts. Recovery
+/// persists which one was selected for auditability, then deliberately
+/// installs no approval gate so every later `RequireApproval` fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalConfig {
+    InteractiveTty,
+    FailClosed,
+}
 
 /// Static configuration for a single run of the convergence loop.
 ///

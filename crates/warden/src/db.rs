@@ -671,14 +671,17 @@ pub async fn suspend_run_with_quota_continuation(
     Ok(())
 }
 
-/// Run ids whose persisted quota reset has elapsed as of `now_unix`.
-/// Materialized before any one run is resumed, so a run that immediately
-/// re-suspends with another already-due timestamp is still attempted at most
-/// once by this startup pass (no hot loop).
-pub async fn list_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result<Vec<String>> {
+/// Atomically claims every quota continuation due as of `now_unix`.
+///
+/// Each candidate is changed from its exact persisted
+/// `awaiting_quota_reset:<timestamp>` generation to `resuming_quota` with a
+/// compare-and-swap update. Concurrent Warden startups can materialize the
+/// same candidates, but only one update can affect each row; only that
+/// process receives the run id and may decode or execute its checkpoint.
+pub async fn claim_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result<Vec<String>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id as "id!"
+        SELECT id as "id!", state as "state!", quota_resets_at as "quota_resets_at!", updated_at as "updated_at!"
         FROM runs
         WHERE state LIKE 'awaiting_quota_reset:%'
           AND quota_resets_at IS NOT NULL
@@ -689,7 +692,36 @@ pub async fn list_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result<
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|row| row.id).collect())
+
+    let claimed_state = RunState::ResumingQuota.as_str();
+    let claimed_at = now_rfc3339();
+    let mut claimed = Vec::with_capacity(rows.len());
+    for row in rows {
+        let result = sqlx::query!(
+            r#"
+            UPDATE runs
+            SET state = ?, quota_resets_at = NULL, updated_at = ?
+            WHERE id = ?
+              AND state = ?
+              AND quota_resets_at = ?
+              AND quota_resets_at <= ?
+              AND updated_at = ?
+            "#,
+            claimed_state,
+            claimed_at,
+            row.id,
+            row.state,
+            row.quota_resets_at,
+            now_unix,
+            row.updated_at,
+        )
+        .execute(pool)
+        .await?;
+        if result.rows_affected() == 1 {
+            claimed.push(row.id);
+        }
+    }
+    Ok(claimed)
 }
 
 pub async fn get_quota_continuation(
@@ -853,7 +885,8 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
 }
 
 /// Runs left in an intermediate state (`RunState::is_intermediate`) as of
-/// the last shutdown/crash. The `coder_running`/`awaiting_ci` literals and
+/// the last shutdown/crash. The `coder_running`/`awaiting_ci`/
+/// `resuming_quota` literals and
 /// the `running_step:%` pattern below must stay in sync with
 /// [`RunState::is_intermediate`] — enforced by a test in this module, since
 /// a `?`-parameterised `IN (...)` list isn't expressible in a
@@ -866,7 +899,7 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
         r#"
         SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
-        WHERE state IN ('coder_running', 'awaiting_ci') OR state LIKE 'running_step:%'
+        WHERE state IN ('coder_running', 'awaiting_ci', 'resuming_quota') OR state LIKE 'running_step:%'
         "#
     )
     .fetch_all(pool)
@@ -1556,6 +1589,10 @@ mod tests {
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000,
+            },
+            RunState::ResumingQuota,
             RunState::Done,
             RunState::StepCyclesExceeded(1),
             RunState::StepCyclesExceeded(2),
@@ -1563,6 +1600,7 @@ mod tests {
         ] {
             let literal_says_intermediate = state.as_str() == "coder_running"
                 || state.as_str() == "awaiting_ci"
+                || state.as_str() == "resuming_quota"
                 || state.as_str().starts_with("running_step:");
             assert_eq!(
                 literal_says_intermediate,

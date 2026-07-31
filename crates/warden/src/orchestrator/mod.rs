@@ -117,7 +117,10 @@ mod tampering;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use config::{GateConfig, RunConfig, UntrustedRepoAgentDefinition};
+pub use config::{
+    ApprovalConfig, GateConfig, RunConfig, RunExecutionContext, SandboxConfig,
+    UntrustedRepoAgentDefinition,
+};
 pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs, resume_quota_suspended_runs};
 
 use tampering::AgentDefinitionSnapshot;
@@ -581,6 +584,11 @@ pub struct Orchestrator {
     /// ([`PolicyGate::empty`]), so this check is a strict no-op until a
     /// caller installs one via [`Orchestrator::with_policy_gate`].
     policy_gate: Arc<PolicyGate>,
+    /// Exact startup choices required for durable quota resumption. Library
+    /// callers using a non-built-in adapter may leave this unset, but then a
+    /// quota suspension fails closed instead of writing an unrecoverable
+    /// checkpoint.
+    run_execution_context: Option<RunExecutionContext>,
     quota_anticipation_threshold: f64,
 }
 
@@ -597,6 +605,7 @@ impl Orchestrator {
             sandbox: Arc::new(LocalSandbox::new()),
             hooks: HookRegistry::new(),
             policy_gate: Arc::new(PolicyGate::empty()),
+            run_execution_context: None,
             quota_anticipation_threshold: 0.90,
         }
     }
@@ -641,6 +650,13 @@ impl Orchestrator {
     /// [`Orchestrator::with_sandbox`]/[`Orchestrator::with_hooks`].
     pub fn with_policy_gate(mut self, policy_gate: Arc<PolicyGate>) -> Self {
         self.policy_gate = policy_gate;
+        self
+    }
+
+    /// Installs the durable counterpart of this orchestrator's adapter,
+    /// sandbox, hooks, policy, and approval-channel choices.
+    pub fn with_run_execution_context(mut self, context: RunExecutionContext) -> Self {
+        self.run_execution_context = Some(context);
         self
     }
 

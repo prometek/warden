@@ -281,6 +281,12 @@ pub enum WardenError {
     InvalidQuotaContinuation { run_id: String, reason: String },
 
     #[error(
+        "cannot suspend run {run_id} for durable quota resumption: the original tool and \
+         execution/security context were not configured"
+    )]
+    MissingQuotaExecutionContext { run_id: String },
+
+    #[error(
         "cannot checkpoint non-UTF-8 path in `{field}` ({path}); exact path bytes are required \
          for deterministic quota resumption"
     )]

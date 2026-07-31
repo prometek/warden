@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +28,7 @@ struct RunConfigCheckpoint {
     evidence_store_in_repo: bool,
     gate: Option<GateConfigCheckpoint>,
     untrusted_repo_agent_definitions: Vec<UntrustedAgentDefinitionCheckpoint>,
+    execution_context: RunExecutionContextCheckpoint,
     quota_anticipation_threshold: f64,
 }
 
@@ -78,6 +79,26 @@ struct UntrustedAgentDefinitionCheckpoint {
     role: String,
     path: String,
     canonical_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunExecutionContextCheckpoint {
+    tool: String,
+    sandbox: SandboxConfigCheckpoint,
+    hooks_toml: Option<String>,
+    policy_yaml: Option<String>,
+    approval: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum SandboxConfigCheckpoint {
+    Worktree,
+    Docker {
+        image: String,
+        claude_config_dir: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,15 +159,18 @@ struct FindingCheckpoint {
 
 pub(super) struct RestoredRun {
     pub config: RunConfig,
+    pub execution_context: RunExecutionContext,
     pub continuation: ConvergenceContinuation,
     pub quota_anticipation_threshold: f64,
 }
 
 pub(super) fn encode_run_config(
     config: &RunConfig,
+    execution_context: &RunExecutionContext,
     quota_anticipation_threshold: f64,
 ) -> Result<String> {
-    let checkpoint = RunConfigCheckpoint::from_config(config, quota_anticipation_threshold)?;
+    let checkpoint =
+        RunConfigCheckpoint::from_config(config, execution_context, quota_anticipation_threshold)?;
     serde_json::to_string(&checkpoint)
         .map_err(|source| WardenError::QuotaContinuationEncode { source })
 }
@@ -186,11 +210,12 @@ pub(super) fn decode_run(run_id: &str, config_json: &str, state_json: &str) -> R
         ));
     }
 
-    let config = config_checkpoint.into_config(run_id)?;
+    let (config, execution_context) = config_checkpoint.into_config(run_id)?;
     let continuation = state_checkpoint.into_continuation(run_id, config.workflow.steps.len())?;
 
     Ok(RestoredRun {
         config,
+        execution_context,
         continuation,
         quota_anticipation_threshold,
     })
@@ -225,7 +250,11 @@ fn exact_path(path: &Path, field: &'static str) -> Result<String> {
 }
 
 impl RunConfigCheckpoint {
-    fn from_config(config: &RunConfig, quota_anticipation_threshold: f64) -> Result<Self> {
+    fn from_config(
+        config: &RunConfig,
+        execution_context: &RunExecutionContext,
+        quota_anticipation_threshold: f64,
+    ) -> Result<Self> {
         Ok(Self {
             version: CHECKPOINT_VERSION,
             repo_path: exact_path(&config.repo_path, "repo_path")?,
@@ -253,11 +282,12 @@ impl RunConfigCheckpoint {
                 .iter()
                 .map(UntrustedAgentDefinitionCheckpoint::from_config)
                 .collect::<Result<Vec<_>>>()?,
+            execution_context: RunExecutionContextCheckpoint::from_config(execution_context)?,
             quota_anticipation_threshold,
         })
     }
 
-    fn into_config(self, run_id: &str) -> Result<RunConfig> {
+    fn into_config(self, run_id: &str) -> Result<(RunConfig, RunExecutionContext)> {
         let workflow_json = serde_json::to_string(&self.workflow)
             .map_err(|source| WardenError::QuotaContinuationEncode { source })?;
         let workflow = warden_core::Workflow::parse_yaml(&workflow_json)?;
@@ -277,8 +307,9 @@ impl RunConfigCheckpoint {
             .into_iter()
             .map(|entry| entry.into_config(run_id))
             .collect::<Result<Vec<_>>>()?;
+        let execution_context = self.execution_context.into_config(run_id)?;
 
-        Ok(RunConfig {
+        let config = RunConfig {
             repo_path: PathBuf::from(self.repo_path),
             warden_home: PathBuf::from(self.warden_home),
             branch: self.branch,
@@ -292,7 +323,8 @@ impl RunConfigCheckpoint {
             evidence_store_in_repo: self.evidence_store_in_repo,
             gate,
             untrusted_repo_agent_definitions,
-        })
+        };
+        Ok((config, execution_context))
     }
 }
 
@@ -395,6 +427,67 @@ impl UntrustedAgentDefinitionCheckpoint {
             role,
             path: PathBuf::from(self.path),
             canonical_path: PathBuf::from(self.canonical_path),
+        })
+    }
+}
+
+impl RunExecutionContextCheckpoint {
+    fn from_config(config: &RunExecutionContext) -> Result<Self> {
+        let sandbox = match &config.sandbox {
+            SandboxConfig::Worktree => SandboxConfigCheckpoint::Worktree,
+            SandboxConfig::Docker {
+                image,
+                claude_config_dir,
+            } => SandboxConfigCheckpoint::Docker {
+                image: image.clone(),
+                claude_config_dir: exact_path(
+                    claude_config_dir,
+                    "execution_context.sandbox.claude_config_dir",
+                )?,
+            },
+        };
+        Ok(Self {
+            tool: config.tool.as_str().to_string(),
+            sandbox,
+            hooks_toml: config.hooks_toml.clone(),
+            policy_yaml: config.policy_yaml.clone(),
+            approval: match config.approval {
+                ApprovalConfig::InteractiveTty => "interactive_tty",
+                ApprovalConfig::FailClosed => "fail_closed",
+            }
+            .to_string(),
+        })
+    }
+
+    fn into_config(self, run_id: &str) -> Result<RunExecutionContext> {
+        let tool = crate::tool_adapter::ToolName::parse(&self.tool)
+            .map_err(|reason| invalid(run_id, reason))?;
+        let sandbox = match self.sandbox {
+            SandboxConfigCheckpoint::Worktree => SandboxConfig::Worktree,
+            SandboxConfigCheckpoint::Docker {
+                image,
+                claude_config_dir,
+            } => SandboxConfig::Docker {
+                image,
+                claude_config_dir: PathBuf::from(claude_config_dir),
+            },
+        };
+        let approval = match self.approval.as_str() {
+            "interactive_tty" => ApprovalConfig::InteractiveTty,
+            "fail_closed" => ApprovalConfig::FailClosed,
+            other => {
+                return Err(invalid(
+                    run_id,
+                    format!("unknown approval context {other:?}"),
+                ));
+            }
+        };
+        Ok(RunExecutionContext {
+            tool,
+            sandbox,
+            hooks_toml: self.hooks_toml,
+            policy_yaml: self.policy_yaml,
+            approval,
         })
     }
 }

@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id as \"id!\", state as \"state!\", quota_resets_at as \"quota_resets_at!\", updated_at as \"updated_at!\"\n        FROM runs\n        WHERE state LIKE 'awaiting_quota_reset:%'\n          AND quota_resets_at IS NOT NULL\n          AND quota_resets_at <= ?\n        ORDER BY quota_resets_at, created_at, id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "state!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "name": "quota_resets_at!",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "quota_resets_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at!",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d31c9fa0602147c226631009df4e68b1fbea645e62fe2f7f5f804fb49f0e866c"
+}

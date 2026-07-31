@@ -199,6 +199,7 @@ impl HookPoint {
             | RunState::RunningStep(_)
             | RunState::AwaitingCi
             | RunState::AwaitingQuotaReset { .. }
+            | RunState::ResumingQuota
             | RunState::Done
             | RunState::StepCyclesExceeded(_)
             | RunState::Failed => None,
