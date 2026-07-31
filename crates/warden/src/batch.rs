@@ -58,6 +58,7 @@ pub struct SingleIntentArgs<'a> {
     pub max_review_cycles: u32,
     pub max_test_cycles: u32,
     pub max_cycles: u32,
+    pub quota_anticipation_threshold: f64,
     pub warden_home: &'a str,
     pub tool: &'a str,
     pub trust_repo_agents: bool,
@@ -99,6 +100,8 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out.push(args.max_test_cycles.to_string());
     out.push("--max-cycles".to_string());
     out.push(args.max_cycles.to_string());
+    out.push("--quota-anticipation-threshold".to_string());
+    out.push(args.quota_anticipation_threshold.to_string());
     out.push("--warden-home".to_string());
     out.push(args.warden_home.to_string());
     out.push("--tool".to_string());
@@ -331,6 +334,7 @@ mod tests {
             max_review_cycles: 5,
             max_test_cycles: 5,
             max_cycles: 5,
+            quota_anticipation_threshold: 0.90,
             warden_home: "/home/.warden",
             tool: "claude",
             trust_repo_agents: true,
@@ -368,6 +372,8 @@ mod tests {
                 "5",
                 "--max-cycles",
                 "5",
+                "--quota-anticipation-threshold",
+                "0.9",
                 "--warden-home",
                 "/home/.warden",
                 "--tool",
@@ -403,6 +409,7 @@ mod tests {
             max_review_cycles: 5,
             max_test_cycles: 5,
             max_cycles: 5,
+            quota_anticipation_threshold: 0.90,
             warden_home: "/home/.warden",
             tool: "claude",
             trust_repo_agents: false,

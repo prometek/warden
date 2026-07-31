@@ -226,6 +226,14 @@ impl Orchestrator {
         // return the unchanged base commit, silently making the loop look
         // like a no-op success. Fail the run explicitly instead.
         if outcome.exit_code != 0 {
+            if self.suspend_for_exhausted_quota(run_id).await? {
+                return Err(WardenError::QuotaSuspended {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                });
+            }
             tracing::warn!(
                 run_id,
                 cycle_id,
@@ -448,6 +456,14 @@ impl Orchestrator {
         // transient invocation failure, a flaky sandbox, ...), unlike a
         // producer that never produced a commit worth reviewing at all.
         let findings = if outcome.exit_code != 0 {
+            if self.suspend_for_exhausted_quota(run_id).await? {
+                return Err(WardenError::QuotaSuspended {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                });
+            }
             tracing::warn!(
                 run_id,
                 cycle_id,

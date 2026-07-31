@@ -53,6 +53,13 @@ pub enum RunState {
     Converged,
     Pushed,
     AwaitingCi,
+    /// Quota was exhausted or reached the configured anticipation threshold.
+    /// The Unix timestamp comes from the CLI's rate-limit report and is kept
+    /// in the state so an interrupted process never turns a suspension into
+    /// an ordinary failed run.
+    AwaitingQuotaReset {
+        resets_at: i64,
+    },
     Done,
     /// The step at this index (same indexing as [`RunState::RunningStep`])
     /// raised a blocking finding on every cycle up to and including its own
@@ -78,6 +85,9 @@ impl RunState {
             RunState::Converged => "converged".to_string(),
             RunState::Pushed => "pushed".to_string(),
             RunState::AwaitingCi => "awaiting_ci".to_string(),
+            RunState::AwaitingQuotaReset { resets_at } => {
+                format!("awaiting_quota_reset:{resets_at}")
+            }
             RunState::Done => "done".to_string(),
             RunState::StepCyclesExceeded(index) => format!("step_cycles_exceeded:{index}"),
             RunState::Failed => "failed".to_string(),
@@ -93,6 +103,12 @@ impl RunState {
         }
         if let Some(index) = raw.strip_prefix("step_cycles_exceeded:") {
             return parse_step_index(raw, index).map(RunState::StepCyclesExceeded);
+        }
+        if let Some(resets_at) = raw.strip_prefix("awaiting_quota_reset:") {
+            return resets_at
+                .parse::<i64>()
+                .map(|resets_at| RunState::AwaitingQuotaReset { resets_at })
+                .map_err(|_| CoreError::UnknownState(raw.to_string()));
         }
         match raw {
             "pending" => Ok(RunState::Pending),
@@ -159,9 +175,14 @@ impl RunState {
                         RunState::CoderRunning,
                         RunState::StepCyclesExceeded(0),
                         RunState::Failed,
+                        RunState::AwaitingQuotaReset { resets_at: 0 },
                     ]
                 } else {
-                    vec![RunState::RunningStep(1), RunState::Failed]
+                    vec![
+                        RunState::RunningStep(1),
+                        RunState::Failed,
+                        RunState::AwaitingQuotaReset { resets_at: 0 },
+                    ]
                 }
             }
             // Issue #73 (was: `Reviewing`/`Testing`, ADR-0014): a gated
@@ -181,6 +202,7 @@ impl RunState {
                     RunState::CoderRunning,
                     RunState::StepCyclesExceeded(index),
                     RunState::Failed,
+                    RunState::AwaitingQuotaReset { resets_at: 0 },
                 ]
             }
             // Issue #51: a policy `Deny` (or an unapproved `RequireApproval`)
@@ -196,6 +218,9 @@ impl RunState {
             RunState::AwaitingCi => {
                 vec![RunState::Done, RunState::CoderRunning, RunState::Failed]
             }
+            // Resume is deliberately owned by #86. Until then a quota-suspended
+            // run is stable across restart and cannot be mistaken for failed.
+            RunState::AwaitingQuotaReset { .. } => vec![],
             RunState::StepCyclesExceeded(_) => vec![RunState::Failed],
             RunState::Done => vec![],
             RunState::Failed => vec![],
@@ -207,7 +232,16 @@ impl RunState {
     /// see [`RunState::allowed_next_states`]'s own docs for why this needs
     /// it. Returns [`CoreError::InvalidTransition`] otherwise.
     pub fn validate_transition(self, to: RunState, total_steps: u32) -> Result<()> {
-        if self.allowed_next_states(total_steps).contains(&to) {
+        if self.allowed_next_states(total_steps).iter().any(|allowed| {
+            allowed == &to
+                || matches!(
+                    (allowed, &to),
+                    (
+                        RunState::AwaitingQuotaReset { .. },
+                        RunState::AwaitingQuotaReset { .. }
+                    )
+                )
+        }) {
             Ok(())
         } else {
             Err(CoreError::InvalidTransition { from: self, to })
@@ -303,6 +337,21 @@ mod tests {
         assert!(RunState::CoderRunning
             .validate_transition(RunState::RunningStep(1), DEFAULT_TOTAL_STEPS)
             .is_ok());
+    }
+
+    #[test]
+    fn quota_suspension_is_a_persistable_non_intermediate_state() {
+        let awaiting = RunState::AwaitingQuotaReset {
+            resets_at: 1_785_686_400,
+        };
+        assert_eq!(RunState::parse(&awaiting.as_str()).unwrap(), awaiting);
+        assert!(!awaiting.is_intermediate());
+        assert!(RunState::CoderRunning
+            .validate_transition(awaiting, DEFAULT_TOTAL_STEPS)
+            .is_ok());
+        assert!(awaiting
+            .validate_transition(RunState::Failed, DEFAULT_TOTAL_STEPS)
+            .is_err());
     }
 
     #[test]

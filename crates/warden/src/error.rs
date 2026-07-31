@@ -254,6 +254,11 @@ pub enum WardenError {
     #[error(transparent)]
     Core(#[from] warden_core::CoreError),
 
+    /// An agent invocation was stopped by its CLI quota. This is a control
+    /// flow outcome, distinct from an ordinary agent/process failure.
+    #[error("agent invocation suspended until quota resets at {resets_at}")]
+    QuotaSuspended { resets_at: i64 },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

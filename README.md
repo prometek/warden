@@ -910,10 +910,17 @@ frontière (fractions hors `0.0..=2.0` ou non finies, `resets_at <= 0` → rejet
 `tracing::warn!`, jamais de clamp silencieux) ; un `rate_limit_event` récent illisible fait
 tomber le statut à « n/a » et ne retombe jamais sur un rapport plus ancien du même flux.
 
-> **Fondation seulement.** Cette issue capte, type, persiste et publie le signal. Elle ne
-> change *aucun* comportement de run : rien n'anticipe encore l'épuisement du quota, ne
-> suspend un run, ni ne le reprend au reset — ce sont les issues #85/#86, et l'affichage
-> dédié en TUI est l'issue #87 (voir l'épique #83).
+**Anticipation et suspension (issue #85).** `warden run` accepte
+`--quota-anticipation-threshold <fraction>` (défaut : `0.90`, soit 90 %). Lorsqu'un outil
+expose un statut de quota et que sa `utilization` atteint ce seuil, warden vérifie ce statut
+**entre deux étapes** : il ne crée ni worktree ni invocation pour l'étape suivante et persiste
+le run en `AwaitingQuotaReset { resets_at }`. La migration
+`crates/warden/migrations/0012_awaiting_quota_reset.sql` conserve aussi l'heure de reset ; un
+run suspendu n'est donc pas marqué `Failed`. Si le quota tombe malgré tout pendant une
+invocation, le signal typé est traité comme la même suspension et le worktree de cette
+invocation est conservé. Les outils dont `extract_rate_limit` renvoie `None` gardent le
+comportement historique. La reprise automatique au reset est explicitement reportée à l'issue
+#86 ; l'affichage TUI dédié reste l'issue #87 (voir l'épique #83).
 
 **Vue arborescente du workflow (issue #54)** : entre le header et le journal d'événements,
 un panneau dédié projette le run sous forme d'arbre git-graph-like (rails `│`/`├─`/`╰─`) —

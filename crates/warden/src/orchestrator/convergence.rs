@@ -254,7 +254,18 @@ impl Orchestrator {
         // like `step_last_reviewed_commit`.
         let mut own_step_cycle_numbers = vec![0u32; config.workflow.steps.len()];
 
-        let final_state = loop {
+        let final_state = 'convergence: loop {
+            // Issue #85: only inspect a CLI quota report at this boundary,
+            // before a new workflow step/cycle starts. A tool that exposes no
+            // report leaves the database value absent and this is a no-op.
+            if self.suspend_for_anticipated_quota(&run_id).await? {
+                break RunState::AwaitingQuotaReset {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                };
+            }
             let cycle_id = Uuid::new_v4().to_string();
             db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
             self.publish_event(RunEvent::CycleStarted { cycle_number })
@@ -301,7 +312,7 @@ impl Orchestrator {
             // then, so nothing can match it and every step gets `Full`.
             let producer_base_commit_this_cycle = base_commit.clone();
             let producer_role = &config.workflow.steps[0].role;
-            let producer_result = self
+            let producer_result = match self
                 .run_producer(
                     &runner,
                     ProducerInvocation {
@@ -322,8 +333,26 @@ impl Orchestrator {
                         cancel: cancel.clone(),
                     },
                 )
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                Err(WardenError::QuotaSuspended { resets_at }) => {
+                    break RunState::AwaitingQuotaReset { resets_at };
+                }
+                Err(error) => return Err(error),
+            };
             base_commit = producer_result.commit;
+
+            // The producer has completed; do not start the first gated step
+            // when its report says the configured quota threshold is reached.
+            if self.suspend_for_anticipated_quota(&run_id).await? {
+                break RunState::AwaitingQuotaReset {
+                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at,
+                };
+            }
 
             let mut findings: Vec<Finding> = Vec::new();
             // Issue #24 review, M4: folded in alongside the first gated
@@ -465,7 +494,21 @@ impl Orchestrator {
                     .await?;
                 }
 
-                let step_findings = self
+                // This is the last boundary before this particular step can
+                // create its worktree or spawn its agent. A prior gated step
+                // can have updated the run's last-known quota, so checking
+                // only after the producer would let a later step start even
+                // though the threshold was already crossed.
+                if self.suspend_for_anticipated_quota(&run_id).await? {
+                    break 'convergence RunState::AwaitingQuotaReset {
+                        resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
+                            .await?
+                            .expect("quota suspension requires a stored rate-limit status")
+                            .resets_at,
+                    };
+                }
+
+                let step_findings = match self
                     .run_gated_step(
                         &runner,
                         GatedStepInvocation {
@@ -488,7 +531,14 @@ impl Orchestrator {
                             cancel: cancel.clone(),
                         },
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(findings) => findings,
+                    Err(WardenError::QuotaSuspended { resets_at }) => {
+                        break 'convergence RunState::AwaitingQuotaReset { resets_at };
+                    }
+                    Err(error) => return Err(error),
+                };
                 if step_is_scoped_re_reviewable {
                     // This step's target commit *this* invocation was
                     // `base_commit` (unchanged since the producer ran, above)
@@ -1907,7 +1957,9 @@ mod tests {
         let db_dir = TempDir::new().unwrap();
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
 
-        let orchestrator = Orchestrator::new(pool.clone());
+        // Keep this #84 plumbing test below #85's default anticipation
+        // threshold; the suspension behavior is covered separately.
+        let orchestrator = Orchestrator::new(pool.clone()).with_quota_anticipation_threshold(0.95);
         // The coder is judged by exit code alone (`extract_findings` is
         // never called for it -- ADR-0012), so its stdout needs no NDJSON
         // shape at all -- just the real captured `rate_limit_event` line.
@@ -1979,6 +2031,264 @@ mod tests {
             rate_limit_events,
             vec![("coder", &expected_status)],
             "expected exactly one RateLimitStatusUpdated event, from the coder: {persisted:?}"
+        );
+    }
+
+    /// Minimal deterministic adapter for issue #85's orchestration tests.
+    /// Commands declare `RATE:<fraction>` and `ROLE:<role>` in their stdout;
+    /// the adapter turns the former into the same optional quota seam real
+    /// tools use, and records only gated invocations named by the latter.
+    struct QuotaTestAdapter {
+        gated_roles: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ToolAdapter for QuotaTestAdapter {
+        fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+            Ok(decode_smuggled_command(definition))
+        }
+
+        fn env_allowlist(&self) -> &'static [&'static str] {
+            &[]
+        }
+
+        fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+            for line in stdout.lines() {
+                if let Some(role) = line.strip_prefix("ROLE:") {
+                    self.gated_roles.lock().unwrap().push(role.to_string());
+                }
+            }
+            let findings = stdout
+                .lines()
+                .filter(|line| !line.starts_with("RATE:") && !line.starts_with("ROLE:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            warden_core::parse_findings(&findings)
+        }
+
+        fn default_prompt(&self, _role: AgentRole) -> &'static str {
+            "unused: every test provides an explicit definition"
+        }
+
+        fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
+            None
+        }
+
+        fn extract_rate_limit(&self, stdout: &str) -> Option<warden_core::RateLimitStatus> {
+            let utilization = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("RATE:")?.parse::<f64>().ok())?;
+            Some(warden_core::RateLimitStatus::new(
+                warden_core::RateLimitState::AllowedWarning,
+                warden_core::RateLimitWindow::SevenDay,
+                utilization,
+                false,
+                0.75,
+                1_800_000_000,
+            ))
+        }
+    }
+
+    fn quota_test_adapter() -> (QuotaTestAdapter, Arc<std::sync::Mutex<Vec<String>>>) {
+        let gated_roles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            QuotaTestAdapter {
+                gated_roles: gated_roles.clone(),
+            },
+            gated_roles,
+        )
+    }
+
+    fn quota_test_config(
+        repo: &TempDir,
+        warden_home: &TempDir,
+        agents: Vec<AgentCommand>,
+    ) -> RunConfig {
+        RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "issue #85 quota suspension".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: agents.into_iter().map(definition).collect(),
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        }
+    }
+
+    fn committing_coder(rate: Option<f64>) -> AgentCommand {
+        let rate = rate
+            .map(|value| format!("echo RATE:{value};"))
+            .unwrap_or_default();
+        AgentCommand::new(
+            "sh",
+            [
+                "-c",
+                &format!(
+                    "{rate} echo quota-test > work.txt; git add work.txt; git -c user.email=test@warden.local -c user.name=warden-test commit -q -m quota-test"
+                ),
+            ],
+        )
+    }
+
+    fn quota_gated(role: &str, rate: Option<f64>) -> AgentCommand {
+        let rate = rate
+            .map(|value| format!("echo RATE:{value};"))
+            .unwrap_or_default();
+        AgentCommand::new("sh", ["-c", &format!("echo ROLE:{role}; {rate}")])
+    }
+
+    #[tokio::test]
+    async fn quota_anticipation_before_the_first_gated_step_suspends_without_starting_it() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (adapter, gated_roles) = quota_test_adapter();
+
+        let (run_id, state) = Orchestrator::new(pool.clone())
+            .run_convergence_loop(
+                quota_test_config(
+                    &repo,
+                    &warden_home,
+                    vec![
+                        committing_coder(Some(0.95)),
+                        quota_gated("reviewer", None),
+                        quota_gated("tester", None),
+                    ],
+                ),
+                adapter,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000
+            }
+        );
+        assert_eq!(
+            db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+            state
+        );
+        assert!(gated_roles.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn quota_anticipation_after_a_gated_step_never_starts_the_next_step() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (adapter, gated_roles) = quota_test_adapter();
+
+        let (run_id, state) = Orchestrator::new(pool.clone())
+            .run_convergence_loop(
+                quota_test_config(
+                    &repo,
+                    &warden_home,
+                    vec![
+                        committing_coder(None),
+                        quota_gated("reviewer", Some(0.95)),
+                        quota_gated("tester", None),
+                    ],
+                ),
+                adapter,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000
+            }
+        );
+        assert_eq!(
+            db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+            state
+        );
+        assert_eq!(&*gated_roles.lock().unwrap(), &["reviewer"]);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_quota_during_an_invocation_is_typed_and_preserves_its_worktree() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let (adapter, gated_roles) = quota_test_adapter();
+        let exhausted_coder = AgentCommand::new("sh", ["-c", "echo RATE:1.0; exit 1"]);
+
+        let (run_id, state) = Orchestrator::new(pool.clone())
+            .run_convergence_loop(
+                quota_test_config(
+                    &repo,
+                    &warden_home,
+                    vec![
+                        exhausted_coder,
+                        quota_gated("reviewer", None),
+                        quota_gated("tester", None),
+                    ],
+                ),
+                adapter,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000
+            }
+        );
+        assert_eq!(
+            db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+            state
+        );
+        assert!(gated_roles.lock().unwrap().is_empty());
+        assert_eq!(
+            db::list_worktree_paths_for_run(&pool, &run_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adapter_without_quota_reports_keeps_the_existing_workflow_behavior() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let config = quota_test_config(
+            &repo,
+            &warden_home,
+            vec![
+                AgentCommand::new("the-coder", Vec::<String>::new()),
+                AgentCommand::new("the-reviewer", Vec::<String>::new()),
+                AgentCommand::new("the-tester", Vec::<String>::new()),
+            ],
+        );
+
+        let (run_id, state) = Orchestrator::new(pool.clone())
+            .run_convergence_loop(config, FakeRunner::new(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(state, RunState::Converged);
+        assert_eq!(
+            db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+            RunState::Converged
         );
     }
 
