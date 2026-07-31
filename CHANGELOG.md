@@ -9,10 +9,10 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ### Added — Issue #84 : fondation quota — cartographie `rate_limit_info` + `RateLimitStatus` + seam `extract_rate_limit`
 
-> **Fondation seulement** (sous-tâche de #83, bloque #85/#86/#87) : capte, type,
-> persiste et publie le signal de quota. **Rien ici** sur le seuil d'anticipation,
-> `RunState::AwaitingQuotaReset`, la suspension ou la reprise autonome — ce sont
-> les sous-tâches suivantes.
+> **Fondation du signal** (sous-tâche de #83) : capte, type, persiste et publie le
+> statut de quota. L'anticipation et la suspension qui s'appuient sur ce signal sont
+> livrées séparément par l'issue #85 ci-dessous ; la reprise autonome reste l'issue
+> #86 et l'affichage TUI dédié l'issue #87.
 
 - **Cartographie du format réel** (préalable explicite du ticket) : `claude
   --output-format stream-json` émet, une fois par tour assistant, un événement
@@ -56,6 +56,24 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   chaque nouveau rapport). Nouveau `RunEvent::RateLimitStatusUpdated { role,
   status }` / `EventKind::RateLimitStatusUpdated`, publié par
   `Orchestrator::run_agent` dès qu'une invocation rapporte un statut.
+
+### Added — Issue #85 : anticipation et suspension durable du quota CLI
+
+- **Seuil CLI configurable** : `warden run --quota-anticipation-threshold <fraction>`
+  accepte une fraction finie de `0.0` à `1.0` (défaut `0.90`). Pour un outil qui publie
+  un statut de quota, warden suspend le run avant de démarrer l'étape suivante lorsque
+  `utilization` atteint ce seuil ; un outil sans rapport de quota conserve son
+  comportement précédent.
+- **Suspension non destructive** : l'état terminal persistant
+  `AwaitingQuotaReset { resets_at }` et la migration
+  `0012_awaiting_quota_reset.sql` gardent l'heure de reset du CLI en base. Le run n'est
+  pas assimilé à un `Failed`, reste stable après redémarrage et ne démarre ni worktree
+  ni invocation supplémentaire une fois le seuil atteint.
+- **Épuisement pendant une invocation** : si le CLI signale un quota épuisé pendant
+  une étape, warden le traite comme la même suspension et conserve le worktree de cette
+  invocation. La reprise automatique au reset n'est pas incluse : elle reste l'issue
+  #86.
+
 ### Added — Issue #81 : gates étendus — re-review scopée généralisée + budget de cycles par étape (`max_cycles`)
 
 - **Nouveau `gate: scoped-re-review`** (aux côtés de `loop-until-clean` et du pass-through
