@@ -151,22 +151,28 @@ impl RunModel {
         })
     }
 
-    /// `true` once a `RunFinished` event has been applied -- the run has
-    /// reached a terminal state and nothing further will arrive on the bus.
+    /// `true` once the latest event is a terminal `RunFinished` event. A
+    /// quota suspension also publishes `RunFinished` to close that event
+    /// stream, but is not terminal: a resumed run appends fresh events after
+    /// it and this immediately becomes `false` again.
     pub fn is_finished(&self) -> bool {
-        self.final_state().is_some()
+        self.final_state().is_some_and(|state| {
+            !matches!(
+                warden_core::RunState::parse(state),
+                Ok(warden_core::RunState::AwaitingQuotaReset { .. })
+            )
+        })
     }
 
-    /// The run's terminal [`warden_core::RunState`] (as its stable string
-    /// form), from its `RunFinished` event, if the run has finished.
+    /// The run's current final-state record, when `RunFinished` is its latest
+    /// event. A resumed quota-suspended run retains the old suspension event
+    /// in history, but later live events supersede it rather than leaving the
+    /// TUI falsely labelled suspended or finished.
     pub fn final_state(&self) -> Option<&str> {
-        self.events
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
-                RunEvent::RunFinished { final_state } => Some(final_state.as_str()),
-                _ => None,
-            })
+        self.events.last().and_then(|record| match &record.event {
+            RunEvent::RunFinished { final_state } => Some(final_state.as_str()),
+            _ => None,
+        })
     }
 
     /// Every `FindingRaised` event applied so far, oldest first.
@@ -277,6 +283,35 @@ impl RunModel {
             .map(|(_, _, usage)| usage)
             .collect();
         warden_core::TokenUsage::sum(&usages)
+    }
+
+    /// Last quota report delivered by the tool CLI, if that CLI exposes one.
+    ///
+    /// This is intentionally a snapshot, not an aggregation: each report
+    /// describes the account's current quota window, so adding reports from
+    /// separate agent invocations would fabricate consumption. `None` means
+    /// no observed invocation exposed quota data and must render as `n/a`.
+    pub fn latest_rate_limit_status(&self) -> Option<&warden_core::RateLimitStatus> {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event {
+                RunEvent::RateLimitStatusUpdated { status, .. } => Some(status),
+                _ => None,
+            })
+    }
+
+    /// Reset instant carried by the final `AwaitingQuotaReset` state, if the
+    /// run is suspended. This is deliberately derived from the event stream,
+    /// so a live `RunFinished` event updates the read-only TUI immediately;
+    /// it never needs to write or poll the orchestrator's database.
+    pub fn quota_suspension_resets_at(&self) -> Option<i64> {
+        self.final_state()
+            .and_then(|state| warden_core::RunState::parse(state).ok())
+            .and_then(|state| match state {
+                warden_core::RunState::AwaitingQuotaReset { resets_at } => Some(resets_at),
+                _ => None,
+            })
     }
 
     /// Derives the run's workflow tree (issue #54): one branch per cycle,
@@ -607,6 +642,48 @@ mod tests {
             1,
             "a duplicate delivery (live + history overlap) must not be logged twice"
         );
+    }
+
+    #[test]
+    fn quota_snapshot_and_suspension_are_derived_from_live_events() {
+        let mut model = RunModel::new();
+        let status = warden_core::RateLimitStatus::new(
+            warden_core::RateLimitState::AllowedWarning,
+            warden_core::RateLimitWindow::SevenDay,
+            0.93,
+            false,
+            0.75,
+            1_785_686_400,
+        );
+        model.apply(record(
+            "e1",
+            RunEvent::RateLimitStatusUpdated {
+                role: "coder".to_string(),
+                status: status.clone(),
+            },
+        ));
+        assert_eq!(model.latest_rate_limit_status(), Some(&status));
+        assert_eq!(model.quota_suspension_resets_at(), None);
+
+        model.apply(record(
+            "e2",
+            RunEvent::RunFinished {
+                final_state: warden_core::RunState::AwaitingQuotaReset {
+                    resets_at: status.resets_at,
+                }
+                .as_str(),
+            },
+        ));
+        assert_eq!(model.quota_suspension_resets_at(), Some(status.resets_at));
+        assert!(!model.is_finished(), "quota suspension is resumable");
+
+        model.apply(record("e3", RunEvent::CycleStarted { cycle_number: 2 }));
+        assert_eq!(
+            model.final_state(),
+            None,
+            "resumed events supersede suspension"
+        );
+        assert_eq!(model.quota_suspension_resets_at(), None);
     }
 
     fn undecodable(id: &str, created_at: &str) -> UndecodableEvent {

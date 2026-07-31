@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect, Size};
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
@@ -152,7 +153,13 @@ fn render_evidence_pane(
 fn header_widget(model: &RunModel) -> Paragraph<'static> {
     let text = match (model.run_id(), model.run_started()) {
         (Some(run_id), Some((intent, branch, max_review_cycles, max_test_cycles))) => {
-            let status = if let Some(final_state) = model.final_state() {
+            let status = if let Some(resets_at) = model.quota_suspension_resets_at() {
+                format!(
+                    "SUSPENDED for quota (not failed) -- resumes {} -- run total {}",
+                    format_reset_time(resets_at),
+                    format_token_usage(&model.total_token_usage()),
+                )
+            } else if let Some(final_state) = model.final_state() {
                 format!(
                     "finished: {final_state} -- run total {}",
                     format_token_usage(&model.total_token_usage())
@@ -194,6 +201,32 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
 
     Paragraph::new(text)
         .block(Block::bordered().title(" warden-tui (read-only) -- press q to quit "))
+}
+
+/// Formats one observed quota snapshot. The CLI reports utilization rather
+/// than absolute usage/limit counts, so show its honest complement as
+/// remaining. No report is distinct from an empty quota: it is always `n/a`.
+fn format_quota_status(status: Option<&warden_core::RateLimitStatus>) -> String {
+    let Some(status) = status else {
+        return "quota: n/a".to_string();
+    };
+    let remaining = (1.0 - status.utilization).max(0.0);
+    format!(
+        "quota: used {:.0}%, remaining {:.0}%, resets {}",
+        status.utilization * 100.0,
+        remaining * 100.0,
+        format_reset_time(status.resets_at)
+    )
+}
+
+/// UTC wall-clock rendering of the CLI's Unix reset timestamp. The adapter
+/// validates positive timestamps before they reach this UI; preserve an
+/// explicit fallback for an out-of-range persisted legacy value rather than
+/// panicking during terminal rendering.
+fn format_reset_time(resets_at: i64) -> String {
+    DateTime::<Utc>::from_timestamp(resets_at, 0)
+        .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| format!("unix {resets_at}"))
 }
 
 /// Truncates `intent` to at most `max_len` characters, appending `"..."` when
@@ -362,15 +395,27 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         RunEvent::RateLimitStatusUpdated { role, status } => (
             Style::default().fg(Color::Gray),
             format!(
-                "{role}: rate limit status {} (utilization {:.0}%, resets at unix {})",
+                "{role}: rate limit status {} (used {:.0}%, remaining {:.0}%, resets {})",
                 status.status.as_str(),
                 status.utilization * 100.0,
-                status.resets_at
+                (1.0 - status.utilization).max(0.0) * 100.0,
+                format_reset_time(status.resets_at),
             ),
         ),
         RunEvent::RunFinished { final_state } => (
-            Style::default().fg(Color::Green),
-            format!("run finished: {final_state}"),
+            match warden_core::RunState::parse(final_state) {
+                Ok(warden_core::RunState::AwaitingQuotaReset { resets_at: _ }) => {
+                    Style::default().fg(Color::Yellow)
+                }
+                _ => Style::default().fg(Color::Green),
+            },
+            match warden_core::RunState::parse(final_state) {
+                Ok(warden_core::RunState::AwaitingQuotaReset { resets_at }) => format!(
+                    "run SUSPENDED for quota (not failed); resumes {}",
+                    format_reset_time(resets_at)
+                ),
+                _ => format!("run finished: {final_state}"),
+            },
         ),
     };
 
@@ -384,14 +429,18 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
 /// -- so this pane starts directly at the first cycle's own branch.
 fn workflow_tree_widget(model: &RunModel) -> List<'static> {
     let tree = model.workflow_tree();
-    let items: Vec<ListItem> = if tree.cycles.is_empty() {
-        vec![ListItem::new(Line::styled(
+    let mut items = vec![ListItem::new(Line::styled(
+        format_quota_status(model.latest_rate_limit_status()),
+        Style::default().fg(Color::Gray),
+    ))];
+    if tree.cycles.is_empty() {
+        items.push(ListItem::new(Line::styled(
             "no cycle started yet",
             Style::default().fg(Color::DarkGray),
-        ))]
+        )));
     } else {
-        workflow_tree_lines(&tree.cycles)
-    };
+        items.extend(workflow_tree_lines(&tree.cycles));
+    }
     List::new(items).block(Block::bordered().title(" workflow tree "))
 }
 
@@ -525,6 +574,93 @@ mod tests {
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("add email validation"));
         assert!(content.contains("main"));
+    }
+
+    #[test]
+    fn draw_shows_n_a_when_no_tool_reported_quota() {
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+
+        let backend = TestBackend::new(180, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw(frame, &model, GraphicsCapability::None, None))
+            .unwrap();
+
+        assert!(buffer_to_string(terminal.backend().buffer()).contains("quota: n/a"));
+    }
+
+    #[test]
+    fn draw_shows_quota_remaining_and_a_live_quota_suspension_as_not_failed() {
+        let mut model = RunModel::new();
+        let resets_at = 1_785_686_400;
+        model.apply(record(
+            "e1",
+            RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_review_cycles: 3,
+                max_test_cycles: 3,
+            },
+        ));
+        model.apply(record(
+            "e2",
+            RunEvent::RateLimitStatusUpdated {
+                role: "coder".to_string(),
+                status: warden_core::RateLimitStatus::new(
+                    warden_core::RateLimitState::AllowedWarning,
+                    warden_core::RateLimitWindow::SevenDay,
+                    0.93,
+                    false,
+                    0.75,
+                    resets_at,
+                ),
+            },
+        ));
+
+        let render = |model: &RunModel| {
+            let backend = TestBackend::new(240, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| draw(frame, model, GraphicsCapability::None, None))
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        };
+        let quota_content = render(&model);
+        assert!(
+            quota_content.contains("quota: used 93%, remaining 7%"),
+            "{quota_content}"
+        );
+        assert!(
+            quota_content.contains("2026-08-02 16:00 UTC"),
+            "{quota_content}"
+        );
+
+        // Same model mutation `app_loop` performs after receiving this live
+        // Event Bus event: no database write or polling is involved.
+        model.apply(record(
+            "e3",
+            RunEvent::RunFinished {
+                final_state: warden_core::RunState::AwaitingQuotaReset { resets_at }.as_str(),
+            },
+        ));
+        let suspended_content = render(&model);
+        assert!(
+            suspended_content.contains("SUSPENDED for quota (not failed)"),
+            "{suspended_content}"
+        );
+        assert!(
+            suspended_content.contains("resumes 2026-08-02 16:00 UTC"),
+            "{suspended_content}"
+        );
     }
 
     #[test]
