@@ -11,7 +11,10 @@ use super::*;
 /// ([`RunState::is_intermediate`]) with no live process associated is marked
 /// `Failed`. A run whose latest agent process is still alive -- same PID
 /// *and* same recorded start time, see `process::is_process_alive` -- is
-/// left untouched; this does not attempt to re-attach to it.
+/// left untouched; this does not attempt to re-attach to it. A
+/// `ResumingQuota` run also remains intact while its persisted resume lease
+/// belongs to a live Warden process: it can be claimed before its first
+/// resumed agent PID exists.
 ///
 /// A run recovered as `Failed` may have left two kinds of resources
 /// orphaned by the crash (a crash is a `SIGKILL`, so no `Drop`/`kill_on_drop`
@@ -47,6 +50,19 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
         // the watch with (this free function has no trigger of its own).
         if run.state == RunState::AwaitingCi {
             continue;
+        }
+
+        if run.state == RunState::ResumingQuota {
+            let has_live_resume_lease = db::get_quota_resume_lease(pool, &run.id)
+                .await?
+                .is_some_and(|lease| {
+                    process::is_process_alive(lease.owner_pid, lease.owner_started_at_unix)
+                });
+            if has_live_resume_lease {
+                tracing::info!(run_id = %run.id, "quota resume has a live owner lease; leaving state untouched");
+                continue;
+            }
+            tracing::warn!(run_id = %run.id, "quota resume claim has no live owner lease; recovering as crashed");
         }
 
         let open_process = db::latest_open_agent_process_for_run(pool, &run.id).await?;
@@ -540,6 +556,89 @@ mod tests {
             RunState::Failed
         );
         assert!(db::get_quota_continuation(&pool, "corrupt-quota-run")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Regression for #86's final review: startup A claims a due continuation
+    /// before it has spawned a resumed agent; startup B's crash recovery must
+    /// preserve that live claim, allowing startup A to make its first
+    /// write-ahead resume transition afterwards.
+    #[tokio::test]
+    async fn recovery_preserves_live_quota_resume_claim_until_its_owner_continues() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "live-quota-resume-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "live-quota-resume-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::suspend_run_with_quota_continuation(
+            &pool,
+            "live-quota-resume-run",
+            RESET_BOUNDARY,
+            r#"{"config":"checkpoint"}"#,
+            r#"{"state":"checkpoint"}"#,
+        )
+        .await
+        .unwrap();
+
+        let candidate = db::list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            db::claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY)
+                .await
+                .unwrap()
+        );
+
+        assert!(recover_crashed_runs(&pool).await.unwrap().is_empty());
+        let claimed_run = db::get_run(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_run.state, RunState::ResumingQuota);
+        let lease = db::get_quota_resume_lease(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.owner_pid, std::process::id());
+        assert!(process::is_process_alive(
+            lease.owner_pid,
+            lease.owner_started_at_unix
+        ));
+
+        claimed_run
+            .state
+            .validate_transition(RunState::CoderRunning, claimed_run.total_steps)
+            .unwrap();
+        db::update_run_state(&pool, "live-quota-resume-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        assert_eq!(
+            db::get_run(&pool, "live-quota-resume-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::CoderRunning
+        );
+        assert!(db::get_quota_resume_lease(&pool, "live-quota-resume-run")
             .await
             .unwrap()
             .is_none());

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT quota_resume_owner_pid, quota_resume_owner_started_at_unix,\n               quota_resume_claimed_at\n        FROM runs\n        WHERE id = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "quota_resume_owner_pid",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "quota_resume_owner_pid"
+          }
+        }
+      },
+      {
+        "name": "quota_resume_owner_started_at_unix",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "quota_resume_owner_started_at_unix"
+          }
+        }
+      },
+      {
+        "name": "quota_resume_claimed_at",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "quota_resume_claimed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "32f52c239b65e49b6dfcfdd77398d847307c4e3c1486079278de4148b7ff8f1f"
+}

@@ -323,7 +323,9 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
         _ => None,
     };
     sqlx::query!(
-        "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
+        "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ?",
         state,
         quota_resets_at,
         now,
@@ -659,7 +661,9 @@ pub async fn suspend_run_with_quota_continuation(
     .execute(&mut *transaction)
     .await?;
     sqlx::query!(
-        "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
+        "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ?",
         state,
         resets_at,
         now,
@@ -723,10 +727,15 @@ pub async fn claim_due_quota_continuation(
 ) -> Result<bool> {
     let claimed_state = RunState::ResumingQuota.as_str();
     let claimed_at = now_rfc3339();
+    let owner_pid = std::process::id();
+    let owner_started_at_unix = crate::process::process_start_time(owner_pid)
+        .ok_or(WardenError::MissingQuotaResumeLeaseFingerprint { pid: owner_pid })?;
+    let owner_pid = i64::from(owner_pid);
     let result = sqlx::query!(
         r#"
         UPDATE runs
-        SET state = ?, quota_resets_at = NULL, updated_at = ?
+        SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = ?,
+            quota_resume_owner_started_at_unix = ?, quota_resume_claimed_at = ?, updated_at = ?
         WHERE id = ?
           AND state = ?
           AND quota_resets_at = ?
@@ -734,6 +743,9 @@ pub async fn claim_due_quota_continuation(
           AND updated_at = ?
         "#,
         claimed_state,
+        owner_pid,
+        owner_started_at_unix,
+        claimed_at,
         claimed_at,
         candidate.run_id,
         candidate.expected_state,
@@ -744,6 +756,54 @@ pub async fn claim_due_quota_continuation(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// The Warden process that currently owns a `ResumingQuota` claim. Its PID
+/// fingerprint has the same PID-reuse protection as agent-process records.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaResumeLease {
+    pub owner_pid: u32,
+    pub owner_started_at_unix: i64,
+}
+
+/// Reads a quota-resume lease at the persistence boundary. A partially
+/// written lease is invalid rather than treated as a live owner; claims are
+/// written atomically, so partial data signals database corruption.
+pub async fn get_quota_resume_lease(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<QuotaResumeLease>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT quota_resume_owner_pid, quota_resume_owner_started_at_unix,
+               quota_resume_claimed_at
+        FROM runs
+        WHERE id = ?
+        "#,
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    match (
+        row.quota_resume_owner_pid,
+        row.quota_resume_owner_started_at_unix,
+        row.quota_resume_claimed_at,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(pid), Some(owner_started_at_unix), Some(_)) => Ok(Some(QuotaResumeLease {
+            owner_pid: checked_u32(pid, "runs.quota_resume_owner_pid")?,
+            owner_started_at_unix,
+        })),
+        _ => Err(WardenError::InvalidQuotaContinuation {
+            run_id: run_id.to_string(),
+            reason: "quota-resume lease fields are only partially populated".to_string(),
+        }),
+    }
 }
 
 pub async fn get_quota_continuation(

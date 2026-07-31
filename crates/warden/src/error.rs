@@ -280,6 +280,9 @@ pub enum WardenError {
     #[error("invalid quota continuation checkpoint for run {run_id}: {reason}")]
     InvalidQuotaContinuation { run_id: String, reason: String },
 
+    #[error("cannot claim quota continuation: Warden process {pid} has no start-time fingerprint")]
+    MissingQuotaResumeLeaseFingerprint { pid: u32 },
+
     #[error(
         "cannot suspend run {run_id} for durable quota resumption: the original tool and \
          execution/security context were not configured"
