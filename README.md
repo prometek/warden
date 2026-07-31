@@ -934,7 +934,18 @@ reprise ; un checkpoint absent, corrompu ou incohérent fait de même échouer e
 en `Failed`. Si le quota est de nouveau atteint, le checkpoint actualisé est conservé et le run
 retourne en `AwaitingQuotaReset`. Cette récupération démarre avant le préflight du nouveau run
 et est attendue avant la sortie du processus, y compris si ce preflight échoue. L'affichage TUI
-reste l'issue #87 (voir l'épique #83).
+correspondant est décrit ci-dessous.
+
+**Affichage TUI du quota et de la suspension (issue #87).** Le panneau « workflow tree »
+affiche le dernier rapport de quota connu : utilisation et reste dérivé (en pourcentage), avec
+l'heure de réinitialisation en UTC ; sans rapport disponible, il affiche « quota: n/a ». Le
+journal d'événements affiche les mêmes valeurs à la réception de
+`RunEvent::RateLimitStatusUpdated`. Quand le dernier événement est un `RunFinished` portant
+`AwaitingQuotaReset { resets_at }`, le header et le journal indiquent explicitement « SUSPENDED
+for quota (not failed) » et l'heure de reprise, au lieu de présenter le run comme terminé en
+échec. Cette suspension reste observable en direct sans écriture ni polling par la TUI. Dès que
+la reprise ajoute un nouvel événement, elle cesse d'être l'état courant dans la TUI ; l'ancien
+événement de suspension reste visible dans l'historique.
 
 **Vue arborescente du workflow (issue #54)** : entre le header et le journal d'événements,
 un panneau dédié projette le run sous forme d'arbre git-graph-like (rails `│`/`├─`/`╰─`) —
