@@ -573,7 +573,7 @@ mod tests {
 
         assert!(recover_crashed_runs(&pool).await.unwrap().is_empty());
         assert_eq!(
-            db::get_run(&pool, "missing-quota-checkpoint-run")
+            db::get_run(&pool, "corrupt-quota-run")
                 .await
                 .unwrap()
                 .unwrap()
