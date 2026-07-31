@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE runs SET quota_resume_owner_pid = NULL, quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL WHERE id = (SELECT run_id FROM cycles WHERE id = ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "21a8742e4f4553a9b74b5c7f8503d8d27fd99ef17cbe194348cba268b4718f45"
+}

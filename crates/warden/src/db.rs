@@ -315,6 +315,12 @@ pub async fn insert_run(
 /// against [`RunState::validate_transition`]; that's the orchestrator's
 /// responsibility so the intent is recorded even if the action that
 /// follows fails.
+///
+/// A quota-resume lease intentionally survives an intermediate state write.
+/// Recovery can observe the restored write-ahead state before the resumed
+/// agent's process row exists; [`insert_agent_process`] clears the lease
+/// atomically with that first durable handoff. A terminal `Failed` write
+/// clears any remaining lease instead.
 pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunState) -> Result<()> {
     let now = now_rfc3339();
     let state = new_state.as_str();
@@ -322,17 +328,29 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
         RunState::AwaitingQuotaReset { resets_at } => Some(resets_at),
         _ => None,
     };
-    sqlx::query!(
-        "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
-         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
-         updated_at = ? WHERE id = ?",
-        state,
-        quota_resets_at,
-        now,
-        run_id,
-    )
-    .execute(pool)
-    .await?;
+    if new_state == RunState::Failed {
+        sqlx::query!(
+            "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
+             quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+             updated_at = ? WHERE id = ?",
+            state,
+            quota_resets_at,
+            now,
+            run_id,
+        )
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query!(
+            "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
+            state,
+            quota_resets_at,
+            now,
+            run_id,
+        )
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -804,6 +822,31 @@ pub async fn get_quota_resume_lease(
             reason: "quota-resume lease fields are only partially populated".to_string(),
         }),
     }
+}
+
+/// Atomically fails a claimed quota resume before it has handed off to an
+/// agent process. The lease predicate prevents an unrelated later lifecycle
+/// state from being overwritten by cleanup of an earlier failed task.
+pub async fn fail_quota_resume_claim(pool: &SqlitePool, run_id: &str) -> Result<bool> {
+    let now = now_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query!(
+        "UPDATE runs SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ? AND quota_resume_owner_pid IS NOT NULL",
+        RunState::Failed.as_str(),
+        now,
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    if result.rows_affected() == 1 {
+        sqlx::query!("DELETE FROM quota_continuations WHERE run_id = ?", run_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn get_quota_continuation(
@@ -1546,6 +1589,7 @@ pub async fn insert_agent_process(
     let pid_started_at_unix =
         crate::process::process_start_time(pid).unwrap_or(crate::process::UNKNOWN_START_TIME);
     let pid = i64::from(pid);
+    let mut transaction = pool.begin().await?;
     sqlx::query!(
         "INSERT INTO agent_processes (id, cycle_id, role, pid, pid_started_at_unix, worktree_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id,
@@ -1556,8 +1600,16 @@ pub async fn insert_agent_process(
         worktree_path,
         now,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    sqlx::query!(
+        "UPDATE runs SET quota_resume_owner_pid = NULL, quota_resume_owner_started_at_unix = NULL, \
+         quota_resume_claimed_at = NULL WHERE id = (SELECT run_id FROM cycles WHERE id = ?)",
+        cycle_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
