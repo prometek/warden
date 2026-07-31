@@ -2042,4 +2042,21 @@ mod tests {
         assert!(error.contains("codex"), "{error:?}");
         assert!(error.contains("mistral"), "{error:?}");
     }
+
+    /// Issue #85: the quota suspension threshold is user input, so its
+    /// boundary values are valid while non-finite and out-of-range values
+    /// fail at the CLI boundary rather than reaching the orchestrator.
+    #[test]
+    fn quota_anticipation_threshold_accepts_fraction_boundaries_only() {
+        assert_eq!(parse_quota_anticipation_threshold("0"), Ok(0.0));
+        assert_eq!(parse_quota_anticipation_threshold("0.90"), Ok(0.90));
+        assert_eq!(parse_quota_anticipation_threshold("1"), Ok(1.0));
+
+        for invalid in ["-0.01", "1.01", "NaN", "inf", "not-a-number"] {
+            assert!(
+                parse_quota_anticipation_threshold(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
 }

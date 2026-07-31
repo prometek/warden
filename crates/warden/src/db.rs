@@ -1525,6 +1525,117 @@ mod tests {
         assert_eq!(intermediate[0].id, "run-2");
     }
 
+    /// Issue #85: quota suspension must durably retain its reset time, while
+    /// later ordinary state changes clear that quota-specific column.
+    #[tokio::test]
+    async fn quota_suspension_persists_and_clears_its_queryable_reset_time() {
+        let (_dir, pool) = test_pool().await;
+        insert_run(
+            &pool,
+            "run-quota-reset",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+
+        update_run_state(
+            &pool,
+            "run-quota-reset",
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored: Option<i64> =
+            sqlx::query_scalar("SELECT quota_resets_at FROM runs WHERE id = 'run-quota-reset'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, Some(1_800_000_000));
+        assert_eq!(
+            get_run(&pool, "run-quota-reset")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000,
+            }
+        );
+
+        update_run_state(&pool, "run-quota-reset", RunState::Failed)
+            .await
+            .unwrap();
+        let cleared: Option<i64> =
+            sqlx::query_scalar("SELECT quota_resets_at FROM runs WHERE id = 'run-quota-reset'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, None);
+    }
+
+    /// A database created before migration 0012 has no quota column and no
+    /// quota-suspended state. Applying the migration must preserve that
+    /// legacy run and represent its absent reset time as NULL.
+    #[tokio::test]
+    async fn awaiting_quota_reset_migration_keeps_legacy_runs_coherent() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("state.db");
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let quota_migration_index = migrations
+            .iter()
+            .position(|migration| migration.description.contains("awaiting quota reset"))
+            .expect("0012_awaiting_quota_reset.sql must remain in the migration set");
+        let pre_quota_migration_version = migrations[quota_migration_index - 1].version;
+
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal);
+            let pool = SqlitePoolOptions::new()
+                .connect_with(options)
+                .await
+                .unwrap();
+            MIGRATOR
+                .run_to(pre_quota_migration_version, &pool)
+                .await
+                .unwrap();
+            insert_run(
+                &pool,
+                "legacy-run",
+                "/tmp/repo",
+                "main",
+                "intent",
+                3,
+                3,
+                3,
+                5,
+            )
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+
+        let pool = connect(&db_path).await.unwrap();
+        let legacy = get_run(&pool, "legacy-run").await.unwrap().unwrap();
+        assert_eq!(legacy.state, RunState::Pending);
+        let reset_time: Option<i64> =
+            sqlx::query_scalar("SELECT quota_resets_at FROM runs WHERE id = 'legacy-run'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reset_time, None);
+    }
+
     #[tokio::test]
     async fn converged_run_is_not_listed_as_intermediate() {
         let (_dir, pool) = test_pool().await;
