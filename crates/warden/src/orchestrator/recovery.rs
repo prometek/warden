@@ -194,7 +194,7 @@ async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Resu
         };
 
         // Only the process whose compare-and-swap wrote this durable claim
-        // receives the id from `claim_due_quota_run_ids`.
+        // receives `true` from `claim_due_quota_continuation`.
         if run.state != RunState::ResumingQuota {
             tracing::warn!(run_id = %run.id, state = run.state.as_str(), "claimed quota continuation no longer has its resuming state; skipping");
             continue;
@@ -494,6 +494,56 @@ mod tests {
     use super::*;
     use crate::orchestrator::test_support::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn corrupt_quota_checkpoint_fails_closed_and_is_deleted() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "corrupt-quota-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "corrupt-quota-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::suspend_run_with_quota_continuation(
+            &pool,
+            "corrupt-quota-run",
+            RESET_BOUNDARY,
+            "{not valid JSON",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
+            .await
+            .unwrap();
+
+        assert!(resumed.is_empty());
+        assert_eq!(
+            db::get_run(&pool, "corrupt-quota-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Failed
+        );
+        assert!(db::get_quota_continuation(&pool, "corrupt-quota-run")
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn recovery_marks_intermediate_run_failed_when_its_process_is_dead() {

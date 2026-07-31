@@ -1600,6 +1600,34 @@ mod tests {
         (dir, pool)
     }
 
+    async fn suspend_test_quota_run(
+        pool: &SqlitePool,
+        run_id: &str,
+        resets_at: i64,
+        config_json: &str,
+        state_json: &str,
+    ) {
+        insert_run(
+            pool,
+            run_id,
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        update_run_state(pool, run_id, RunState::CoderRunning)
+            .await
+            .unwrap();
+        suspend_run_with_quota_continuation(pool, run_id, resets_at, config_json, state_json)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn intermediate_state_literals_match_run_state_is_intermediate() {
         for state in [
@@ -1776,6 +1804,143 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(cleared, None);
+    }
+
+    #[tokio::test]
+    async fn quota_resume_claim_is_due_at_the_exact_reset_boundary() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "exact-boundary-run",
+            RESET_BOUNDARY,
+            r#"{"config":"original"}"#,
+            r#"{"state":"original"}"#,
+        )
+        .await;
+
+        assert!(list_due_quota_continuations(&pool, RESET_BOUNDARY - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let candidates = list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            claim_due_quota_continuation(&pool, &candidates[0], RESET_BOUNDARY)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_run(&pool, "exact-boundary-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::ResumingQuota
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_resume_claim_has_exactly_one_concurrent_owner() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "atomic-claim-run",
+            RESET_BOUNDARY,
+            r#"{"config":"original"}"#,
+            r#"{"state":"original"}"#,
+        )
+        .await;
+        let candidate = list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY),
+            claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY),
+        );
+
+        assert_eq!(
+            [first.unwrap(), second.unwrap()]
+                .into_iter()
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            get_run(&pool, "atomic-claim-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::ResumingQuota
+        );
+    }
+
+    #[tokio::test]
+    async fn re_suspension_retains_the_new_checkpoint_and_rejects_the_stale_claim() {
+        const FIRST_RESET: i64 = 1_800_000_000;
+        const SECOND_RESET: i64 = 1_800_003_600;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "re-suspended-run",
+            FIRST_RESET,
+            r#"{"config":"first"}"#,
+            r#"{"state":"first"}"#,
+        )
+        .await;
+        let stale_candidate = list_due_quota_continuations(&pool, FIRST_RESET)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            claim_due_quota_continuation(&pool, &stale_candidate, FIRST_RESET)
+                .await
+                .unwrap()
+        );
+
+        suspend_run_with_quota_continuation(
+            &pool,
+            "re-suspended-run",
+            SECOND_RESET,
+            r#"{"config":"second"}"#,
+            r#"{"state":"second"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !claim_due_quota_continuation(&pool, &stale_candidate, SECOND_RESET)
+                .await
+                .unwrap()
+        );
+        assert!(list_due_quota_continuations(&pool, SECOND_RESET - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let current = get_quota_continuation(&pool, "re-suspended-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.config_json, r#"{"config":"second"}"#);
+        assert_eq!(current.state_json, r#"{"state":"second"}"#);
+        assert_eq!(
+            get_run(&pool, "re-suspended-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::AwaitingQuotaReset {
+                resets_at: SECOND_RESET
+            }
+        );
     }
 
     /// A database created before migration 0012 has no quota column and no

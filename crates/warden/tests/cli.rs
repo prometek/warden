@@ -5968,3 +5968,108 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "coder
          not attempted: {stdout:?}"
     );
 }
+
+/// Issue #86: startup recovery must use the suspended run's original adapter
+/// and must be awaited even when the new foreground invocation fails during
+/// repository preflight.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_startup_awaits_quota_resume_with_the_stored_adapter_before_preflight_failure() {
+    const QUOTA_CODER_BODY: &str = r#"
+printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1,"rateLimitType":"seven_day","utilization":0.95,"isUsingOverage":false,"surpassedThreshold":0.75}}'
+echo quota-resume > quota.txt
+git add quota.txt
+git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "quota suspension"
+"#;
+
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let resume_marker = warden_home.path().join("stored-claude-resume.txt");
+    let reviewer_body = format!("printf '%s\\n' reviewer >> '{}'", resume_marker.display());
+    let tester_body = format!("printf '%s\\n' tester >> '{}'", resume_marker.display());
+    write_fake_claude(
+        bin_dir.path(),
+        QUOTA_CODER_BODY,
+        &reviewer_body,
+        &tester_body,
+    );
+
+    let first_assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "suspend before reviewer",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: AwaitingQuotaReset"));
+    let first_stdout = String::from_utf8(first_assert.get_output().stdout.clone()).unwrap();
+    let suspended_run_id = first_stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("run ")
+                .and_then(|line| line.strip_suffix(" started"))
+        })
+        .unwrap();
+    assert!(
+        !resume_marker.exists(),
+        "the first run must suspend before invoking reviewer or tester"
+    );
+
+    let workflow_dir = repo.path().join(".warden");
+    std::fs::create_dir_all(&workflow_dir).unwrap();
+    std::fs::write(
+        workflow_dir.join("workflow.yaml"),
+        "this is not a valid workflow",
+    )
+    .unwrap();
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "foreground must fail preflight",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "mistral",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid workflow file"));
+
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        warden::db::get_run(&pool, suspended_run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RunState::Converged
+    );
+    assert!(warden::db::get_quota_continuation(&pool, suspended_run_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        std::fs::read_to_string(&resume_marker).unwrap(),
+        "reviewer\ntester\n"
+    );
+}
