@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE runs SET\n            rate_limit_status = NULL,\n            rate_limit_type = NULL,\n            rate_limit_utilization = NULL,\n            rate_limit_is_using_overage = NULL,\n            rate_limit_surpassed_threshold = NULL,\n            rate_limit_resets_at = NULL,\n            updated_at = ?\n        WHERE id = ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "877c4763d106ca62e55a4a45d8e5c7f030a7c6bc596380441419c7a6f15b0f5e"
+}

@@ -58,6 +58,40 @@ use warden_core::{AgentDefinition, AgentRole, Finding, RateLimitStatus, TokenUsa
 use crate::error::Result;
 use crate::process::AgentCommand;
 
+/// Stable identity of a built-in agent CLI.
+///
+/// This is both the CLI's closed `--tool` value and a [`ToolAdapter`]
+/// implementation. Keeping the identity on the adapter itself lets a
+/// quota-suspended run persist the original tool and reconstruct that exact
+/// adapter on a later process startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolName {
+    Claude,
+    Codex,
+    Mistral,
+}
+
+impl ToolName {
+    pub fn parse(raw: &str) -> std::result::Result<Self, String> {
+        match raw {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "mistral" => Ok(Self::Mistral),
+            other => Err(format!(
+                "unknown tool {other:?} (supported: \"claude\", \"codex\", \"mistral\")"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Mistral => "mistral",
+        }
+    }
+}
+
 /// Turns a role's definition into the command to spawn for it, plus
 /// everything else specific to one tool CLI.
 ///
@@ -185,6 +219,72 @@ pub trait ToolAdapter: Sync {
     /// issue #53.
     fn extract_rate_limit(&self, _stdout: &str) -> Option<RateLimitStatus> {
         None
+    }
+}
+
+impl ToolAdapter for ToolName {
+    fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
+        match self {
+            Self::Claude => ClaudeAdapter.build_command(definition),
+            Self::Codex => CodexAdapter.build_command(definition),
+            Self::Mistral => MistralAdapter.build_command(definition),
+        }
+    }
+
+    fn env_allowlist(&self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => ClaudeAdapter.env_allowlist(),
+            Self::Codex => CodexAdapter.env_allowlist(),
+            Self::Mistral => MistralAdapter.env_allowlist(),
+        }
+    }
+
+    fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
+        match self {
+            Self::Claude => ClaudeAdapter.extract_findings(stdout),
+            Self::Codex => CodexAdapter.extract_findings(stdout),
+            Self::Mistral => MistralAdapter.extract_findings(stdout),
+        }
+    }
+
+    fn default_prompt(&self, role: AgentRole) -> &'static str {
+        match self {
+            Self::Claude => ClaudeAdapter.default_prompt(role),
+            Self::Codex => CodexAdapter.default_prompt(role),
+            Self::Mistral => MistralAdapter.default_prompt(role),
+        }
+    }
+
+    fn default_tools(&self, role: AgentRole) -> Option<&'static str> {
+        match self {
+            Self::Claude => ClaudeAdapter.default_tools(role),
+            Self::Codex => CodexAdapter.default_tools(role),
+            Self::Mistral => MistralAdapter.default_tools(role),
+        }
+    }
+
+    fn parse_progress_line(&self, line: &str) -> Option<String> {
+        match self {
+            Self::Claude => ClaudeAdapter.parse_progress_line(line),
+            Self::Codex => CodexAdapter.parse_progress_line(line),
+            Self::Mistral => MistralAdapter.parse_progress_line(line),
+        }
+    }
+
+    fn extract_usage(&self, stdout: &str) -> Option<TokenUsage> {
+        match self {
+            Self::Claude => ClaudeAdapter.extract_usage(stdout),
+            Self::Codex => CodexAdapter.extract_usage(stdout),
+            Self::Mistral => MistralAdapter.extract_usage(stdout),
+        }
+    }
+
+    fn extract_rate_limit(&self, stdout: &str) -> Option<RateLimitStatus> {
+        match self {
+            Self::Claude => ClaudeAdapter.extract_rate_limit(stdout),
+            Self::Codex => CodexAdapter.extract_rate_limit(stdout),
+            Self::Mistral => MistralAdapter.extract_rate_limit(stdout),
+        }
     }
 }
 

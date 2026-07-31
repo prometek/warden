@@ -259,6 +259,42 @@ pub enum WardenError {
     #[error("agent invocation suspended until quota resets at {resets_at}")]
     QuotaSuspended { resets_at: i64 },
 
+    /// A durable issue-#86 continuation could not be encoded. Kept distinct
+    /// from event payload errors so a failure names the state that would
+    /// otherwise be lost before the process exits.
+    #[error("failed to encode quota continuation checkpoint: {source}")]
+    QuotaContinuationEncode {
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A checkpoint row is persisted input and is validated at the database
+    /// boundary before it can reconstruct workflow state.
+    #[error("failed to decode quota continuation checkpoint for run {run_id}: {source}")]
+    QuotaContinuationDecode {
+        run_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("invalid quota continuation checkpoint for run {run_id}: {reason}")]
+    InvalidQuotaContinuation { run_id: String, reason: String },
+
+    #[error("cannot claim quota continuation: Warden process {pid} has no start-time fingerprint")]
+    MissingQuotaResumeLeaseFingerprint { pid: u32 },
+
+    #[error(
+        "cannot suspend run {run_id} for durable quota resumption: the original tool and \
+         execution/security context were not configured"
+    )]
+    MissingQuotaExecutionContext { run_id: String },
+
+    #[error(
+        "cannot checkpoint non-UTF-8 path in `{field}` ({path}); exact path bytes are required \
+         for deterministic quota resumption"
+    )]
+    NonUtf8QuotaContinuationPath { field: &'static str, path: PathBuf },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

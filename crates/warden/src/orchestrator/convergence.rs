@@ -31,6 +31,43 @@ async fn select_prior_findings(
 }
 
 impl Orchestrator {
+    async fn persist_quota_suspension(
+        &self,
+        run_id: &str,
+        config: &RunConfig,
+        continuation: &ConvergenceContinuation,
+        resets_at: i64,
+    ) -> Result<RunState> {
+        let run =
+            db::get_run(&self.pool, run_id)
+                .await?
+                .ok_or_else(|| WardenError::RunNotFound {
+                    run_id: run_id.to_string(),
+                })?;
+        let state = RunState::AwaitingQuotaReset { resets_at };
+        run.state.validate_transition(state, run.total_steps)?;
+        let execution_context = self.run_execution_context.as_ref().ok_or_else(|| {
+            WardenError::MissingQuotaExecutionContext {
+                run_id: run_id.to_string(),
+            }
+        })?;
+        let config_json = super::continuation::encode_run_config(
+            config,
+            execution_context,
+            self.quota_anticipation_threshold,
+        )?;
+        let state_json = super::continuation::encode_convergence_state(continuation)?;
+        db::suspend_run_with_quota_continuation(
+            &self.pool,
+            run_id,
+            resets_at,
+            &config_json,
+            &state_json,
+        )
+        .await?;
+        Ok(state)
+    }
+
     /// Runs a full convergence loop for one intent: opens a run, then
     /// alternates coder / review+test cycles until convergence, the cycle
     /// budget is exhausted, or `cancel` fires. Returns the run id and its
@@ -47,11 +84,37 @@ impl Orchestrator {
         runner: R,
         cancel: CancellationToken,
     ) -> Result<(String, RunState)> {
-        let run_id = Uuid::new_v4().to_string();
+        self.run_convergence_continuation(config, &runner, cancel, None)
+            .await
+    }
+
+    pub(super) async fn resume_convergence_loop<R: ToolAdapter>(
+        &self,
+        run_id: String,
+        config: RunConfig,
+        runner: &R,
+        cancel: CancellationToken,
+        continuation: ConvergenceContinuation,
+    ) -> Result<(String, RunState)> {
+        self.run_convergence_continuation(config, runner, cancel, Some((run_id, continuation)))
+            .await
+    }
+
+    async fn run_convergence_continuation<R: ToolAdapter>(
+        &self,
+        config: RunConfig,
+        runner: &R,
+        cancel: CancellationToken,
+        restored: Option<(String, ConvergenceContinuation)>,
+    ) -> Result<(String, RunState)> {
+        let run_id = restored
+            .as_ref()
+            .map(|(run_id, _)| run_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         // Before the `runs` row exists: a definition this runner cannot
         // honour is a configuration error, and must not leave a half-started
         // run behind.
-        let agents = ResolvedAgents::resolve(&runner, &config)?;
+        let agents = ResolvedAgents::resolve(runner, &config)?;
         let worktree_manager =
             WorktreeManager::new(&config.repo_path, config.warden_home.join("worktrees"))?;
 
@@ -66,84 +129,86 @@ impl Orchestrator {
             })
             .map_err(|_| WardenError::RunAlreadyInProgress)?;
 
-        db::insert_run(
-            &self.pool,
-            &run_id,
-            &config.repo_path.display().to_string(),
-            &config.branch,
-            &config.intent,
-            config.max_review_cycles,
-            config.max_test_cycles,
-            config.workflow.steps.len() as u32,
-            config.max_extra_step_cycles,
-        )
-        .await?;
-        self.publish_event(RunEvent::RunStarted {
-            intent: config.intent.clone(),
-            branch: config.branch.clone(),
-            max_review_cycles: config.max_review_cycles,
-            max_test_cycles: config.max_test_cycles,
-        })
-        .await?;
-
-        // Issue #26: one `UntrustedAgentDefinitionUsed` per repo-sourced
-        // reviewer/tester definition (`--trust-repo-agents`), right after
-        // `RunStarted` -- see `RunConfig::untrusted_repo_agent_definitions`'s
-        // own docs for why this is an event (persisted, replayable by a
-        // later `warden-tui attach`) rather than only the `tracing::warn!`
-        // `agent_def::resolve_agent_definition` already logged at resolution
-        // time, before this run (or its Event Bus) even existed.
-        for untrusted in &config.untrusted_repo_agent_definitions {
-            self.publish_event(RunEvent::UntrustedAgentDefinitionUsed {
-                role: untrusted.role.as_str().to_string(),
-                path: untrusted.path.display().to_string(),
-                canonical_path: untrusted.canonical_path.display().to_string(),
-            })
-            .await?;
-        }
-        // Issue #31: the `runs` row and the Event Bus socket both exist by
-        // now, so `warden-tui attach --run-id <run_id>` is already a valid
-        // command -- this is the earliest point at which printing it is
-        // meaningful.
-        if let Some(callback) = &self.on_run_started {
-            callback(&run_id);
-        }
-
-        // Run-level setup hooks: fire once, before the coder, while the run is
-        // still `Pending`. This is where deterministic environment prep runs
-        // (`docker compose up -d`, `git fetch`/pull, dependency install)
-        // instead of being spent as agent tokens. A `Block` means the
-        // environment could not be established -- there is nothing to code
-        // against -- so the run fails here, before any agent spawns. Teardown
-        // still runs (finally semantics): whatever a partial setup left behind
-        // gets a chance to be cleaned up.
-        if let HookOutcome::Block { reason } = self
-            .dispatch_run_hooks(
+        if restored.is_none() {
+            db::insert_run(
+                &self.pool,
                 &run_id,
-                &config.repo_path,
-                RunState::Pending,
-                HookPoint::OnRunStart,
+                &config.repo_path.display().to_string(),
+                &config.branch,
+                &config.intent,
+                config.max_review_cycles,
+                config.max_test_cycles,
+                config.workflow.steps.len() as u32,
+                config.max_extra_step_cycles,
             )
-            .await?
-        {
-            tracing::warn!(
-                run_id,
-                reason,
-                "on_run_start hook blocked the run; failing before the coder runs"
-            );
-            self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
-                .await;
-            self.transition(&run_id, RunState::Failed).await?;
-            self.publish_event(RunEvent::RunFinished {
-                final_state: RunState::Failed.as_str().to_string(),
+            .await?;
+            self.publish_event(RunEvent::RunStarted {
+                intent: config.intent.clone(),
+                branch: config.branch.clone(),
+                max_review_cycles: config.max_review_cycles,
+                max_test_cycles: config.max_test_cycles,
             })
             .await?;
-            return Ok((run_id, RunState::Failed));
-        }
 
-        // Write-ahead: the run is about to launch the coder, so record the
-        // intent to do so before actually spawning anything (ADR-0004).
-        self.transition(&run_id, RunState::CoderRunning).await?;
+            // Issue #26: one `UntrustedAgentDefinitionUsed` per repo-sourced
+            // reviewer/tester definition (`--trust-repo-agents`), right after
+            // `RunStarted` -- see `RunConfig::untrusted_repo_agent_definitions`'s
+            // own docs for why this is an event (persisted, replayable by a
+            // later `warden-tui attach`) rather than only the `tracing::warn!`
+            // `agent_def::resolve_agent_definition` already logged at resolution
+            // time, before this run (or its Event Bus) even existed.
+            for untrusted in &config.untrusted_repo_agent_definitions {
+                self.publish_event(RunEvent::UntrustedAgentDefinitionUsed {
+                    role: untrusted.role.as_str().to_string(),
+                    path: untrusted.path.display().to_string(),
+                    canonical_path: untrusted.canonical_path.display().to_string(),
+                })
+                .await?;
+            }
+            // Issue #31: the `runs` row and the Event Bus socket both exist by
+            // now, so `warden-tui attach --run-id <run_id>` is already a valid
+            // command -- this is the earliest point at which printing it is
+            // meaningful.
+            if let Some(callback) = &self.on_run_started {
+                callback(&run_id);
+            }
+
+            // Run-level setup hooks: fire once, before the coder, while the run is
+            // still `Pending`. This is where deterministic environment prep runs
+            // (`docker compose up -d`, `git fetch`/pull, dependency install)
+            // instead of being spent as agent tokens. A `Block` means the
+            // environment could not be established -- there is nothing to code
+            // against -- so the run fails here, before any agent spawns. Teardown
+            // still runs (finally semantics): whatever a partial setup left behind
+            // gets a chance to be cleaned up.
+            if let HookOutcome::Block { reason } = self
+                .dispatch_run_hooks(
+                    &run_id,
+                    &config.repo_path,
+                    RunState::Pending,
+                    HookPoint::OnRunStart,
+                )
+                .await?
+            {
+                tracing::warn!(
+                    run_id,
+                    reason,
+                    "on_run_start hook blocked the run; failing before the coder runs"
+                );
+                self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
+                    .await;
+                self.transition(&run_id, RunState::Failed).await?;
+                self.publish_event(RunEvent::RunFinished {
+                    final_state: RunState::Failed.as_str().to_string(),
+                })
+                .await?;
+                return Ok((run_id, RunState::Failed));
+            }
+
+            // Write-ahead: the run is about to launch the coder, so record the
+            // intent to do so before actually spawning anything (ADR-0004).
+            self.transition(&run_id, RunState::CoderRunning).await?;
+        }
 
         // Issue #30: the run's true original starting commit -- the fixed
         // point every cycle's agent-definition-tampering check (`run_coder`
@@ -155,7 +220,10 @@ impl Orchestrator {
         // bytes are still sitting there relative to this same fixed origin
         // -- only actually reverting them (re-resolving back to what this
         // commit holds) stops the finding from firing.
-        let run_base_commit_sha = read_head_commit(&config.repo_path).await?;
+        let run_base_commit_sha = match &restored {
+            Some((_, continuation)) => continuation.run_base_commit_sha.clone(),
+            None => read_head_commit(&config.repo_path).await?,
+        };
 
         // Issue #30: the raw, unparsed run-start snapshot
         // `agent_definition_tampering_finding` compares every cycle's
@@ -172,132 +240,125 @@ impl Orchestrator {
         )
         .await?;
 
-        let mut base_commit = "HEAD".to_string();
-        // The run's overall loop-iteration counter -- every cycle advances
-        // it, whether it reboucled because of a review-blocking finding, a
-        // test-blocking finding, or neither (a fresh CI reboucle). Purely
-        // informational (`cycles.cycle_number`, `RunEvent::CycleStarted`) --
-        // *not* the review budget itself; see `review_cycle_number` below for
-        // that (code review of issue #43's first commit, MEDIUM: the reviewer
-        // runs every cycle, but not every cycle's reboucle is *caused* by a
-        // review-blocking finding, so this counter over-counts the review
-        // budget whenever a tester-driven reboucle's own re-review comes back
-        // clean).
-        let mut cycle_number: u32 = 1;
-        // Issue #43: the review budget's own counter -- advances only on a
-        // cycle whose reboucle is actually charged to the review phase (a
-        // blocking `Reviewer`/`Warden`-sourced finding, decision #37 Q1),
-        // never merely because the reviewer ran. This is what keeps the two
-        // budgets genuinely independent: a run whose every reboucle is
-        // tester-driven (review clean every single cycle) never advances
-        // this counter at all, however many cycles it takes.
-        let mut review_cycle_number: u32 = 0;
-        // Issue #43: the tester, unlike the reviewer, only actually runs on a
-        // cycle whose review came back clean (issue #41's gate) -- so this
-        // only advances then, independently of `review_cycle_number`.
-        let mut test_cycle_number: u32 = 0;
-        // Issue #73: the single shared counter for any workflow step beyond
-        // the built-in reviewer/tester pair -- advances once per cycle in
-        // which that whole extra-step chain actually runs (a clean tester
-        // cycle in a workflow with more steps left), never once per
-        // individual extra step.
-        let mut extra_step_cycle_number: u32 = 0;
-        // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles to the
-        // coder exactly like a reviewer/tester blocking finding does, just
-        // one step later in the pipeline -- these are seeded into the next
-        // cycle's `findings` rows right below, the one time this is
-        // non-empty (see the `PostConvergenceOutcome::Reboucle` arm further
-        // down).
-        let mut pending_ci_findings: Vec<Finding> = Vec::new();
-        // ADR-0012/issue #20: the cycle_id of the most recently *closed*
-        // cycle, used to fetch its findings as the reviewer/tester's
-        // "prior-cycle findings" context below (`None` on a run's first
-        // cycle, which has no prior cycle to report on).
-        let mut previous_cycle_id: Option<String> = None;
-        // Issue #37/#41, ADR-0014, decision #37 Q3 (generalized per-step by
-        // issue #81); revised by issue #81's own code review, HIGH: `None`
-        // until a given step index has completed a pass, then `Some(commit)`
-        // -- the commit that step was invoked against (this run loop's own
-        // `base_commit`, i.e. the producer's new commit for the cycle that
-        // ran it) -- tracked across cycles (not reset per cycle), same as
-        // before. What changed: the earlier `bool` ("has this step ever run
-        // once") granted `Correctif` to a step at `step_index >= 2` even
-        // after a cycle in which an earlier gated step blocked and this step
-        // was never reached -- that step's `diff` only ever carries the
-        // *current* cycle's producer diff (`agents.rs`'s own `read_diff`),
-        // so a step that missed one or more intervening cycles must not be
-        // told to look only at "this correctif": the correctif payload
-        // silently omits every commit produced during the cycles it missed.
-        // The fix: `Correctif` is legal only when this step's *last*
-        // recorded commit equals `producer_base_commit_this_cycle` (captured
-        // below, right before this cycle's producer runs) -- i.e. this step
-        // did see (as its own prior invocation's target commit) exactly the
-        // commit this cycle's producer diff was computed against, with
-        // nothing in between it never looked at.
-        //
-        // `step_index == 1` is retro-compat-critical (issue #81 non-
-        // negotiable) and unaffected: that step always runs every single
-        // cycle (it's the first entry into the gated-step `while` loop,
-        // never skipped), so its own last-recorded commit is always exactly
-        // last cycle's producer commit -- exactly `producer_base_commit_this_
-        // cycle` on every subsequent cycle. The new condition is therefore
-        // equivalent to the old `step_has_run_once[1]` at that index: neither
-        // ever diverges from the other because index 1 can never itself be
-        // the "skipped a cycle" case this fix targets.
-        let mut step_last_reviewed_commit: Vec<Option<String>> =
-            vec![None; config.workflow.steps.len()];
-        // Issue #81: one independent cycle counter per step that declares
-        // its own `max_cycles` budget ([`warden_core::StepBudget::Own`]),
-        // instead of one of the three run-level buckets above -- tracked
-        // purely in-memory (see `StepBudget::Own`'s own docs for why this
-        // never touches the `runs` table), indexed by `step_index` exactly
-        // like `step_last_reviewed_commit`.
-        let mut own_step_cycle_numbers = vec![0u32; config.workflow.steps.len()];
+        if let Some((_, continuation)) = &restored {
+            db::clear_run_rate_limit_status(&self.pool, &run_id).await?;
+            self.transition(&run_id, continuation.next_run_state())
+                .await?;
+        }
+
+        let continuation = restored
+            .map(|(_, continuation)| continuation)
+            .unwrap_or_else(|| {
+                ConvergenceContinuation::new(
+                    run_base_commit_sha.clone(),
+                    config.workflow.steps.len(),
+                )
+            });
+        let ConvergenceContinuation {
+            run_base_commit_sha,
+            mut base_commit,
+            mut cycle_number,
+            mut review_cycle_number,
+            mut test_cycle_number,
+            mut extra_step_cycle_number,
+            mut pending_ci_findings,
+            mut previous_cycle_id,
+            mut step_last_reviewed_commit,
+            mut own_step_cycle_numbers,
+            mut active_cycle,
+        } = continuation;
+        macro_rules! continuation_at {
+            ($active_cycle:expr) => {
+                ConvergenceContinuation {
+                    run_base_commit_sha: run_base_commit_sha.clone(),
+                    base_commit: base_commit.clone(),
+                    cycle_number,
+                    review_cycle_number,
+                    test_cycle_number,
+                    extra_step_cycle_number,
+                    pending_ci_findings: pending_ci_findings.clone(),
+                    previous_cycle_id: previous_cycle_id.clone(),
+                    step_last_reviewed_commit: step_last_reviewed_commit.clone(),
+                    own_step_cycle_numbers: own_step_cycle_numbers.clone(),
+                    active_cycle: $active_cycle,
+                }
+            };
+        }
 
         let final_state = 'convergence: loop {
             // Issue #85: only inspect a CLI quota report at this boundary,
             // before a new workflow step/cycle starts. A tool that exposes no
             // report leaves the database value absent and this is a no-op.
-            if self.suspend_for_anticipated_quota(&run_id).await? {
-                break RunState::AwaitingQuotaReset {
-                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
-                        .await?
-                        .expect("quota suspension requires a stored rate-limit status")
-                        .resets_at,
+            let resumed_cycle = active_cycle.take();
+            if resumed_cycle.is_none() && self.suspend_for_anticipated_quota(&run_id).await? {
+                let resets_at = db::get_run_rate_limit_status(&self.pool, &run_id)
+                    .await?
+                    .expect("quota suspension requires a stored rate-limit status")
+                    .resets_at;
+                let continuation = continuation_at!(None);
+                break self
+                    .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
+                    .await?;
+            }
+
+            let (cycle_id, prior_findings, producer_base_commit_this_cycle, resumed_gated_phase) =
+                match resumed_cycle {
+                    Some(ActiveCycleContinuation {
+                        cycle_id,
+                        prior_findings,
+                        producer_base_commit,
+                        phase,
+                    }) => {
+                        let gated = match phase {
+                            ActiveCyclePhase::Producer => None,
+                            ActiveCyclePhase::Gated {
+                                producer_result,
+                                findings,
+                                next_step_index,
+                                entered_extra_budget_this_cycle,
+                            } => Some((
+                                producer_result,
+                                findings,
+                                next_step_index,
+                                entered_extra_budget_this_cycle,
+                            )),
+                        };
+                        (cycle_id, prior_findings, producer_base_commit, gated)
+                    }
+                    None => {
+                        let cycle_id = Uuid::new_v4().to_string();
+                        db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
+                        self.publish_event(RunEvent::CycleStarted { cycle_number })
+                            .await?;
+
+                        let ci_seeded_findings = pending_ci_findings.clone();
+                        for finding in pending_ci_findings.drain(..) {
+                            db::insert_finding(
+                                &self.pool,
+                                &Uuid::new_v4().to_string(),
+                                &cycle_id,
+                                &finding,
+                            )
+                            .await?;
+                            self.publish_event(RunEvent::FindingRaised {
+                                cycle_number,
+                                source: finding.source.as_str().to_string(),
+                                severity: finding.severity.as_str().to_string(),
+                                file: finding.file.clone(),
+                                description: finding.description.clone(),
+                                action: finding.action.clone(),
+                            })
+                            .await?;
+                        }
+                        let prior_findings = select_prior_findings(
+                            &self.pool,
+                            ci_seeded_findings,
+                            previous_cycle_id.as_deref(),
+                        )
+                        .await?;
+                        (cycle_id, prior_findings, base_commit.clone(), None)
+                    }
                 };
-            }
-            let cycle_id = Uuid::new_v4().to_string();
-            db::insert_cycle(&self.pool, &cycle_id, &run_id, cycle_number).await?;
-            self.publish_event(RunEvent::CycleStarted { cycle_number })
-                .await?;
-
-            // ADR-0012: captured before the drain below empties
-            // `pending_ci_findings` -- on a CI reboucle these *are* this
-            // cycle's prior findings (they're what triggered it), so the
-            // reviewer/tester gets them directly rather than via a
-            // (would-be-empty) previous-cycle DB lookup.
-            let ci_seeded_findings = pending_ci_findings.clone();
-
-            for finding in pending_ci_findings.drain(..) {
-                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, &finding)
-                    .await?;
-                self.publish_event(RunEvent::FindingRaised {
-                    cycle_number,
-                    source: finding.source.as_str().to_string(),
-                    severity: finding.severity.as_str().to_string(),
-                    file: finding.file.clone(),
-                    description: finding.description.clone(),
-                    action: finding.action.clone(),
-                })
-                .await?;
-            }
-
-            // ADR-0012: what the reviewer/tester are told triggered this
-            // cycle -- and, since A2 (ADR-0013), what the coder is told to
-            // fix. One selection, one list, all three roles.
-            let prior_findings =
-                select_prior_findings(&self.pool, ci_seeded_findings, previous_cycle_id.as_deref())
-                    .await?;
 
             // Issue #81 review, HIGH: captured before the producer call
             // below reassigns `base_commit` to this cycle's new commit --
@@ -310,51 +371,56 @@ impl Orchestrator {
             // initial `base_commit`) rather than a resolved SHA, which is
             // harmless: every `step_last_reviewed_commit` entry is `None`
             // then, so nothing can match it and every step gets `Full`.
-            let producer_base_commit_this_cycle = base_commit.clone();
             let producer_role = &config.workflow.steps[0].role;
-            let producer_result = match self
-                .run_producer(
-                    &runner,
-                    ProducerInvocation {
-                        run_id: &run_id,
-                        cycle_id: &cycle_id,
-                        cycle_number,
-                        config: &config,
-                        role: producer_role,
-                        agent: agents.steps[0].as_ref().expect(
-                            "the producer step is always StepKind::Agent -- \
+            let mut producer_result = match resumed_gated_phase.as_ref() {
+                Some((producer_result, _, _, _)) => producer_result.clone(),
+                None => match self
+                    .run_producer(
+                        runner,
+                        ProducerInvocation {
+                            run_id: &run_id,
+                            cycle_id: &cycle_id,
+                            cycle_number,
+                            config: &config,
+                            role: producer_role,
+                            agent: agents.steps[0].as_ref().expect(
+                                "the producer step is always StepKind::Agent -- \
                              Workflow::parse_yaml enforces this",
-                        ),
-                        env_allowlist: agents.env_allowlist,
-                        worktree_manager: &worktree_manager,
-                        base_commit: &base_commit,
-                        run_agent_definition_snapshot: &run_agent_definition_snapshot,
-                        prior_findings: &prior_findings,
-                        cancel: cancel.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(WardenError::QuotaSuspended { resets_at }) => {
-                    break RunState::AwaitingQuotaReset { resets_at };
-                }
-                Err(error) => return Err(error),
+                            ),
+                            env_allowlist: agents.env_allowlist,
+                            worktree_manager: &worktree_manager,
+                            base_commit: &base_commit,
+                            run_agent_definition_snapshot: &run_agent_definition_snapshot,
+                            prior_findings: &prior_findings,
+                            cancel: cancel.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(WardenError::QuotaSuspended { resets_at }) => {
+                        let active = ActiveCycleContinuation {
+                            cycle_id: cycle_id.clone(),
+                            prior_findings: prior_findings.clone(),
+                            producer_base_commit: producer_base_commit_this_cycle.clone(),
+                            phase: ActiveCyclePhase::Producer,
+                        };
+                        let continuation = continuation_at!(Some(active));
+                        break self
+                            .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
+                            .await?;
+                    }
+                    Err(error) => return Err(error),
+                },
             };
-            base_commit = producer_result.commit;
+            base_commit = producer_result.commit.clone();
 
             // The producer has completed; do not start the first gated step
             // when its report says the configured quota threshold is reached.
-            if self.suspend_for_anticipated_quota(&run_id).await? {
-                break RunState::AwaitingQuotaReset {
-                    resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
-                        .await?
-                        .expect("quota suspension requires a stored rate-limit status")
-                        .resets_at,
-                };
-            }
-
-            let mut findings: Vec<Finding> = Vec::new();
+            let mut findings = resumed_gated_phase
+                .as_ref()
+                .map(|(_, findings, _, _)| findings.clone())
+                .unwrap_or_default();
             // Issue #24 review, M4: folded in alongside the first gated
             // step's own findings below -- an unresolved definition-
             // tampering finding gates it exactly like that step's own
@@ -362,19 +428,26 @@ impl Orchestrator {
             // commit that still carries one either. Persisted here,
             // immediately, since it never appears in any step's own
             // `step_findings` batch persisted further down.
-            if let Some(finding) = producer_result.definition_tampering_finding {
-                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, &finding)
+            if resumed_gated_phase.is_none() {
+                if let Some(finding) = producer_result.definition_tampering_finding.take() {
+                    db::insert_finding(
+                        &self.pool,
+                        &Uuid::new_v4().to_string(),
+                        &cycle_id,
+                        &finding,
+                    )
                     .await?;
-                self.publish_event(RunEvent::FindingRaised {
-                    cycle_number,
-                    source: finding.source.as_str().to_string(),
-                    severity: finding.severity.as_str().to_string(),
-                    file: finding.file.clone(),
-                    description: finding.description.clone(),
-                    action: finding.action.clone(),
-                })
-                .await?;
-                findings.push(finding);
+                    self.publish_event(RunEvent::FindingRaised {
+                        cycle_number,
+                        source: finding.source.as_str().to_string(),
+                        severity: finding.severity.as_str().to_string(),
+                        file: finding.file.clone(),
+                        description: finding.description.clone(),
+                        action: finding.action.clone(),
+                    })
+                    .await?;
+                    findings.push(finding);
+                }
             }
 
             let total_steps = config.workflow.steps.len();
@@ -408,7 +481,11 @@ impl Orchestrator {
             // tester steps' budgets explicitly (`Review`/`Test`), so this is
             // byte-for-byte the same rule the pre-review code applied by
             // position.
-            let mut next_state = if total_steps <= 1 {
+            let mut next_state = if let Some((_, _, next_step_index, _)) =
+                resumed_gated_phase.as_ref()
+            {
+                RunState::RunningStep(*next_step_index)
+            } else if total_steps <= 1 {
                 // Issue #73 review, finding F4: a degenerate one-step
                 // workflow (producer only, no gates at all) has no later
                 // gated step to catch a blocking finding the producer itself
@@ -441,7 +518,10 @@ impl Orchestrator {
             // (the counter advanced) at most once per cycle, the first time
             // any extra-budgeted step is entered, never once per individual
             // extra step (see the loop's own docs above).
-            let mut entered_extra_budget_this_cycle = false;
+            let mut entered_extra_budget_this_cycle = resumed_gated_phase
+                .as_ref()
+                .is_some_and(|(_, _, _, entered)| *entered);
+            let mut first_resumed_gated_step = resumed_gated_phase.is_some();
             while let RunState::RunningStep(step_index) = next_state {
                 let step = &config.workflow.steps[step_index as usize];
                 let step_agent = agents.steps[step_index as usize].as_ref();
@@ -475,8 +555,12 @@ impl Orchestrator {
                     warden_core::ReviewScope::Full
                 };
 
-                self.transition(&run_id, RunState::RunningStep(step_index))
-                    .await?;
+                if first_resumed_gated_step {
+                    first_resumed_gated_step = false;
+                } else {
+                    self.transition(&run_id, RunState::RunningStep(step_index))
+                        .await?;
+                }
                 if step.budget == Some(warden_core::StepBudget::Extra)
                     && !entered_extra_budget_this_cycle
                 {
@@ -500,17 +584,30 @@ impl Orchestrator {
                 // only after the producer would let a later step start even
                 // though the threshold was already crossed.
                 if self.suspend_for_anticipated_quota(&run_id).await? {
-                    break 'convergence RunState::AwaitingQuotaReset {
-                        resets_at: db::get_run_rate_limit_status(&self.pool, &run_id)
-                            .await?
-                            .expect("quota suspension requires a stored rate-limit status")
-                            .resets_at,
+                    let resets_at = db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires a stored rate-limit status")
+                        .resets_at;
+                    let active = ActiveCycleContinuation {
+                        cycle_id: cycle_id.clone(),
+                        prior_findings: prior_findings.clone(),
+                        producer_base_commit: producer_base_commit_this_cycle.clone(),
+                        phase: ActiveCyclePhase::Gated {
+                            producer_result: producer_result.clone(),
+                            findings: findings.clone(),
+                            next_step_index: step_index,
+                            entered_extra_budget_this_cycle,
+                        },
                     };
+                    let continuation = continuation_at!(Some(active));
+                    break 'convergence self
+                        .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
+                        .await?;
                 }
 
                 let step_findings = match self
                     .run_gated_step(
-                        &runner,
+                        runner,
                         GatedStepInvocation {
                             run_id: &run_id,
                             cycle_id: &cycle_id,
@@ -535,7 +632,21 @@ impl Orchestrator {
                 {
                     Ok(findings) => findings,
                     Err(WardenError::QuotaSuspended { resets_at }) => {
-                        break 'convergence RunState::AwaitingQuotaReset { resets_at };
+                        let active = ActiveCycleContinuation {
+                            cycle_id: cycle_id.clone(),
+                            prior_findings: prior_findings.clone(),
+                            producer_base_commit: producer_base_commit_this_cycle.clone(),
+                            phase: ActiveCyclePhase::Gated {
+                                producer_result: producer_result.clone(),
+                                findings: findings.clone(),
+                                next_step_index: step_index,
+                                entered_extra_budget_this_cycle,
+                            },
+                        };
+                        let continuation = continuation_at!(Some(active));
+                        break 'convergence self
+                            .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
+                            .await?;
                     }
                     Err(error) => return Err(error),
                 };
@@ -2098,6 +2209,16 @@ mod tests {
         )
     }
 
+    fn quota_test_execution_context() -> RunExecutionContext {
+        RunExecutionContext {
+            tool: crate::tool_adapter::ToolName::Claude,
+            sandbox: SandboxConfig::Worktree,
+            hooks_toml: None,
+            policy_yaml: None,
+            approval: ApprovalConfig::FailClosed,
+        }
+    }
+
     fn quota_test_config(
         repo: &TempDir,
         warden_home: &TempDir,
@@ -2151,6 +2272,7 @@ mod tests {
         let (adapter, gated_roles) = quota_test_adapter();
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,
@@ -2189,6 +2311,7 @@ mod tests {
         let (adapter, gated_roles) = quota_test_adapter();
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,
@@ -2228,6 +2351,7 @@ mod tests {
         let exhausted_coder = AgentCommand::new("sh", ["-c", "echo RATE:1.0; exit 1"]);
 
         let (run_id, state) = Orchestrator::new(pool.clone())
+            .with_run_execution_context(quota_test_execution_context())
             .run_convergence_loop(
                 quota_test_config(
                     &repo,

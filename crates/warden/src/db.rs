@@ -315,6 +315,12 @@ pub async fn insert_run(
 /// against [`RunState::validate_transition`]; that's the orchestrator's
 /// responsibility so the intent is recorded even if the action that
 /// follows fails.
+///
+/// A quota-resume lease intentionally survives an intermediate state write.
+/// Recovery can observe the restored write-ahead state before the resumed
+/// agent's process row exists; [`insert_agent_process`] clears the lease
+/// atomically with that first durable handoff. A terminal `Failed` write
+/// clears any remaining lease instead.
 pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunState) -> Result<()> {
     let now = now_rfc3339();
     let state = new_state.as_str();
@@ -322,15 +328,29 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
         RunState::AwaitingQuotaReset { resets_at } => Some(resets_at),
         _ => None,
     };
-    sqlx::query!(
-        "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
-        state,
-        quota_resets_at,
-        now,
-        run_id,
-    )
-    .execute(pool)
-    .await?;
+    if new_state == RunState::Failed {
+        sqlx::query!(
+            "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
+             quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+             updated_at = ? WHERE id = ?",
+            state,
+            quota_resets_at,
+            now,
+            run_id,
+        )
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query!(
+            "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
+            state,
+            quota_resets_at,
+            now,
+            run_id,
+        )
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -594,6 +614,279 @@ pub async fn get_run_rate_limit_status(
     )
 }
 
+/// Removes a quota observation once its reset time has passed and issue #86
+/// is about to retry the recorded workflow boundary. Without this, the
+/// boundary's anticipation check would immediately re-read the stale,
+/// already-expired report and suspend again without giving the CLI a chance
+/// to publish its current quota status.
+pub async fn clear_run_rate_limit_status(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query!(
+        r#"
+        UPDATE runs SET
+            rate_limit_status = NULL,
+            rate_limit_type = NULL,
+            rate_limit_utilization = NULL,
+            rate_limit_is_using_overage = NULL,
+            rate_limit_surpassed_threshold = NULL,
+            rate_limit_resets_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The two validated JSON documents needed to reconstruct one suspended
+/// convergence loop. Kept opaque to the database layer; decoding belongs at
+/// the orchestrator boundary.
+#[derive(Debug)]
+pub struct QuotaContinuationRecord {
+    pub config_json: String,
+    pub state_json: String,
+}
+
+/// Atomically records both the continuation and the state transition that
+/// makes it eligible for startup resumption. A process can therefore never
+/// expose `AwaitingQuotaReset` without all deterministic continuation data
+/// already durable.
+pub async fn suspend_run_with_quota_continuation(
+    pool: &SqlitePool,
+    run_id: &str,
+    resets_at: i64,
+    config_json: &str,
+    state_json: &str,
+) -> Result<()> {
+    let state = RunState::AwaitingQuotaReset { resets_at }.as_str();
+    let now = now_rfc3339();
+    let mut transaction = pool.begin().await?;
+    sqlx::query!(
+        "INSERT INTO quota_continuations (run_id, config_json, state_json, updated_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT (run_id) DO UPDATE SET \
+             config_json = excluded.config_json, \
+             state_json = excluded.state_json, \
+             updated_at = excluded.updated_at",
+        run_id,
+        config_json,
+        state_json,
+        now,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query!(
+        "UPDATE runs SET state = ?, quota_resets_at = ?, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ?",
+        state,
+        resets_at,
+        now,
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// One exact generation of a quota wait observed by a startup recovery pass.
+/// The private comparison fields prevent callers from claiming a later
+/// re-suspension through a stale candidate.
+#[derive(Debug, Clone)]
+pub struct DueQuotaContinuation {
+    pub run_id: String,
+    expected_state: String,
+    expected_resets_at: i64,
+    expected_updated_at: String,
+}
+
+/// Materializes quota continuations due as of `now_unix` without claiming
+/// them. Recovery claims each candidate immediately before processing it, so
+/// a long or failed resume never strands later runs in `resuming_quota`.
+pub async fn list_due_quota_continuations(
+    pool: &SqlitePool,
+    now_unix: i64,
+) -> Result<Vec<DueQuotaContinuation>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id as "id!", state as "state!", quota_resets_at as "quota_resets_at!", updated_at as "updated_at!"
+        FROM runs
+        WHERE state LIKE 'awaiting_quota_reset:%'
+          AND quota_resets_at IS NOT NULL
+          AND quota_resets_at <= ?
+        ORDER BY quota_resets_at, created_at, id
+        "#,
+        now_unix,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DueQuotaContinuation {
+            run_id: row.id,
+            expected_state: row.state,
+            expected_resets_at: row.quota_resets_at,
+            expected_updated_at: row.updated_at,
+        })
+        .collect())
+}
+
+/// Atomically changes one exact quota-wait generation to `resuming_quota`.
+/// Concurrent callers may hold the same candidate, but the compare-and-swap
+/// can affect one row once; only the caller receiving `true` owns the resume.
+pub async fn claim_due_quota_continuation(
+    pool: &SqlitePool,
+    candidate: &DueQuotaContinuation,
+    now_unix: i64,
+) -> Result<bool> {
+    let claimed_state = RunState::ResumingQuota.as_str();
+    let claimed_at = now_rfc3339();
+    let owner_pid = std::process::id();
+    let owner_started_at_unix = crate::process::process_start_time(owner_pid)
+        .ok_or(WardenError::MissingQuotaResumeLeaseFingerprint { pid: owner_pid })?;
+    let owner_pid = i64::from(owner_pid);
+    let result = sqlx::query!(
+        r#"
+        UPDATE runs
+        SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = ?,
+            quota_resume_owner_started_at_unix = ?, quota_resume_claimed_at = ?, updated_at = ?
+        WHERE id = ?
+          AND state = ?
+          AND quota_resets_at = ?
+          AND quota_resets_at <= ?
+          AND updated_at = ?
+        "#,
+        claimed_state,
+        owner_pid,
+        owner_started_at_unix,
+        claimed_at,
+        claimed_at,
+        candidate.run_id,
+        candidate.expected_state,
+        candidate.expected_resets_at,
+        now_unix,
+        candidate.expected_updated_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// The Warden process that currently owns a `ResumingQuota` claim. Its PID
+/// fingerprint has the same PID-reuse protection as agent-process records.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaResumeLease {
+    pub owner_pid: u32,
+    pub owner_started_at_unix: i64,
+}
+
+/// Reads a quota-resume lease at the persistence boundary. A partially
+/// written lease is invalid rather than treated as a live owner; claims are
+/// written atomically, so partial data signals database corruption.
+pub async fn get_quota_resume_lease(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<QuotaResumeLease>> {
+    let row = sqlx::query!(
+        r#"
+        SELECT quota_resume_owner_pid, quota_resume_owner_started_at_unix,
+               quota_resume_claimed_at
+        FROM runs
+        WHERE id = ?
+        "#,
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    match (
+        row.quota_resume_owner_pid,
+        row.quota_resume_owner_started_at_unix,
+        row.quota_resume_claimed_at,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(pid), Some(owner_started_at_unix), Some(_)) => Ok(Some(QuotaResumeLease {
+            owner_pid: checked_u32(pid, "runs.quota_resume_owner_pid")?,
+            owner_started_at_unix,
+        })),
+        _ => Err(WardenError::InvalidQuotaContinuation {
+            run_id: run_id.to_string(),
+            reason: "quota-resume lease fields are only partially populated".to_string(),
+        }),
+    }
+}
+
+/// Atomically fails a claimed quota resume before it has handed off to an
+/// agent process. The lease predicate prevents an unrelated later lifecycle
+/// state from being overwritten by cleanup of an earlier failed task.
+pub async fn fail_quota_resume_claim(pool: &SqlitePool, run_id: &str) -> Result<bool> {
+    let now = now_rfc3339();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query!(
+        "UPDATE runs SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ? AND quota_resume_owner_pid IS NOT NULL",
+        RunState::Failed.as_str(),
+        now,
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    if result.rows_affected() == 1 {
+        sqlx::query!("DELETE FROM quota_continuations WHERE run_id = ?", run_id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(result.rows_affected() == 1)
+}
+
+pub async fn get_quota_continuation(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<QuotaContinuationRecord>> {
+    let row = sqlx::query!(
+        "SELECT config_json as \"config_json!\", state_json as \"state_json!\" \
+         FROM quota_continuations WHERE run_id = ?",
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| QuotaContinuationRecord {
+        config_json: row.config_json,
+        state_json: row.state_json,
+    }))
+}
+
+pub async fn delete_quota_continuation(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    sqlx::query!("DELETE FROM quota_continuations WHERE run_id = ?", run_id,)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Validates that an active-cycle id restored from a checkpoint still names
+/// a cycle belonging to the same run. Checkpoint JSON and relational rows
+/// must agree before any subprocess is launched.
+pub async fn cycle_belongs_to_run(pool: &SqlitePool, cycle_id: &str, run_id: &str) -> Result<bool> {
+    let exists = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM cycles WHERE id = ? AND run_id = ?)",
+        cycle_id,
+        run_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(exists != 0)
+}
+
 /// Converts the six possibly-`NULL` `rate_limit_*` columns read back from
 /// `runs` (issue #84) into `Option<RateLimitStatus>`. Unlike
 /// [`row_to_token_usage`]'s partial optionality (cache fields are
@@ -717,7 +1010,8 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
 }
 
 /// Runs left in an intermediate state (`RunState::is_intermediate`) as of
-/// the last shutdown/crash. The `coder_running`/`awaiting_ci` literals and
+/// the last shutdown/crash. The `coder_running`/`awaiting_ci`/
+/// `resuming_quota` literals and
 /// the `running_step:%` pattern below must stay in sync with
 /// [`RunState::is_intermediate`] — enforced by a test in this module, since
 /// a `?`-parameterised `IN (...)` list isn't expressible in a
@@ -730,7 +1024,7 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
         r#"
         SELECT id as "id!", repo_path, branch, intent, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle, total_steps, max_extra_step_cycles, current_extra_step_cycle, created_at, updated_at, converged_commit_sha, pr_number
         FROM runs
-        WHERE state IN ('coder_running', 'awaiting_ci') OR state LIKE 'running_step:%'
+        WHERE state IN ('coder_running', 'awaiting_ci', 'resuming_quota') OR state LIKE 'running_step:%'
         "#
     )
     .fetch_all(pool)
@@ -1295,6 +1589,7 @@ pub async fn insert_agent_process(
     let pid_started_at_unix =
         crate::process::process_start_time(pid).unwrap_or(crate::process::UNKNOWN_START_TIME);
     let pid = i64::from(pid);
+    let mut transaction = pool.begin().await?;
     sqlx::query!(
         "INSERT INTO agent_processes (id, cycle_id, role, pid, pid_started_at_unix, worktree_path, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         id,
@@ -1305,8 +1600,16 @@ pub async fn insert_agent_process(
         worktree_path,
         now,
     )
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    sqlx::query!(
+        "UPDATE runs SET quota_resume_owner_pid = NULL, quota_resume_owner_started_at_unix = NULL, \
+         quota_resume_claimed_at = NULL WHERE id = (SELECT run_id FROM cycles WHERE id = ?)",
+        cycle_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1409,6 +1712,34 @@ mod tests {
         (dir, pool)
     }
 
+    async fn suspend_test_quota_run(
+        pool: &SqlitePool,
+        run_id: &str,
+        resets_at: i64,
+        config_json: &str,
+        state_json: &str,
+    ) {
+        insert_run(
+            pool,
+            run_id,
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        update_run_state(pool, run_id, RunState::CoderRunning)
+            .await
+            .unwrap();
+        suspend_run_with_quota_continuation(pool, run_id, resets_at, config_json, state_json)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn intermediate_state_literals_match_run_state_is_intermediate() {
         for state in [
@@ -1420,6 +1751,10 @@ mod tests {
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_800_000_000,
+            },
+            RunState::ResumingQuota,
             RunState::Done,
             RunState::StepCyclesExceeded(1),
             RunState::StepCyclesExceeded(2),
@@ -1427,6 +1762,7 @@ mod tests {
         ] {
             let literal_says_intermediate = state.as_str() == "coder_running"
                 || state.as_str() == "awaiting_ci"
+                || state.as_str() == "resuming_quota"
                 || state.as_str().starts_with("running_step:");
             assert_eq!(
                 literal_says_intermediate,
@@ -1580,6 +1916,143 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(cleared, None);
+    }
+
+    #[tokio::test]
+    async fn quota_resume_claim_is_due_at_the_exact_reset_boundary() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "exact-boundary-run",
+            RESET_BOUNDARY,
+            r#"{"config":"original"}"#,
+            r#"{"state":"original"}"#,
+        )
+        .await;
+
+        assert!(list_due_quota_continuations(&pool, RESET_BOUNDARY - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let candidates = list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            claim_due_quota_continuation(&pool, &candidates[0], RESET_BOUNDARY)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get_run(&pool, "exact-boundary-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::ResumingQuota
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_resume_claim_has_exactly_one_concurrent_owner() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "atomic-claim-run",
+            RESET_BOUNDARY,
+            r#"{"config":"original"}"#,
+            r#"{"state":"original"}"#,
+        )
+        .await;
+        let candidate = list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY),
+            claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY),
+        );
+
+        assert_eq!(
+            [first.unwrap(), second.unwrap()]
+                .into_iter()
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            get_run(&pool, "atomic-claim-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::ResumingQuota
+        );
+    }
+
+    #[tokio::test]
+    async fn re_suspension_retains_the_new_checkpoint_and_rejects_the_stale_claim() {
+        const FIRST_RESET: i64 = 1_800_000_000;
+        const SECOND_RESET: i64 = 1_800_003_600;
+        let (_dir, pool) = test_pool().await;
+        suspend_test_quota_run(
+            &pool,
+            "re-suspended-run",
+            FIRST_RESET,
+            r#"{"config":"first"}"#,
+            r#"{"state":"first"}"#,
+        )
+        .await;
+        let stale_candidate = list_due_quota_continuations(&pool, FIRST_RESET)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            claim_due_quota_continuation(&pool, &stale_candidate, FIRST_RESET)
+                .await
+                .unwrap()
+        );
+
+        suspend_run_with_quota_continuation(
+            &pool,
+            "re-suspended-run",
+            SECOND_RESET,
+            r#"{"config":"second"}"#,
+            r#"{"state":"second"}"#,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !claim_due_quota_continuation(&pool, &stale_candidate, SECOND_RESET)
+                .await
+                .unwrap()
+        );
+        assert!(list_due_quota_continuations(&pool, SECOND_RESET - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let current = get_quota_continuation(&pool, "re-suspended-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.config_json, r#"{"config":"second"}"#);
+        assert_eq!(current.state_json, r#"{"state":"second"}"#);
+        assert_eq!(
+            get_run(&pool, "re-suspended-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::AwaitingQuotaReset {
+                resets_at: SECOND_RESET
+            }
+        );
     }
 
     /// A database created before migration 0012 has no quota column and no

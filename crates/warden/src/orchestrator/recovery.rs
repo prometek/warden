@@ -11,7 +11,10 @@ use super::*;
 /// ([`RunState::is_intermediate`]) with no live process associated is marked
 /// `Failed`. A run whose latest agent process is still alive -- same PID
 /// *and* same recorded start time, see `process::is_process_alive` -- is
-/// left untouched; this does not attempt to re-attach to it.
+/// left untouched; this does not attempt to re-attach to it. A
+/// A quota-resumed run also remains intact while its persisted resume lease
+/// belongs to a live Warden process: its restored state transition can be
+/// durable before its first resumed agent PID exists.
 ///
 /// A run recovered as `Failed` may have left two kinds of resources
 /// orphaned by the crash (a crash is a `SIGKILL`, so no `Drop`/`kill_on_drop`
@@ -49,6 +52,16 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
             continue;
         }
 
+        if let Some(lease) = db::get_quota_resume_lease(pool, &run.id).await? {
+            let has_live_resume_lease =
+                process::is_process_alive(lease.owner_pid, lease.owner_started_at_unix);
+            if has_live_resume_lease {
+                tracing::info!(run_id = %run.id, state = run.state.as_str(), "quota resume has a live owner lease; leaving state untouched");
+                continue;
+            }
+            tracing::warn!(run_id = %run.id, "quota resume claim has no live owner lease; recovering as crashed");
+        }
+
         let open_process = db::latest_open_agent_process_for_run(pool, &run.id).await?;
         let has_live_process = open_process
             .map(|p| process::is_process_alive(p.pid, p.pid_started_at_unix))
@@ -62,6 +75,7 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
         run.state
             .validate_transition(RunState::Failed, run.total_steps)?;
         db::update_run_state(pool, &run.id, RunState::Failed).await?;
+        db::delete_quota_continuation(pool, &run.id).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
         reclaim_orphan_resources(pool, &run).await;
@@ -157,6 +171,252 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
     }
 
     Ok(resumed_run_ids)
+}
+
+/// Resumes quota-suspended convergence loops whose persisted reset time has
+/// elapsed (issue #86). The continuation is decoded and cross-checked with
+/// the relational run/cycle rows before any agent is invoked, so a corrupt
+/// checkpoint can never cause Warden to resume a different run's worktree.
+///
+/// This deliberately runs independently of [`recover_crashed_runs`]: an
+/// `AwaitingQuotaReset` run is a stable, intentional stop rather than a
+/// crashed intermediate state. A caller may run it concurrently with a new
+/// command, but must retain and await that task before process exit because
+/// every returned id has already been durably claimed as `ResumingQuota`.
+///
+/// Returns the ids successfully handed back to the convergence loop. A run
+/// with a missing or invalid checkpoint is transitioned to `Failed`, its
+/// checkpoint is deleted, and recovery proceeds with the remaining due
+/// runs. A failure before the resumed loop durably records its first agent
+/// process terminally fails the still-leased claim before it is returned.
+pub async fn resume_quota_suspended_runs(pool: SqlitePool) -> Result<Vec<String>> {
+    resume_quota_suspended_runs_at(pool, Utc::now().timestamp()).await
+}
+
+async fn resume_quota_suspended_runs_at(pool: SqlitePool, now_unix: i64) -> Result<Vec<String>> {
+    let due_continuations = db::list_due_quota_continuations(&pool, now_unix).await?;
+    let mut resumed_run_ids = Vec::new();
+
+    for candidate in due_continuations {
+        if !db::claim_due_quota_continuation(&pool, &candidate, now_unix).await? {
+            continue;
+        }
+        let claimed_run_id = candidate.run_id.clone();
+        match resume_claimed_quota_continuation(&pool, candidate).await {
+            Ok(Some(run_id)) => resumed_run_ids.push(run_id),
+            Ok(None) => {}
+            Err(error) => {
+                // The lease remains present until `insert_agent_process`
+                // commits. Any failure before that handoff must therefore
+                // make this claim terminal while its Warden owner is still
+                // alive; otherwise crash recovery quite correctly preserves
+                // the live lease and leaves `ResumingQuota` stranded.
+                if let Err(cleanup_error) =
+                    db::fail_quota_resume_claim(&pool, &claimed_run_id).await
+                {
+                    tracing::error!(run_id = %claimed_run_id, %cleanup_error, "failed to terminally release a failed quota resume claim");
+                    return Err(cleanup_error);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(resumed_run_ids)
+}
+
+/// Completes one claim that this process acquired. `None` means the claim
+/// was explicitly failed as an invalid continuation; callers only receive an
+/// error for an unexpected failure, which the outer loop then terminalizes.
+async fn resume_claimed_quota_continuation(
+    pool: &SqlitePool,
+    candidate: db::DueQuotaContinuation,
+) -> Result<Option<String>> {
+    let run_id = candidate.run_id;
+    let Some(run) = db::get_run(pool, &run_id).await? else {
+        tracing::warn!(run_id, "due quota continuation has no run row; skipping");
+        return Ok(None);
+    };
+
+    // Only the process whose compare-and-swap wrote this durable claim
+    // receives `true` from `claim_due_quota_continuation`.
+    if run.state != RunState::ResumingQuota {
+        tracing::warn!(run_id = %run.id, state = run.state.as_str(), "claimed quota continuation no longer has its resuming state; skipping");
+        return Ok(None);
+    }
+
+    let Some(record) = db::get_quota_continuation(pool, &run.id).await? else {
+        fail_quota_continuation_recovery(
+            pool,
+            &run,
+            "no quota continuation checkpoint was persisted",
+        )
+        .await?;
+        return Ok(None);
+    };
+
+    let restored =
+        match super::continuation::decode_run(&run.id, &record.config_json, &record.state_json) {
+            Ok(restored) => restored,
+            Err(error) => {
+                fail_quota_continuation_recovery(pool, &run, error.to_string()).await?;
+                return Ok(None);
+            }
+        };
+
+    if let Err(reason) = validate_restored_run_config(&run, &restored.config) {
+        fail_quota_continuation_recovery(pool, &run, reason).await?;
+        return Ok(None);
+    }
+
+    if let Some(active_cycle) = restored.continuation.active_cycle.as_ref() {
+        if !db::cycle_belongs_to_run(pool, &active_cycle.cycle_id, &run.id).await? {
+            fail_quota_continuation_recovery(
+                pool,
+                &run,
+                format!(
+                    "checkpoint active cycle {} does not belong to this run",
+                    active_cycle.cycle_id
+                ),
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
+
+    let policy_rules = match crate::policy_config::parse_repo_policy(
+        &restored.config.repo_path,
+        restored.execution_context.policy_yaml.as_deref(),
+    ) {
+        Ok(rules) => rules,
+        Err(error) => {
+            fail_quota_continuation_recovery(pool, &run, error.to_string()).await?;
+            return Ok(None);
+        }
+    };
+    // Interactive terminal approval is process-local and cannot be
+    // resumed safely in a supervised background task. Installing no
+    // approval gate makes every persisted `RequireApproval` decision
+    // deny explicitly while ordinary Allow/Deny rules remain identical.
+    if restored.execution_context.approval == ApprovalConfig::InteractiveTty {
+        tracing::warn!(
+            run_id = %run.id,
+            "original policy used a non-durable interactive approval channel; resumed \
+             approvals will be denied fail-closed"
+        );
+    }
+    let policy_gate = Arc::new(PolicyGate::new(warden_policy::Evaluator::new(policy_rules)));
+    let hooks = match crate::hook_config::parse_repo_hooks(
+        &restored.config.repo_path,
+        restored.execution_context.hooks_toml.as_deref(),
+        Arc::new(LocalSandbox::new()),
+        Arc::clone(&policy_gate),
+    ) {
+        Ok(hooks) => hooks,
+        Err(error) => {
+            fail_quota_continuation_recovery(pool, &run, error.to_string()).await?;
+            return Ok(None);
+        }
+    };
+    let runner = restored.execution_context.tool;
+    let sandbox = restored
+        .execution_context
+        .sandbox
+        .build(&restored.config.repo_path);
+    let orchestrator = Orchestrator::new(pool.clone())
+        .with_sandbox(sandbox)
+        .with_hooks(hooks)
+        .with_policy_gate(policy_gate)
+        .with_run_execution_context(restored.execution_context)
+        .with_quota_anticipation_threshold(restored.quota_anticipation_threshold);
+    let (_, final_state) = orchestrator
+        .resume_convergence_loop(
+            run.id.clone(),
+            restored.config,
+            &runner,
+            CancellationToken::new(),
+            restored.continuation,
+        )
+        .await?;
+
+    if !matches!(final_state, RunState::AwaitingQuotaReset { .. }) {
+        db::delete_quota_continuation(pool, &run.id).await?;
+    }
+    Ok(Some(run.id))
+}
+
+/// Binds checkpoint JSON back to the immutable values independently stored
+/// in `runs`. A structurally valid checkpoint with an altered repository,
+/// target, intent, or budget must fail before hooks/sandboxes are built.
+fn validate_restored_run_config(
+    run: &db::Run,
+    config: &RunConfig,
+) -> std::result::Result<(), String> {
+    let mismatch = if config.repo_path != Path::new(&run.repo_path) {
+        Some(format!(
+            "repo_path {:?} does not match run row {:?}",
+            config.repo_path, run.repo_path
+        ))
+    } else if config.branch != run.branch {
+        Some(format!(
+            "branch {:?} does not match run row {:?}",
+            config.branch, run.branch
+        ))
+    } else if config.intent != run.intent {
+        Some("intent does not match run row".to_string())
+    } else if config.max_review_cycles != run.max_review_cycles {
+        Some(format!(
+            "max_review_cycles {} does not match run row {}",
+            config.max_review_cycles, run.max_review_cycles
+        ))
+    } else if config.max_test_cycles != run.max_test_cycles {
+        Some(format!(
+            "max_test_cycles {} does not match run row {}",
+            config.max_test_cycles, run.max_test_cycles
+        ))
+    } else if config.workflow.steps.len() != run.total_steps as usize {
+        Some(format!(
+            "workflow has {} steps but run row records {}",
+            config.workflow.steps.len(),
+            run.total_steps
+        ))
+    } else if config.max_extra_step_cycles != run.max_extra_step_cycles {
+        Some(format!(
+            "max_extra_step_cycles {} does not match run row {}",
+            config.max_extra_step_cycles, run.max_extra_step_cycles
+        ))
+    } else {
+        None
+    };
+
+    mismatch.map_or(Ok(()), Err)
+}
+
+/// Makes an unusable quota checkpoint explicit and terminal. There is no
+/// safe in-memory fallback after a process restart: resuming with guessed
+/// workflow state risks re-running or skipping an agent step. Reclaiming
+/// leftovers mirrors ordinary crash recovery now that this run can no
+/// longer be resumed.
+async fn fail_quota_continuation_recovery(
+    pool: &SqlitePool,
+    run: &db::Run,
+    reason: impl std::fmt::Display,
+) -> Result<()> {
+    tracing::error!(
+        run_id = %run.id,
+        %reason,
+        "cannot resume quota-suspended run; marking Failed"
+    );
+    run.state
+        .validate_transition(RunState::Failed, run.total_steps)?;
+    if !db::fail_quota_resume_claim(pool, &run.id).await? {
+        return Err(WardenError::InvalidQuotaContinuation {
+            run_id: run.id.clone(),
+            reason: "quota resume claim disappeared before it could be failed".to_string(),
+        });
+    }
+    reclaim_orphan_resources(pool, run).await;
+    Ok(())
 }
 
 /// Reclaims both kinds of resources a crashed run may have left orphaned
@@ -279,6 +539,325 @@ mod tests {
     use super::*;
     use crate::orchestrator::test_support::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn corrupt_quota_checkpoint_fails_closed_and_is_deleted() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "corrupt-quota-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "corrupt-quota-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::suspend_run_with_quota_continuation(
+            &pool,
+            "corrupt-quota-run",
+            RESET_BOUNDARY,
+            "{not valid JSON",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        assert!(recover_crashed_runs(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            db::get_run(&pool, "corrupt-quota-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::AwaitingQuotaReset {
+                resets_at: RESET_BOUNDARY,
+            }
+        );
+
+        let resumed = resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
+            .await
+            .unwrap();
+
+        assert!(resumed.is_empty());
+        assert_eq!(
+            db::get_run(&pool, "corrupt-quota-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Failed
+        );
+        assert!(db::get_quota_continuation(&pool, "corrupt-quota-run")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A quota-suspended run without its durable continuation cannot be
+    /// resumed safely. Recovery must fail it closed rather than leaving it
+    /// indefinitely suspended or attempting to reconstruct a new run.
+    #[tokio::test]
+    async fn missing_quota_checkpoint_fails_closed() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "missing-quota-checkpoint-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(
+            &pool,
+            "missing-quota-checkpoint-run",
+            RunState::AwaitingQuotaReset {
+                resets_at: RESET_BOUNDARY,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
+            .await
+            .unwrap();
+
+        assert!(resumed.is_empty());
+        assert_eq!(
+            db::get_run(&pool, "missing-quota-checkpoint-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Failed
+        );
+    }
+
+    /// A resumed loop can fail while the Warden task that claimed it is still
+    /// alive (here, an invalid base commit makes snapshot creation fail).
+    /// That error must terminally release the lease instead of relying on a
+    /// later process restart to notice it.
+    #[tokio::test]
+    async fn failed_quota_resume_task_with_live_owner_terminally_releases_its_claim() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "resume must not strand its claim".to_string(),
+            max_review_cycles: 3,
+            max_test_cycles: 3,
+            workflow: warden_core::Workflow::builtin_default(),
+            max_extra_step_cycles: 5,
+            step_agents: vec![
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+                definition(always_passing_tester()),
+            ],
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: None,
+            untrusted_repo_agent_definitions: Vec::new(),
+        };
+        db::insert_run(
+            &pool,
+            "failed-live-owner-quota-run",
+            &config.repo_path.display().to_string(),
+            &config.branch,
+            &config.intent,
+            config.max_review_cycles,
+            config.max_test_cycles,
+            config.workflow.steps.len() as u32,
+            config.max_extra_step_cycles,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "failed-live-owner-quota-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+
+        let execution_context = RunExecutionContext {
+            tool: crate::tool_adapter::ToolName::Claude,
+            sandbox: SandboxConfig::Worktree,
+            hooks_toml: None,
+            policy_yaml: None,
+            approval: ApprovalConfig::FailClosed,
+        };
+        let config_json =
+            super::continuation::encode_run_config(&config, &execution_context, 0.9).unwrap();
+        let state_json = super::continuation::encode_convergence_state(
+            &ConvergenceContinuation::new("not-a-real-git-commit".to_string(), 3),
+        )
+        .unwrap();
+        db::suspend_run_with_quota_continuation(
+            &pool,
+            "failed-live-owner-quota-run",
+            RESET_BOUNDARY,
+            &config_json,
+            &state_json,
+        )
+        .await
+        .unwrap();
+
+        assert!(resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
+            .await
+            .is_err());
+        assert!(process::is_process_alive(
+            std::process::id(),
+            process::process_start_time(std::process::id()).unwrap()
+        ));
+        assert_eq!(
+            db::get_run(&pool, "failed-live-owner-quota-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Failed
+        );
+        assert!(
+            db::get_quota_resume_lease(&pool, "failed-live-owner-quota-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db::get_quota_continuation(&pool, "failed-live-owner-quota-run")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Regression for #86's final review: startup A can persist the restored
+    /// write-ahead state before its first resumed agent process row. Startup
+    /// B's recovery interleaves at that exact point and must honor A's live
+    /// lease until the agent-process handoff commits.
+    #[tokio::test]
+    async fn recovery_preserves_live_quota_lease_after_restored_transition_before_agent_handoff() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "live-quota-resume-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, "live-quota-resume-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        db::suspend_run_with_quota_continuation(
+            &pool,
+            "live-quota-resume-run",
+            RESET_BOUNDARY,
+            r#"{"config":"checkpoint"}"#,
+            r#"{"state":"checkpoint"}"#,
+        )
+        .await
+        .unwrap();
+
+        let candidate = db::list_due_quota_continuations(&pool, RESET_BOUNDARY)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            db::claim_due_quota_continuation(&pool, &candidate, RESET_BOUNDARY)
+                .await
+                .unwrap()
+        );
+
+        assert!(recover_crashed_runs(&pool).await.unwrap().is_empty());
+        let claimed_run = db::get_run(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_run.state, RunState::ResumingQuota);
+        let lease = db::get_quota_resume_lease(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.owner_pid, std::process::id());
+        assert!(process::is_process_alive(
+            lease.owner_pid,
+            lease.owner_started_at_unix
+        ));
+
+        claimed_run
+            .state
+            .validate_transition(RunState::CoderRunning, claimed_run.total_steps)
+            .unwrap();
+        db::update_run_state(&pool, "live-quota-resume-run", RunState::CoderRunning)
+            .await
+            .unwrap();
+        assert!(
+            recover_crashed_runs(&pool).await.unwrap().is_empty(),
+            "the deterministic interleaving after the restored transition but before the \
+             agent-process write must retain the live claim"
+        );
+        assert_eq!(
+            db::get_run(&pool, "live-quota-resume-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::CoderRunning
+        );
+        assert!(db::get_quota_resume_lease(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .is_some());
+
+        db::insert_cycle(&pool, "live-quota-resume-cycle", "live-quota-resume-run", 1)
+            .await
+            .unwrap();
+        let mut agent = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let agent_pid = agent.id().unwrap();
+        db::insert_agent_process(
+            &pool,
+            "live-quota-resume-process",
+            "live-quota-resume-cycle",
+            "coder",
+            agent_pid,
+            "/tmp/wt",
+        )
+        .await
+        .unwrap();
+        assert!(db::get_quota_resume_lease(&pool, "live-quota-resume-run")
+            .await
+            .unwrap()
+            .is_none());
+        agent.kill().await.unwrap();
+    }
 
     #[tokio::test]
     async fn recovery_marks_intermediate_run_failed_when_its_process_is_dead() {

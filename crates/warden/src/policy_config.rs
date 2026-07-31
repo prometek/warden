@@ -43,28 +43,44 @@ fn policy_file_path(repo_path: &Path) -> std::path::PathBuf {
     repo_path.join(".warden").join("policy.yaml")
 }
 
+/// Reads the exact policy document selected for a run. Keeping these bytes
+/// separate from parsing lets a quota checkpoint persist and later parse the
+/// same policy rather than consulting a mutable repository.
+pub fn read_repo_policy(repo_path: &Path) -> Result<Option<String>> {
+    let path = policy_file_path(repo_path);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(WardenError::PolicyConfig {
+            path,
+            reason: format!("could not read the file: {err}"),
+        }),
+    }
+}
+
+/// Parses an already-resolved policy document. `None` is the durable form of
+/// an absent file and therefore yields the empty rule set.
+pub fn parse_repo_policy(
+    repo_path: &Path,
+    contents: Option<&str>,
+) -> Result<warden_policy::RuleSet> {
+    match contents {
+        Some(contents) => {
+            warden_policy::RuleSet::from_yaml(contents).map_err(|error| WardenError::PolicyConfig {
+                path: policy_file_path(repo_path),
+                reason: error.to_string(),
+            })
+        }
+        None => Ok(warden_policy::RuleSet::empty()),
+    }
+}
+
 /// Loads `<repo_path>/.warden/policy.yaml` into a [`warden_policy::RuleSet`].
 /// An absent file yields [`warden_policy::RuleSet::empty`]; a malformed one
 /// is a [`WardenError::PolicyConfig`].
 pub fn load_repo_policy(repo_path: &Path) -> Result<warden_policy::RuleSet> {
-    let path = policy_file_path(repo_path);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(warden_policy::RuleSet::empty());
-        }
-        Err(err) => {
-            return Err(WardenError::PolicyConfig {
-                path,
-                reason: format!("could not read the file: {err}"),
-            });
-        }
-    };
-
-    warden_policy::RuleSet::from_yaml(&contents).map_err(|error| WardenError::PolicyConfig {
-        path,
-        reason: error.to_string(),
-    })
+    let contents = read_repo_policy(repo_path)?;
+    parse_repo_policy(repo_path, contents.as_deref())
 }
 
 #[cfg(test)]

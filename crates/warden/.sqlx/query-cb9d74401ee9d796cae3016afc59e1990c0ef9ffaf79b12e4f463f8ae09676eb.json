@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT config_json as \"config_json!\", state_json as \"state_json!\" FROM quota_continuations WHERE run_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "config_json!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "quota_continuations",
+            "name": "config_json"
+          }
+        }
+      },
+      {
+        "name": "state_json!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "quota_continuations",
+            "name": "state_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "cb9d74401ee9d796cae3016afc59e1990c0ef9ffaf79b12e4f463f8ae09676eb"
+}

@@ -60,6 +60,11 @@ pub enum RunState {
     AwaitingQuotaReset {
         resets_at: i64,
     },
+    /// A startup process atomically claimed an elapsed quota continuation
+    /// and is reconstructing or driving it. Persisting this state before
+    /// decoding/spawning prevents two Warden processes from resuming the
+    /// same checkpoint concurrently.
+    ResumingQuota,
     Done,
     /// The step at this index (same indexing as [`RunState::RunningStep`])
     /// raised a blocking finding on every cycle up to and including its own
@@ -88,6 +93,7 @@ impl RunState {
             RunState::AwaitingQuotaReset { resets_at } => {
                 format!("awaiting_quota_reset:{resets_at}")
             }
+            RunState::ResumingQuota => "resuming_quota".to_string(),
             RunState::Done => "done".to_string(),
             RunState::StepCyclesExceeded(index) => format!("step_cycles_exceeded:{index}"),
             RunState::Failed => "failed".to_string(),
@@ -116,6 +122,7 @@ impl RunState {
             "converged" => Ok(RunState::Converged),
             "pushed" => Ok(RunState::Pushed),
             "awaiting_ci" => Ok(RunState::AwaitingCi),
+            "resuming_quota" => Ok(RunState::ResumingQuota),
             "done" => Ok(RunState::Done),
             "failed" => Ok(RunState::Failed),
             other => Err(CoreError::UnknownState(other.to_string())),
@@ -129,7 +136,10 @@ impl RunState {
     pub fn is_intermediate(self) -> bool {
         matches!(
             self,
-            RunState::CoderRunning | RunState::RunningStep(_) | RunState::AwaitingCi
+            RunState::CoderRunning
+                | RunState::RunningStep(_)
+                | RunState::AwaitingCi
+                | RunState::ResumingQuota
         )
     }
 
@@ -218,9 +228,19 @@ impl RunState {
             RunState::AwaitingCi => {
                 vec![RunState::Done, RunState::CoderRunning, RunState::Failed]
             }
-            // Resume is deliberately owned by #86. Until then a quota-suspended
-            // run is stable across restart and cannot be mistaken for failed.
-            RunState::AwaitingQuotaReset { .. } => vec![],
+            RunState::AwaitingQuotaReset { .. } => vec![RunState::ResumingQuota],
+            // Issue #86: an atomic startup claim leaves `ResumingQuota`
+            // only for the exact checkpointed boundary. `RunningStep(1)` is
+            // a shape placeholder here; `validate_transition` handles any
+            // in-range gated-step index below because the workflow is open.
+            // `Failed` is the explicit escape for a missing/corrupt
+            // checkpoint that cannot be reconstructed safely.
+            RunState::ResumingQuota => vec![
+                RunState::CoderRunning,
+                RunState::RunningStep(1),
+                RunState::AwaitingQuotaReset { resets_at: 0 },
+                RunState::Failed,
+            ],
             RunState::StepCyclesExceeded(_) => vec![RunState::Failed],
             RunState::Done => vec![],
             RunState::Failed => vec![],
@@ -232,6 +252,13 @@ impl RunState {
     /// see [`RunState::allowed_next_states`]'s own docs for why this needs
     /// it. Returns [`CoreError::InvalidTransition`] otherwise.
     pub fn validate_transition(self, to: RunState, total_steps: u32) -> Result<()> {
+        if self == RunState::ResumingQuota {
+            let resumes_at_valid_gated_step =
+                matches!(to, RunState::RunningStep(index) if index > 0 && index < total_steps);
+            if resumes_at_valid_gated_step {
+                return Ok(());
+            }
+        }
         if self.allowed_next_states(total_steps).iter().any(|allowed| {
             allowed == &to
                 || matches!(
@@ -350,8 +377,12 @@ mod tests {
             .validate_transition(awaiting, DEFAULT_TOTAL_STEPS)
             .is_ok());
         assert!(awaiting
+            .validate_transition(RunState::ResumingQuota, DEFAULT_TOTAL_STEPS)
+            .is_ok());
+        assert!(RunState::ResumingQuota.is_intermediate());
+        assert!(RunState::ResumingQuota
             .validate_transition(RunState::Failed, DEFAULT_TOTAL_STEPS)
-            .is_err());
+            .is_ok());
     }
 
     #[test]
@@ -542,6 +573,7 @@ mod tests {
         assert!(RunState::RunningStep(1).is_intermediate());
         assert!(RunState::RunningStep(2).is_intermediate());
         assert!(RunState::AwaitingCi.is_intermediate());
+        assert!(RunState::ResumingQuota.is_intermediate());
         assert!(!RunState::Pending.is_intermediate());
         assert!(!RunState::Converged.is_intermediate());
         assert!(!RunState::Failed.is_intermediate());
@@ -557,6 +589,10 @@ mod tests {
             RunState::Converged,
             RunState::Pushed,
             RunState::AwaitingCi,
+            RunState::AwaitingQuotaReset {
+                resets_at: 1_785_686_400,
+            },
+            RunState::ResumingQuota,
             RunState::Done,
             RunState::StepCyclesExceeded(1),
             RunState::StepCyclesExceeded(2),

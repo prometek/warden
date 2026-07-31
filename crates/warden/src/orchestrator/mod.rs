@@ -86,7 +86,7 @@ use uuid::Uuid;
 use warden_core::{
     decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, AgentRole, CiOutcome,
     CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, Role, RunEvent, RunState,
-    WorkflowStep, DIFF_TRUNCATED_MARKER,
+    Workflow, WorkflowStep, DIFF_TRUNCATED_MARKER,
 };
 use warden_sandbox::{LocalSandbox, Sandbox};
 
@@ -107,6 +107,7 @@ use crate::worktree::{self, WorktreeManager};
 mod agent_run;
 mod agents;
 mod config;
+mod continuation;
 mod convergence;
 mod diff;
 mod evidence_capture;
@@ -116,8 +117,11 @@ mod tampering;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use config::{GateConfig, RunConfig, UntrustedRepoAgentDefinition};
-pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs};
+pub use config::{
+    ApprovalConfig, GateConfig, RunConfig, RunExecutionContext, SandboxConfig,
+    UntrustedRepoAgentDefinition,
+};
+pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs, resume_quota_suspended_runs};
 
 use tampering::AgentDefinitionSnapshot;
 
@@ -413,6 +417,7 @@ struct GatedStepInvocation<'a> {
 /// produced, and the diff introduced against the cycle's starting commit --
 /// the latter is fed to every gated step as `AgentInputMessage::diff`
 /// (ADR-0012, issue #20 Scope B).
+#[derive(Debug, Clone)]
 struct ProducerCycleResult {
     commit: String,
     diff: String,
@@ -422,6 +427,80 @@ struct ProducerCycleResult {
     /// overwhelmingly common case (the producer never touches that
     /// directory).
     definition_tampering_finding: Option<Finding>,
+}
+
+/// All mutable convergence-loop state that must survive a quota suspension.
+/// The static [`RunConfig`] is checkpointed alongside this value; keeping the
+/// two separate makes the workflow boundary itself explicit.
+#[derive(Debug, Clone)]
+struct ConvergenceContinuation {
+    /// Fixed commit against which agent-definition tampering is checked for
+    /// the lifetime of the run.
+    run_base_commit_sha: String,
+    /// Commit the next producer cycle starts from, or the commit every
+    /// remaining gated step in the active cycle inspects.
+    base_commit: String,
+    cycle_number: u32,
+    review_cycle_number: u32,
+    test_cycle_number: u32,
+    extra_step_cycle_number: u32,
+    pending_ci_findings: Vec<Finding>,
+    previous_cycle_id: Option<String>,
+    step_last_reviewed_commit: Vec<Option<String>>,
+    own_step_cycle_numbers: Vec<u32>,
+    active_cycle: Option<ActiveCycleContinuation>,
+}
+
+impl ConvergenceContinuation {
+    fn new(run_base_commit_sha: String, total_steps: usize) -> Self {
+        Self {
+            base_commit: run_base_commit_sha.clone(),
+            run_base_commit_sha,
+            cycle_number: 1,
+            review_cycle_number: 0,
+            test_cycle_number: 0,
+            extra_step_cycle_number: 0,
+            pending_ci_findings: Vec::new(),
+            previous_cycle_id: None,
+            step_last_reviewed_commit: vec![None; total_steps],
+            own_step_cycle_numbers: vec![0; total_steps],
+            active_cycle: None,
+        }
+    }
+
+    fn next_run_state(&self) -> RunState {
+        match self.active_cycle.as_ref().map(|cycle| &cycle.phase) {
+            Some(ActiveCyclePhase::Gated {
+                next_step_index, ..
+            }) => RunState::RunningStep(*next_step_index),
+            Some(ActiveCyclePhase::Producer) | None => RunState::CoderRunning,
+        }
+    }
+}
+
+/// The cycle row already exists when a process suspends during an invocation
+/// or between two steps. Its phase says exactly which invocation is next.
+#[derive(Debug, Clone)]
+struct ActiveCycleContinuation {
+    cycle_id: String,
+    prior_findings: Vec<Finding>,
+    producer_base_commit: String,
+    phase: ActiveCyclePhase,
+}
+
+#[derive(Debug, Clone)]
+enum ActiveCyclePhase {
+    /// The producer invocation did not complete successfully and must be
+    /// retried from the same cycle boundary.
+    Producer,
+    /// The producer completed and `next_step_index` is the first gated step
+    /// that has not completed in this cycle.
+    Gated {
+        producer_result: ProducerCycleResult,
+        findings: Vec<Finding>,
+        next_step_index: u32,
+        entered_extra_budget_this_cycle: bool,
+    },
 }
 
 /// The run this [`Orchestrator`] instance is currently driving, and the
@@ -505,6 +584,11 @@ pub struct Orchestrator {
     /// ([`PolicyGate::empty`]), so this check is a strict no-op until a
     /// caller installs one via [`Orchestrator::with_policy_gate`].
     policy_gate: Arc<PolicyGate>,
+    /// Exact startup choices required for durable quota resumption. Library
+    /// callers using a non-built-in adapter may leave this unset, but then a
+    /// quota suspension fails closed instead of writing an unrecoverable
+    /// checkpoint.
+    run_execution_context: Option<RunExecutionContext>,
     quota_anticipation_threshold: f64,
 }
 
@@ -521,6 +605,7 @@ impl Orchestrator {
             sandbox: Arc::new(LocalSandbox::new()),
             hooks: HookRegistry::new(),
             policy_gate: Arc::new(PolicyGate::empty()),
+            run_execution_context: None,
             quota_anticipation_threshold: 0.90,
         }
     }
@@ -568,6 +653,13 @@ impl Orchestrator {
         self
     }
 
+    /// Installs the durable counterpart of this orchestrator's adapter,
+    /// sandbox, hooks, policy, and approval-channel choices.
+    pub fn with_run_execution_context(mut self, context: RunExecutionContext) -> Self {
+        self.run_execution_context = Some(context);
+        self
+    }
+
     /// Sets the fraction of consumed CLI quota at which the next workflow
     /// step is withheld. The CLI validates this public configuration value;
     /// keeping the default here preserves API callers' historical behavior.
@@ -588,13 +680,6 @@ impl Orchestrator {
         if !predicate(&status) {
             return Ok(false);
         }
-        self.transition(
-            run_id,
-            RunState::AwaitingQuotaReset {
-                resets_at: status.resets_at,
-            },
-        )
-        .await?;
         Ok(true)
     }
 
