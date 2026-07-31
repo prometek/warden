@@ -461,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
                             quota_anticipation_threshold,
                             warden_home,
                             ClaudeAdapter,
+                            ClaudeAdapter,
                             TrustRepoAgents(trust_repo_agents),
                             evidence_tool,
                             evidence_store_in_repo,
@@ -481,6 +482,7 @@ async fn main() -> anyhow::Result<()> {
                             quota_anticipation_threshold,
                             warden_home,
                             CodexAdapter,
+                            CodexAdapter,
                             TrustRepoAgents(trust_repo_agents),
                             evidence_tool,
                             evidence_store_in_repo,
@@ -500,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
                             max_cycles,
                             quota_anticipation_threshold,
                             warden_home,
+                            MistralAdapter,
                             MistralAdapter,
                             TrustRepoAgents(trust_repo_agents),
                             evidence_tool,
@@ -756,7 +759,7 @@ fn parse_approval_answer(line: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run<R: ToolAdapter>(
+async fn run<R: ToolAdapter + Send + 'static>(
     repo: PathBuf,
     intent: String,
     branch: String,
@@ -766,6 +769,7 @@ async fn run<R: ToolAdapter>(
     quota_anticipation_threshold: f64,
     warden_home: Option<PathBuf>,
     adapter: R,
+    recovery_adapter: R,
     trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
@@ -828,6 +832,29 @@ async fn run<R: ToolAdapter>(
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("received Ctrl-C, cancelling run");
             cancel_on_ctrl_c.cancel();
+        }
+    });
+
+    // Issue #86: a due quota continuation resumes from its durable workflow
+    // boundary in the background. It gets a distinct, same-kind adapter
+    // value because the foreground convergence loop consumes `adapter` by
+    // value; all built-in adapters are stateless unit structs. This task is
+    // intentionally not awaited: a resumed agent may run for a long time
+    // and must never delay this command's freshly requested run.
+    let quota_resume_pool = pool.clone();
+    tokio::spawn(async move {
+        match orchestrator::resume_quota_suspended_runs(quota_resume_pool, recovery_adapter).await {
+            Ok(resumed) => {
+                for run_id in &resumed {
+                    tracing::warn!(
+                        run_id,
+                        "resumed a run after its quota reset (crash recovery)"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to resume runs awaiting a quota reset");
+            }
         }
     });
 

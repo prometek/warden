@@ -594,6 +594,142 @@ pub async fn get_run_rate_limit_status(
     )
 }
 
+/// Removes a quota observation once its reset time has passed and issue #86
+/// is about to retry the recorded workflow boundary. Without this, the
+/// boundary's anticipation check would immediately re-read the stale,
+/// already-expired report and suspend again without giving the CLI a chance
+/// to publish its current quota status.
+pub async fn clear_run_rate_limit_status(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    let now = now_rfc3339();
+    sqlx::query!(
+        r#"
+        UPDATE runs SET
+            rate_limit_status = NULL,
+            rate_limit_type = NULL,
+            rate_limit_utilization = NULL,
+            rate_limit_is_using_overage = NULL,
+            rate_limit_surpassed_threshold = NULL,
+            rate_limit_resets_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+        now,
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The two validated JSON documents needed to reconstruct one suspended
+/// convergence loop. Kept opaque to the database layer; decoding belongs at
+/// the orchestrator boundary.
+#[derive(Debug)]
+pub struct QuotaContinuationRecord {
+    pub config_json: String,
+    pub state_json: String,
+}
+
+/// Atomically records both the continuation and the state transition that
+/// makes it eligible for startup resumption. A process can therefore never
+/// expose `AwaitingQuotaReset` without all deterministic continuation data
+/// already durable.
+pub async fn suspend_run_with_quota_continuation(
+    pool: &SqlitePool,
+    run_id: &str,
+    resets_at: i64,
+    config_json: &str,
+    state_json: &str,
+) -> Result<()> {
+    let state = RunState::AwaitingQuotaReset { resets_at }.as_str();
+    let now = now_rfc3339();
+    let mut transaction = pool.begin().await?;
+    sqlx::query!(
+        "INSERT INTO quota_continuations (run_id, config_json, state_json, updated_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT (run_id) DO UPDATE SET \
+             config_json = excluded.config_json, \
+             state_json = excluded.state_json, \
+             updated_at = excluded.updated_at",
+        run_id,
+        config_json,
+        state_json,
+        now,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query!(
+        "UPDATE runs SET state = ?, quota_resets_at = ?, updated_at = ? WHERE id = ?",
+        state,
+        resets_at,
+        now,
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Run ids whose persisted quota reset has elapsed as of `now_unix`.
+/// Materialized before any one run is resumed, so a run that immediately
+/// re-suspends with another already-due timestamp is still attempted at most
+/// once by this startup pass (no hot loop).
+pub async fn list_due_quota_run_ids(pool: &SqlitePool, now_unix: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id as "id!"
+        FROM runs
+        WHERE state LIKE 'awaiting_quota_reset:%'
+          AND quota_resets_at IS NOT NULL
+          AND quota_resets_at <= ?
+        ORDER BY quota_resets_at, created_at, id
+        "#,
+        now_unix,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
+}
+
+pub async fn get_quota_continuation(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<QuotaContinuationRecord>> {
+    let row = sqlx::query!(
+        "SELECT config_json as \"config_json!\", state_json as \"state_json!\" \
+         FROM quota_continuations WHERE run_id = ?",
+        run_id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| QuotaContinuationRecord {
+        config_json: row.config_json,
+        state_json: row.state_json,
+    }))
+}
+
+pub async fn delete_quota_continuation(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    sqlx::query!("DELETE FROM quota_continuations WHERE run_id = ?", run_id,)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Validates that an active-cycle id restored from a checkpoint still names
+/// a cycle belonging to the same run. Checkpoint JSON and relational rows
+/// must agree before any subprocess is launched.
+pub async fn cycle_belongs_to_run(pool: &SqlitePool, cycle_id: &str, run_id: &str) -> Result<bool> {
+    let exists = sqlx::query_scalar!(
+        "SELECT EXISTS(SELECT 1 FROM cycles WHERE id = ? AND run_id = ?)",
+        cycle_id,
+        run_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(exists != 0)
+}
+
 /// Converts the six possibly-`NULL` `rate_limit_*` columns read back from
 /// `runs` (issue #84) into `Option<RateLimitStatus>`. Unlike
 /// [`row_to_token_usage`]'s partial optionality (cache fields are

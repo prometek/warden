@@ -218,9 +218,18 @@ impl RunState {
             RunState::AwaitingCi => {
                 vec![RunState::Done, RunState::CoderRunning, RunState::Failed]
             }
-            // Resume is deliberately owned by #86. Until then a quota-suspended
-            // run is stable across restart and cannot be mistaken for failed.
-            RunState::AwaitingQuotaReset { .. } => vec![],
+            // Issue #86: startup resumption leaves this stable wait state
+            // only for the exact checkpointed boundary. `RunningStep(1)` is
+            // a shape placeholder here; `validate_transition` handles any
+            // in-range gated-step index below because the workflow is open.
+            // `Failed` is the explicit escape for a missing/corrupt
+            // checkpoint that cannot be reconstructed safely.
+            RunState::AwaitingQuotaReset { .. } => vec![
+                RunState::CoderRunning,
+                RunState::RunningStep(1),
+                RunState::AwaitingQuotaReset { resets_at: 0 },
+                RunState::Failed,
+            ],
             RunState::StepCyclesExceeded(_) => vec![RunState::Failed],
             RunState::Done => vec![],
             RunState::Failed => vec![],
@@ -232,6 +241,13 @@ impl RunState {
     /// see [`RunState::allowed_next_states`]'s own docs for why this needs
     /// it. Returns [`CoreError::InvalidTransition`] otherwise.
     pub fn validate_transition(self, to: RunState, total_steps: u32) -> Result<()> {
+        if matches!(self, RunState::AwaitingQuotaReset { .. }) {
+            let resumes_at_valid_gated_step =
+                matches!(to, RunState::RunningStep(index) if index > 0 && index < total_steps);
+            if resumes_at_valid_gated_step {
+                return Ok(());
+            }
+        }
         if self.allowed_next_states(total_steps).iter().any(|allowed| {
             allowed == &to
                 || matches!(

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id as \"id!\"\n        FROM runs\n        WHERE state LIKE 'awaiting_quota_reset:%'\n          AND quota_resets_at IS NOT NULL\n          AND quota_resets_at <= ?\n        ORDER BY quota_resets_at, created_at, id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "runs",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "188b7188decb5f243936a47f70d4e71298f3f4447c3cf26ef8046934493f9785"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO quota_continuations (run_id, config_json, state_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (run_id) DO UPDATE SET config_json = excluded.config_json, state_json = excluded.state_json, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "8ace57ec8e0bfb97f8a08af3ca500ac8608d1cbca5a114a13c923f62b13d8588"
+}

@@ -159,6 +159,142 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
     Ok(resumed_run_ids)
 }
 
+/// Resumes quota-suspended convergence loops whose persisted reset time has
+/// elapsed (issue #86). The continuation is decoded and cross-checked with
+/// the relational run/cycle rows before any agent is invoked, so a corrupt
+/// checkpoint can never cause Warden to resume a different run's worktree.
+///
+/// This deliberately runs independently of [`recover_crashed_runs`]: an
+/// `AwaitingQuotaReset` run is a stable, intentional stop rather than a
+/// crashed intermediate state. Callers should spawn it during startup, as a
+/// resumed agent invocation may take as long as any ordinary convergence
+/// loop and must not delay a new `warden run`.
+///
+/// Returns the ids successfully handed back to the convergence loop. A run
+/// with a missing or invalid checkpoint is transitioned to `Failed`, its
+/// checkpoint is deleted, and recovery proceeds with the remaining due
+/// runs. Database or resumed-loop failures are returned to the caller.
+pub async fn resume_quota_suspended_runs<R: ToolAdapter>(
+    pool: SqlitePool,
+    runner: R,
+) -> Result<Vec<String>> {
+    let due_run_ids = db::list_due_quota_run_ids(&pool, Utc::now().timestamp()).await?;
+    let mut resumed_run_ids = Vec::new();
+
+    for run_id in due_run_ids {
+        let Some(run) = db::get_run(&pool, &run_id).await? else {
+            tracing::warn!(run_id, "due quota continuation has no run row; skipping");
+            continue;
+        };
+
+        // The due-id query is intentionally materialized before resumption.
+        // A concurrently resumed run may therefore have left the stable wait
+        // state by the time this pass reaches it; never overwrite that newer
+        // state with an old checkpoint.
+        if !matches!(run.state, RunState::AwaitingQuotaReset { .. }) {
+            tracing::warn!(run_id = %run.id, state = run.state.as_str(), "due quota continuation no longer awaits a quota reset; skipping");
+            continue;
+        }
+
+        let Some(record) = db::get_quota_continuation(&pool, &run.id).await? else {
+            fail_quota_continuation_recovery(
+                &pool,
+                &run,
+                "no quota continuation checkpoint was persisted",
+            )
+            .await?;
+            continue;
+        };
+
+        let restored =
+            match super::continuation::decode_run(&run.id, &record.config_json, &record.state_json)
+            {
+                Ok(restored) => restored,
+                Err(error) => {
+                    fail_quota_continuation_recovery(&pool, &run, error.to_string()).await?;
+                    continue;
+                }
+            };
+
+        if restored.config.workflow.steps.len() != run.total_steps as usize {
+            fail_quota_continuation_recovery(
+                &pool,
+                &run,
+                format!(
+                    "checkpoint workflow has {} steps but run records {}",
+                    restored.config.workflow.steps.len(),
+                    run.total_steps
+                ),
+            )
+            .await?;
+            continue;
+        }
+
+        if let Some(active_cycle) = restored.continuation.active_cycle.as_ref() {
+            if !db::cycle_belongs_to_run(&pool, &active_cycle.cycle_id, &run.id).await? {
+                fail_quota_continuation_recovery(
+                    &pool,
+                    &run,
+                    format!(
+                        "checkpoint active cycle {} does not belong to this run",
+                        active_cycle.cycle_id
+                    ),
+                )
+                .await?;
+                continue;
+            }
+        }
+
+        // The stored rate-limit observation caused the previous stop. It is
+        // stale after `resets_at`; clearing it before restoring the boundary
+        // lets the next invocation publish a fresh CLI observation rather
+        // than immediately suspending on yesterday's report.
+        db::clear_run_rate_limit_status(&pool, &run.id).await?;
+
+        let orchestrator = Orchestrator::new(pool.clone())
+            .with_quota_anticipation_threshold(restored.quota_anticipation_threshold);
+        let (_, final_state) = orchestrator
+            .resume_convergence_loop(
+                run.id.clone(),
+                restored.config,
+                &runner,
+                CancellationToken::new(),
+                restored.continuation,
+            )
+            .await?;
+
+        if !matches!(final_state, RunState::AwaitingQuotaReset { .. }) {
+            db::delete_quota_continuation(&pool, &run.id).await?;
+        }
+        resumed_run_ids.push(run.id);
+    }
+
+    Ok(resumed_run_ids)
+}
+
+/// Makes an unusable quota checkpoint explicit and terminal. There is no
+/// safe in-memory fallback after a process restart: resuming with guessed
+/// workflow state risks re-running or skipping an agent step. Reclaiming
+/// leftovers mirrors ordinary crash recovery now that this run can no
+/// longer be resumed.
+async fn fail_quota_continuation_recovery(
+    pool: &SqlitePool,
+    run: &db::Run,
+    reason: impl std::fmt::Display,
+) -> Result<()> {
+    tracing::error!(
+        run_id = %run.id,
+        %reason,
+        "cannot resume quota-suspended run; marking Failed"
+    );
+    run.state
+        .validate_transition(RunState::Failed, run.total_steps)?;
+    db::update_run_state(pool, &run.id, RunState::Failed).await?;
+    db::delete_quota_continuation(pool, &run.id).await?;
+    reclaim_orphan_resources(pool, run).await;
+    Ok(())
+}
+
 /// Reclaims both kinds of resources a crashed run may have left orphaned
 /// (issue #6). Processes are terminated *before* worktrees are removed: a
 /// still-live orphan agent's `cwd` is inside the worktree directory
