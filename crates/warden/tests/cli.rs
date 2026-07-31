@@ -6068,8 +6068,123 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "quota
         .await
         .unwrap()
         .is_none());
+    let (run_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        run_count, 1,
+        "startup recovery must continue the suspended run instead of creating a new run"
+    );
     assert_eq!(
         std::fs::read_to_string(&resume_marker).unwrap(),
         "reviewer\ntester\n"
     );
+}
+
+/// Issue #86: if the quota remains unavailable after startup resumes a run,
+/// Warden must persist a new suspension instead of failing the run or
+/// creating a foreground run.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_startup_re_suspends_the_original_run_when_quota_is_still_unavailable() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let bin_dir = TempDir::new().unwrap();
+    let resumed_coder_marker = warden_home.path().join("resumed-coder-marker");
+    let coder_body = format!(
+        r#"
+if [ -f '{marker}' ]; then
+    printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":2000000000,"rateLimitType":"seven_day","utilization":0.95,"isUsingOverage":false,"surpassedThreshold":0.75}}}}'
+else
+    printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":1,"rateLimitType":"seven_day","utilization":0.95,"isUsingOverage":false,"surpassedThreshold":0.75}}}}'
+fi
+"#,
+        marker = resumed_coder_marker.display(),
+    );
+    let reviewer_body = format!(
+        r#"
+printf '%s\n' '{{"source":"reviewer","severity":"blocking","description":"retry coder after quota reset"}}' > "$WARDEN_RESULT_FILE"
+touch '{marker}'
+"#,
+        marker = resumed_coder_marker.display(),
+    );
+    write_fake_claude(bin_dir.path(), &coder_body, &reviewer_body, NOOP_BODY);
+
+    let first_assert = warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "suspend before reviewer",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: AwaitingQuotaReset"));
+    let first_stdout = String::from_utf8(first_assert.get_output().stdout.clone()).unwrap();
+    let suspended_run_id = first_stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("run ")
+                .and_then(|line| line.strip_suffix(" started"))
+        })
+        .unwrap();
+
+    let workflow_dir = repo.path().join(".warden");
+    std::fs::create_dir_all(&workflow_dir).unwrap();
+    std::fs::write(
+        workflow_dir.join("workflow.yaml"),
+        "this is not a valid workflow",
+    )
+    .unwrap();
+
+    warden_command()
+        .0
+        .env("PATH", path_with_fake_bin_first(bin_dir.path()))
+        .env("XDG_CONFIG_HOME", warden_home.path())
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "foreground must fail preflight",
+            "--warden-home",
+            warden_home.path().to_str().unwrap(),
+            "--tool",
+            "mistral",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("invalid workflow file"));
+
+    let pool = warden::db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        warden::db::get_run(&pool, suspended_run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RunState::AwaitingQuotaReset {
+            resets_at: 2_000_000_000,
+        }
+    );
+    assert!(warden::db::get_quota_continuation(&pool, suspended_run_id)
+        .await
+        .unwrap()
+        .is_some());
+    let (run_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM runs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(run_count, 1);
 }

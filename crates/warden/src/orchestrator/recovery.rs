@@ -571,6 +571,18 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(recover_crashed_runs(&pool).await.unwrap().is_empty());
+        assert_eq!(
+            db::get_run(&pool, "missing-quota-checkpoint-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::AwaitingQuotaReset {
+                resets_at: RESET_BOUNDARY,
+            }
+        );
+
         let resumed = resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
             .await
             .unwrap();
@@ -588,6 +600,52 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// A quota-suspended run without its durable continuation cannot be
+    /// resumed safely. Recovery must fail it closed rather than leaving it
+    /// indefinitely suspended or attempting to reconstruct a new run.
+    #[tokio::test]
+    async fn missing_quota_checkpoint_fails_closed() {
+        const RESET_BOUNDARY: i64 = 1_800_000_000;
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "missing-quota-checkpoint-run",
+            "/tmp/repo",
+            "main",
+            "quota recovery",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(
+            &pool,
+            "missing-quota-checkpoint-run",
+            RunState::AwaitingQuotaReset {
+                resets_at: RESET_BOUNDARY,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumed = resume_quota_suspended_runs_at(pool.clone(), RESET_BOUNDARY)
+            .await
+            .unwrap();
+
+        assert!(resumed.is_empty());
+        assert_eq!(
+            db::get_run(&pool, "missing-quota-checkpoint-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            RunState::Failed
+        );
     }
 
     /// A resumed loop can fail while the Warden task that claimed it is still
