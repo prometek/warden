@@ -1,15 +1,5 @@
-//! Evidence rendering (ADR-0010): images render inline when the terminal
-//! supports a graphics protocol (see [`crate::capabilities`]).
-//!
-//! Video frame extraction (`ffmpeg`) and asciinema sub-terminal playback are
-//! **deliberately deferred**, stubbed behind [`crate::error::TuiError::NotYetImplemented`]:
-//! Phase 7 (issue #7, the Evidence Capture Adapter that would actually
-//! produce video/asciinema evidence) has not landed on this branch, so
-//! there is no `EVIDENCE` table and no real data to build or exercise those
-//! paths against. [`Evidence`] mirrors the row shape Architecture.md §6
-//! already documents for that future table, so this module is ready to
-//! receive real evidence the moment Phase 7 lands, without a protocol
-//! change here.
+//! Evidence rendering: images render inline when the terminal supports a graphics protocol (see
+//! [`crate::capabilities`]).
 
 use std::path::PathBuf;
 
@@ -21,11 +11,7 @@ use ratatui_image::Resize;
 use crate::capabilities::GraphicsCapability;
 use crate::error::{Result, TuiError};
 
-/// Mirrors `EVIDENCE.type` from Architecture.md §6 (`{image, video, log,
-/// other}`, with `log` renamed `Asciinema` here to match ADR-0010's actual
-/// handling, which is specific to asciinema recordings rather than generic
-/// text logs). Kept as its own type instead of a `warden_core` enum since
-/// none exists yet -- `EVIDENCE` itself is Phase 7 scope (issue #7).
+/// Mirrors `EVIDENCE.type` from Architecture.md §6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceKind {
     Image,
@@ -35,15 +21,7 @@ pub enum EvidenceKind {
 }
 
 impl EvidenceKind {
-    /// Maps `RunEvent::EvidenceCaptured.evidence_type`'s free-form string
-    /// onto a rendering kind. Deliberately infallible rather than a
-    /// `Result`-returning `parse` (unlike `warden_core::EventKind::parse`,
-    /// which guards the wire *protocol*): an unrecognized value here is not
-    /// a corrupted protocol, only a rendering hint this crate doesn't
-    /// specifically know how to render inline -- it degrades to `Other`
-    /// (external-viewer fallback, per ADR-0010's own universal fallback
-    /// rule) rather than breaking the whole evidence pane over a single
-    /// unfamiliar type string.
+    /// Maps `RunEvent::EvidenceCaptured.evidence_type`'s free-form string onto a rendering kind.
     pub fn parse(raw: &str) -> Self {
         match raw {
             "image" => EvidenceKind::Image,
@@ -54,9 +32,8 @@ impl EvidenceKind {
     }
 }
 
-/// One piece of evidence to render, in the shape a future Phase 7
-/// `EVIDENCE` row would carry -- passed in directly by the caller rather
-/// than read from a database query that doesn't exist yet.
+/// One piece of evidence to render, in the shape a future `EVIDENCE` row would carry -- passed in
+/// directly by the caller rather than read from a database query that doesn't exist yet.
 #[derive(Debug, Clone)]
 pub struct Evidence {
     pub kind: EvidenceKind,
@@ -64,20 +41,13 @@ pub struct Evidence {
     pub description: Option<String>,
 }
 
-/// The outcome of [`render`]: either evidence ready to hand to a
-/// `ratatui_image::Image` widget, or a typed reason it can't be shown
-/// inline right now, so the caller can offer ADR-0010's universal fallback
-/// (open in the system's default external viewer).
 pub enum Rendering {
     Inline(Protocol),
     ExternalViewer { path: PathBuf, reason: &'static str },
 }
 
-/// Renders `evidence` for a terminal with the given [`GraphicsCapability`],
-/// dispatching per [`EvidenceKind`] as ADR-0010 specifies. `picker` is
-/// `None` exactly when `capability` is [`GraphicsCapability::None`] (see
-/// [`crate::capabilities::detect`]) -- both are threaded through together
-/// rather than re-deriving one from the other.
+/// Renders `evidence` for a terminal with the given [`GraphicsCapability`], dispatching per
+/// [`EvidenceKind`] as specifies.
 pub fn render(
     evidence: &Evidence,
     capability: GraphicsCapability,

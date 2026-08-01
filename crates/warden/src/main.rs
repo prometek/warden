@@ -1,5 +1,4 @@
-//! `warden` binary: CLI parsing + dispatch only. All orchestration logic
-//! lives in the `warden` library crate (`src/lib.rs` and friends).
+//! `warden` binary: CLI parsing + dispatch only.
 
 use std::path::PathBuf;
 
@@ -51,15 +50,7 @@ async fn main() -> anyhow::Result<()> {
             isolation,
             isolation_image,
         } => {
-            // Issue #72: `--intents-file` entries run first (file order),
-            // followed by any repeated `--intent` flags, in the order given.
             let mut intents = Vec::new();
-            // Issue #72 review, LOW 2: tracked separately from `intents`
-            // itself so the final "no intent provided" error (below) can
-            // name the file specifically when it's the reason the combined
-            // list is empty -- e.g. an all-comment/blank `--intents-file`
-            // with no `--intent` flags at all reads very differently from
-            // "you forgot both flags entirely".
             let mut empty_intents_file: Option<&PathBuf> = None;
             if let Some(intents_file_path) = &intents_file {
                 let file_intents = warden::batch::read_intents_file(intents_file_path)
@@ -89,24 +80,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Issue #72: a single intent is the pre-existing, unchanged
-            // mono-intent path -- built and awaited in-process exactly as
-            // before this issue. Two or more intents switch to `run_batch`,
-            // which never builds a `RunConfig`/`Orchestrator` itself; each
-            // intent gets its own `warden run` subprocess instead (see
-            // `run_batch`'s own docs for why). The intent-count branch wraps
-            // the `--tool` dispatch (issue #71) so every adapter -- and the
-            // batch runner -- shares this same single-vs-batch decision.
+            // a single intent is the pre-existing, unchanged mono-intent path -- built and awaited
+            // in-process exactly as before this issue.
             if intents.len() == 1 {
                 let intent = intents
                     .into_iter()
                     .next()
                     .expect("checked intents.len() == 1 above");
 
-                // Issue #15/ADR-0011: the post-Converged tail only runs when
-                // both paths it needs are configured; omitting either
-                // preserves this crate's original behaviour (stop at
-                // `Converged`).
                 let gate = match (gate_bare_repo, gate_gated_bin) {
                     (Some(bare_repo_path), Some(gated_bin)) => Some(orchestrator::GateConfig {
                         bare_repo_path,
@@ -118,14 +99,10 @@ async fn main() -> anyhow::Result<()> {
                     _ => None,
                 };
 
-                // Issue #32: `--tui-bin` is only meaningful alongside `--tui`;
-                // resolved once here (not inside `run`), same shape as `gate`
-                // above.
                 let tui_launch = tui.then(|| TuiLaunchConfig {
                     tui_bin: resolve_tui_binary(tui_bin),
                 });
 
-                // Issue #49: bundled the same way as `gate`/`tui_launch` above.
                 let isolation_config = IsolationConfig {
                     isolation,
                     image: isolation_image,
@@ -198,10 +175,6 @@ fn init_tracing(verbosity: u8) {
 mod tests {
     use super::*;
 
-    /// Issue #51: only an explicit affirmative answer approves --
-    /// `TtyApprovalGate`'s human-validation wait point must fail closed on
-    /// anything else, including a bare newline (the operator just pressed
-    /// enter) or a typo.
     #[test]
     fn parse_approval_answer_accepts_only_y_or_yes_case_insensitively() {
         for approved in ["y", "Y", "yes", "YES", "Yes", "  y  ", "y\n", "y\r\n"] {
@@ -218,15 +191,6 @@ mod tests {
         }
     }
 
-    /// Issue #51 review round 2, finding A: `NoTuiApprovalGate` -- installed
-    /// whenever `--tui` is attached -- must deny a `RequireApproval` decision
-    /// immediately, with no attempt to read stdin/prompt a terminal. This is
-    /// the one behaviour `TtyApprovalGate`'s own docs say a real prompt would
-    /// get wrong under `--tui` (raw mode swallows `\n`, so a `read_line`
-    /// there would simply hang forever). A test that resolves at all --
-    /// rather than timing out -- is itself the proof there is no hidden
-    /// blocking read on this path; the explicit `false` assertion additionally
-    /// pins the fail-closed contract.
     #[tokio::test]
     async fn no_tui_approval_gate_denies_immediately_without_prompting() {
         let gate = NoTuiApprovalGate;
@@ -245,11 +209,6 @@ mod tests {
         );
     }
 
-    /// Issue #32 re-review: pins down `should_wait_for_spawned_tui`'s gate
-    /// in isolation, without needing a real pty (impractical in this test
-    /// harness -- `assert_cmd` never gives a spawned binary a real
-    /// terminal) -- see its own docs for why a tty must wait and a non-tty
-    /// must not.
     #[test]
     fn should_wait_for_spawned_tui_is_gated_on_stdout_being_a_terminal() {
         assert!(
@@ -263,30 +222,12 @@ mod tests {
         );
     }
 
-    /// Issue #32: `--tui-bin`, when given, must always win over any
-    /// sibling-binary/`PATH` auto-detection -- this is the branch every
-    /// `--tui`/`--tui-bin` CLI test in `cli.rs` actually exercises (they all
-    /// pass an explicit `--tui-bin`), but `resolve_tui_binary` itself had no
-    /// direct unit coverage of its own branching before this test.
     #[test]
     fn resolve_tui_binary_prefers_the_explicit_override_when_given() {
         let explicit = PathBuf::from("/some/explicit/path/to/warden-tui");
         assert_eq!(resolve_tui_binary(Some(explicit.clone())), explicit);
     }
 
-    /// Issue #32: with no `--tui-bin`, `resolve_tui_binary` must fall back to
-    /// a bare `warden-tui` name (left for `spawn_tui_attach`'s own
-    /// `Command::new` to resolve against `PATH`) when no `warden-tui` binary
-    /// sits next to the *current* executable.
-    ///
-    /// Deterministic under `cargo test` without needing to fake
-    /// `std::env::current_exe()` (not injectable/mockable here without
-    /// refactoring production code purely for testability): a test binary's
-    /// own `current_exe()` always resolves under `target/.../deps/`, a
-    /// different directory than where compiled `[[bin]]` outputs like
-    /// `target/.../warden-tui` actually land -- so the sibling-lookup branch
-    /// reliably misses in this harness, and the fallback below is exercised
-    /// for real, not merely assumed.
     #[test]
     fn resolve_tui_binary_falls_back_to_a_bare_name_when_no_sibling_binary_exists() {
         let current_exe = std::env::current_exe().expect("current_exe available under cargo test");
@@ -309,11 +250,6 @@ mod tests {
         );
     }
 
-    /// Issue #71: `--tool` accepts `codex`/`mistral` alongside `claude`,
-    /// each resolving to its own closed-set variant (see `ToolName`'s own
-    /// docs) -- the CLI-level equivalent of `e2e_an_unknown_tool_is_a_clean_
-    /// cli_error_naming_the_value` in `tests/cli.rs`, but for the parser
-    /// itself rather than the whole binary.
     #[test]
     fn parse_tool_accepts_claude_codex_and_mistral() {
         assert_eq!(parse_tool("claude"), Ok(ToolName::Claude));
@@ -321,9 +257,6 @@ mod tests {
         assert_eq!(parse_tool("mistral"), Ok(ToolName::Mistral));
     }
 
-    /// The unknown-value error message must name every supported value, not
-    /// just `claude` (issue #71 acceptance criterion) -- so a user who
-    /// mistypes `--tool` sees the full closed set to choose from.
     #[test]
     fn parse_tool_rejects_an_unknown_value_and_lists_every_supported_one() {
         let error = parse_tool("aider").unwrap_err();
@@ -333,9 +266,6 @@ mod tests {
         assert!(error.contains("mistral"), "{error:?}");
     }
 
-    /// Issue #85: the quota suspension threshold is user input, so its
-    /// boundary values are valid while non-finite and out-of-range values
-    /// fail at the CLI boundary rather than reaching the orchestrator.
     #[test]
     fn quota_anticipation_threshold_accepts_fraction_boundaries_only() {
         assert_eq!(parse_quota_anticipation_threshold("0"), Ok(0.0));

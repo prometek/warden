@@ -1,12 +1,4 @@
 //! Pure orchestration logic for Warden.
-//!
-//! This crate contains no I/O: no filesystem, no subprocess, no database. It
-//! is the state machine and convergence rules that decide *what* should
-//! happen next; the `warden` binary crate decides *how* to make it happen.
-//! The one narrow exception is [`resolve_socket_path`], which reads
-//! `std::env::temp_dir()` (an environment/OS constant lookup, not a
-//! filesystem access) -- see its module docs for why it lives here rather
-//! than duplicated per-crate like the rest of the I/O layer.
 
 mod agent_def;
 mod agent_wire;

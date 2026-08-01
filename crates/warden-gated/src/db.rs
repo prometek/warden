@@ -1,12 +1,4 @@
 //! Independent, read-only view of the SQLite database written by `warden`.
-//!
-//! This module is deliberately **duplicated** from (rather than importing)
-//! `warden`'s own `db.rs` -- see Architecture.md §13 ("crate partagée
-//! `warden-core` (types seulement, pas la logique de vérification —
-//! dupliquée volontairement côté gate)") and ADR-0006. `warden-gated` must
-//! never inherit a bug in `warden`'s own query/parsing logic when deciding
-//! whether a push reaches `origin`; the two crates only share `warden-core`
-//! (the `RunState` type itself), never each other's I/O code.
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,16 +9,9 @@ use warden_core::RunState;
 
 use crate::error::{GatedError, Result};
 
-/// Matches `warden::db`'s own busy timeout: the gate's read-only connection
-/// can still contend with `warden`'s writer under WAL, so this is named and
-/// explicit rather than left at whatever sqlx defaults to.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Opens `db_path` strictly **read-only** (code-standards.md, "SQLite &
-/// sqlx": "`warden-gated` ... ouvrent la base en lecture seule"). Fails
-/// loudly rather than creating the file -- an absent database means a
-/// misconfigured path, never a case to silently paper over by creating an
-/// empty one.
+/// Opens `db_path` strictly **read-only** (code-standards.md, "SQLite & sqlx": "`warden-gated`...
 pub async fn connect_read_only(db_path: &Path) -> Result<SqlitePool> {
     if !db_path.exists() {
         return Err(GatedError::DatabaseNotFound(db_path.to_path_buf()));
@@ -41,20 +26,16 @@ pub async fn connect_read_only(db_path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// The subset of a `runs` row `warden-gated` needs to authorize a push: its
-/// current state and the commit it converged on. Re-read from SQLite on
-/// every single push attempt -- never cached, never trusted from a prior
-/// read or from anything `warden` claims over the notification channel.
+/// The subset of a `runs` row `warden-gated` needs to authorize a push: its current state and the
+/// commit it converged on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateRunView {
     pub state: RunState,
     pub converged_commit_sha: Option<String>,
 }
 
-/// Raw shape of the columns this crate reads, before `state` has been
-/// validated into a [`RunState`]. Kept private: [`GateRunView`] is the only
-/// form that ever leaves this module (code-standards.md: "toute ligne
-/// relue est reparsée en type Rust fort").
+/// Raw shape of the columns this crate reads, before `state` has been validated into a
+/// [`RunState`].
 struct RunRow {
     state: String,
     converged_commit_sha: Option<String>,
@@ -78,13 +59,6 @@ pub async fn get_run_view(pool: &SqlitePool, run_id: &str) -> Result<Option<Gate
     .transpose()
 }
 
-/// The subset of a `runs` row the crash-recovery `resume-watch` path needs
-/// (issue #15/ADR-0011): its current state (must still be `AwaitingCi` --
-/// re-verified here rather than trusted from the caller, same "never trust
-/// the caller" principle as [`GateRunView`]/[`get_run_view`]) and the PR
-/// number `warden` persisted for it. A dedicated, narrower read rather than
-/// growing [`GateRunView`] itself, whose existing fields/tests are specific
-/// to the push-authorization path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwaitingCiRunView {
     pub state: RunState,
@@ -139,10 +113,6 @@ mod tests {
         assert!(matches!(result, Err(GatedError::DatabaseNotFound(_))));
     }
 
-    /// Sets up a real SQLite file with `warden`'s own schema (via a plain
-    /// `CREATE TABLE`, since this crate must not depend on `warden`'s
-    /// migrations either) and a writable connection to seed rows, mirroring
-    /// code-standards.md's "DB de test: SQLite fichier temporaire réel".
     async fn seed_db_with_run(
         dir: &Path,
         run_id: &str,
@@ -208,9 +178,6 @@ mod tests {
         assert!(view.is_none());
     }
 
-    /// A dedicated fixture (rather than growing [`seed_db_with_run`]) since
-    /// [`get_awaiting_ci_run_view`] reads a column (`pr_number`) the
-    /// push-authorization tests above have no reason to know about.
     async fn seed_db_with_awaiting_ci_run(
         dir: &Path,
         run_id: &str,

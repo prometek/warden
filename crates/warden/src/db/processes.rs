@@ -1,12 +1,7 @@
 use super::*;
 
-/// Persists an agent process record, capturing the OS-reported start time
-/// of `pid` *at insert time* (H1: PID-reuse hardening). This is what lets
-/// `recover_crashed_runs` later tell this exact process instance apart from
-/// an unrelated process that reuses the same PID after a reboot — see
-/// `process::is_process_alive`. The caller doesn't supply the start time
-/// directly: it's derived here, right when the PID is freshest, so callers
-/// can't accidentally pass a stale or fabricated value.
+/// Persists an agent process record, capturing the OS-reported start time of `pid` *at insert time*
+/// (H1: PID-reuse hardening).
 pub async fn insert_agent_process(
     pool: &SqlitePool,
     id: &str,
@@ -57,11 +52,7 @@ pub async fn mark_agent_process_ended(pool: &SqlitePool, id: &str, exit_code: i3
     Ok(())
 }
 
-/// The most recent agent process associated with `run_id` that was never
-/// marked as ended — i.e. the process the orchestrator was waiting on when
-/// it last wrote to the database. Used by crash recovery: if this process's
-/// PID is no longer alive (or has been reused by an unrelated process, per
-/// `pid_started_at_unix`), the run is stuck and must be marked `Failed`.
+/// The most recent agent process associated with `run_id` that was never marked as ended — i.e.
 pub struct OpenAgentProcess {
     pub id: String,
     pub pid: u32,
@@ -96,12 +87,6 @@ pub async fn latest_open_agent_process_for_run(
     .transpose()
 }
 
-/// Every agent process associated with `run_id` that was never marked
-/// ended, not just the most recent one (as [`latest_open_agent_process_for_run`]
-/// returns, used only to decide whether a run is still legitimately in
-/// progress). Reviewer and tester run concurrently (ADR-0003), so more than
-/// one row can be open at once — crash recovery needs all of them to
-/// terminate every orphaned process, not just the newest.
 pub async fn list_open_agent_processes_for_run(
     pool: &SqlitePool,
     run_id: &str,

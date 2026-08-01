@@ -6,11 +6,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TuiError {
-    /// `warden-tui` must never create the database itself -- only `warden`
-    /// does, via its migrations (mirrors `warden_gated::GatedError`, same
-    /// "read-only consumer" boundary, ADR-0008). A missing file means a
-    /// misconfigured path or a `warden` that has never run, never a case to
-    /// paper over by creating an empty one.
+    /// `warden-tui` must never create the database itself -- only `warden` does, via its
+    /// migrations.
     #[error("database not found at {0} -- warden-tui never creates it, only warden does")]
     DatabaseNotFound(PathBuf),
 
@@ -29,12 +26,6 @@ pub enum TuiError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    // Note: a terminal not supporting any inline graphics protocol
-    // (Kitty/iTerm2/Sixel, ADR-0010) is deliberately *not* a variant here --
-    // `evidence::render` treats it as a successful, ordinary rendering
-    // outcome (`Rendering::ExternalViewer`), not a failure: ADR-0010's
-    // universal fallback is expected, everyday behaviour on an
-    // unsupported terminal, not an error condition to surface as one.
     #[error("failed to decode image {path}: {source}")]
     ImageDecode {
         path: PathBuf,
@@ -49,12 +40,8 @@ pub enum TuiError {
         source: ratatui_image::errors::Errors,
     },
 
-    /// Video frame extraction (`ffmpeg`) and asciinema sub-terminal playback
-    /// (ADR-0010) are deliberately out of scope for this pass: there is no
-    /// `EVIDENCE` producer yet (Phase 7, issue #7, is not implemented on
-    /// this branch), so there is no real evidence data to exercise either
-    /// path against. Modeled as an explicit, typed "not yet implemented"
-    /// rather than a half-working attempt.
+    /// Video frame extraction (`ffmpeg`) and asciinema sub-terminal playback are deliberately out
+    /// of scope for this pass.
     #[error("{feature} is not yet implemented (deferred: {reason})")]
     NotYetImplemented {
         feature: &'static str,

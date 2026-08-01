@@ -1,24 +1,9 @@
-//! Ties together the read-only database access (`db.rs`, I/O) and the pure
-//! authorization rule (`verify.rs`) into the one entry point both the
-//! `serve` daemon and the `verify-run` CLI diagnostic call: independently
-//! re-verify a run before authorizing a push (ADR-0002/ADR-0006).
-
 use sqlx::SqlitePool;
 
 use crate::db;
 use crate::error::Result;
 use crate::verify::{decide, GateDecision};
 
-/// Re-reads `run_id` from the read-only database and decides whether
-/// `pushed_commit_sha` (the commit that was actually written into the local
-/// bare gate repo -- see `notification::parse_post_receive_line`) may be
-/// relayed to `origin`.
-///
-/// This is the only place `warden-gated` ever consults SQLite to make a
-/// push decision, and it never accepts a `RunState`/hash as a parameter --
-/// only a `run_id` and the commit sha to check against, both of which are
-/// independently verifiable (the run_id names a real row or it doesn't; the
-/// commit sha is what git itself just wrote to the bare repo).
 pub async fn verify_and_authorize(
     pool: &SqlitePool,
     run_id: &str,
@@ -37,10 +22,6 @@ mod tests {
 
     use crate::verify::GateBlockReason;
 
-    /// A real, temporary SQLite database seeded directly with a plain
-    /// `INSERT` (code-standards.md: "DB de test: SQLite fichier temporaire
-    /// réel, jamais de mock") -- this stands in for the file `warden` would
-    /// have written, without depending on the `warden` crate itself.
     async fn seeded_db(state: RunState, converged_commit_sha: Option<&str>) -> (TempDir, String) {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("state.db");
@@ -77,15 +58,6 @@ mod tests {
         (dir, db_path.display().to_string())
     }
 
-    /// Acceptance criterion 1 (issue #3), exercised end-to-end against a
-    /// real read-only SQLite connection: the run genuinely sitting in
-    /// SQLite is `CoderRunning` (never advanced further -- simulating a
-    /// crashed/stuck/still-in-progress run), while the *notification*
-    /// passed in claims a commit as though the run had converged on it
-    /// (standing in for whatever a compromised or buggy `warden` might
-    /// assert). `verify_and_authorize` must ignore that claim and block,
-    /// because it re-derives the state itself rather than trusting the
-    /// caller.
     #[tokio::test]
     async fn push_is_blocked_when_the_real_db_disagrees_with_what_the_notification_claims() {
         let (_dir, db_path) = seeded_db(RunState::CoderRunning, None).await;

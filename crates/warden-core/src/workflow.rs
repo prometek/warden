@@ -1,79 +1,11 @@
-//! Issue #73: the user-definable pipeline. Before this, the pipeline was
-//! wired directly into code -- a closed `AgentRole { Coder, Reviewer, Tester }`
-//! (`crate::state::AgentRole`) and a hardcoded coder -> gate review -> gate
-//! test sequence (`warden::orchestrator`). [`Workflow`] moves that sequence
-//! from code to **data** a user can define in `.warden/workflow.yaml`:
-//!
-//! ```yaml
-//! name: default
-//! steps:
-//!   - role: coder
-//!     agent: coder
-//!   - role: reviewer
-//!     agent: code-reviewer
-//!     gate: loop-until-clean
-//!     budget: review
-//!   - role: tester
-//!     agent: test-runner
-//!     gate: loop-until-clean
-//!     budget: test
-//!     evidence: true
-//! ```
-//!
-//! [`Workflow::builtin_default`] is exactly this shape -- what a run uses
-//! when no `.warden/workflow.yaml` exists at all, so the **absence** of a
-//! workflow file reproduces today's pipeline exactly (strict retro-compat,
-//! the acceptance criterion issue #73 calls out as the most important one).
-//!
-//! Deliberately linear (issue #73 "out of scope"): a [`Workflow`] is a plain
-//! ordered list of [`WorkflowStep`]s, each an open, named [`Role`] resolved
-//! to an agent, with an optional [`Gate`]. No DAG, no conditional branches,
-//! no parallel steps -- every step but the first (the "producer", coder-like
-//! role that has no gate of its own) may loop back to the first step when its
-//! own gate finds a blocking problem, exactly like the reviewer/tester
-//! already did. [`Gate`] is deliberately a small, explicit enum rather than a
-//! free-form string precisely so it stays *extensible* without a schema
-//! change: adding a new gate kind later is a new variant plus two match arms
-//! here, never a change to this module's shape.
-//!
-//! Pure/parsing shape only, mirroring every other user-facing file this
-//! crate parses (`agent_def`, `ci_channel`, `evidence_wire`): reading
-//! `.warden/workflow.yaml` off disk lives in `warden::agent_def` (I/O), this
-//! module only knows the schema and its invariants.
-//!
-//! Issue #81 extends both axes issue #73 deliberately left minimal:
-//! [`Gate::ScopedReReview`] is a second gate kind (alongside
-//! [`Gate::LoopUntilClean`]) that scopes a step's re-invocations to just the
-//! producer's latest correctif instead of the whole cycle diff, usable by
-//! any step rather than only the built-in reviewer's own position; a step
-//! may also declare `max_cycles: N` instead of `budget: review|test|extra`
-//! for its own independent cycle budget ([`StepBudget::Own`]). Both are
-//! additive: every value/shape issue #73 shipped keeps parsing to the exact
-//! same [`WorkflowStep`], unchanged.
-
 use serde::Deserialize;
 
 use crate::error::{CoreError, Result};
 
-/// A step's name in the pipeline (`steps[].role` in `workflow.yaml`) --
-/// open, unlike the closed `AgentRole` the built-in coder/reviewer/tester
-/// path still uses internally (see this module's own docs and
-/// `crate::state::AgentRole`'s). Any non-blank string is a legal role name:
-/// `"coder"`/`"reviewer"`/`"tester"` are not special-cased by this type at
-/// all -- they're just the names the *built-in* default workflow happens to
-/// use. A custom workflow can name a step anything (`"techlead"`, `"docs"`,
-/// ...); [`crate::FindingSource::role`] and [`crate::decide_next_state_for_step`]
-/// key off exactly this string, so a custom role's findings aggregate in the
-/// convergence loop the same way a reviewer's or tester's already do.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Role(String);
 
 impl Role {
-    /// Rejects a blank (empty or all-whitespace) name -- a step with no real
-    /// name can never be meaningfully compared against a
-    /// [`crate::FindingSource`], so this is validated once, at construction,
-    /// rather than left for every later comparison to silently no-op
-    /// against.
     pub fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -95,56 +27,13 @@ impl std::fmt::Display for Role {
     }
 }
 
-/// How a step's findings gate the pipeline. Deliberately a closed enum, not
-/// a free-form string: an unknown gate name in `workflow.yaml` must be a
-/// clear parse error naming the bad value, never silently treated as one of
-/// the known kinds. Extensible in principle (issue #73: "conçu pour être
-/// extensible") -- a future kind is a new variant plus two match arms here
-/// (`as_str`/`parse`), not a change to [`WorkflowStep`]'s shape or to any
-/// caller's signature.
+/// How a step's findings gate the pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// No gate at all: the step runs once per cycle and never reboucles the
-    /// pipeline back to the first step, whatever it reports. This is the
-    /// first step's own implicit gate (see [`Workflow::validate`]) -- a
-    /// producer step (the coder-equivalent) has nothing to gate *on* yet,
-    /// since it hasn't produced this cycle's work until it runs.
+    /// No gate at all: the step runs once per cycle and never reboucles the pipeline back to the
+    /// first step, whatever it reports.
     PassThrough,
-    /// The step's findings gate the pipeline exactly like the reviewer/
-    /// tester already do: a blocking finding attributed to this step's own
-    /// role reboucles the whole pipeline back to the first step (within this
-    /// step's own cycle budget), instead of letting the pipeline advance.
     LoopUntilClean,
-    /// Issue #81: gates exactly like [`Gate::LoopUntilClean`] (a blocking
-    /// finding attributed to this step's own role reboucles within budget),
-    /// **plus** a scoped-re-review optimization (#37/ADR-0014, "re-review
-    /// scopée"): this step's very first pass over a run's body of work is
-    /// full (the whole cycle diff); an invocation that follows a producer
-    /// correction is scoped to just that correctif plus the findings that
-    /// motivated it ([`crate::agent_wire::ReviewScope::Correctif`]), instead
-    /// of the whole diff again.
-    ///
-    /// That scoping is conditional, not automatic on every re-invocation
-    /// (issue #81 review, HIGH): it applies only when this step's *previous*
-    /// invocation targeted the very commit this cycle's producer diff is
-    /// computed against. A step that never saw that base commit -- it was
-    /// skipped for one or more cycles because an earlier gated step blocked
-    /// before the pipeline reached it -- gets a full pass on its return
-    /// instead, since a correctif payload carries only the current cycle's
-    /// producer diff and would silently omit every commit produced during
-    /// the cycles it missed. (A cycle in which the producer committed
-    /// nothing leaves the base commit unchanged, so the scoping correctly
-    /// still applies: there was nothing for the step to miss.)
-    ///
-    /// Before this, the optimization was wired
-    /// only into the built-in reviewer's own *position* (`workflow.steps[1]`,
-    /// `warden::orchestrator::run_convergence_loop`'s `has_reviewed_once`) --
-    /// this makes it a property any step can opt into, at any position,
-    /// declared in `workflow.yaml` rather than hardcoded. The pre-existing
-    /// positional behaviour at `workflow.steps[1]` is untouched (issue #81's
-    /// retro-compat requirement): a `workflow.steps[1]` step still gets
-    /// scoped re-review even when it declares `loop-until-clean`, exactly as
-    /// it always has.
     ScopedReReview,
 }
 
@@ -170,43 +59,11 @@ impl Gate {
     }
 }
 
-/// A step's execution mechanism (issue #79, ADR-0020's own "an étape ne
-/// devrait pas toujours être un agent" deferral): whether the step spawns an
-/// **agent** subprocess (an LLM's own judgement) or runs a deterministic
-/// **hook** command (issue #55, ADR-0017 -- no LLM, no judgement call).
-/// Closed on purpose, mirroring [`Gate`]'s own "extensible by variant, never
-/// a free-form string" rationale: an unrecognized `type` in `workflow.yaml`
-/// must be a clear parse error naming the bad value, never silently treated
-/// as one of the two known kinds.
-///
-/// [`StepKind::Agent`] is the default -- the only kind that existed before
-/// this issue -- so a step that omits `type` entirely (every step in every
-/// `workflow.yaml` written before this issue) behaves exactly as it always
-/// has (strict retro-compat, [`Workflow::parse_yaml`]'s own contract).
+/// A step's execution mechanism: whether the step spawns an **agent** subprocess (an LLM's own
+/// judgement) or runs a deterministic **hook** command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
-    /// Spawns an agent subprocess resolved from `agent` -- the built-in
-    /// trio's own hardened, role-asymmetric resolution for `role: coder`/
-    /// `reviewer`/`tester` (ADR-0018), or `.claude/agents/<agent>.md`
-    /// (ADR-0013) for any other role. This is the *only* kind before issue
-    /// #79, and the default when `type` is omitted.
     Agent,
-    /// Issue #79: a deterministic shell command (`run`), executed through
-    /// the same sandboxed, policy-gated mechanics a lifecycle
-    /// [`crate::hook`] hook already uses (issue #55/#51) -- reused, not
-    /// duplicated, against this step's own worktree instead of a
-    /// [`crate::hook::HookContext::repo_path`]. No LLM round-trip, no
-    /// judgement call: a non-zero exit (or a policy deny) is this step's own
-    /// blocking finding, a zero exit is a clean pass -- aggregated into the
-    /// convergence loop exactly like a `type: agent` step's findings
-    /// already are.
-    ///
-    /// Never legal for `steps[0]` (the pipeline's producer,
-    /// [`Workflow::parse_yaml`]'s own invariant): a hook authors no commit,
-    /// so it can only ever gate work an earlier `type: agent` producer has
-    /// already written. Cannot capture evidence either (`evidence: true` is
-    /// rejected for this kind) -- ADR-0009 evidence records an *agent's*
-    /// command session, which a hook step has none of.
     Hook,
 }
 
@@ -230,55 +87,22 @@ impl StepKind {
     }
 }
 
-/// Which run-level cycle budget a gated step's blocking findings are
-/// charged against, and how (issue #73 review, finding F3). Before this,
-/// the budget rule followed a step's *position* (`workflow.steps[1]` always
-/// got `max_review_cycles`, `steps[2]` always got `max_test_cycles`) -- but
-/// steps can now be reordered, so a swapped built-in pair would silently
-/// apply the wrong rule to each. This is [`WorkflowStep`]'s own declared
-/// property instead: whichever step claims [`StepBudget::Review`] gets the
-/// review rule, wherever it sits in the pipeline.
-///
-/// `None` only ever applies to `steps[0]` (the producer, which has no gate
-/// and so nothing to charge a budget against) -- every other step always
-/// carries `Some` (defaulted to [`StepBudget::Extra`] when
-/// `workflow.yaml` omits the key, see [`Workflow::parse_yaml`]).
+/// Which run-level cycle budget a gated step's blocking findings are charged against, and how.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepBudget {
-    /// `max_review_cycles` -- charged only when *this* step's own
-    /// evaluation is blocking (decision #37 Q1's imputation rule): a cycle
-    /// whose first pass over the work is clean never advances this
-    /// counter, however many cycles a *different* step's own blocking
-    /// finding costs.
     Review,
-    /// `max_test_cycles` -- charged unconditionally, once per invocation
-    /// (this step runs, and its counter advances, every time the pipeline
-    /// reaches it).
+    /// `max_test_cycles` -- charged unconditionally, once per invocation (this step runs, and its
+    /// counter advances, every time the pipeline reaches it).
     Test,
-    /// `max_extra_step_cycles` -- the single budget shared by every step
-    /// that isn't `Review` or `Test`, charged once per cycle the first time
-    /// any such step is entered (never once per individual extra step).
     Extra,
-    /// Issue #81: this step's own, independent cycle budget (`max_cycles: N`
-    /// in `workflow.yaml`), instead of one of the three run-level buckets
-    /// above. Charged unconditionally, once per invocation, exactly like
-    /// [`StepBudget::Test`] -- there is no sibling budget this one needs to
-    /// stay independent from (unlike `Review`, whose conditional-on-blocking
-    /// rule exists specifically to keep it independent from `Test`), so the
-    /// simpler unconditional rule applies. Tracked entirely in-memory by the
-    /// convergence loop (never persisted to the `runs` table, unlike
-    /// `Review`/`Test`/`Extra`'s `current_*_cycle` columns) -- a step's own
-    /// budget is a property of *that* step alone, and the `runs` table has
-    /// no generic per-step-index column to store an arbitrary number of
-    /// these in.
+    /// this step's own, independent cycle budget (`max_cycles: N` in `workflow.yaml`), instead of
+    /// one of the three run-level buckets above.
     Own(u32),
 }
 
 impl StepBudget {
-    /// A label for this budget kind -- **not** a round-trippable wire form
-    /// for [`StepBudget::Own`] (its `u32` payload isn't representable in a
-    /// `&'static str`); only [`Self::parse`] input ("review"/"test"/"extra")
-    /// round-trips through this and back. Used for error messages/debugging.
+    /// A label for this budget kind -- **not** a round-trippable wire form for [`StepBudget::Own`]
+    /// (its `u32` payload isn't representable in a `&'static str`).
     pub fn as_str(self) -> &'static str {
         match self {
             StepBudget::Review => "review",
@@ -302,69 +126,29 @@ impl StepBudget {
     }
 }
 
-/// One step of a [`Workflow`]: a [`Role`] resolved to an `agent` (a name
-/// `warden::agent_def` resolves onto a markdown agent definition, ADR-0013 --
-/// e.g. `.claude/agents/<agent>.md` for a role beyond the built-in three),
-/// gated by an optional [`Gate`].
+/// One step of a [`Workflow`]: a [`Role`] resolved to an `agent`, gated by an optional [`Gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowStep {
     pub role: Role,
-    /// Issue #79: which mechanism this step runs through. `Some(agent)`/
-    /// `Some(run)` below track this invariant -- see their own docs.
     pub kind: StepKind,
-    /// The agent definition name this step resolves to -- not necessarily
-    /// the same string as `role` (`workflow.yaml`'s own example: `role:
-    /// reviewer` / `agent: code-reviewer`), since a workflow may want two
-    /// steps sharing a role's *function* to still be told apart by name, or
-    /// simply prefer a differently-named agent file for a role. `Some` iff
-    /// `kind == StepKind::Agent` ([`Workflow::parse_yaml`]'s own invariant,
-    /// enforced at parse time, never left to a downstream caller to assume).
     pub agent: Option<String>,
-    /// Issue #79: the shell command a `type: hook` step runs (`sh -c
-    /// "<run>"`, mirroring `crate::hook`'s own `CommandHook`). `Some` iff
-    /// `kind == StepKind::Hook` -- the same "declared invariant, enforced at
-    /// parse time" contract as `agent` above.
+    /// the shell command a `type: hook` step runs (`sh -c "<run>"`, mirroring `crate::hook`'s own
+    /// `CommandHook`).
     pub run: Option<String>,
     pub gate: Gate,
-    /// See [`StepBudget`]'s own docs -- `None` only for `steps[0]`.
     pub budget: Option<StepBudget>,
-    /// Issue #73 review, finding F2: whether this step's successful,
-    /// clean run triggers ADR-0009 evidence capture. Before this, capture
-    /// fired whenever `role.as_str() == "tester"` -- a custom workflow that
-    /// renamed its test step lost evidence capture silently. Declared here
-    /// instead, so the property is explicit in `workflow.yaml` (or in
-    /// [`Workflow::builtin_default`]'s literal) rather than inferred from a
-    /// name. Only one step may set this per workflow (see
-    /// [`Workflow::parse_yaml`]).
     pub captures_evidence: bool,
 }
 
-/// A user-definable pipeline (issue #73): an ordered, non-empty list of
-/// [`WorkflowStep`]s. `steps[0]` is always the **producer** -- the
-/// coder-equivalent role that does this cycle's actual work -- and every
-/// later step gates on that cycle's work, looping back to `steps[0]` on a
-/// blocking finding attributed to its own role (see
-/// [`crate::decide_next_state_for_step`]). Deliberately linear: no DAG, no
-/// conditional branching, no parallel steps (issue #73 "out of scope").
+/// A user-definable pipeline: an ordered, non-empty list of [`WorkflowStep`]s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workflow {
     pub name: String,
     pub steps: Vec<WorkflowStep>,
 }
 
-/// Wire shape of one `workflow.yaml` step -- `gate` absent means "plain
-/// pass-through" (never "reject", never "assume loop-until-clean": an
-/// omitted key and a wrong one must not be conflated, see [`Gate::parse`]).
-/// `budget` absent means [`StepBudget::Extra`] (see [`Workflow::parse_yaml`]);
-/// `evidence` absent means `false`. `type` absent means [`StepKind::Agent`]
-/// (issue #79) -- `agent`/`run` are `Option` here (rather than one required
-/// `agent: String` as before issue #79) precisely so *which* of the two is
-/// required can depend on `type`, validated in [`Workflow::parse_yaml`]
-/// rather than by serde itself. Issue #81: `max_cycles` is mutually
-/// exclusive with `budget` -- at most one of the two may be present (see
-/// [`Workflow::parse_yaml`]); when present it's this step's own
-/// [`StepBudget::Own`] cycle budget instead of one of the three named
-/// buckets.
+/// Wire shape of one `workflow.yaml` step -- `gate` absent means "plain pass-through" (never
+/// "reject", never "assume loop-until-clean".
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowStepWire {
@@ -388,16 +172,6 @@ struct WorkflowWire {
     steps: Vec<WorkflowStepWire>,
 }
 
-/// Issue #73 review (LOW security, path traversal): a step's `role`/`agent`
-/// value ends up embedded, verbatim, in a filesystem path built by an I/O
-/// caller downstream -- `agent` in
-/// `warden::agent_def::resolve_custom_step_agent_definition`'s
-/// `.claude/agents/<agent>.md` join, `role` in
-/// `warden::worktree::WorktreeManager::create`'s per-role worktree
-/// directory name. Neither caller re-validates it (this is the one place
-/// every step is already validated), so a value containing a path
-/// separator (`/` or `\`) or a `..` component is rejected right here, at the
-/// boundary, rather than trusted through to those two path joins.
 fn reject_path_like_value(step_index: usize, field: &'static str, value: &str) -> Result<()> {
     let has_separator = value.contains('/') || value.contains('\\');
     let has_dotdot_component = value.split(['/', '\\']).any(|part| part == "..");
@@ -411,17 +185,9 @@ fn reject_path_like_value(step_index: usize, field: &'static str, value: &str) -
 }
 
 impl Workflow {
-    /// The pipeline every run drives when no `.warden/workflow.yaml` exists
-    /// at all -- the exact shape `workflow.yaml`'s own doc-comment example
-    /// carries, and the one this crate's tests pin against the pre-issue-#73
-    /// pipeline (coder -> gate review -> gate test): this is issue #73's
-    /// central retro-compat guarantee, made an explicit, testable value
-    /// rather than an implicit "well, the code just happens to still do
-    /// that" claim.
     pub fn builtin_default() -> Self {
-        // Constructed from already-valid literals -- `expect` here is an
-        // invariant on this crate's own hardcoded default, never on
-        // user-controlled input (`parse_yaml`'s job).
+        // Constructed from already-valid literals -- `expect` here is an invariant on this crate's
+        // own hardcoded default, never on user-controlled input (`parse_yaml`'s job).
         Self {
             name: "default".to_string(),
             steps: vec![
@@ -456,15 +222,7 @@ impl Workflow {
         }
     }
 
-    /// Parses and validates a `.warden/workflow.yaml` document. Every
-    /// failure is a [`CoreError::InvalidWorkflow`] naming *what* is wrong
-    /// (malformed YAML, an unknown key, a blank role/agent, a duplicate
-    /// role, an unknown gate, a first step that isn't a plain
-    /// pass-through) -- the caller (`warden::agent_def`, which reads the
-    /// file) names *which file*, never silently falling back to
-    /// [`Self::builtin_default`] on a parse failure (code-standards.md: no
-    /// silent fallback -- a malformed workflow file must fail the run, not
-    /// quietly run the default pipeline instead).
+    /// Parses and validates a `.warden/workflow.yaml` document.
     pub fn parse_yaml(raw: &str) -> Result<Self> {
         let wire: WorkflowWire = serde_yaml::from_str(raw)
             .map_err(|error| CoreError::InvalidWorkflow(format!("invalid YAML: {error}")))?;
@@ -482,15 +240,8 @@ impl Workflow {
 
         let mut steps = Vec::with_capacity(wire.steps.len());
         let mut seen_roles = std::collections::HashSet::new();
-        // Issue #73 review F3: at most one step may claim each of `Review`/
-        // `Test` -- two steps sharing the same budget counter would silently
-        // conflate two independent cycle counts. `Extra` is deliberately
-        // exempt: it's the *shared* bucket every non-review/test step already
-        // pools into.
         let mut review_budget_step: Option<usize> = None;
         let mut test_budget_step: Option<usize> = None;
-        // Issue #73 review F2: at most one step may capture evidence -- ADR-
-        // 0009's evidence is one artifact per converged run, not per step.
         let mut evidence_capture_step: Option<usize> = None;
         for (index, step) in wire.steps.into_iter().enumerate() {
             reject_path_like_value(index, "role", &step.role)?;
@@ -506,32 +257,14 @@ impl Workflow {
             let role = Role::new(step.role)
                 .map_err(|error| CoreError::InvalidWorkflow(format!("step {index}: {error}")))?;
 
-            // Issue #79: `type` decides which of `agent`/`run` this step
-            // requires -- validated here rather than left to serde, since
-            // which one is required depends on a sibling field's value, not
-            // the wire shape alone.
             let kind = match &step.kind {
                 None => StepKind::Agent,
-                // Issue #79 review (optional): `policy` is a real value from
-                // the ticket this issue shipped against (#79's own "agent |
-                // hook | policy" framing) -- a reader who tries it should be
-                // told it isn't supported *yet*, not that they made a typo.
-                // `warden-policy` (#51) is consumed as an execution
-                // mechanic's *infra* (`type: hook`'s own policy-gated
-                // command), but a step whose whole *identity* is a policy
-                // decision is intentionally out of scope for this delivery.
                 Some(raw_kind) if raw_kind == "policy" => {
                     return Err(CoreError::InvalidWorkflow(format!(
                         "step {index} (role {role:?}): type: policy is not supported yet (see \
                          issue #51) -- use type: agent or type: hook"
                     )));
                 }
-                // Issue #79 review (cycle 3): wraps `StepKind::parse`'s own
-                // message with step/role context instead of re-hand-writing
-                // it here -- the two could otherwise drift (a future new
-                // `StepKind` variant, or a wording tweak to `parse`'s own
-                // message, would leave this duplicate stale). Mirrors
-                // `Role::new`'s own call site a few lines above.
                 Some(raw_kind) => StepKind::parse(raw_kind).map_err(|error| {
                     CoreError::InvalidWorkflow(format!("step {index} (role {role:?}): {error}"))
                 })?,
@@ -629,10 +362,6 @@ impl Workflow {
                 }
                 None
             } else {
-                // Issue #81: `budget` (a named, run-level bucket) and
-                // `max_cycles` (this step's own, independent budget) are
-                // mutually exclusive -- a step declaring both would leave it
-                // ambiguous which counter actually gates it.
                 let budget = match (&step.budget, step.max_cycles) {
                     (Some(_), Some(_)) => {
                         return Err(CoreError::InvalidWorkflow(format!(
@@ -663,10 +392,8 @@ impl Workflow {
                 let duplicate_of = match budget {
                     StepBudget::Review => &mut review_budget_step,
                     StepBudget::Test => &mut test_budget_step,
-                    // `Extra` is the shared bucket -- no single-claimant
-                    // invariant applies, so there's nothing to check. `Own`
-                    // is this step's own independent budget -- by
-                    // definition, no other step could ever conflict with it.
+                    // `Extra` is the shared bucket -- no single-claimant invariant applies, so
+                    // there's nothing to check.
                     StepBudget::Extra | StepBudget::Own(_) => &mut None,
                 };
                 if let Some(prior_index) = *duplicate_of {
@@ -707,18 +434,13 @@ impl Workflow {
         })
     }
 
-    /// The step this pipeline reboucles to when a later step's gate finds a
-    /// blocking problem -- always the first one (issue #73: linear sequence,
-    /// no DAG). Named rather than every caller writing `steps[0]` directly,
-    /// so the "reboucle target is always the producer" invariant has exactly
-    /// one place it's stated.
+    /// The step this pipeline reboucles to when a later step's gate finds a blocking problem --
+    /// always the first one.
     pub fn producer_role(&self) -> &Role {
         &self.steps[0].role
     }
 
-    /// `true` when `step_index` is this workflow's last step -- the point at
-    /// which a clean gate converges the run instead of advancing to the next
-    /// step (see [`crate::decide_next_state_for_step`]).
+    /// `true` when `step_index` is this workflow's last step.
     pub fn is_last_step(&self, step_index: u32) -> bool {
         step_index as usize == self.steps.len() - 1
     }
@@ -853,9 +575,6 @@ steps:
         ));
     }
 
-    /// Issue #73 review (LOW security): `agent` ends up joined verbatim into
-    /// `.claude/agents/<agent>.md` (`warden::agent_def::resolve_custom_step_agent_definition`)
-    /// -- a relative path-traversal component must never reach that join.
     #[test]
     fn rejects_an_agent_name_containing_a_path_traversal_component() {
         let yaml = r#"
@@ -872,9 +591,6 @@ steps:
         assert!(error.to_string().contains("path separator"), "{error}");
     }
 
-    /// An absolute path is rejected too -- it contains a leading `/`, caught
-    /// by the same separator check regardless of whether it also has a
-    /// `..` component.
     #[test]
     fn rejects_an_agent_name_that_is_an_absolute_path() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: /etc/passwd\n";
@@ -883,8 +599,6 @@ steps:
         assert!(error.to_string().contains("path separator"), "{error}");
     }
 
-    /// A backslash-separated traversal must be rejected identically -- the
-    /// check must not only recognize the Unix separator.
     #[test]
     fn rejects_an_agent_name_containing_a_backslash_path_traversal_component() {
         let yaml = r#"name: x
@@ -899,9 +613,6 @@ steps:
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
     }
 
-    /// `role` is checked too -- it flows into
-    /// `warden::worktree::WorktreeManager::create`'s per-role worktree
-    /// directory name, a second path-building call site besides `agent`.
     #[test]
     fn rejects_a_role_name_containing_a_path_traversal_component() {
         let yaml = "name: x\nsteps:\n  - role: ../coder\n    agent: coder\n";
@@ -910,8 +621,6 @@ steps:
         assert!(error.to_string().contains("path separator"), "{error}");
     }
 
-    /// A bare `..` with no separator at all must still be rejected -- the
-    /// whole value, not just a `/../` pattern, is a traversal component.
     #[test]
     fn rejects_a_bare_dot_dot_agent_name_with_no_separator() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: \"..\"\n";
@@ -920,8 +629,6 @@ steps:
         assert!(error.to_string().contains(".."), "{error}");
     }
 
-    /// The legitimate control: ordinary hyphenated names (used throughout
-    /// this module's own other tests) must never trip this check.
     #[test]
     fn accepts_ordinary_hyphenated_role_and_agent_names() {
         let yaml = r#"
@@ -939,10 +646,6 @@ steps:
         assert!(Workflow::parse_yaml(yaml).is_ok());
     }
 
-    /// Review F1: `role: warden`/`role: ci` would break the finding
-    /// round-trip (`FindingSource::Warden`/`Ci` vs `FindingSource::Role`),
-    /// so both reserved words must be rejected at parse time, not left to
-    /// fail obscurely at run time via `validate_finding_sources_for_role`.
     #[test]
     fn rejects_a_reserved_role_name() {
         for reserved in crate::convergence::FindingSource::RESERVED_ROLE_NAMES {
@@ -1013,9 +716,6 @@ steps:
         assert!(Gate::parse("ghost").is_err());
     }
 
-    /// Issue #81: a step can declare the new `scoped-re-review` gate value,
-    /// just like it already could `loop-until-clean` -- parses to
-    /// [`Gate::ScopedReReview`], not rejected as unknown.
     #[test]
     fn a_step_can_declare_the_scoped_re_review_gate() {
         let yaml = r#"
@@ -1031,8 +731,6 @@ steps:
         assert_eq!(workflow.steps[1].gate, Gate::ScopedReReview);
     }
 
-    /// Issue #81 acceptance criterion: an unknown gate value's error message
-    /// must name both accepted values, not just the pre-#81 one.
     #[test]
     fn unknown_gate_error_names_both_accepted_values() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
@@ -1060,9 +758,6 @@ steps:
         assert_eq!(workflow.producer_role().as_str(), "coder");
     }
 
-    /// Issue #73 review, F3: a gated step that omits `budget` altogether
-    /// falls into the shared "extra" bucket -- exactly the pre-fix behaviour
-    /// for any step beyond the built-in reviewer/tester pair.
     #[test]
     fn a_gated_step_with_no_budget_key_defaults_to_extra() {
         let yaml = r#"
@@ -1078,8 +773,6 @@ steps:
         assert_eq!(workflow.steps[1].budget, Some(StepBudget::Extra));
     }
 
-    /// The producer has no gate and no budget of its own -- declaring one
-    /// is rejected exactly like declaring a gate on it already was.
     #[test]
     fn rejects_a_budget_declared_on_the_first_step() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    budget: extra\n";
@@ -1088,11 +781,6 @@ steps:
         assert!(error.to_string().contains("producer"), "{error}");
     }
 
-    /// Review follow-up (MEDIUM introduced by F2): the producer never runs
-    /// through `run_gated_step` (the only place `captures_evidence` is ever
-    /// consulted), so `evidence: true` on the first step used to parse fine
-    /// and silently capture nothing -- a silent misconfiguration, and
-    /// asymmetric with the sibling `budget`-on-producer rejection above.
     #[test]
     fn rejects_an_evidence_flag_declared_on_the_first_step() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    evidence: true\n";
@@ -1109,15 +797,9 @@ steps:
         assert!(matches!(error, CoreError::InvalidWorkflow(_)));
         let message = error.to_string();
         assert!(message.contains("unknown budget"), "{message}");
-        // Issue #81 code review, LOW: a step-specific budget uses a
-        // DIFFERENT key (`max_cycles: N`, not `budget`) -- the error must
-        // point there too, not just at the three named buckets.
         assert!(message.contains("max_cycles"), "{message}");
     }
 
-    /// Issue #73 review, F3: two steps can't both claim `review` (or both
-    /// claim `test`) -- the counter each backs is a single run-level value,
-    /// so a second claimant would silently share it with the first.
     #[test]
     fn rejects_two_steps_claiming_the_same_review_or_test_budget() {
         for budget in ["review", "test"] {
@@ -1132,9 +814,6 @@ steps:
         }
     }
 
-    /// Unlike `review`/`test`, `extra` is the shared bucket every non-
-    /// review/test step already pools into -- multiple steps claiming it
-    /// (or omitting `budget` altogether) is completely legal.
     #[test]
     fn multiple_steps_may_share_the_extra_budget() {
         let yaml = r#"
@@ -1154,10 +833,6 @@ steps:
         assert!(Workflow::parse_yaml(yaml).is_ok());
     }
 
-    // ---- issue #81: per-step `max_cycles` (`StepBudget::Own`) --------------
-
-    /// The acceptance criterion's core case: a step declares its own cycle
-    /// budget via `max_cycles` instead of one of the three named buckets.
     #[test]
     fn a_step_can_declare_its_own_max_cycles_budget() {
         let yaml = r#"
@@ -1174,9 +849,6 @@ steps:
         assert_eq!(workflow.steps[1].budget, Some(StepBudget::Own(7)));
     }
 
-    /// Unlike `review`/`test`, two different steps may each declare their
-    /// own `max_cycles` -- each backs a fully independent counter, so there
-    /// is no shared-bucket conflict to reject.
     #[test]
     fn two_steps_may_each_declare_their_own_independent_max_cycles() {
         let yaml = r#"
@@ -1198,14 +870,6 @@ steps:
         assert_eq!(workflow.steps[2].budget, Some(StepBudget::Own(9)));
     }
 
-    /// Issue #81's two new axes are independent of each other, not just
-    /// independent of the pre-#81 shape: a step may declare `gate:
-    /// scoped-re-review` *and* `max_cycles` together -- the gate governs how
-    /// much of the diff this step is re-invoked against, `max_cycles` governs
-    /// how many times it may reboucle before exhausting, and neither key
-    /// constrains what the other may be. Regression coverage for a parser
-    /// that (incorrectly) treated `max_cycles` as only legal alongside
-    /// `loop-until-clean`.
     #[test]
     fn a_step_can_combine_the_scoped_re_review_gate_with_its_own_max_cycles() {
         let yaml = r#"
@@ -1223,12 +887,6 @@ steps:
         assert_eq!(workflow.steps[1].budget, Some(StepBudget::Own(4)));
     }
 
-    /// A full round-trip through the real parser exercising every new key
-    /// issue #81 introduces at once, on a workflow shaped like a plausible
-    /// real one (producer, a named-bucket reviewer, and a custom step
-    /// combining both new axes) -- not just each key pinned in isolation
-    /// against a minimal two-step fixture, the shape every other test in
-    /// this section uses.
     #[test]
     fn a_workflow_combining_scoped_re_review_and_max_cycles_round_trips_through_the_real_parser() {
         let yaml = r#"
@@ -1269,8 +927,6 @@ steps:
         assert!(workflow.is_last_step(2));
     }
 
-    /// `budget` and `max_cycles` are mutually exclusive -- declaring both
-    /// leaves it ambiguous which counter actually gates the step.
     #[test]
     fn rejects_a_step_declaring_both_budget_and_max_cycles() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
@@ -1286,11 +942,6 @@ steps:
         );
     }
 
-    /// A zero budget is exhausted before the step ever runs -- unlike
-    /// `max_cycles: 1` (accepted: the step gets exactly one pass before its
-    /// budget is spent), zero could never let it run even that once. A
-    /// clear, actionable error rather than a degenerate always-exhausted
-    /// step.
     #[test]
     fn rejects_a_zero_max_cycles() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: reviewer\n    \
@@ -1300,8 +951,6 @@ steps:
         assert!(error.to_string().contains("max_cycles"), "{error}");
     }
 
-    /// The producer has no cycle budget of its own -- `max_cycles` on it is
-    /// rejected exactly like `budget` on it already is.
     #[test]
     fn rejects_a_max_cycles_declared_on_the_first_step() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n    max_cycles: 3\n";
@@ -1310,9 +959,6 @@ steps:
         assert!(error.to_string().contains("producer"), "{error}");
     }
 
-    /// Issue #73 review, F2: evidence capture is a declared per-step
-    /// property, not inferred from a role literally named `"tester"` --
-    /// a custom step can opt in by name.
     #[test]
     fn a_step_can_declare_itself_as_the_evidence_capturing_step() {
         let yaml = r#"
@@ -1350,13 +996,6 @@ steps:
         assert!(error.to_string().contains("already set"), "{error}");
     }
 
-    // -----------------------------------------------------------------
-    // Issue #79: `type: agent | hook` -- non-agent workflow steps.
-    // -----------------------------------------------------------------
-
-    /// A step with no `type` key parses to [`StepKind::Agent`] -- strict
-    /// retro-compat, pinned explicitly (every other test in this module
-    /// already exercises this implicitly by never setting `type` at all).
     #[test]
     fn a_step_with_no_type_key_defaults_to_agent_kind() {
         let workflow = Workflow::parse_yaml(DEFAULT_YAML).unwrap();
@@ -1395,10 +1034,6 @@ steps:
         assert!(error.to_string().contains("unknown type"), "{error}");
     }
 
-    /// Issue #79 review (optional): `type: policy` is a real value from the
-    /// ticket this issue shipped against, not a typo -- the error must say
-    /// "not supported yet", never lump it in with a genuinely unrecognized
-    /// string.
     #[test]
     fn a_type_policy_step_is_rejected_as_not_supported_yet_not_as_an_unknown_type() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
@@ -1445,10 +1080,6 @@ steps:
         assert!(error.to_string().contains("\"run\""), "{error}");
     }
 
-    /// The producer (`steps[0]`) authors this cycle's commit -- a
-    /// deterministic hook has nothing to author, so it must always be
-    /// `type: agent`, mirroring the existing "producer must be a plain
-    /// pass-through" invariant.
     #[test]
     fn rejects_a_hook_step_as_the_producer() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    type: hook\n    run: \"true\"\n";
@@ -1457,9 +1088,6 @@ steps:
         assert!(error.to_string().contains("producer"), "{error}");
     }
 
-    /// ADR-0009 evidence capture records an *agent's* command session -- a
-    /// `type: hook` step has none, so `evidence: true` on one is rejected at
-    /// parse time rather than silently captured as nothing.
     #[test]
     fn rejects_a_hook_step_declaring_evidence_capture() {
         let yaml = "name: x\nsteps:\n  - role: coder\n    agent: coder\n  - role: lint\n    \
@@ -1469,9 +1097,6 @@ steps:
         assert!(error.to_string().contains("evidence"), "{error}");
     }
 
-    /// A hook step can still declare/share a `budget`, and still gates the
-    /// pipeline like any other step -- `type: hook` only changes *how* the
-    /// step runs, not the surrounding gate/budget machinery.
     #[test]
     fn a_hook_step_can_declare_a_budget_like_any_other_gated_step() {
         let yaml = r#"

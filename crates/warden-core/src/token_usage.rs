@@ -1,26 +1,8 @@
-//! Token usage (issue #53): a pure, tool-agnostic value type carrying what
-//! one agent invocation's underlying CLI reported spending. Lives in
-//! `warden-core` (not `warden::tool_adapter`, which is where it is actually
-//! produced) so it can ride on [`crate::RunEvent::AgentFinished`] without
-//! `warden-core` gaining a dependency on any one tool's wire format --
-//! exactly the same "pure core type, I/O-owning crate produces it" split
-//! `crate::Finding` already uses for `warden::tool_adapter::ToolAdapter::extract_findings`.
-//!
-//! **Optional by construction**: not every `--tool` adapter's CLI reports
-//! usage at all (see `warden::tool_adapter::ToolAdapter::extract_usage`'s own
-//! docs) -- a caller that has no [`TokenUsage`] for an invocation must render
-//! that as "n/a", never as zero (code-standards.md: "no silent fallback"
-//! -- zero tokens and "unknown" are not the same fact). The cache fields are
-//! independently optional from `input_tokens`/`output_tokens` for the same
-//! reason: a tool can report input/output while never using (or reporting)
-//! prompt caching at all.
+//! Token usage: a pure, tool-agnostic value type carrying what one agent invocation's underlying
+//! CLI reported spending.
 use serde::{Deserialize, Serialize};
 
-/// Tokens spent by a single agent invocation, as reported by its underlying
-/// tool CLI. `input_tokens`/`output_tokens` are always present once a tool
-/// reports *any* usage at all; `cache_read_tokens`/`cache_creation_tokens`
-/// are separately optional (prompt caching is a distinct, not universally
-/// reported, dimension of the same report).
+/// Tokens spent by a single agent invocation, as reported by its underlying tool CLI.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -46,9 +28,6 @@ impl TokenUsage {
         }
     }
 
-    /// The grand total across every dimension this report carries -- what a
-    /// caller shows as "tokens" when it has no reason to break the figure
-    /// down further (e.g. a compact TUI header).
     pub fn total(&self) -> u64 {
         self.input_tokens
             + self.output_tokens
@@ -56,14 +35,8 @@ impl TokenUsage {
             + self.cache_creation_tokens.unwrap_or(0)
     }
 
-    /// Combines `self` with `other`, field by field -- the aggregation
-    /// primitive every "per cycle"/"run total" rollup (issue #53) is built
-    /// from, agent-invocation by agent-invocation. A cache field is `None`
-    /// only if *neither* side ever reported it; once either side has a real
-    /// value, the merge treats the other's absence as "not additionally
-    /// reported this time" (0), not "reset the running total to unknown" --
-    /// otherwise a single invocation that didn't report cache stats would
-    /// erase a running total that a prior invocation legitimately built up.
+    /// Combines `self` with `other`, field by field -- the aggregation primitive every "per
+    /// cycle"/"run total" rollup is built from, agent-invocation by agent-invocation.
     pub fn merge(&self, other: &TokenUsage) -> TokenUsage {
         TokenUsage {
             input_tokens: self.input_tokens + other.input_tokens,
@@ -76,12 +49,6 @@ impl TokenUsage {
         }
     }
 
-    /// Folds an iterator of per-invocation usages into one running total, or
-    /// `None` if the iterator yielded nothing at all -- distinct from
-    /// `Some(TokenUsage::default())`, which would mean "we know the total,
-    /// and it is genuinely zero" rather than "nothing was ever reported"
-    /// (the same "n/a" vs. "zero" distinction this module's own docs open
-    /// with).
     pub fn sum<'a>(usages: impl IntoIterator<Item = &'a TokenUsage>) -> Option<TokenUsage> {
         usages.into_iter().fold(None, |acc, usage| match acc {
             None => Some(*usage),
@@ -131,8 +98,6 @@ mod tests {
         assert_eq!(merged.cache_creation_tokens, None);
     }
 
-    /// A single invocation's silence about caching must not erase a running
-    /// total a prior invocation already reported.
     #[test]
     fn merge_preserves_a_cache_total_even_when_the_other_side_never_reports_it() {
         let a = TokenUsage::new(100, 50, Some(30), None);
@@ -176,9 +141,6 @@ mod tests {
         assert_eq!(decoded, usage);
     }
 
-    /// A historical `AgentFinished` row persisted before issue #53 (or from
-    /// a tool adapter that never reported usage) must still decode -- the
-    /// missing cache fields default to `None`, not a deserialize error.
     #[test]
     fn token_usage_decodes_from_json_missing_the_optional_cache_fields() {
         let json = r#"{"input_tokens":100,"output_tokens":50}"#;

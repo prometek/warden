@@ -1,7 +1,3 @@
-//! Shared test-only fixtures used across `orchestrator`'s submodule test
-//! suites: a real throwaway git repo, deterministic coder/reviewer/tester
-//! fixtures, and fake `ToolAdapter`s standing in for a real agent CLI.
-
 #![cfg(test)]
 
 use super::*;
@@ -27,12 +23,6 @@ pub(crate) fn init_test_repo() -> TempDir {
     dir
 }
 
-/// A coder that flips `status.txt` between "broken" and "fixed" each
-/// time it runs, and a reviewer that raises a blocking finding only
-/// while it reads "broken" — this deterministically exercises exactly
-/// one reboucle before converging, without depending on a real AI
-/// agent (out of scope for Phase 1; see ADR-0005 for the general
-/// subprocess contract this stands in for).
 pub(crate) fn flip_status_coder() -> AgentCommand {
     AgentCommand::new(
         "sh",
@@ -51,9 +41,8 @@ pub(crate) fn flip_status_coder() -> AgentCommand {
     )
 }
 
-/// NDJSON wire format (code-standards.md "Agent Subprocess Protocol",
-/// M3): one finding object per line, no wrapping `{"findings": [...]}`.
-/// "No findings" is simply no stdout at all.
+/// NDJSON wire format (code-standards.md "Agent Subprocess Protocol", M3): one finding object per
+/// line, no wrapping `{"findings": [...]}`.
 pub(crate) fn status_gated_reviewer() -> AgentCommand {
     AgentCommand::new(
         "sh",
@@ -72,21 +61,16 @@ pub(crate) fn always_passing_tester() -> AgentCommand {
     AgentCommand::new("sh", ["-c", "true"])
 }
 
-/// A test-only wire shape smuggling an `AgentCommand` fixture through an
-/// `AgentDefinition`'s `name` field (issue #24: the real schema has no
-/// `program`/`args` at all -- those are entirely a `ToolAdapter`'s own
-/// business now). JSON round-trips losslessly, unlike a naive
-/// space-join/split, so a fixture with a whitespace-/newline-containing
-/// arg (every `sh -c "<script>"` fixture in this file) survives intact.
+/// A test-only wire shape smuggling an `AgentCommand` fixture through an `AgentDefinition`'s `name`
+/// field.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct SmuggledCommand {
     program: String,
     args: Vec<String>,
 }
 
-/// Wraps an `AgentCommand` fixture in the markdown definition
-/// `RunConfig` now takes (issue #24), with a fixed test system prompt.
-/// See [`definition_with_prompt`] for a caller that needs its own.
+/// Wraps an `AgentCommand` fixture in the markdown definition `RunConfig` now takes, with a fixed
+/// test system prompt.
 pub(crate) fn definition(command: AgentCommand) -> AgentDefinition {
     definition_with_prompt(command, "test agent system prompt")
 }
@@ -100,8 +84,7 @@ pub(crate) fn definition_with_prompt(command: AgentCommand, prompt: &str) -> Age
     AgentDefinition::new(Some(encoded), None, None, None, prompt).unwrap()
 }
 
-/// The other half of [`definition`]/[`definition_with_prompt`]'s
-/// smuggling.
+/// The other half of [`definition`]/[`definition_with_prompt`]'s smuggling.
 pub(crate) fn decode_smuggled_command(definition: &AgentDefinition) -> AgentCommand {
     let encoded = definition
         .name
@@ -111,13 +94,7 @@ pub(crate) fn decode_smuggled_command(definition: &AgentDefinition) -> AgentComm
     AgentCommand::new(smuggled.program, smuggled.args)
 }
 
-/// The identity-mapping fake: decodes exactly what [`definition`]
-/// encoded and runs it verbatim. Fills the role the removed, real,
-/// shipped-in-production `CommandRunner` (ADR-0013's generic
-/// any-program/args runner) used to fill in these tests -- issue #24
-/// replaces that generic runner with tool-specific adapters
-/// (`ClaudeAdapter` in production), so an identity mapping is now only
-/// ever a test double, never something Warden ships.
+/// The identity-mapping fake: decodes exactly what [`definition`] encoded and runs it verbatim.
 pub(crate) struct FakeCommandAdapter;
 
 impl ToolAdapter for FakeCommandAdapter {
@@ -142,17 +119,6 @@ impl ToolAdapter for FakeCommandAdapter {
     }
 }
 
-/// Issue #33: a `FakeCommandAdapter` that also translates stdout lines
-/// into progress, so a test can exercise the full
-/// `warden_sandbox::Sandbox::execute`'s `on_stdout_line` callback ->
-/// `ToolAdapter::parse_progress_line` -> `Orchestrator::publish_progress_event`
-/// -> `EventBus` pipeline (issue #50: the per-line drain this callback
-/// used to reach through `process::wait_with_progress` now lives in
-/// `warden_sandbox::LocalSandbox`) without needing a real `claude` CLI.
-/// Recognizes any line prefixed
-/// `PROGRESS: ` (a made-up convention for this fake only -- real
-/// progress recognition is `ClaudeAdapter`'s own `stream-json`-specific
-/// concern, unrelated to this marker).
 pub(crate) struct ProgressReportingAdapter;
 
 impl ToolAdapter for ProgressReportingAdapter {
@@ -181,11 +147,8 @@ impl ToolAdapter for ProgressReportingAdapter {
     }
 }
 
-/// The tool-adapter seam (issue #24): the orchestrator spawns what the
-/// *adapter* returns for a definition, not something read straight out
-/// of `RunConfig` -- so a fake adapter can serve every role from
-/// abstract definitions that name no real binary at all. Records what it
-/// was handed, to prove all three roles are resolved through it.
+/// The tool-adapter seam: the orchestrator spawns what the *adapter* returns for a definition, not
+/// something read straight out of `RunConfig`.
 pub(crate) struct FakeRunner {
     resolved_programs: std::sync::Mutex<Vec<String>>,
 }
@@ -202,8 +165,6 @@ impl ToolAdapter for FakeRunner {
     fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand> {
         let program = decode_smuggled_command(definition).program;
         self.resolved_programs.lock().unwrap().push(program.clone());
-        // The mapping a real adapter does: an abstract definition onto
-        // whatever CLI actually implements that role.
         Ok(match program.as_str() {
             "the-coder" => AgentCommand::new(
                 "sh",
@@ -237,9 +198,6 @@ impl ToolAdapter for FakeRunner {
     }
 }
 
-/// An adapter that refuses every definition -- models a definition this
-/// build cannot honour (e.g. one written for a tool this binary has no
-/// adapter for).
 pub(crate) struct FailingRunner;
 
 impl ToolAdapter for FailingRunner {
@@ -276,10 +234,7 @@ pub(crate) async fn count_runs(pool: &SqlitePool) -> i64 {
     count
 }
 
-/// Looks up a specific cycle's findings by its 1-based `cycle_number` --
-/// used where a test needs to compare more than one cycle's findings
-/// separately (unlike a single-cycle run, which can just list every
-/// finding for its one cycle).
+/// Looks up a specific cycle's findings by its 1-based `cycle_number`.
 pub(crate) async fn findings_for_cycle_number(
     pool: &SqlitePool,
     run_id: &str,
@@ -295,22 +250,8 @@ pub(crate) async fn findings_for_cycle_number(
     db::list_findings_for_cycle(pool, &cycle_id).await.unwrap()
 }
 
-/// Implements [`warden_sandbox::Sandbox`] from scratch -- own bookkeeping,
-/// own process spawn, own [`warden_sandbox::Execution`] -- using nothing but
-/// this crate's public API (`SandboxId::new`, `Execution::new`; issue #50
-/// review, MEDIUM A). Deliberately *not* a delegate to
-/// [`warden_sandbox::LocalSandbox`]: a delegate would only prove
-/// `with_sandbox` can carry a wrapper around the one implementation already
-/// in-crate, not that the trait itself is implementable by an out-of-crate
-/// backend, which is exactly what `DockerSandbox` (#49) needed to be.
-/// Records which of `create`/`execute`/`destroy` ran, in order, and can be
-/// told to fail `execute` outright, to exercise the early-return path
-/// `run_agent`'s own `?` takes right after `execute`.
-///
-/// Shared across `agent_run`'s and `agents`' own test suites (issue #79
-/// review, cycle 3): both need to observe the exact same `create`/`execute`/
-/// `destroy` ordering `SandboxGuard` guarantees, for an agent invocation and
-/// a `type: hook` workflow step's command respectively.
+/// Implements [`warden_sandbox::Sandbox`] from scratch -- own bookkeeping, own process spawn, own
+/// [`warden_sandbox::Execution`] -- using nothing but this crate's public API.
 pub(crate) struct RecordingSandbox {
     calls: std::sync::Mutex<Vec<&'static str>>,
     cwds: std::sync::Mutex<std::collections::HashMap<warden_sandbox::SandboxId, PathBuf>>,
@@ -401,19 +342,9 @@ impl warden_sandbox::Sandbox for RecordingSandbox {
                     let stdin_task = async {
                         if let Some(mut handle) = stdin_handle.take() {
                             if let Some(payload) = stdin_payload {
-                                // A broken pipe here is not a failure --
-                                // it means the child exited without
-                                // reading its payload, which the fake
-                                // `claude` scripts these tests use do
-                                // routinely. `LocalSandbox` classifies it
-                                // the same way (see
-                                // `warden_sandbox::local::classify_stdin_write_error`,
-                                // which logs and continues); propagating
-                                // it instead made this fake diverge from
-                                // the production backend it stands in for,
-                                // and the test fail intermittently with
-                                // `StdinWrite { .. BrokenPipe }` whenever
-                                // the child won the race to exit.
+                                // A broken pipe here is not a failure -- it means the child exited
+                                // without reading its payload, which the fake `claude` scripts
+                                // these tests use do routinely.
                                 if let Err(error) =
                                     handle.write_all(payload.as_bytes()).await
                                 {

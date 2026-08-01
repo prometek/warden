@@ -61,9 +61,6 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
         isolation,
         isolation_image,
     } = command;
-    // Resolved once here (not once per child), so every intent in this batch
-    // shares the exact same `--warden-home` regardless of which point in
-    // time `HOME` is read at -- same rationale as `run`'s own resolution.
     let warden_home = match warden_home {
         Some(warden_home) => warden_home,
         None => default_warden_home()?,
@@ -72,24 +69,10 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
         "failed to resolve the path to the running warden binary (needed to spawn batch children)",
     )?;
 
-    // Issue #72 review, MEDIUM 2: opened once here (not per intent) so the
-    // crash-recovery call after each intent below reuses the same pool --
-    // this is the exact same `<warden_home>/state.db` every batch child
-    // opens for itself, so this parent process reads/writes nothing a
-    // concurrently-running child wouldn't already expect another `warden`
-    // process to touch (ADR-0004's SQLite is already multi-writer-safe via
-    // WAL, and no child is alive when this call runs -- it only runs
-    // between children, once each has already exited).
     let pool = warden::db::connect(&warden_home.join("state.db"))
         .await
         .context("failed to open Warden's SQLite database for batch crash recovery")?;
 
-    // Issue #72 review, LOW 1: without this, an unhandled Ctrl-C would kill
-    // this process outright (default `SIGINT` disposition), abandoning the
-    // loop below without ever printing the batch summary -- even though the
-    // in-flight child (same foreground process group) already receives and
-    // handles that same signal itself, exactly like a plain `warden run`
-    // would. This only arms a flag; it never touches the in-flight child.
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancelled_setter = cancelled.clone();
     tokio::spawn(async move {
@@ -171,12 +154,6 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
         let child_args = warden::batch::build_single_intent_args(&single_intent_args, intent);
         let report = run_one_batch_intent(&current_exe, &child_args, intent).await?;
 
-        // Issue #72 review, MEDIUM 2: reclaims this intent's own orphaned
-        // agent process(es)/worktree if its child crashed uncleanly --
-        // best-effort, exactly like every `warden run` startup already does
-        // (see this fn's own docs above). Run unconditionally, whether the
-        // intent converged or not: a converging child already tore down
-        // after itself, so this is a cheap no-op for it.
         match orchestrator::recover_crashed_runs(&pool).await {
             Ok(recovered) => {
                 for recovered_run_id in &recovered {
@@ -220,12 +197,8 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Converts a `Path` into the `&str` a batch child's argv needs (issue #72),
-/// naming `flag_name` in the error so a non-UTF-8 `--repo`/`--warden-home`/...
-/// fails clearly rather than being silently mangled via `Path::display()`
-/// (code-standards.md: "no silent fallback") -- the same shape
-/// `attach_warden_home_quoted` above already uses for the analogous
-/// `--warden-home` case.
+/// Converts a `Path` into the `&str` a batch child's argv needs, naming `flag_name` in the error so
+/// a non-UTF-8 `--repo`/`--warden-home`/...
 fn path_arg<'a>(path: &'a Path, flag_name: &str) -> anyhow::Result<&'a str> {
     path.to_str().with_context(|| {
         format!(
@@ -235,29 +208,6 @@ fn path_arg<'a>(path: &'a Path, flag_name: &str) -> anyhow::Result<&'a str> {
     })
 }
 
-/// Runs one batch intent's child (issue #72): spawns `current_exe` with
-/// `child_args`, relays its stdout live (through the same
-/// [`print_stdout_line_or_log`] every other run output goes through) while
-/// parsing it for the `"run <id> started"`, `"run <id> finished: <Debug>"`,
-/// and `"run <id> outcome: <as_str()>"` lines [`run`] itself always prints,
-/// then classifies the outcome once the child exits.
-///
-/// Issue #72 review, MEDIUM 1: classification (converged or not) is decided
-/// **only** from the `"... outcome: ..."` line -- `RunState::as_str()`'s
-/// stable, migration-guarded string form -- never from the human-readable
-/// `"... finished: <Debug>"` line, which carries no such stability
-/// guarantee. The `Debug` text is still captured, purely to give
-/// [`warden::batch::summarize`] a nicer label than the `snake_case` stable
-/// form; a child that (for whatever reason) prints one line but not the
-/// other is treated as untrustworthy either way (see the final `match`
-/// below) -- this batch never classifies an intent from a partial read.
-///
-/// Returns `Err` only for an infrastructure failure this batch cannot
-/// meaningfully continue past (the child failed to even spawn, or waiting on
-/// it failed) -- a *child* that ran and reported a non-converged outcome, or
-/// exited non-zero, is instead reported as a normal (non-`Err`)
-/// [`warden::batch::IntentStatus::SubprocessError`]/`NotConverged`, so the
-/// batch's own continue-by-default policy can act on it.
 async fn run_one_batch_intent(
     current_exe: &Path,
     child_args: &[String],
@@ -283,10 +233,7 @@ async fn run_one_batch_intent(
     let mut lines = BufReader::new(stdout).lines();
 
     let mut run_id: Option<String> = None;
-    // Display-only (issue #72 review, MEDIUM 1): the human-readable
-    // `RunState` `Debug` text, used purely for `summarize`'s label.
     let mut finished_display: Option<(String, String)> = None;
-    // The classification source of truth: `RunState::as_str()`'s stable form.
     let mut outcome: Option<(String, String)> = None;
 
     while let Some(line) = lines
@@ -325,9 +272,9 @@ async fn run_one_batch_intent(
 
     match outcome {
         Some((outcome_run_id, stable_state)) => {
-            // Prefers the `Debug`-form label for the report's own text when
-            // available (nicer to read), falling back to the stable form
-            // itself -- purely cosmetic, never the classification.
+            // Prefers the `Debug`-form label for the report's own text when available (nicer to
+            // read), falling back to the stable form itself -- purely cosmetic, never the
+            // classification.
             let final_state = finished_display
                 .map(|(_, debug_state)| debug_state)
                 .unwrap_or_else(|| stable_state.clone());

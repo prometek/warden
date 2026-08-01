@@ -1,10 +1,4 @@
-//! The `post-receive` hook installed into the local bare gate repo
-//! (ADR-0002/ADR-0006, issue #3: "hook post-receive minimal (relais
-//! uniquement, aucune logique métier dans le hook)"). The script this
-//! module generates does exactly one thing: exec the already-installed
-//! `warden-gated notify` subcommand with stdin passed through untouched.
-//! No parsing, no decision -- both happen later, in Rust, inside the
-//! `serve` daemon (`notification.rs`, `gate.rs`), where they're testable.
+//! The `post-receive` hook installed into the local bare gate repo ").
 
 use std::path::Path;
 
@@ -15,12 +9,7 @@ use tokio::fs;
 
 use crate::error::Result;
 
-/// Builds the `post-receive` hook script content. `warden_gated_bin` is the
-/// absolute path to the installed `warden-gated` binary; `socket_path` is
-/// where the `serve` daemon listens. Both are baked into the script at
-/// install time so the hook itself needs no environment/config lookup of
-/// its own -- one less thing that could drift or be tampered with between
-/// install and invocation.
+/// Builds the `post-receive` hook script content.
 pub fn post_receive_script(warden_gated_bin: &Path, socket_path: &Path) -> String {
     format!(
         "#!/bin/sh\n\
@@ -36,16 +25,12 @@ pub fn post_receive_script(warden_gated_bin: &Path, socket_path: &Path) -> Strin
     )
 }
 
-/// Single-quotes `value` for embedding in the generated `/bin/sh` script,
-/// escaping any literal single quotes it contains -- paths are attacker-
-/// adjacent input here (an admin-controlled install path, not untrusted at
-/// runtime, but still worth not word-splitting/globbing by accident).
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Installs the hook into `bare_repo_path/hooks/post-receive`, executable
-/// (`0755` on Unix -- git refuses to run a non-executable hook).
+/// Installs the hook into `bare_repo_path/hooks/post-receive`, executable (`0755` on Unix -- git
+/// refuses to run a non-executable hook).
 pub async fn install(
     bare_repo_path: &Path,
     warden_gated_bin: &Path,

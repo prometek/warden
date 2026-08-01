@@ -1,7 +1,6 @@
 use super::*;
 
-/// Selects findings that triggered a cycle. CI findings take precedence;
-/// otherwise previous cycle findings are reused.
+/// Selects findings that triggered a cycle.
 pub(super) async fn select_prior_findings(
     pool: &SqlitePool,
     ci_seeded_findings: Vec<Finding>,

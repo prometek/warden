@@ -22,20 +22,14 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Run a full convergence loop against a repository: a producer step
-    /// (the coder, by default) followed by a sequence of gated steps
-    /// (reviewer/tester by default; customizable via `.warden/workflow.yaml`,
-    /// issue #73), reboucling to the producer on a blocking finding. Each
-    /// step runs sequentially, in its own worktree synced onto the
-    /// producer's commit (ADR-0003).
+    /// Run a full convergence loop against a repository: a producer step (the coder, by default)
+    /// followed by a sequence of gated steps, reboucling to the producer on a blocking finding.
     Run {
-        /// Path to the user's existing repository. Never written to
-        /// directly; only worktrees created under `--warden-home` are.
+        /// Path to the user's existing repository.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         repo: PathBuf,
 
-        /// Task description passed to producer agent. Repeatable; multiple
-        /// values switch to batch mode.
+        /// Task description passed to producer agent.
         #[arg(long = "intent", value_parser = parse_intent)]
         intent: Vec<String>,
 
@@ -51,7 +45,6 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "main")]
         branch: String,
 
-        /// Maximum coder/reviewer round trips.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_review_cycles: u32,
 
@@ -75,7 +68,6 @@ pub(crate) enum Commands {
         #[arg(long, value_parser = parse_tool)]
         tool: ToolName,
 
-        /// Allow repository-supplied reviewer/tester definitions.
         #[arg(long)]
         trust_repo_agents: bool,
 

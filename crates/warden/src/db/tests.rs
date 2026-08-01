@@ -110,8 +110,6 @@ async fn pr_number_is_none_until_set_then_round_trips() {
     assert_eq!(run.pr_number, Some(42));
 }
 
-/// Issue #15 review, L2: an overflowing pr_number must be reported with
-/// its own real value, not a misleading placeholder like `i64::MAX`.
 #[tokio::test]
 async fn set_run_pr_number_overflow_reports_the_real_value() {
     let (_dir, pool) = test_pool().await;
@@ -157,8 +155,6 @@ async fn update_run_state_persists_and_list_intermediate_finds_it() {
     assert_eq!(intermediate[0].id, "run-2");
 }
 
-/// Issue #85: quota suspension must durably retain its reset time, while
-/// later ordinary state changes clear that quota-specific column.
 #[tokio::test]
 async fn quota_suspension_persists_and_clears_its_queryable_reset_time() {
     let (_dir, pool) = test_pool().await;
@@ -351,9 +347,6 @@ async fn re_suspension_retains_the_new_checkpoint_and_rejects_the_stale_claim() 
     );
 }
 
-/// A database created before migration 0012 has no quota column and no
-/// quota-suspended state. Applying the migration must preserve that
-/// legacy run and represent its absent reset time as NULL.
 #[tokio::test]
 async fn awaiting_quota_reset_migration_keeps_legacy_runs_coherent() {
     let dir = TempDir::new().unwrap();
@@ -457,10 +450,6 @@ async fn cycle_and_finding_round_trip() {
     close_cycle(&pool, "cycle-1").await.unwrap();
 }
 
-// -----------------------------------------------------------------
-// Token usage (issue #53)
-// -----------------------------------------------------------------
-
 #[tokio::test]
 async fn cycle_role_token_usage_is_none_until_something_is_recorded() {
     let (_dir, pool) = test_pool().await;
@@ -533,15 +522,10 @@ async fn add_cycle_role_token_usage_accumulates_across_multiple_invocations() {
         .unwrap();
     assert_eq!(usage.input_tokens, 120);
     assert_eq!(usage.output_tokens, 60);
-    // The second invocation didn't report `cache_read_tokens` -- must not
-    // reset the first invocation's own reported total.
     assert_eq!(usage.cache_read_tokens, Some(10));
     assert_eq!(usage.cache_creation_tokens, Some(3));
 }
 
-/// Each role's own running total on the same cycle must be tracked
-/// independently -- recording the coder's usage must never leak into the
-/// reviewer's columns on that same row.
 #[tokio::test]
 async fn add_cycle_role_token_usage_keeps_each_role_independent() {
     let (_dir, pool) = test_pool().await;
@@ -640,12 +624,6 @@ async fn run_token_usage_is_none_until_something_is_recorded_then_accumulates() 
     assert_eq!(usage.cache_read_tokens, Some(15));
 }
 
-/// Issue #53: a `u64` token count too large for SQLite's native `i64`
-/// column must surface as a typed `WardenError::TokenCountOverflow`
-/// naming the real value that failed to convert -- never silently
-/// truncated/clamped (same "no silent fallback" contract
-/// `set_run_pr_number_overflow_reports_the_real_value` already pins for
-/// `runs.pr_number`).
 #[tokio::test]
 async fn add_run_token_usage_overflow_reports_the_real_value() {
     let (_dir, pool) = test_pool().await;
@@ -677,9 +655,6 @@ async fn add_run_token_usage_overflow_reports_the_real_value() {
     ));
 }
 
-/// Same contract as
-/// [`add_run_token_usage_overflow_reports_the_real_value`], for the
-/// per-cycle-role columns [`add_cycle_role_token_usage`] writes.
 #[tokio::test]
 async fn add_cycle_role_token_usage_overflow_reports_the_real_value() {
     let (_dir, pool) = test_pool().await;
@@ -714,10 +689,6 @@ async fn add_cycle_role_token_usage_overflow_reports_the_real_value() {
         Err(WardenError::TokenCountOverflow { value, .. }) if value == overflowing
     ));
 }
-
-// -----------------------------------------------------------------
-// `set_run_rate_limit_status` / `get_run_rate_limit_status` (issue #84)
-// -----------------------------------------------------------------
 
 #[tokio::test]
 async fn run_rate_limit_status_is_none_until_something_is_recorded_then_overwritten() {
@@ -769,9 +740,6 @@ async fn run_rate_limit_status_is_none_until_something_is_recorded_then_overwrit
     assert_eq!(status.surpassed_threshold, 0.75);
     assert_eq!(status.resets_at, 1785686400);
 
-    // Issue #84: this is a snapshot, not a running total (unlike token
-    // usage) -- a second report must overwrite the first, not merge with
-    // it.
     set_run_rate_limit_status(
         &pool,
         "run-rate-limit",
@@ -794,10 +762,6 @@ async fn run_rate_limit_status_is_none_until_something_is_recorded_then_overwrit
     assert_eq!(status.utilization, 0.94);
 }
 
-/// An unrecognized `status`/`rate_limit_type` value must round-trip
-/// through the database unharmed -- both columns are plain `TEXT`, and
-/// `RateLimitState`/`RateLimitWindow`'s own tolerance for unknown values
-/// applies just as much on the read-back side as on the wire.
 #[tokio::test]
 async fn run_rate_limit_status_round_trips_an_unrecognized_status_and_type() {
     let (_dir, pool) = test_pool().await;
@@ -842,12 +806,6 @@ async fn run_rate_limit_status_round_trips_an_unrecognized_status_and_type() {
     assert!(status.is_using_overage);
 }
 
-/// A row with some, but not all, of the six `rate_limit_*` columns set
-/// is corrupted -- `set_run_rate_limit_status` never writes a partial
-/// row, so this can only happen from something other than this code
-/// (code-standards.md: "no silent fallback"). Must surface as a typed
-/// error, never silently reconstructed from whichever columns happen to
-/// be present.
 #[tokio::test]
 async fn a_partially_populated_rate_limit_row_is_a_typed_error_not_a_silent_guess() {
     let (_dir, pool) = test_pool().await;
@@ -909,7 +867,6 @@ async fn inserting_a_run_with_a_duplicate_id_is_a_typed_error_not_a_panic() {
     .await;
     assert!(matches!(result, Err(WardenError::Database(_))));
 
-    // The original row must be untouched by the failed duplicate insert.
     let run = get_run(&pool, "dup-run").await.unwrap().unwrap();
     assert_eq!(run.intent, "intent");
 }
@@ -938,14 +895,6 @@ async fn list_findings_for_cycle_with_no_findings_is_empty_not_an_error() {
     assert!(findings.is_empty());
 }
 
-/// Re-test cycle (issue #20 review fix, fdcaa4e): `ORDER BY id ASC`
-/// must actually determine the returned order, not merely happen to
-/// agree with insertion order. Deliberately inserts the
-/// lexicographically-later id first, so a query without the `ORDER BY`
-/// clause (which SQLite would otherwise satisfy via a plain rowid/
-/// insertion-order table scan here, since neither `cycle_id` nor `id`
-/// has a covering index driving this query) would return the rows in
-/// the opposite order from what's asserted here.
 #[tokio::test]
 async fn list_findings_for_cycle_orders_findings_by_id_ascending_not_insertion_order() {
     let (_dir, pool) = test_pool().await;
@@ -1053,8 +1002,6 @@ async fn list_open_agent_processes_returns_every_open_row_not_just_the_latest() 
         .unwrap();
     insert_cycle(&pool, "cycle-6", "run-6", 1).await.unwrap();
 
-    // Reviewer and tester open concurrently (ADR-0003): both rows must
-    // come back, not just whichever sorts last.
     insert_agent_process(
         &pool,
         "proc-reviewer",
@@ -1075,7 +1022,6 @@ async fn list_open_agent_processes_returns_every_open_row_not_just_the_latest() 
     )
     .await
     .unwrap();
-    // Already closed: must not be returned.
     insert_agent_process(
         &pool,
         "proc-coder",
@@ -1129,8 +1075,6 @@ async fn list_worktree_paths_collects_distinct_non_null_paths_across_cycles() {
     set_cycle_worktree_path(&pool, "cycle-8b", "coder", "/tmp/wt/coder-2")
         .await
         .unwrap();
-    // Tester path left unset for both cycles — must not appear as a
-    // spurious empty/None entry.
 
     let mut paths = list_worktree_paths_for_run(&pool, "run-8").await.unwrap();
     paths.sort();
@@ -1178,10 +1122,7 @@ async fn connect_does_not_back_up_when_the_schema_is_already_current() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");
 
-    // First connect creates the file and applies every migration.
     connect(&db_path).await.unwrap();
-    // Second connect against the same file: schema is already current,
-    // so no migration is about to run — nothing worth backing up.
     connect(&db_path).await.unwrap();
 
     let backups: Vec<_> = std::fs::read_dir(dir.path())
@@ -1200,10 +1141,6 @@ async fn connect_backs_up_a_pre_existing_database_before_applying_pending_migrat
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");
 
-    // Simulate an older Warden installation: only the first migration
-    // has ever been applied (`Migrator::run_to`, sqlx's own supported
-    // way to stop partway through), so the rest are still pending on
-    // the next `connect`.
     {
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
@@ -1236,33 +1173,11 @@ async fn connect_backs_up_a_pre_existing_database_before_applying_pending_migrat
     );
 }
 
-/// Issue #43 (#37.4): `0007_phase_budgets.sql` must not just add the new
-/// per-phase columns -- it also has to carry forward rows already
-/// sitting on the pre-#43 schema (single `max_cycles`/`current_cycle`,
-/// and `RunState` string values only the removed
-/// `AwaitingReviewTest`/`MaxCyclesExceeded` variants ever wrote:
-/// `awaiting_review_test`/`max_cycles_exceeded`). Every other test in
-/// this module goes through `connect`/`test_pool`, which always starts
-/// from an empty file and so applies migration 0007 against zero rows --
-/// it would pass even if the `UPDATE runs SET state = ...` remap
-/// statements were deleted entirely. This test instead seeds a row on
-/// the *pre-0007* schema (mirroring
-/// `connect_backs_up_a_pre_existing_database_before_applying_pending_migrations`'s
-/// `Migrator::run_to` technique to stop short of 0007), then lets
-/// `MIGRATOR.run` apply 0007 for real and checks the row lands exactly
-/// where the migration's own comments say it should.
 #[tokio::test]
 async fn phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strings() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");
 
-    // Issue #53 review: found by description, not by position relative
-    // to the end of the migration list -- `migrations.len() - 2` (this
-    // test's original technique) silently pointed at the wrong migration
-    // the moment 0008 was appended after 0007, since "second-to-last"
-    // stopped meaning "the one right before phase_budgets". Robust to any
-    // number of migrations appended after 0007, as long as it keeps this
-    // description.
     let migrations: Vec<_> = MIGRATOR.iter().collect();
     let phase_budgets_index = migrations
         .iter()
@@ -1285,9 +1200,6 @@ async fn phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strin
             .await
             .unwrap();
 
-        // Two rows, each pinned on a distinct legacy `state` string the
-        // migration must remap, both still on the single `max_cycles`/
-        // `current_cycle` pair 0007 replaces.
         sqlx::query(
                 "INSERT INTO runs (id, repo_path, branch, intent, state, max_cycles, current_cycle, created_at, updated_at) \
                  VALUES ('run-mid-cycle', '/tmp/repo', 'main', 'legacy mid-cycle run', 'awaiting_review_test', 5, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -1306,8 +1218,6 @@ async fn phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strin
         pool.close().await;
     }
 
-    // Re-`connect` applies every remaining pending migration, including
-    // 0007, against the seeded rows above.
     let pool = connect(&db_path).await.unwrap();
 
     let mid_cycle = get_run(&pool, "run-mid-cycle").await.unwrap().unwrap();
@@ -1346,24 +1256,6 @@ async fn phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strin
     assert_eq!(exhausted.current_test_cycle, 0);
 }
 
-/// Issue #73: `0009_generic_workflow_state.sql`'s own remap of the four
-/// legacy `state` strings the closed `Reviewing`/`Testing`/
-/// `MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded` variants used to
-/// write (`crates/warden/migrations/0009_generic_workflow_state.sql`'s
-/// own comment: "a lossless, exact remap, not an approximation") --
-/// `reviewing` -> `running_step:1`, `testing` -> `running_step:2`,
-/// `max_review_cycles_exceeded` -> `step_cycles_exceeded:1`,
-/// `max_test_cycles_exceeded` -> `step_cycles_exceeded:2`.
-///
-/// [`phase_budgets_migration_remaps_pre_existing_rows_and_legacy_state_strings`]
-/// above already drives rows through 0007's own remap and on into 0009,
-/// but every row it seeds starts from the *pre-0007* schema, so it only
-/// ever lands on `reviewing`/`max_review_cycles_exceeded` (index 1) by
-/// the time 0009 sees them -- `testing`/`max_test_cycles_exceeded`
-/// (index 2) is never exercised there at all. This test seeds all four
-/// legacy strings directly, on the schema exactly as 0007/0008 leave it
-/// (`run_to` the migration immediately before 0009), so every one of
-/// 0009's four `UPDATE` statements is independently exercised.
 #[tokio::test]
 async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
     let dir = TempDir::new().unwrap();
@@ -1391,10 +1283,6 @@ async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
             .await
             .unwrap();
 
-        // Four rows, one per legacy state string 0009 must remap, seeded
-        // directly on the post-0007/0008 schema (`max_review_cycles`/
-        // `max_test_cycles`/`current_review_cycle`/`current_test_cycle`,
-        // no more single `max_cycles`/`current_cycle` pair).
         for (id, legacy_state) in [
             ("run-reviewing", "reviewing"),
             ("run-testing", "testing"),
@@ -1415,8 +1303,6 @@ async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
         pool.close().await;
     }
 
-    // Re-`connect` applies every remaining pending migration, including
-    // 0009, against the seeded rows above.
     let pool = connect(&db_path).await.unwrap();
 
     let reviewing = get_run(&pool, "run-reviewing").await.unwrap().unwrap();
@@ -1454,16 +1340,6 @@ async fn generic_workflow_state_migration_remaps_every_legacy_state_string() {
     );
 }
 
-/// Issue #6: "a failed backup aborts migration (fails loud) rather than
-/// proceeding". Forces `VACUUM INTO` to fail by revoking write
-/// permission on the directory the backup file would be created in
-/// *after* the pool (and its `-wal`/`-shm` sidecars) already exist —
-/// so the failure genuinely comes from the backup step itself, not from
-/// merely opening the database. `backup_before_migration` is private but
-/// reachable here via `super::*`, letting this test target the exact
-/// failure point without needing a full second `connect` (which would
-/// hit the same permission error earlier, at WAL setup, and not prove
-/// anything about the backup step specifically).
 #[cfg(unix)]
 #[tokio::test]
 async fn backup_failure_is_a_typed_error_not_a_silent_fallback() {
@@ -1472,9 +1348,6 @@ async fn backup_failure_is_a_typed_error_not_a_silent_fallback() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("state.db");
 
-    // Simulate an older Warden installation with only the first
-    // migration applied, so a migration is genuinely pending and a
-    // backup is attempted (mirrors the "pending migrations" test above).
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
         .create_if_missing(true)
@@ -1489,10 +1362,6 @@ async fn backup_failure_is_a_typed_error_not_a_silent_fallback() {
         .await
         .unwrap();
 
-    // Revoke write permission on the directory only now, after the pool
-    // and its WAL sidecars already exist -- `VACUUM INTO` must fail
-    // trying to create the *new* backup file in a directory it can no
-    // longer write to.
     let original_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
     let mut readonly = original_permissions.clone();
     readonly.set_mode(0o555);
@@ -1500,8 +1369,6 @@ async fn backup_failure_is_a_typed_error_not_a_silent_fallback() {
 
     let result = backup_before_migration(&db_path, &pool).await;
 
-    // Restore permissions before the TempDir is dropped, regardless of
-    // the assertion outcome, so cleanup doesn't itself fail.
     std::fs::set_permissions(dir.path(), original_permissions).unwrap();
 
     assert!(
@@ -1518,14 +1385,9 @@ async fn unique_backup_path_appends_a_suffix_on_a_same_timestamp_collision() {
     let db_path = dir.path().join("state.db");
     let timestamp = "2026-07-11T00-00-00+00-00";
 
-    // Nothing on disk yet: the plain, unsuffixed name is used.
     let first = unique_backup_path(&db_path, timestamp).await.unwrap();
     assert_eq!(first, dir.path().join(format!("state.db.bak-{timestamp}")));
 
-    // Simulates a leftover/duplicate backup sharing the same timestamp
-    // (e.g. two restarts within the same second) -- `VACUUM INTO` would
-    // otherwise abort on a spurious naming collision rather than a real
-    // backup failure.
     std::fs::write(&first, b"pre-existing backup").unwrap();
     let second = unique_backup_path(&db_path, timestamp).await.unwrap();
     assert_eq!(
@@ -1677,20 +1539,12 @@ async fn failed_run_with_a_recorded_worktree_path_needs_cleanup() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, "run-recorded-wt");
 
-    // Once the path is cleared (simulating a successful removal), the
-    // run must stop being returned -- no separate "cleanup done" flag,
-    // the recorded path itself is the signal.
     clear_cycle_worktree_path(&pool, "cycle-recorded-wt", "coder")
         .await
         .unwrap();
     let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
     assert!(pending.is_empty());
 }
-
-// -----------------------------------------------------------------
-// EVIDENCE entity (ADR-0009, issue #7): insert + query back
-// (migration 0004_evidence).
-// -----------------------------------------------------------------
 
 #[tokio::test]
 async fn evidence_round_trips_through_insert_and_list_evidence_for_run() {
@@ -1847,9 +1701,6 @@ async fn list_evidence_for_run_orders_by_cycle_number_then_capture_time() {
         .await
         .unwrap();
 
-    // Deliberately inserted out of cycle order: cycle 2's evidence
-    // lands in the table first, but must still be listed *after*
-    // cycle 1's when read back.
     insert_evidence(
         &pool,
         "evidence-cycle-2",
@@ -1907,8 +1758,6 @@ async fn intermediate_runs_are_not_returned_by_the_failed_cleanup_query() {
         "a run that isn't Failed yet belongs to list_intermediate_runs, not this query"
     );
 }
-
-// ---- events (Phase 8, issue #8) ----------------------------------------
 
 #[tokio::test]
 async fn event_round_trips_through_insert_and_list() {
@@ -2009,13 +1858,6 @@ async fn list_events_for_run_is_empty_for_a_run_with_no_events() {
     assert!(events.is_empty());
 }
 
-/// code-standards.md: "toute ligne relue est reparsée en type Rust
-/// fort" -- a row whose `event_type` column disagrees with what its own
-/// `payload_json` decodes to (corruption, or a write from something
-/// other than `insert_event`) must never be silently trusted as
-/// whichever of the two the reader happens to pick. Issue #58: this must
-/// no longer fail the whole query -- it's surfaced as a typed
-/// `Undecodable` entry instead.
 #[tokio::test]
 async fn mismatched_event_type_and_payload_kind_is_an_undecodable_entry_not_a_failed_query() {
     let (_dir, pool) = test_pool().await;
@@ -2067,11 +1909,6 @@ async fn mismatched_event_type_and_payload_kind_is_an_undecodable_entry_not_a_fa
     }
 }
 
-/// Issue #58 acceptance: a run whose history includes one row with
-/// malformed `payload_json` *and* one row with a kind-mismatched
-/// `event_type` must still return the full history -- the good events
-/// intact, both bad rows surfaced as typed `Undecodable` markers, never
-/// dropped and never a reason for the whole query to fail.
 #[tokio::test]
 async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_every_good_event() {
     let (_dir, pool) = test_pool().await;
@@ -2104,9 +1941,6 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
     .await
     .unwrap();
 
-    // Malformed `payload_json` -- not even valid JSON for any `RunEvent`
-    // variant (simulates a reshape that changed the payload shape
-    // without a rewrite migration, issue #58's own motivating scenario).
     sqlx::query!(
             "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
             "event-malformed",
@@ -2119,7 +1953,6 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
         .await
         .unwrap();
 
-    // Kind-mismatched row: valid JSON, but for the wrong `event_type`.
     let mismatched_payload =
         serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
     sqlx::query!(
@@ -2185,14 +2018,6 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
     ));
 }
 
-/// Issue #58 test gap: an `event_type` column this binary's own
-/// [`EventKind::parse`] doesn't recognize at all (e.g. an older
-/// `warden-tui`/`warden` reading a database a newer writer already
-/// advanced with an event kind this binary predates) must decode as
-/// [`UndecodableReason::UnknownEventType`] specifically -- distinct from
-/// [`UndecodableReason::PayloadDeserialize`]/`KindMismatch`, which both
-/// require `event_type` to parse successfully first. This branch of
-/// `row_to_history_entry` had no covering test before this change.
 #[tokio::test]
 async fn unrecognized_event_type_column_is_an_unknown_event_type_undecodable_entry() {
     let (_dir, pool) = test_pool().await;
@@ -2239,12 +2064,6 @@ async fn unrecognized_event_type_column_is_an_unknown_event_type_undecodable_ent
     }
 }
 
-/// Issue #58's own motivating real-world scenario, issue #26's reshape:
-/// a `UntrustedAgentDefinitionUsed` row persisted *before* that issue
-/// added `canonical_path` has no such key in its `payload_json` at all
-/// (unlike issue #53's `AgentFinished.usage`, `canonical_path` carries
-/// no `#[serde(default)]` -- see `warden_core::event`'s own docs) -- this
-/// must decode as `Undecodable`, not panic or silently invent a value.
 #[tokio::test]
 async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_path_is_undecodable(
 ) {
@@ -2293,11 +2112,6 @@ async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_
     }
 }
 
-/// Issue #58's own motivating real-world scenario, issue #43's reshape:
-/// a `RunStarted` row persisted before that issue split the single
-/// `max_cycles` field into `max_review_cycles`/`max_test_cycles` has
-/// neither of the two new keys -- this must decode as `Undecodable`, not
-/// be coerced into a fabricated budget.
 #[tokio::test]
 async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_undecodable() {
     let (_dir, pool) = test_pool().await;
@@ -2346,10 +2160,6 @@ async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_unde
     }
 }
 
-/// Issue #58 test gap: a run whose *every* row is undecodable must still
-/// return the full set (none dropped) rather than failing or returning
-/// an empty history that looks indistinguishable from "no events at
-/// all" (`list_events_for_run_is_empty_for_a_run_with_no_events`).
 #[tokio::test]
 async fn history_where_every_row_is_undecodable_returns_all_of_them() {
     let (_dir, pool) = test_pool().await;
@@ -2426,11 +2236,6 @@ async fn history_where_every_row_is_undecodable_returns_all_of_them() {
     );
 }
 
-/// Issue #58 test gap: two rows sharing the exact same `created_at`
-/// (second-resolution timestamps collide easily) -- one decodable, one
-/// not -- must still come back in a stable, deterministic order (`id`
-/// ASC as the tiebreaker, per `list_events_for_run`'s own `ORDER BY`),
-/// regardless of which of the two is undecodable.
 #[tokio::test]
 async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by_id() {
     let (_dir, pool) = test_pool().await;
@@ -2439,9 +2244,6 @@ async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by
         .unwrap();
 
     let same_timestamp = "2026-07-12T00:00:00+00:00";
-    // "event-a" (undecodable) sorts before "event-b" (decoded) by id --
-    // inserted in the opposite order here to prove the ordering comes
-    // from the SQL `ORDER BY`, not insertion order.
     insert_event(
         &pool,
         "event-b",

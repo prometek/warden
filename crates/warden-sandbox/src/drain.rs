@@ -1,15 +1,3 @@
-//! The spawn-to-completion drain shared by every [`crate::Sandbox`] backend
-//! that spawns a real child process directly (today: [`crate::LocalSandbox`]
-//! and [`crate::DockerSandbox`] -- the latter spawns `docker run` itself as
-//! its own direct child, so it needs the exact same stdin/stdout/stderr/wait
-//! concurrency, not a second copy of it).
-//!
-//! Factored out of `LocalSandbox::execute` during #49 review (ADR-0015
-//! explicitly flags a second copy of this logic as the mistake to avoid --
-//! `warden::process::wait_with_progress`/`spawn_with_extra_env` were deleted
-//! for exactly that reason when #50 landed): this is now the *only* place
-//! the deadlock-avoidance property below is implemented, for either backend.
-
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
@@ -17,21 +5,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Result, SandboxError};
 use crate::ExecutionResult;
 
-/// The actual spawn-to-completion drain: stdin write, stdout drain, stderr
-/// drain, and the wait for exit all run *concurrently* via `tokio::join!`,
-/// never sequentially -- a naive sequential implementation deadlocks the
-/// moment both a stdin payload and the child's own stdout exceed the OS pipe
-/// buffer (the child blocks writing stdout while this side is still blocked
-/// writing stdin). Cancellation is a biased `tokio::select!` arm that kills
-/// the child and returns a typed error the moment the token fires, in
-/// preference to ever polling the join future.
-///
-/// `program` is a caller-chosen label for the process actually spawned --
-/// [`crate::LocalSandbox`] passes the agent's own `command.program`;
-/// [`crate::DockerSandbox`] passes a label naming the `docker` client itself
-/// (it is what was actually spawned; see that module's own docs for why a
-/// `Wait`/`StdinWrite`/`Cancelled` error surfacing here describes a
-/// docker-level failure, not an agent-level one).
 pub(crate) async fn drain_and_wait(
     mut child: Child,
     program: String,
@@ -51,8 +24,6 @@ pub(crate) async fn drain_and_wait(
                     classify_stdin_write_error(error, &stdin_program)?;
                 }
             }
-            // Dropping `stdin_handle` here closes the write half, signalling
-            // EOF -- required even with no payload to write.
         }
         Ok::<(), std::io::Error>(())
     };
@@ -122,14 +93,6 @@ pub(crate) async fn drain_and_wait(
     }
 }
 
-/// A broken pipe (the agent closed or never opened its read side of stdin)
-/// is a legitimate outcome, logged but not fatal; anything else fails the
-/// execution outright, since the payload is a single JSON object and a
-/// partial write is unparsable by construction. `program` is logged under
-/// the `command` field name -- unchanged from `warden::process`'s own log
-/// shape (issue #50 review, LOW 5) so existing log queries built against it
-/// still match, and so the warning says *which* process closed stdin early
-/// rather than which of several concurrently-running ones.
 fn classify_stdin_write_error(
     error: std::io::Error,
     program: &str,

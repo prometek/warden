@@ -1,44 +1,4 @@
 //! Declarative hook configuration: `<repo>/.warden/hooks.toml`.
-//!
-//! Compiles a repo's hook file into a [`HookRegistry`] of [`CommandHook`]s --
-//! the concrete half of the lifecycle-hook feature (the foundation is
-//! `warden_core::hook` / `crate::hook`). Each `[[hooks]]` entry names a
-//! [`HookPoint`] and a shell `run` line; the loader turns it into a
-//! [`CommandHook`] that runs through the [`Sandbox`], in **file order**
-//! (registration order = execution order, `HookRegistry`'s own contract).
-//!
-//! ```toml
-//! [[hooks]]
-//! point = "on_run_start"
-//! run = "docker compose up -d"
-//! block_on_failure = true      # default; a failed setup step blocks the run
-//!
-//! [[hooks]]
-//! point = "on_run_end"
-//! run = "docker compose down"
-//! ```
-//!
-//! # Trust model
-//!
-//! `.warden/hooks.toml` lives **in the target repo**, and a `run` line is an
-//! arbitrary shell command executed on this host (the same OS user Warden
-//! runs as -- `LocalSandbox` is not isolation). It is honoured **by default**,
-//! with no opt-in flag. This is a deliberate, operator-owned choice and is
-//! consistent with how the repo's own `.warden/agents/coder.md` is already
-//! trusted by default (only the reviewer/tester definitions require
-//! `--trust-repo-agents`, issue #26): a developer running Warden on a repo is
-//! already running that repo's coder agent. Running a repo whose
-//! `.warden/hooks.toml` you have not read will run its commands -- the same
-//! footgun a `Makefile` or an npm `postinstall` already is.
-//!
-//! # Failure handling
-//!
-//! A present-but-broken config (malformed TOML, or an entry naming an unknown
-//! `point`) is a hard [`WardenError::HookConfig`], never silently ignored --
-//! code-standards.md's "no silent fallback", so a typo does not leave a setup
-//! hook quietly not running. An **absent** file is not an error: it yields an
-//! empty registry (no hooks; dispatch is the same strict no-op the default
-//! empty registry already is).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -58,17 +18,14 @@ struct HooksFile {
     hooks: Vec<RawHook>,
 }
 
-/// One `[[hooks]]` entry, before its `point` string is resolved to a
-/// [`HookPoint`].
+/// One `[[hooks]]` entry, before its `point` string is resolved to a [`HookPoint`].
 #[derive(Debug, Deserialize)]
 struct RawHook {
     /// The lifecycle point, as its stable string form (`HookPoint::as_str`).
     point: String,
     /// The shell line to run (executed via `sh -c`).
     run: String,
-    /// Whether a non-zero exit blocks the run. Defaults to `true`: a hook is
-    /// most often a setup/gate step whose failure means the run should not
-    /// proceed; opting out is the deliberate `false`.
+    /// Whether a non-zero exit blocks the run.
     #[serde(default = "default_block_on_failure")]
     block_on_failure: bool,
 }
@@ -82,9 +39,8 @@ fn hooks_file_path(repo_path: &Path) -> std::path::PathBuf {
     repo_path.join(".warden").join("hooks.toml")
 }
 
-/// Reads the exact hook document selected for a run so quota recovery can
-/// persist it instead of re-reading a repository that agents may have
-/// changed since the run started.
+/// Reads the exact hook document selected for a run so quota recovery can persist it instead of re-
+/// reading a repository that agents may have changed since the run started.
 pub fn read_repo_hooks(repo_path: &Path) -> Result<Option<String>> {
     let path = hooks_file_path(repo_path);
     match std::fs::read_to_string(&path) {
@@ -97,8 +53,7 @@ pub fn read_repo_hooks(repo_path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Builds a hook registry from an already-resolved document. `None` is the
-/// durable representation of an absent file.
+/// Builds a hook registry from an already-resolved document.
 pub fn parse_repo_hooks(
     repo_path: &Path,
     contents: Option<&str>,
@@ -141,10 +96,8 @@ pub fn parse_repo_hooks(
     Ok(registry)
 }
 
-/// Loads `<repo_path>/.warden/hooks.toml` into a [`HookRegistry`], one
-/// [`CommandHook`] per entry (file order preserved). An absent file yields an
-/// empty registry; a malformed one is a [`WardenError::HookConfig`]. Every
-/// hook runs through `sandbox` and is gated by `policy_gate`.
+/// Loads `<repo_path>/.warden/hooks.toml` into a [`HookRegistry`], one [`CommandHook`] per entry
+/// (file order preserved).
 pub fn load_repo_hooks(
     repo_path: &Path,
     sandbox: Arc<dyn Sandbox>,
@@ -199,10 +152,6 @@ mod tests {
         );
         let registry = load_repo_hooks(dir.path(), sandbox(), policy_gate()).unwrap();
         assert!(!registry.is_empty());
-        // Registration order is the observable contract; the count and the
-        // points are asserted through the registry's public dispatch behaviour
-        // in `crate::hook`'s own tests, so here we prove the file was accepted
-        // and produced a non-empty registry.
     }
 
     #[test]
@@ -232,8 +181,6 @@ mod tests {
 
     #[test]
     fn block_on_failure_defaults_to_true_when_omitted() {
-        // The default is asserted at the deserialization boundary: an entry
-        // that omits `block_on_failure` parses, and the loader accepts it.
         let dir = TempDir::new().unwrap();
         write_hooks(
             dir.path(),

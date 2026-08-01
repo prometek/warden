@@ -1,69 +1,9 @@
-//! The **tool adapter seam** (issue #24): maps a parsed markdown agent
-//! definition (`warden_core::AgentDefinition`) onto the concrete subprocess
-//! invocation `warden_sandbox::Sandbox::execute` runs (issue #50; strict
-//! parity with what used to be `crate::process::spawn` for this path), one
-//! built-in CLI at a time, selected once per run by `--tool <name>`.
-//!
-//! Shaped exactly like the trait it replaces, ADR-0013's
-//! `warden::agent_runner::AgentRunner` -- itself modelled on
-//! [`crate::gate_trigger::GateTrigger`] -- a trait resolved at **compile
-//! time**, a generic call site, one concrete implementation per tool used in
-//! production, a fake substitutable in tests.
-//!
-//! # Why this replaces the warden-native runner (issue #24, reversing
-//! ADR-0013 / Q1)
-//!
-//! ADR-0013 kept Warden agent-agnostic by making the *definition* schema
-//! warden-native (`runner = "command"` + raw `program`/`args`) and pushing
-//! all CLI-specific knowledge into a user-authored file. In practice that
-//! made a real run too expensive to set up: three markdown files, plus a
-//! wrapper script the user had to write by hand to (a) restore `HOME` so an
-//! agent CLI could find its own auth (`env_clear()` only ever forwards
-//! `PATH`, Architecture.md §10) and (b) translate that CLI's own output
-//! format into the findings NDJSON `warden_core::parse_findings` expects.
-//! The warden-native frontmatter added essentially nothing over the prompt
-//! itself once that wrapper existed.
-//!
-//! Issue #24's decision: **Warden ships opinionated, built-in adapters** for
-//! specific CLIs (`claude` first; `codex` and `mistral` followed in issue
-//! #71; other CLIs are meant to gain their own [`ToolAdapter`] impl later,
-//! never a config-declared registry --
-//! `--tool <name>` selects one of a closed, compiled-in set, exactly like
-//! [`warden_core::RunState`]/`AgentRole` string parsing). Warden is no
-//! longer agent-agnostic at the *schema* level (a definition is Claude
-//! Code's own `.claude/agents/*.md` shape, `warden_core::agent_def`) --
-//! agent-agnosticism now lives here instead: at the trait boundary, a new
-//! CLI is a new [`ToolAdapter`] impl, and Warden ships no LLM implementation
-//! of its own (ADR-0005 still holds at that level).
-//!
-//! Each adapter owns everything that used to be the user's problem:
-//! - [`ToolAdapter::build_command`] builds the real invocation (program,
-//!   args, this tool's own system-prompt flag, its own model flag) from a
-//!   definition's `tools`/`model`.
-//! - [`ToolAdapter::env_allowlist`] declares the env vars (beyond `PATH`)
-//!   this tool needs to run at all -- see `warden_sandbox::LocalSandbox`'s
-//!   own docs for the Architecture.md §10 relaxation this requires (issue
-//!   #50: that forwarding now happens in `warden_sandbox`, not here).
-//! - [`ToolAdapter::extract_findings`] turns a reviewer/tester invocation's
-//!   raw captured stdout into the findings it reported, so a user never
-//!   writes an output-translation wrapper again.
-//! - [`ToolAdapter::default_prompt`] gives every role something to run even
-//!   when the run's base repo has no `.warden/agents/<role>.md` at all
-//!   (`warden::agent_def::resolve_agent_definition`) -- the
-//!   `warden run --repo ... --intent ... --tool claude` zero-`.md` UX issue
-//!   #24 exists to enable.
-
 use warden_core::{AgentDefinition, AgentRole, Finding, RateLimitStatus, TokenUsage};
 
 use crate::error::Result;
 use crate::process::AgentCommand;
 
 /// Stable identity of a built-in agent CLI.
-///
-/// This is both the CLI's closed `--tool` value and a [`ToolAdapter`]
-/// implementation. Keeping the identity on the adapter itself lets a
-/// quota-suspended run persist the original tool and reconstruct that exact
-/// adapter on a later process startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolName {
     Claude,
@@ -92,131 +32,32 @@ impl ToolName {
     }
 }
 
-/// Turns a role's definition into the command to spawn for it, plus
-/// everything else specific to one tool CLI.
-///
-/// [`build_command`](ToolAdapter::build_command) is fallible on purpose: an
-/// adapter that cannot honour a definition must say so with a typed error
-/// rather than substitute a default invocation (code-standards.md: "no
-/// silent fallback"). The other three methods are infallible where the
-/// underlying operation genuinely cannot fail structurally (env allowlists
-/// and default prompts are compiled-in constants); only
-/// [`extract_findings`](ToolAdapter::extract_findings) can fail, since it
-/// parses untrusted subprocess output.
-///
-/// `Sync` supertrait (issue #33): `Orchestrator::run_agent` closes over a
-/// `&R` inside the `on_stdout_line` callback it hands to
-/// `warden_sandbox::Sandbox::execute` (issue #50: this used to be
-/// `process::wait_with_progress`), which itself must be `Send + Sync` so
-/// its future stays spawnable from any caller (including one that runs it
-/// inside `tokio::spawn`, as some tests do). Every real and test implementor
-/// here is a stateless unit/plain struct, so this is free in practice, not a
-/// constraint that costs an adapter author anything.
+/// Turns a role's definition into the command to spawn for it, plus everything else specific to one
+/// tool CLI.
 pub trait ToolAdapter: Sync {
-    /// Builds the concrete CLI invocation for `definition`: program, args,
-    /// this tool's own system-prompt flag (fed `definition.system_prompt`),
-    /// and this tool's own model flag when `definition.model` is set.
+    /// Builds the concrete CLI invocation for `definition`.
     fn build_command(&self, definition: &AgentDefinition) -> Result<AgentCommand>;
 
-    /// Environment variable names (beyond `PATH`, which
-    /// `warden_sandbox::LocalSandbox::execute` always forwards) this tool
-    /// needs to find its own configuration/auth. Never the whole environment
-    /// -- see `warden_sandbox::LocalSandbox`'s own docs for why this remains
-    /// a named allowlist rather than `env_clear()` being dropped altogether
-    /// (issue #50: that forwarding now happens in `warden_sandbox`, not
-    /// `crate::process`).
+    /// Environment variable names (beyond `PATH`, which `warden_sandbox::LocalSandbox::execute`
+    /// always forwards) this tool needs to find its own configuration/auth.
     fn env_allowlist(&self) -> &'static [&'static str];
 
-    /// Transforms one reviewer/tester invocation's raw captured stdout into
-    /// the findings it reported (issue #24 point 1, third bullet): the
-    /// adapter's job, not a wrapper script the user has to write. Wraps
-    /// `warden_core::parse_findings` after stripping whatever envelope this
-    /// tool's own output format wraps the agent's final answer in --
-    /// **never called for the coder role**, which is judged by exit code
-    /// alone (unchanged since ADR-0012).
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>>;
 
-    /// The system prompt a role runs with when the base repo has no
-    /// `.warden/agents/<role>.md` (issue #24 point 3): what lets
-    /// `warden run --tool claude` work with zero markdown at all.
+    /// The system prompt a role runs with when the base repo has no `.warden/agents/<role>.md`:
+    /// what lets `warden run --tool claude` work with zero markdown at all.
     fn default_prompt(&self, role: AgentRole) -> &'static str;
 
-    /// The `tools` a role runs with when the base repo has no
-    /// `.warden/agents/<role>.md` -- the other half of the "zero markdown"
-    /// UX alongside [`default_prompt`](ToolAdapter::default_prompt): a role
-    /// whose default prompt asks it to act, but whose default `tools` grants
-    /// nothing, cannot actually act at all for a tool like `claude` where
-    /// tool permission is opt-in even in non-interactive mode (see
-    /// `ClaudeAdapter`'s own docs on this). `None` is a legitimate answer
-    /// for a tool that needs no such grant.
     fn default_tools(&self, role: AgentRole) -> Option<&'static str>;
 
-    /// Translates one line of an agent's streamed stdout into a short,
-    /// human-readable progress description to publish on the Event Bus as a
-    /// `warden_core::RunEvent::AgentProgress`, or `None` if the line carries
-    /// nothing worth surfacing to a live observer (issue #33).
-    ///
-    /// **Declarative, not verified**: the returned text is whatever the
-    /// agent's own tool CLI *reports* itself doing (a streamed assistant
-    /// message, a `tool_use` block, ...), not a checked execution trace --
-    /// ADR-0009's evidence keeps that role, and a caller must never present
-    /// this as one. This method is exactly the seam that absorbs a tool's
-    /// own wire format (e.g. `claude --output-format stream-json`'s NDJSON
-    /// event shape): the returned `String` is plain text, so nothing about
-    /// that format ever needs to leak past this adapter into
-    /// `warden_core`/`warden-tui`.
-    ///
-    /// Defaults to `None` for every line -- an adapter is not required to
-    /// implement streaming progress at all (the same "a legitimate answer"
-    /// convention as [`default_tools`](ToolAdapter::default_tools) returning
-    /// `None`); a tool that never overrides this simply produces no
-    /// progress signal, degrading gracefully to the pre-issue-#33 silence
-    /// between `AgentStarted`/`AgentFinished` rather than failing anything.
     fn parse_progress_line(&self, _line: &str) -> Option<String> {
         None
     }
 
-    /// Extracts the token usage this invocation's underlying tool CLI
-    /// reported for it (issue #53), from the exact same captured stdout
-    /// [`extract_findings`](ToolAdapter::extract_findings) parses -- never a
-    /// second read of the stream (this run's own progress/findings/usage
-    /// extraction all graft onto the one captured buffer `Orchestrator::run_agent`
-    /// already has). `None` is a legitimate answer, exactly like
-    /// [`default_tools`](ToolAdapter::default_tools) and
-    /// [`parse_progress_line`](ToolAdapter::parse_progress_line) returning
-    /// `None`: a tool whose CLI never reports usage at all (or a malformed
-    /// invocation this adapter can't make sense of) yields "n/a" to a caller,
-    /// never a fabricated zero.
-    ///
-    /// Defaults to `None` for every adapter that doesn't override it -- usage
-    /// extraction is optional per tool (issue #53 scope: "extraction pour
-    /// d'autres CLI que claude" is out of scope, the seam is simply ready for
-    /// a future adapter to fill in).
     fn extract_usage(&self, _stdout: &str) -> Option<TokenUsage> {
         None
     }
 
-    /// Extracts the rate-limit/quota status this invocation's underlying
-    /// tool CLI reported for it (issue #84), from the exact same captured
-    /// stdout [`extract_findings`](ToolAdapter::extract_findings)/
-    /// [`extract_usage`](ToolAdapter::extract_usage) parse -- no second read
-    /// of the stream. Unlike usage (reported once, in the terminal `result`
-    /// envelope), a CLI that exposes this signal at all may report it
-    /// **repeatedly** over one invocation's stdout (e.g. `claude`'s
-    /// `rate_limit_event`, once per assistant turn) -- an implementation
-    /// must scan the whole buffer and keep the **most recent** report, not
-    /// just the last line, so a caller always sees this invocation's
-    /// up-to-date status.
-    ///
-    /// `None` is a legitimate answer, exactly like
-    /// [`extract_usage`](ToolAdapter::extract_usage): a tool whose CLI never
-    /// reports quota at all (or a malformed invocation this adapter can't
-    /// make sense of) yields "n/a" to a caller, never a fabricated status.
-    ///
-    /// Defaults to `None` for every adapter that doesn't override it --
-    /// rate-limit extraction is optional per tool, the same convention
-    /// [`extract_usage`](ToolAdapter::extract_usage) already established for
-    /// issue #53.
     fn extract_rate_limit(&self, _stdout: &str) -> Option<RateLimitStatus> {
         None
     }
@@ -288,125 +129,17 @@ impl ToolAdapter for ToolName {
     }
 }
 
-/// The `claude` adapter (issue #24): Warden's first built-in
-/// [`ToolAdapter`], wrapping the `claude` CLI (Claude Code) in non-interactive
-/// print mode.
-///
-/// # Invocation shape
-///
-/// `claude -p --output-format stream-json --verbose --append-system-prompt
-/// <prompt> [--model <model>] [--allowedTools <tools>]`, with the role's own
-/// context (run intent, or target commit/diff/prior findings,
-/// `AgentInputMessage` -- unchanged from ADR-0012) still fed on stdin as the
-/// user turn: `claude -p` with no positional prompt argument reads its user
-/// prompt from stdin in plain-text input mode (verified directly against the
-/// real CLI), so this adapter needs no involvement in *that* channel at all
-/// -- it only owns the invocation's argv.
-///
-/// `--verbose` is not optional decoration: verified directly against the
-/// real CLI, `claude -p --output-format stream-json` without it refuses to
-/// run at all (`Error: When using --print, --output-format=stream-json
-/// requires --verbose`).
-///
-/// # `--append-system-prompt` reverses ADR-0013 / Q2's "no argv" stance
-///
-/// ADR-0012/ADR-0013 rejected argv as a channel for a warden-managed system
-/// prompt (arbitrary, potentially multi-line text leaking into `ps`/logs).
-/// That objection doesn't disappear here -- it is knowingly accepted for
-/// this one, tool-specific channel: `claude` has no way to accept a system
-/// prompt other than `--append-system-prompt` (its stdin, in text input
-/// mode, *is* the user turn; there's no separate system-prompt channel on
-/// it), so an adapter that builds "the real CLI invocation" for `claude`
-/// has no alternative but to pass it as an argument. This is exactly the
-/// trade issue #24 asks for by name ("construit l'invocation réelle du CLI
-/// ... `--append-system-prompt` ... depuis le frontmatter"), scoped to this
-/// concrete adapter rather than reopening the general warden-native stdin
-/// contract (`warden_core::agent_wire`, unchanged by this issue).
-///
-/// # `--output-format stream-json` (issue #33, was `json`)
-///
-/// Originally `--output-format json`, chosen specifically because it emits a
-/// single well-formed JSON envelope and nothing else on stdout -- see this
-/// module's git history for that reasoning. Issue #33 (the TUI is blind for
-/// an agent's whole running time -- no signal at all between `AgentStarted`
-/// and `AgentFinished`) needed a second consumer of this same output: not
-/// just "one parsable final answer" (`extract_findings`) but also "an
-/// observable stream of what the agent is doing right now"
-/// (`parse_progress_line`). `stream-json` (with `--verbose`, see above)
-/// satisfies both without arbitration between them, because it emits its own
-/// NDJSON events *as the agent works* (`assistant` messages, `tool_use`
-/// blocks) and, verified directly against the real CLI, still ends with the
-/// **exact same** `{"type":"result", ..., "result": "<final answer
-/// text>"}` envelope as `json` mode did, as its last line. `extract_findings`
-/// below therefore doesn't need to change what it looks for, only *where*
-/// in stdout it looks (the last non-blank line, not the whole buffer as a
-/// single JSON value) -- see that method's own docs.
-///
-/// Every other line in the stream is `parse_progress_line`'s to interpret;
-/// this is a strictly additive change to what this adapter observes, not a
-/// new capability for Warden to *act* on anything (ADR-0005 is unaffected --
-/// see this issue's own analysis: Warden reads what `claude` already emits,
-/// it does not become a tool provider or intercept any command). The default
-/// per-role prompts ([`ClaudeAdapter::default_prompt`]) instruct the
-/// reviewer/tester to make the final answer *be* NDJSON findings, so
-/// `extract_findings` only has to unwrap the envelope before handing the
-/// inner text to `warden_core::parse_findings` -- it does not itself
-/// understand findings.
-///
-/// # `--allowedTools` is required for a non-interactive invocation to act at
-/// all
-///
-/// Verified directly against the real CLI (`warden run --tool claude` with
-/// no `.warden/agents/coder.md` at all, real repo, real API): a
-/// non-interactive `claude -p` invocation with **no** `--allowedTools`
-/// denies every mutating tool call (`Write`, `Bash`, ...) outright --
-/// `permission_denials` in its own JSON envelope, the agent left unable to
-/// do anything but explain that it lacks permission. This holds even though
-/// Claude Code's own subagent docs describe an *omitted* `tools:` key as
-/// "inherits all tools": that description is about which tools an
-/// interactive subagent may be *asked* to use, not about a non-interactive
-/// invocation being pre-approved to actually use them without either
-/// `--allowedTools` or `--dangerously-skip-permissions` (the latter not
-/// used here -- see `ClaudeAdapter::default_tools`'s own docs for why an
-/// explicit grant is the chosen fix instead). A `.warden/agents/<role>.md`
-/// naming its own `tools:` key is unaffected by any of this and reaches
-/// [`ClaudeAdapter::build_command`] exactly as written.
+/// The `claude` adapter: Warden's first built-in [`ToolAdapter`], wrapping the `claude` CLI (Claude
+/// Code) in non-interactive print mode.
 pub struct ClaudeAdapter;
 
-/// `claude`'s own `result` envelope -- the same shape under both
-/// `--output-format json` (the entirety of stdout) and, since issue #33,
-/// `--output-format stream-json` (the last NDJSON line of stdout; every
-/// earlier line is some other `"type"`, left to [`ClaudeAdapter::parse_progress_line`]).
-/// Verified directly against the real CLI in both modes -- not documented
-/// CLI output, so only the fields this adapter actually needs are modelled;
-/// every other field the real CLI emits is ignored by `serde`'s default
-/// "extra fields are fine" behaviour, not `deny_unknown_fields` -- this is
-/// *not* a Warden-owned wire contract like `agent_wire`/`agent_def`, it's a
-/// third party's output format Warden has no say over and must tolerate
-/// changing underneath it).
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeResultEnvelope {
-    /// The agent's final answer text. Absent on some non-success `subtype`s
-    /// (e.g. a turn-limit abort) -- modelled as `Option` rather than
-    /// defaulted to `""`, so that case is reported as the malformed/unusable
-    /// output it is instead of being silently treated as "zero findings".
     result: Option<String>,
-    /// Issue #53: this invocation's token usage, cumulative for the whole
-    /// turn -- absent entirely on some non-success `subtype`s, same as
-    /// `result` above, and modelled as `Option` for exactly that reason
-    /// (never defaulted to a zeroed [`ClaudeUsage`], which would misreport
-    /// "unknown" as "zero", see `crate::tool_adapter::ClaudeAdapter::extract_usage`).
     #[serde(default)]
     usage: Option<ClaudeUsage>,
 }
 
-/// `claude`'s own `usage` object, nested in [`ClaudeResultEnvelope`] --
-/// verified directly against the real CLI (see that struct's own docs on
-/// this not being a documented, stable wire contract). `cache_read_input_tokens`/
-/// `cache_creation_input_tokens` are independently optional: a turn that
-/// never engages prompt caching at all is not the same fact as "0 tokens
-/// cached", so both are modelled as `Option` rather than defaulted to `0`
-/// (`warden_core::TokenUsage`'s own docs make the same distinction).
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeUsage {
     input_tokens: u64,
@@ -417,91 +150,38 @@ struct ClaudeUsage {
     cache_creation_input_tokens: Option<u64>,
 }
 
-/// Stage one of `extract_rate_limit`'s two-stage parse (issue #84 review,
-/// finding 3): decodes *only* the `type` discriminant every
-/// `--output-format stream-json` line carries. Deliberately minimal on
-/// purpose -- this must succeed for any well-formed line regardless of its
-/// actual event kind, so `extract_rate_limit`'s backward scan can tell "this
-/// line isn't JSON at all / carries no `type`" (benign noise -- an
-/// `assistant` message, a truncated line, ... -- keep scanning further back)
-/// apart from "this line's `type` is `rate_limit_event`" (a real candidate:
-/// whatever happens decoding it next, the scan must not fall through to an
-/// older line -- see [`ClaudeAdapter::extract_rate_limit`]'s own docs).
+/// Stage one of `extract_rate_limit`'s two-stage parse: decodes *only* the `type` discriminant
+/// every `--output-format stream-json` line carries.
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeLineKind {
     #[serde(rename = "type")]
     kind: String,
 }
 
-/// Stage two of `extract_rate_limit`'s two-stage parse -- only attempted
-/// once [`ClaudeLineKind`] has already confirmed a line's `type` is
-/// `rate_limit_event`. `rate_limit_info` is **required** (not `Option`):
-/// verified directly against the real CLI, captured as this exact JSON line
-/// (`ClaudeAdapter::extract_rate_limit`'s own docs quote it verbatim):
-/// `{"type":"rate_limit_event","rate_limit_info":{...},"uuid":...,
-/// "session_id":...}`. A `rate_limit_event` line whose own `rate_limit_info`
-/// doesn't decode (missing entirely, or malformed) is exactly the "no longer
-/// decodes" regression finding 3 covers -- treated as one and the same
-/// failure by making the whole struct fail to deserialize, rather than
-/// separately handling "key absent" (`None`) vs. "key present but wrong
-/// shape" (a serde error).
+/// Stage two of `extract_rate_limit`'s two-stage parse -- only attempted once [`ClaudeLineKind`]
+/// has already confirmed a line's `type` is `rate_limit_event`.
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeRateLimitEnvelope {
     rate_limit_info: ClaudeRateLimitInfo,
 }
 
-/// `claude`'s own `rate_limit_info` object, nested in
-/// [`ClaudeRateLimitEnvelope`] -- verified directly against the real CLI
-/// (issue #84, see [`ClaudeAdapter::extract_rate_limit`]'s own docs for the
-/// captured payload this is modelled from). **Fields are camelCase on the
-/// wire** (`resetsAt`, `rateLimitType`, `isUsingOverage`,
-/// `surpassedThreshold`), unlike every other `claude` struct in this module
-/// -- `rename_all = "camelCase"` reflects that real, observed asymmetry
-/// rather than normalizing it away. `status`/`rate_limit_type` deserialize
-/// straight into `warden_core`'s own tolerant enums (`RateLimitState`/
-/// `RateLimitWindow`), so an unrecognized value never fails this line's
-/// parse -- but the numeric fields below are taken on faith by serde alone
-/// (any finite `f64`/`i64` decodes); [`validate_rate_limit_info`] is the
-/// boundary check that catches an implausible *value* serde itself has no
-/// opinion on (issue #84 review, finding 1).
+/// `claude`'s own `rate_limit_info` object, nested in [`ClaudeRateLimitEnvelope`] -- verified
+/// directly against the real CLI.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeRateLimitInfo {
     status: warden_core::RateLimitState,
     resets_at: i64,
     rate_limit_type: warden_core::RateLimitWindow,
-    /// Fraction in `0.0..=1.0`, **not** a percentage -- observed `0.93` for
-    /// 93% utilization. See `warden_core::RateLimitStatus::utilization`'s own
-    /// docs for why this unit is never silently converted, and
-    /// [`validate_rate_limit_info`] for the range this is checked against.
+    /// Fraction in `0.0..=1.0`, **not** a percentage -- observed `0.93` for 93% utilization.
     utilization: f64,
     is_using_overage: bool,
     surpassed_threshold: f64,
 }
 
-/// Upper bound on `utilization`/`surpassed_threshold` (issue #84 review,
-/// finding 1): both are fractions of a quota, normally `0.0..=1.0`, but
-/// `is_using_overage` in the very same payload proves a CLI can legitimately
-/// report utilization *past* 100% while an account is over quota (plausibly
-/// somewhere around `1.05`-`1.5`) -- so a hard `<= 1.0` ceiling would
-/// silently discard exactly the reports that matter most, the over-quota
-/// ones. `2.0` (200% of quota) is chosen instead: generous enough that no
-/// plausible legitimate overage report is ever rejected, while still well
-/// below the failure mode this bound exists to catch -- a future CLI
-/// switching this field to a percentage, which would land at roughly `93.0`,
-/// not `0.93`. A value beyond this bound is rejected outright (`None` +
-/// `tracing::warn!`), never clamped -- clamping would silently misreport a
-/// unit regression as a plausible-looking in-range value instead of
-/// surfacing it.
 const MAX_PLAUSIBLE_QUOTA_FRACTION: f64 = 2.0;
 
-/// Boundary validation for [`ClaudeRateLimitInfo`]'s numeric fields (issue
-/// #84 review, finding 1) -- untrusted agent-CLI output, checked here before
-/// [`ClaudeAdapter::extract_rate_limit`] ever turns it into a
-/// [`RateLimitStatus`]. `Err` names the offending field and value, for the
-/// `tracing::warn!` the caller logs before treating the whole line as
-/// unusable (finding 3: this must behave exactly like a decode failure --
-/// warn, and never fall through to an older, stale report).
+/// Boundary validation for [`ClaudeRateLimitInfo`]'s numeric fields.
 fn validate_rate_limit_info(info: &ClaudeRateLimitInfo) -> std::result::Result<(), String> {
     if !info.utilization.is_finite()
         || info.utilization < 0.0
@@ -532,32 +212,6 @@ fn validate_rate_limit_info(info: &ClaudeRateLimitInfo) -> std::result::Result<(
     Ok(())
 }
 
-/// Env vars `claude` needs beyond `PATH` to find its own configuration and
-/// credentials (`~/.claude/...`) -- ADR-0005: Warden delegates entirely to
-/// the CLI's own already-authenticated state, never handling API keys
-/// itself, so the CLI must be able to find where it stashed that state.
-///
-/// **`USER` is required alongside `HOME`**, discovered by live
-/// verification (`warden run --tool claude` against a real repo, real
-/// account) rather than assumed from documentation: with only `HOME`
-/// forwarded, `claude` reported `"Not logged in · Please run /login"` even
-/// though the exact same invocation succeeded outside Warden -- bisected by
-/// reproducing the failure directly (`env -i PATH=... HOME=... claude ...`)
-/// and adding candidate variables back one at a time until it started
-/// succeeding again. On this platform, `claude`'s OAuth credential
-/// resolution goes through the OS keychain, which is apparently keyed off
-/// the OS user identity (`$USER`), not merely `$HOME`; `$LOGNAME` alone was
-/// verified *not* sufficient. Whether this generalizes to every platform
-/// `claude` runs on isn't verified here -- `USER` is cheap to forward and
-/// carries no secret, so it is included unconditionally rather than gated
-/// behind a platform check.
-///
-/// This is the Architecture.md §10 relaxation issue #24 asks for by name: a
-/// documented, minimal, per-adapter allowlist, **not** a switch to
-/// inheriting the full environment (`env_clear()` still runs first in
-/// `warden_sandbox::LocalSandbox::execute` -- issue #50: that's where this
-/// runs now, not `crate::process::spawn` -- only these named variables are
-/// layered back on top, on an explicit opt-in basis per tool).
 const CLAUDE_ENV_ALLOWLIST: &[&str] = &["HOME", "USER"];
 
 impl ToolAdapter for ClaudeAdapter {
@@ -566,9 +220,6 @@ impl ToolAdapter for ClaudeAdapter {
             "-p".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            // Required alongside `stream-json` in print mode (see this
-            // struct's own docs) -- without it the CLI refuses to start at
-            // all, before ever reaching `--append-system-prompt`.
             "--verbose".to_string(),
             "--append-system-prompt".to_string(),
             definition.system_prompt.clone(),
@@ -589,15 +240,6 @@ impl ToolAdapter for ClaudeAdapter {
     }
 
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
-        // Issue #33: `--output-format stream-json` emits one NDJSON event
-        // per line while the agent works, then the exact same `result`
-        // envelope `json` mode used to emit as the *entirety* of stdout --
-        // now as its last line (verified directly against the real CLI, see
-        // `ClaudeAdapter`'s own docs). Every earlier line is
-        // `parse_progress_line`'s to interpret, not this method's --
-        // finding the last non-blank line first keeps this unchanged for
-        // plain `json`-mode stdout too (a single line, trivially "the last
-        // one"), so no separate code path is needed for the two modes.
         let last_line = stdout
             .lines()
             .rev()
@@ -633,29 +275,13 @@ impl ToolAdapter for ClaudeAdapter {
 
     fn default_tools(&self, role: AgentRole) -> Option<&'static str> {
         Some(match role {
-            // Full implementation capability -- the default coder prompt
-            // asks it to implement the intent and commit locally.
             AgentRole::Coder => "Read, Write, Edit, Bash",
-            // Read-only + Bash (to run linters/static analysis) --
-            // deliberately no Write/Edit: Architecture.md §1 defines the
-            // reviewer as raising findings, never fixing them itself, and a
-            // default grant should not contradict that division of labour.
             AgentRole::Reviewer => "Read, Grep, Glob, Bash",
-            // The default tester prompt asks it to both run the existing
-            // test suite (Bash) and add tests the diff lacks (Write/Edit).
             AgentRole::Tester => "Read, Write, Edit, Grep, Glob, Bash",
         })
     }
 
     fn parse_progress_line(&self, line: &str) -> Option<String> {
-        // Every other event `type` this stream can emit (`system`, `user`,
-        // `result`, `rate_limit_event`, ...) is either plumbing/noise for a
-        // live observer or already `extract_findings`'s own concern -- only
-        // `assistant` messages carry what the ticket asks for: complete
-        // messages and `tool_use` blocks, deliberately *not*
-        // `--include-partial-messages` chunks (issue #33: "probably too
-        // granular ... to validate by implementing", and this adapter never
-        // passes that flag in the first place, see `build_command`).
         let parsed: ClaudeStreamLine = serde_json::from_str(line).ok()?;
         if parsed.kind != "assistant" {
             return None;
@@ -680,16 +306,6 @@ impl ToolAdapter for ClaudeAdapter {
         }
     }
 
-    /// Issue #53: reads the exact same last non-blank stdout line
-    /// [`extract_findings`](ClaudeAdapter::extract_findings) unwraps its
-    /// envelope from -- no second read of the stream, just a second, more
-    /// tolerant parse of the buffer already captured for this invocation.
-    /// Deliberately infallible (`Option`, not `warden_core::Result`) unlike
-    /// `extract_findings`: usage is observability, not something a caller
-    /// must act on, so a missing/malformed line yields "n/a" (`None`)
-    /// rather than failing the whole invocation over a CLI's own output
-    /// this adapter can't parse -- see [`ToolAdapter::extract_usage`]'s own
-    /// docs on why `None` is a legitimate answer, not a swallowed error.
     fn extract_usage(&self, stdout: &str) -> Option<TokenUsage> {
         let last_line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
         let envelope: ClaudeResultEnvelope = serde_json::from_str(last_line).ok()?;
@@ -702,63 +318,16 @@ impl ToolAdapter for ClaudeAdapter {
         ))
     }
 
-    /// Issue #84: captures `rate_limit_event` -- verified directly against
-    /// the real CLI (`claude` version `2.1.220 (Claude Code)`,
-    /// `--output-format stream-json --verbose`) to emit exactly this line
-    /// (`uuid`/`session_id` values are one real, captured sample -- not
-    /// stable identifiers this adapter depends on):
-    ///
-    /// ```json
-    /// {"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"21c05092-e021-402f-bee8-df86ed81af44","session_id":"cc97c92a-3093-421b-a6f1-ecb2b3546855"}
-    /// ```
-    ///
-    /// Previously discarded entirely as noise by
-    /// [`parse_progress_line`](ClaudeAdapter::parse_progress_line) (its own
-    /// `if parsed.kind != "assistant"` guard, unchanged by this method) --
-    /// this is the seam that actually reads it, not a repurposing of that
-    /// method.
-    ///
-    /// Unlike [`extract_usage`](ClaudeAdapter::extract_usage), which reads
-    /// only the terminal `result` line, `claude` emits one `rate_limit_event`
-    /// **per assistant turn** (verified directly: `utilization` observed
-    /// advancing turn over turn, e.g. `0.93` then `0.94` in a two-turn run),
-    /// so this scans the whole captured buffer looking for the **last** one
-    /// seen -- the most recent status, the same "scan everything, keep the
-    /// last match" shape [`CodexAdapter::extract_usage`] already uses for its
-    /// own repeatedly-reported `token_count` event.
-    ///
-    /// # Two-stage parse, and why the scan aborts rather than falls back
-    /// (issue #84 review, finding 3)
-    ///
-    /// Each line is decoded twice: first as [`ClaudeLineKind`] (`type`
-    /// only), to tell "not a `rate_limit_event` at all" (benign -- keep
-    /// scanning further back) apart from "this line's `type` *is*
-    /// `rate_limit_event`". The moment a line's `type` matches, it is this
-    /// scan's one and only candidate: whatever happens next --
-    /// [`ClaudeRateLimitEnvelope`] fails to decode, or
-    /// [`validate_rate_limit_info`] rejects an implausible numeric value --
-    /// is logged (`tracing::warn!`) and this method returns `None`
-    /// immediately, **never** continuing the backward scan to an older
-    /// line. Silently substituting an older report for a newer one that
-    /// failed to parse would be worse than reporting "n/a": it would look
-    /// like a fresh status while actually being stale, with nothing in the
-    /// logs to say so -- exactly the "catch-and-ignore" code-standards.md
-    /// forbids, and a real correctness risk once issue #85 starts comparing
-    /// `utilization` against a suspend threshold.
     fn extract_rate_limit(&self, stdout: &str) -> Option<RateLimitStatus> {
         for line in stdout.lines().rev() {
             let Ok(kind) = serde_json::from_str::<ClaudeLineKind>(line) else {
-                // Not JSON at all, or no `type` field -- benign noise
-                // (a truncated line, a stray non-JSON diagnostic, ...),
-                // unrelated to whether a real `rate_limit_event` exists
-                // further back.
                 continue;
             };
             if kind.kind != "rate_limit_event" {
                 continue;
             }
-            // The newest `rate_limit_event` in the scanned range -- from
-            // here on, always return (`Some` or `None`), never `continue`.
+            // The newest `rate_limit_event` in the scanned range -- from here on, always return
+            // (`Some` or `None`), never `continue`.
             let envelope = match serde_json::from_str::<ClaudeRateLimitEnvelope>(line) {
                 Ok(envelope) => envelope,
                 Err(error) => {
@@ -796,10 +365,6 @@ impl ToolAdapter for ClaudeAdapter {
     }
 }
 
-/// One line of `claude --output-format stream-json` output, kept
-/// deliberately minimal (see `ClaudeResultEnvelope`'s own docs on why this
-/// isn't a `deny_unknown_fields` wire contract): only enough structure to
-/// recognize an `assistant` message and read its content blocks.
 #[derive(Debug, serde::Deserialize)]
 struct ClaudeStreamLine {
     #[serde(rename = "type")]
@@ -814,14 +379,6 @@ struct ClaudeStreamMessage {
     content: Option<Vec<ClaudeContentBlock>>,
 }
 
-/// One content block of an `assistant` message. `#[serde(other)]` on
-/// `Other` means every block type this adapter doesn't specifically
-/// translate into progress (`thinking`, `image`, a future addition to the
-/// CLI's own format, ...) parses without error and is simply skipped by
-/// [`ClaudeAdapter::parse_progress_line`], rather than failing the whole
-/// line -- consistent with `code-standards.md`'s "never trust agent output"
-/// while still tolerating a third party's format evolving underneath this
-/// adapter (see `ClaudeResultEnvelope`'s own docs on the same point).
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClaudeContentBlock {
@@ -837,11 +394,7 @@ enum ClaudeContentBlock {
     Other,
 }
 
-/// How much of a progress line's text is worth showing a live observer --
-/// long enough to be useful, short enough that one busy assistant message
-/// doesn't dominate the TUI's scrollable event log. Collapses internal
-/// whitespace (including newlines) to single spaces first: this is a
-/// one-line log entry, not a rendered markdown block.
+/// How much of a progress line's text is worth showing a live observer.
 const MAX_PROGRESS_DETAIL_CHARS: usize = 200;
 
 fn summarize_progress_text(text: &str) -> String {
@@ -854,13 +407,8 @@ fn summarize_progress_text(text: &str) -> String {
     }
 }
 
-/// Field names checked, in order, for a short human-readable summary of a
-/// `tool_use` block's `input` (issue #33: "tool_use blocks are likely enough
-/// ... start without partial messages"). Not exhaustive over every tool
-/// `claude` might call -- a tool whose input uses none of these field names
-/// still gets *a* progress line (just the tool name alone, see
-/// `format_tool_use_progress`), never a missing/failed one; this is
-/// observability, not a schema Warden owns or validates against.
+/// Field names checked, in order, for a short human-readable summary of a `tool_use` block's
+/// `input`.
 const TOOL_USE_SUMMARY_FIELDS: [&str; 5] =
     ["command", "description", "file_path", "path", "pattern"];
 
@@ -874,11 +422,6 @@ fn format_tool_use_progress(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-/// Every default prompt tells the agent about the stdin JSON contract
-/// (`warden_core::AgentInputMessage`, ADR-0012, unchanged by issue #24) --
-/// that channel is not part of `ClaudeAdapter`'s own invocation, but an
-/// agent that doesn't know to look for it would never see its intent/
-/// findings/diff at all.
 const DEFAULT_CODER_PROMPT: &str = "You are Warden's coder agent.\n\n\
 Warden will send a single JSON object on stdin (fields: version, role, \
 intent, findings, scope) before closing stdin. Read it before doing \
@@ -930,93 +473,11 @@ exactly these fields: `source` (always the string \"tester\"), `severity` \
 the test suite failed; no findings at all means it passed. Do not include \
 any other text in your final answer.";
 
-/// The `codex` adapter (issue #71): Warden's second built-in [`ToolAdapter`],
-/// wrapping the OpenAI Codex CLI (the `codex` binary) in its non-interactive
-/// `codex exec` mode.
-///
-/// # Open question resolved pragmatically, not verified live (issue #71)
-///
-/// Unlike [`ClaudeAdapter`], whose every claim above is checked against a
-/// real, authenticated CLI, this adapter's invocation shape and JSON event
-/// schema were **not** verified against a live `codex` install -- this
-/// environment has neither the binary nor network access to install/run it.
-/// What follows is this adapter's author's best-effort, documented reading
-/// of OpenAI's own published Codex CLI ("codex-rs") behaviour at the time of
-/// writing (`codex exec`'s non-interactive mode, its experimental `--json`
-/// streamed-event output, and its `--sandbox`/`--ask-for-approval` execution
-/// policy flags), not a byte-for-byte captured transcript the way
-/// `ClaudeAdapter`'s own regression fixtures are. Should the real CLI's
-/// flags or event shape differ from what's modelled here, the failure mode
-/// is deliberately graceful rather than silent: `extract_findings` surfaces
-/// a named [`warden_core::CoreError::MalformedAgentOutput`] instead of
-/// fabricating findings, and `extract_usage` degrades to `None` ("n/a",
-/// issue #53) instead of a fabricated zero -- the exact two contracts
-/// [`ToolAdapter`]'s own docs already require of every adapter, live-verified
-/// or not. Tests below exercise this adapter's own parsing logic against
-/// fixtures matching the schema documented here, not a real captured
-/// transcript (see this module's own test docs).
-///
-/// **Known risk called out explicitly**: the relative *ordering* of event
-/// types within one `--json` transcript is itself unverified -- in
-/// particular, whether a `token_count` event can ever appear *after* the
-/// terminal `task_complete` event, or whether more than one `task_complete`/
-/// `error` event could ever appear in one transcript. `extract_findings` and
-/// `extract_usage` are both written defensively against that uncertainty
-/// (see their own docs): `extract_findings` scans backwards for the first
-/// `task_complete`/`error` event rather than hard-requiring it to be the
-/// stream's literal last line, and `extract_usage` already scanned the whole
-/// buffer rather than assuming a fixed position. If the real protocol turns
-/// out to interleave events completely differently than modelled here, the
-/// worst case is still the same graceful degradation this section already
-/// promises -- a typed parse error or "n/a", never a wrong answer presented
-/// as a right one.
-///
-/// # Invocation shape
-///
-/// `codex exec --json --ask-for-approval never [--sandbox <mode>] [--model
-/// <model>] <system_prompt>`, with the role's own `AgentInputMessage`
-/// context still fed on stdin exactly as for every other adapter (unchanged
-/// ADR-0012 channel, `Orchestrator::run_agent`). `codex exec`'s own
-/// positional `PROMPT` argument reads from stdin when omitted -- the same
-/// reason [`ClaudeAdapter`] is forced onto an argv flag for its system
-/// prompt rather than stdin (see that struct's own docs): stdin here already
-/// carries Warden's own JSON payload, so the system prompt has no channel
-/// left but argv, the ADR-0013/Q2 trade-off `ClaudeAdapter` already accepts,
-/// scoped to this adapter too.
-///
-/// - `--json`: the CLI's own experimental streamed-event output mode
-///   (this ticket's own research), the `codex` analogue of
-///   `claude --output-format stream-json` -- both an `extract_findings`
-///   source and a `parse_progress_line` source, same split as
-///   `ClaudeAdapter`.
-/// - `--ask-for-approval never`: unconditional, never driven by the
-///   definition -- a non-interactive subprocess with no human present to
-///   answer an approval prompt would otherwise hang forever. This is about
-///   *whether a human is asked*, not *what the agent may do*; that's
-///   `--sandbox`, below.
-/// - `--sandbox <mode>`: fed from `definition.tools` verbatim, the same
-///   "reinterpreted per adapter, passed through unvalidated" convention
-///   `definition.model` already uses (`AgentDefinition`'s own docs) --
-///   `tools:` in a markdown definition means "the comma-separated
-///   `--allowedTools` list" for `claude` and "one of `codex`'s own sandbox
-///   policy names (`read-only`/`workspace-write`/`danger-full-access`)" for
-///   `codex`; a value that isn't one of those is `codex`'s own error to
-///   report, not validated here -- see [`CodexAdapter::default_tools`].
+/// The `codex` adapter: Warden's second built-in [`ToolAdapter`], wrapping the OpenAI Codex CLI
+/// (the `codex` binary) in its non-interactive `codex exec` mode.
 pub struct CodexAdapter;
 
-/// Env vars `codex` needs beyond `PATH` to find its own configuration and
-/// credentials -- ADR-0005: Warden delegates entirely to the CLI's own
-/// already-authenticated state (`codex login`), never handling API keys
-/// itself. Only `HOME` is forwarded: unlike `ClaudeAdapter`'s `USER`
-/// (empirically required for that CLI's keychain-based OAuth resolution on
-/// this platform, see that adapter's own docs), no equivalent requirement is
-/// known here -- this has not been verified against a live install (see this
-/// module's own docs on `CodexAdapter`), so nothing beyond the one variable
-/// this adapter is confident every config-file-based CLI needs is forwarded.
-/// Deliberately **not** an `OPENAI_API_KEY`-shaped variable: forwarding a raw
-/// API key would make Warden a holder of that secret, contradicting ADR-0005
-/// ("Warden holds no keys") -- this adapter relies on `codex`'s own
-/// already-authenticated on-disk session, exactly like `ClaudeAdapter`.
+/// Env vars `codex` needs beyond `PATH` to find its own configuration and credentials.
 const CODEX_ENV_ALLOWLIST: &[&str] = &["HOME"];
 
 impl ToolAdapter for CodexAdapter {
@@ -1035,19 +496,6 @@ impl ToolAdapter for CodexAdapter {
             args.push("--model".to_string());
             args.push(model.clone());
         }
-        // The positional `PROMPT` argument: `codex exec`'s only channel for
-        // a system prompt (see this struct's own docs) -- pushed last, after
-        // every flag, matching the CLI's documented `[OPTIONS] [PROMPT]`
-        // argument order. A defensive `--` end-of-options separator goes
-        // immediately before it: a `system_prompt` that happens to start
-        // with `-` (a markdown definition's body is arbitrary user text,
-        // not validated against this) would otherwise risk being parsed as
-        // a flag by codex's own arg parser rather than the positional
-        // prompt. This convention is universal across `clap`-based CLIs
-        // (and getopt-style parsers generally); not independently verified
-        // against this exact CLI (see this struct's own docs on what has/
-        // hasn't been), but safe to include unconditionally even if codex
-        // turns out not to need it.
         args.push("--".to_string());
         args.push(definition.system_prompt.clone());
         Ok(AgentCommand::new("codex", args))
@@ -1058,9 +506,6 @@ impl ToolAdapter for CodexAdapter {
     }
 
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
-        /// The two event kinds `extract_findings` actually terminates on --
-        /// scanned for below rather than assumed to be the stream's literal
-        /// last line, see this method's own docs on why.
         enum Terminal {
             Complete(Option<String>),
             Failed(String),
@@ -1074,19 +519,6 @@ impl ToolAdapter for CodexAdapter {
             ));
         }
 
-        // Scans backwards for the first `task_complete`/`error` event rather
-        // than hard-requiring it to be the stream's literal last line
-        // (`ClaudeAdapter::extract_findings`'s own "last non-blank line"
-        // contract does not carry over unchanged here) -- this adapter's
-        // modeled event ordering is itself unverified (see `CodexAdapter`'s
-        // own "known risk called out explicitly" docs), so a trailing
-        // `token_count` (or any other/unrecognized event) after the
-        // terminal one must not make an otherwise well-formed transcript
-        // look malformed. Every line that isn't parsable JSON, or parses to
-        // some other event type, is simply skipped while scanning, not
-        // itself an error -- `codex`'s own protocol is expected to
-        // interleave several such lines (`agent_message`, `token_count`,
-        // ...) before its terminal event either way.
         let terminal = stdout.lines().rev().find_map(|line| {
             let line = line.trim();
             if line.is_empty() {
@@ -1130,31 +562,13 @@ impl ToolAdapter for CodexAdapter {
 
     fn default_tools(&self, role: AgentRole) -> Option<&'static str> {
         Some(match role {
-            // Full read/write within the role's own worktree -- the default
-            // coder prompt asks it to implement the intent and commit
-            // locally, same capability `ClaudeAdapter`'s `Bash`/`Write`/`Edit`
-            // grant gives its own coder.
             AgentRole::Coder => "workspace-write",
-            // Architecture.md §1: the reviewer raises findings, it never
-            // fixes them itself -- `read-only` is `codex`'s own sandbox
-            // policy closest to `ClaudeAdapter`'s deliberate omission of
-            // `Write`/`Edit` from the reviewer's grant.
             AgentRole::Reviewer => "read-only",
-            // The default tester prompt asks it to both run the existing
-            // suite and add tests the diff lacks, same as
-            // `ClaudeAdapter::default_tools`'s tester grant.
             AgentRole::Tester => "workspace-write",
         })
     }
 
     fn parse_progress_line(&self, line: &str) -> Option<String> {
-        // Conservative on purpose (see this struct's own docs): only the one
-        // event variant this adapter's author is confident enough to model
-        // (`agent_message`, a complete assistant message) is translated into
-        // progress text. Every other event type this stream might carry
-        // (`task_complete`/`error`, already `extract_findings`'s concern; an
-        // unrecognized type; a malformed line) yields `None` rather than a
-        // guessed interpretation.
         let event: CodexEvent = serde_json::from_str(line).ok()?;
         match event.msg {
             CodexEventMsg::AgentMessage { message } => {
@@ -1164,18 +578,6 @@ impl ToolAdapter for CodexAdapter {
         }
     }
 
-    /// Issue #53: unlike `ClaudeAdapter`, which reads usage off the exact
-    /// same terminal `result` line `extract_findings` unwraps, this adapter
-    /// models `codex`'s token usage as its own distinct streamed event
-    /// (`token_count`), not necessarily the stream's last line -- so this
-    /// scans every captured line, keeping the last `token_count` event seen
-    /// (a cumulative report superseding any earlier one), rather than only
-    /// the final line. No cache-token dimension is modelled: nothing in this
-    /// adapter's documented understanding of `codex`'s protocol (see this
-    /// struct's own docs) describes a prompt-caching figure distinct from
-    /// input/output tokens, so both cache fields are always `None` here --
-    /// never fabricated as `0` (same "n/a, not zero" contract
-    /// `ClaudeAdapter::extract_usage`'s own docs describe).
     fn extract_usage(&self, stdout: &str) -> Option<TokenUsage> {
         stdout.lines().rev().find_map(|line| {
             let event: CodexEvent = serde_json::from_str(line).ok()?;
@@ -1190,135 +592,41 @@ impl ToolAdapter for CodexAdapter {
     }
 }
 
-/// One line of `codex exec --json` output, modelled from OpenAI's published
-/// Codex CLI event protocol as this adapter's author understood it -- **not
-/// independently verified against a live install** (see [`CodexAdapter`]'s
-/// own docs on why). Kept deliberately tolerant, the same convention
-/// `ClaudeStreamLine`/`ClaudeResultEnvelope` already use for a third party's
-/// own wire format: unknown top-level fields are ignored by serde's default
-/// behaviour, and an unrecognized `msg.type` parses into
-/// [`CodexEventMsg::Other`] (via `#[serde(other)]`) rather than failing the
-/// whole line.
 #[derive(Debug, serde::Deserialize)]
 struct CodexEvent {
     msg: CodexEventMsg,
 }
 
-/// The `msg.type` payload of one [`CodexEvent`] -- see that struct's own
-/// docs on this not being a verified, stable wire contract.
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CodexEventMsg {
-    /// A complete assistant message -- `parse_progress_line`'s only
-    /// recognized event (see [`CodexAdapter::parse_progress_line`]'s own
-    /// docs on why this adapter models no other progress-worthy event type).
-    AgentMessage { message: String },
-    /// The stream's terminal event -- `extract_findings`'s target, the
-    /// `codex` analogue of `claude`'s own `result` envelope.
-    /// `last_agent_message` absent (rather than defaulted to `""`) reports
-    /// the same "the agent likely did not complete normally" fact
-    /// `ClaudeResultEnvelope::result`'s own `Option` models.
+    AgentMessage {
+        message: String,
+    },
+    /// The stream's terminal event -- `extract_findings`'s target, the `codex` analogue of
+    /// `claude`'s own `result` envelope.
     TaskComplete {
         #[serde(default)]
         last_agent_message: Option<String>,
     },
-    /// Issue #53's source for this adapter -- required, non-`Option` fields:
-    /// a `token_count` event missing either figure fails to deserialize
-    /// (caught by `extract_usage`'s `.ok()?`) rather than reporting a
-    /// fabricated `0` for the missing one.
+    /// 's source for this adapter -- required, non-`Option` fields.
     TokenCount {
         input_tokens: u64,
         output_tokens: u64,
     },
-    /// A terminal failure this invocation reported on its own -- distinct
-    /// from a malformed line `extract_findings` itself can't parse at all.
-    Error { message: String },
-    /// Every event type this adapter doesn't specifically model (a future
-    /// addition to the CLI's own protocol, `task_started`,
-    /// `exec_command_begin`/`exec_command_end`, ...) -- tolerated, not
-    /// treated as this line failing to parse at all, same convention as
-    /// `ClaudeContentBlock::Other`.
+    /// A terminal failure this invocation reported on its own -- distinct from a malformed line
+    /// `extract_findings` itself can't parse at all.
+    Error {
+        message: String,
+    },
     #[serde(other)]
     Other,
 }
 
-/// The `mistral` adapter (issue #71): Warden's third built-in
-/// [`ToolAdapter`], wrapping a `mistral` CLI in the most conservative shape
-/// defensible without a live install to verify against.
-///
-/// # Open question resolved conservatively, not guessed at (issue #71)
-///
-/// Issue #71 itself flags this CLI's maturity/existence as uncertain (`le
-/// chat`/`mistral` -- unlike `codex`, no single, widely-documented
-/// non-interactive automation mode could be identified with any confidence
-/// while writing this adapter). Per this ticket's own guidance ("prefer a
-/// design that degrades gracefully over guessing at a format that may not
-/// exist"), this adapter therefore assumes the least possible about the
-/// underlying CLI's own contract:
-///
-/// - No structured/streamed output format is assumed at all --
-///   [`extract_usage`](MistralAdapter::extract_usage) always returns `None`
-///   ("n/a", issue #53) and [`parse_progress_line`](ToolAdapter::parse_progress_line)
-///   is left at the trait's own default (`None` for every line -- issue #33's
-///   "legitimate to not implement progress at all", see
-///   [`ToolAdapter::parse_progress_line`]'s own docs).
-/// - [`extract_findings`](MistralAdapter::extract_findings) treats the
-///   **entire trimmed stdout** as the final answer text -- no envelope to
-///   unwrap at all, unlike `claude`/`codex`. This is invocation-shape-
-///   independent: if the real `mistral` CLI's argv turns out to differ from
-///   what [`build_command`](MistralAdapter::build_command) assumes below,
-///   only that method needs to change -- this findings contract does not.
-///   A **blank** buffer (nothing printed at all) is *not* treated as an
-///   error here, unlike `ClaudeAdapter`/`CodexAdapter`: both of those CLIs
-///   always emit a structural envelope, so a zero-byte stdout there is real
-///   evidence something crashed silently before that envelope was ever
-///   printed, distinct from that envelope's own payload being empty.
-///   `mistral`, as modelled, has no envelope at all -- and every default
-///   reviewer/tester prompt this codebase ships
-///   (`DEFAULT_REVIEWER_PROMPT`/`DEFAULT_TESTER_PROMPT`, shared across every
-///   adapter) explicitly instructs the agent to answer with **zero NDJSON
-///   lines** when it has nothing to flag ("no findings at all means no
-///   lines"). For an envelope-less CLI that is indistinguishable from a
-///   literally blank stdout, so treating blank as an error here would make
-///   this adapter's own "zero `.md`" default prompts never able to reach a
-///   clean state at all. Blank stdout therefore parses to zero findings,
-///   matching `warden_core::parse_findings`'s own established "no non-blank
-///   lines" convention (see that function's own docs).
-///
-///   **This is only safe because [`extract_findings`](MistralAdapter::extract_findings)
-///   is never actually the thing distinguishing "clean pass" from "crashed
-///   silently"** (issue #71 review, HIGH): that job belongs to the
-///   orchestrator, one layer up (`warden::orchestrator::agents`'s own
-///   `run_finding_agent`), which checks this invocation's exit code
-///   *before* ever calling this method at all, and synthesizes a blocking
-///   finding of its own on anything non-zero -- mirroring the coder path's
-///   own non-zero-exit check, extended to reviewer/tester by that same
-///   review. This method is therefore only ever reached, for any adapter,
-///   once the process has already exited `0`; a blank buffer at that point
-///   is trusted as "no findings" precisely *because* a non-zero exit could
-///   never reach here to be misread as one. This adapter carries no such
-///   guard of its own (nor should it -- exit-code trust belongs to the one
-///   caller that spawned the process, not to a `stdout`-only translation
-///   layer that never sees the exit code at all).
-///
-/// # Invocation shape
-///
-/// `mistral --system <system_prompt> [--model <model>]` -- the minimal shape
-/// a plain prompt-in/answer-out CLI would expose, with the role's own
-/// `AgentInputMessage` context still fed on stdin exactly as for every other
-/// adapter (unchanged ADR-0012 channel). `definition.tools` is not consumed
-/// at all: no equivalent of `claude`'s `--allowedTools`/`codex`'s `--sandbox`
-/// is known for this CLI's surface -- see
-/// [`MistralAdapter::default_tools`].
+/// The `mistral` adapter: Warden's third built-in [`ToolAdapter`], wrapping a `mistral` CLI in the
+/// most conservative shape defensible without a live install to verify against.
 pub struct MistralAdapter;
 
-/// Env vars `mistral` needs beyond `PATH` -- ADR-0005: delegated entirely to
-/// the CLI's own already-authenticated state, never an API key Warden itself
-/// holds (same reasoning as [`CODEX_ENV_ALLOWLIST`]'s own docs). Only `HOME`
-/// is forwarded, on the same "every config-file-based CLI needs at least
-/// this" reasoning -- not verified against a live install, since this CLI's
-/// own configuration/credential storage location is itself unconfirmed (see
-/// this module's own docs on [`MistralAdapter`]).
 const MISTRAL_ENV_ALLOWLIST: &[&str] = &["HOME"];
 
 impl ToolAdapter for MistralAdapter {
@@ -1336,17 +644,6 @@ impl ToolAdapter for MistralAdapter {
     }
 
     fn extract_findings(&self, stdout: &str) -> warden_core::Result<Vec<Finding>> {
-        // No envelope to unwrap (see this adapter's own docs) -- the whole
-        // trimmed buffer is the agent's final answer, handed straight to
-        // `warden_core::parse_findings`, which already treats a blank
-        // buffer as zero findings rather than an error. Deliberately *not*
-        // special-cased into an error here the way
-        // `ClaudeAdapter`/`CodexAdapter` treat a genuinely empty stdout --
-        // see this adapter's own docs for why that's safe: this method is
-        // only ever called once the orchestrator has already confirmed a
-        // zero exit code, so a blank buffer reaching here is a legitimate
-        // "nothing to report", never a crash this method would otherwise
-        // have to guess about.
         warden_core::parse_findings(stdout.trim())
     }
 
@@ -1359,10 +656,6 @@ impl ToolAdapter for MistralAdapter {
     }
 
     fn default_tools(&self, _role: AgentRole) -> Option<&'static str> {
-        // No known equivalent of `--allowedTools`/`--sandbox` for this CLI's
-        // surface (see this adapter's own docs) -- `None` is the legitimate
-        // answer `ToolAdapter::default_tools`'s own docs describe for a tool
-        // that needs no such grant, not an oversight.
         None
     }
 }
@@ -1429,9 +722,6 @@ mod tests {
         assert!(!command.args.iter().any(|arg| arg == "--allowedTools"));
     }
 
-    /// The system prompt is not itself a marker to search for blindly; this
-    /// just pins that it rides directly after `--append-system-prompt`,
-    /// never split or mangled.
     #[test]
     fn the_system_prompt_is_passed_to_append_system_prompt_intact() {
         let command = ClaudeAdapter
@@ -1494,12 +784,6 @@ mod tests {
         assert!(ClaudeAdapter.extract_findings(stdout).is_err());
     }
 
-    /// Issue #33: `--output-format stream-json` prints many NDJSON lines
-    /// before the final `result` envelope -- `extract_findings` must find
-    /// that envelope as the *last* non-blank line, ignoring everything
-    /// preceding it, rather than trying to parse the whole buffer as one
-    /// JSON value the way `--output-format json` mode's single-line output
-    /// allowed.
     #[test]
     fn extract_findings_finds_the_result_envelope_as_the_last_line_of_a_stream_json_transcript() {
         let stdout = concat!(
@@ -1519,8 +803,6 @@ mod tests {
         assert_eq!(findings[0].description, "bug");
     }
 
-    /// A trailing blank line (a stray final `\n`) must not be mistaken for
-    /// "no output at all", nor parsed as the result line itself.
     #[test]
     fn extract_findings_ignores_a_trailing_blank_line_after_the_result_envelope() {
         let stdout =
@@ -1586,9 +868,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.parse_progress_line(""), None);
     }
 
-    /// Long text is truncated for the live log rather than dumped verbatim
-    /// -- one huge assistant message must not dominate the TUI's scrollable
-    /// event list.
     #[test]
     fn parse_progress_line_truncates_a_very_long_assistant_message() {
         let long_text = "word ".repeat(100); // well past MAX_PROGRESS_DETAIL_CHARS
@@ -1600,21 +879,12 @@ mod tests {
         assert!(progress.ends_with('…'));
     }
 
-    /// A content block type this adapter doesn't specifically translate
-    /// (e.g. `thinking`) must not fail the whole line -- it is simply
-    /// skipped, per `ClaudeContentBlock::Other`'s own docs.
     #[test]
     fn parse_progress_line_skips_unrecognized_content_block_types_without_failing() {
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"pondering..."}]}}"#;
         assert_eq!(ClaudeAdapter.parse_progress_line(line), None);
     }
 
-    /// Regression fixture captured verbatim from a real
-    /// `claude -p --output-format stream-json --verbose` invocation (issue
-    /// #33 implementation) -- not a hand-written approximation, so it also
-    /// exercises fields this adapter doesn't model (`caller`, `usage`,
-    /// `parent_tool_use_id`, ...) tolerated by serde's default "extra
-    /// fields are fine" behaviour (see `ClaudeStreamLine`'s own docs).
     #[test]
     fn parse_progress_line_handles_a_real_captured_tool_use_line() {
         let line = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_011Cd9HiRpTrNZbpg6SsxFb7","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_01GLvBUCpwy33TmUv2zhwwWc","name":"Bash","input":{"command":"ls -la /private/tmp/stream-json-probe","description":"List files in working dir"},"caller":{"type":"direct"}}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":2},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","uuid":"dd65275f-4dc6-402b-bc2b-d7c5bf62f8af","timestamp":"2026-07-18T09:30:28.145Z","request_id":"req_011Cd9HiKv1bhZVTuY3FD96a"}"#;
@@ -1625,20 +895,9 @@ mod tests {
         );
     }
 
-    /// Same real-capture provenance as the test above, for the terminal
-    /// `result` line -- an em-dash and embedded newlines in `result` (real
-    /// model output, not a test fixture's simplification) must round-trip
-    /// through `extract_findings` without corruption.
     #[test]
     fn extract_findings_handles_a_real_captured_result_line() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":8120,"result":"Files:\n- `err.log` — empty\n- `out.ndjson` — 11.7 KB\n\nHello.","stop_reason":"end_turn","session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","total_cost_usd":0.1483495,"permission_denials":[],"terminal_reason":"completed","uuid":"1d4ae256-0ea2-4dc3-addd-526a68c08806"}"#;
-        // This transcript's final answer is free text (an em-dash and
-        // embedded newlines, real model output, not a test simplification),
-        // not a reviewer/tester's NDJSON findings -- `extract_findings`
-        // must still correctly unwrap the real envelope (proving the
-        // `result` field round-trips through serde intact) before failing
-        // for the unrelated reason of `parse_findings` rejecting non-NDJSON
-        // text.
         let error = match ClaudeAdapter.extract_findings(stdout).unwrap_err() {
             warden_core::CoreError::MalformedAgentOutput(message) => message,
             other => panic!("expected MalformedAgentOutput, got {other:?}"),
@@ -1648,10 +907,6 @@ mod tests {
             "must fail on the inner NDJSON, not on unwrapping the envelope: {error}"
         );
     }
-
-    // -----------------------------------------------------------------
-    // `extract_usage` (issue #53)
-    // -----------------------------------------------------------------
 
     #[test]
     fn extract_usage_reads_input_output_and_cache_tokens_from_the_result_envelope() {
@@ -1673,10 +928,6 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, None);
     }
 
-    /// Issue #53 scope: a tool CLI that reports no usage at all (or an
-    /// invocation this adapter otherwise can't make sense of) must yield
-    /// "n/a" (`None`), never a fabricated zero and never a failed invocation
-    /// -- `extract_usage` is infallible by design, unlike `extract_findings`.
     #[test]
     fn extract_usage_returns_none_when_the_result_envelope_has_no_usage_field() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
@@ -1693,11 +944,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_usage(""), None);
     }
 
-    /// Same "last non-blank line, not the whole buffer" contract
-    /// `extract_findings` already relies on for `--output-format
-    /// stream-json`'s multi-line transcripts (issue #33) -- `extract_usage`
-    /// must find the same terminal `result` line, ignoring every earlier
-    /// NDJSON event.
     #[test]
     fn extract_usage_finds_the_result_envelope_as_the_last_line_of_a_stream_json_transcript() {
         let stdout = concat!(
@@ -1713,26 +959,12 @@ mod tests {
         assert_eq!(usage.output_tokens, 2);
     }
 
-    /// Regression coverage using the same real-captured `result` line
-    /// `extract_findings_handles_a_real_captured_result_line` uses -- that
-    /// fixture's real invocation reported no `usage` field at all, so this
-    /// pins `extract_usage`'s "n/a, not an error" contract against real CLI
-    /// output, not just a hand-written approximation.
     #[test]
     fn extract_usage_returns_none_for_the_real_captured_result_line_with_no_usage_field() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":8120,"result":"Files:\n- `err.log` — empty\n- `out.ndjson` — 11.7 KB\n\nHello.","stop_reason":"end_turn","session_id":"4d83aff1-794c-4154-8cbf-34a6beb3423a","total_cost_usd":0.1483495,"permission_denials":[],"terminal_reason":"completed","uuid":"1d4ae256-0ea2-4dc3-addd-526a68c08806"}"#;
         assert_eq!(ClaudeAdapter.extract_usage(stdout), None);
     }
 
-    // -----------------------------------------------------------------
-    // `extract_rate_limit` (issue #84)
-    // -----------------------------------------------------------------
-
-    /// The exact `rate_limit_event` line captured against a real `claude`
-    /// CLI (version `2.1.220 (Claude Code)`,
-    /// `--output-format stream-json --verbose`) -- the fixture this issue's
-    /// own acceptance criteria ask for ("payload d'exemple en test"), used
-    /// verbatim, not a hand-written approximation.
     const REAL_CAPTURED_RATE_LIMIT_EVENT_LINE: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75},"uuid":"21c05092-e021-402f-bee8-df86ed81af44","session_id":"cc97c92a-3093-421b-a6f1-ecb2b3546855"}"#;
 
     #[test]
@@ -1751,11 +983,6 @@ mod tests {
         assert_eq!(status.resets_at, 1785686400);
     }
 
-    /// `parse_progress_line` must keep discarding `rate_limit_event` as noise
-    /// (unchanged since before issue #84 -- see
-    /// `parse_progress_line_ignores_non_assistant_event_types`), while this
-    /// separate seam is what actually reads the exact same line -- proving
-    /// the two don't interfere with each other on the same input.
     #[test]
     fn extract_rate_limit_and_parse_progress_line_both_see_the_same_real_line_differently() {
         assert_eq!(
@@ -1767,11 +994,6 @@ mod tests {
             .is_some());
     }
 
-    /// A CLI whose stdout never carries a `rate_limit_event` at all (e.g. a
-    /// transcript with only `assistant`/`result` lines) must yield "n/a"
-    /// (`None`), never an error and never a fabricated status --
-    /// `extract_rate_limit` is infallible by design, exactly like
-    /// `extract_usage`.
     #[test]
     fn extract_rate_limit_returns_none_when_no_rate_limit_event_is_present() {
         let stdout = concat!(
@@ -1792,11 +1014,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_rate_limit(""), None);
     }
 
-    /// Verified directly against the real CLI: `utilization` advances
-    /// turn-over-turn (`0.93` then `0.94` observed across a two-turn run) --
-    /// unlike `extract_usage`'s single terminal report, this scans the whole
-    /// buffer and must keep the **most recent** report, not the first one it
-    /// finds scanning forward.
     #[test]
     fn extract_rate_limit_keeps_the_last_event_when_several_are_reported_across_turns() {
         let stdout = concat!(
@@ -1812,9 +1029,6 @@ mod tests {
         assert_eq!(status.utilization, 0.94);
     }
 
-    /// A future/unobserved `status`/`rateLimitType` value must not fail this
-    /// line's parse at all -- `warden_core::RateLimitState`/`RateLimitWindow`
-    /// tolerate any string, see those types' own docs.
     #[test]
     fn extract_rate_limit_tolerates_an_unrecognized_status_and_rate_limit_type() {
         let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"blocked","resetsAt":1785686400,"rateLimitType":"five_hour","utilization":1.0,"isUsingOverage":true,"surpassedThreshold":0.97}}"#;
@@ -1829,11 +1043,6 @@ mod tests {
         );
     }
 
-    /// A legitimate overage report (issue #84 review, finding 1):
-    /// `isUsingOverage: true` with `utilization` past `1.0` must not be
-    /// rejected by the numeric range check -- that is exactly the case
-    /// `MAX_PLAUSIBLE_QUOTA_FRACTION` is chosen generously enough to still
-    /// accept.
     #[test]
     fn extract_rate_limit_accepts_a_legitimate_overage_utilization_past_1_0() {
         let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":1.05,"isUsingOverage":true,"surpassedThreshold":0.97}}"#;
@@ -1842,10 +1051,6 @@ mod tests {
         assert!(status.is_using_overage);
     }
 
-    /// Issue #84 review, finding 1: a `utilization` that looks like it was
-    /// reported as a percentage rather than a fraction (a future CLI unit
-    /// regression) must be rejected outright, not silently accepted and
-    /// later misrendered as "9300%".
     #[test]
     fn extract_rate_limit_rejects_a_utilization_that_looks_like_a_percentage() {
         let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":93.0,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
@@ -1858,13 +1063,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_rate_limit(stdout), None);
     }
 
-    /// `serde_json` has no literal syntax for `NaN`/`Infinity` (standard
-    /// JSON doesn't either), so a wire value can never directly produce a
-    /// non-finite `f64` -- `validate_rate_limit_info`'s own `is_finite()`
-    /// check is a defensive belt-and-braces regardless. What a malformed
-    /// wire value *can* do is fail to deserialize into `f64` at all (e.g.
-    /// `null`, a string) -- covered by the decode-failure path, not the
-    /// range check, but must still resolve to `None` either way.
     #[test]
     fn extract_rate_limit_rejects_a_utilization_that_is_not_a_number_at_all() {
         let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":null,"isUsingOverage":false,"surpassedThreshold":0.75}}"#;
@@ -1886,13 +1084,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_rate_limit(stdout_negative), None);
     }
 
-    /// Issue #84 review, finding 3 (the most consequential one): a malformed
-    /// or invalid **newest** `rate_limit_event` must never make this method
-    /// silently fall through to an older, valid one earlier in the same
-    /// transcript -- that would persist/publish a stale status as if it were
-    /// current, with no diagnostic trail. Covers both failure shapes finding
-    /// 3 asks to be made coherent: a `rate_limit_info` that doesn't decode at
-    /// all, and one that decodes but fails range validation (finding 1).
     #[test]
     fn a_malformed_newest_rate_limit_event_does_not_fall_back_to_an_older_valid_one() {
         let stdout_undecodable = concat!(
@@ -1900,7 +1091,6 @@ mod tests {
             "\n",
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still working"}]}}"#,
             "\n",
-            // The newest report's own `rate_limit_info` is missing entirely.
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning"}}"#,
         );
         assert_eq!(
@@ -1912,7 +1102,6 @@ mod tests {
         let stdout_out_of_range = concat!(
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":0.93,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
             "\n",
-            // The newest report decodes fine but is out of the plausible range.
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":93.0,"isUsingOverage":false,"surpassedThreshold":0.75}}"#,
         );
         assert_eq!(
@@ -1922,22 +1111,12 @@ mod tests {
         );
     }
 
-    /// Builds a `rate_limit_event` line with a chosen `utilization`, so the
-    /// accept/reject boundary can be probed exactly rather than only at the
-    /// far-apart values the other tests use (`1.05` accepted, `93.0`
-    /// rejected leave the actual cut-off unpinned).
     fn rate_limit_line_with_utilization(utilization: &str) -> String {
         format!(
             r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","resetsAt":1785686400,"rateLimitType":"seven_day","utilization":{utilization},"isUsingOverage":true,"surpassedThreshold":0.97}}}}"#
         )
     }
 
-    /// Pins the exact `MAX_PLAUSIBLE_QUOTA_FRACTION` cut-off. The bound is a
-    /// deliberate judgement call (see the constant's docs: high enough to
-    /// keep a legitimate overage report, low enough to catch a
-    /// fraction-to-percentage unit regression), so where it sits is a
-    /// behavioural contract worth a regression test, not an implementation
-    /// detail -- issue #85 will act on values right up against it.
     #[test]
     fn extract_rate_limit_accepts_up_to_the_plausible_ceiling_and_rejects_past_it() {
         for accepted in ["0.0", "1.0", "1.9999", "2.0"] {
@@ -1957,9 +1136,6 @@ mod tests {
         }
     }
 
-    /// `-0.0 < 0.0` is false in IEEE 754, so a negative-zero utilization
-    /// takes the accept path. Harmless (it *is* zero), but pinned so the
-    /// behaviour is a decision on record rather than an accident.
     #[test]
     fn extract_rate_limit_treats_negative_zero_utilization_as_zero() {
         let stdout = rate_limit_line_with_utilization("-0.0");
@@ -1967,10 +1143,6 @@ mod tests {
         assert_eq!(status.utilization, 0.0);
     }
 
-    /// The far end of `resets_at`'s accepted range. `i64::MAX` is absurd as a
-    /// timestamp but is not what this boundary exists to reject (that is
-    /// `<= 0`), and silently dropping it would be a surprise; `i64::MIN`
-    /// must be rejected like any other non-positive value.
     #[test]
     fn extract_rate_limit_accepts_a_far_future_resets_at_and_rejects_the_extreme_negative() {
         let far_future = format!(
@@ -1992,10 +1164,6 @@ mod tests {
         assert_eq!(ClaudeAdapter.extract_rate_limit(&extreme_negative), None);
     }
 
-    /// A CLI writing CRLF line endings must not defeat the scan. `str::lines`
-    /// strips the trailing `\r`, but a stray `\r` left on a JSON line would
-    /// make every decode fail and silently report n/a forever, so this is
-    /// worth pinning rather than assuming.
     #[test]
     fn extract_rate_limit_reads_the_event_through_crlf_line_endings() {
         let stdout = format!(
@@ -2007,8 +1175,6 @@ mod tests {
         assert_eq!(status.utilization, 0.93);
     }
 
-    /// A trailing newline (what a real CLI actually emits) must not change
-    /// the outcome versus a buffer without one.
     #[test]
     fn extract_rate_limit_is_unaffected_by_a_trailing_newline() {
         let with_newline = format!("{REAL_CAPTURED_RATE_LIMIT_EVENT_LINE}\n");
@@ -2018,9 +1184,6 @@ mod tests {
         );
     }
 
-    /// A buffer whose only `rate_limit_event` is malformed has no older
-    /// report to fall back to -- it must still resolve to n/a rather than
-    /// panicking or looping.
     #[test]
     fn extract_rate_limit_returns_none_when_the_only_event_present_is_malformed() {
         let stdout = concat!(
@@ -2038,9 +1201,6 @@ mod tests {
         }
     }
 
-    /// The "zero .md" UX must actually be able to act: a `None` default here
-    /// would leave every mutating tool call denied in non-interactive mode
-    /// (see this module's own docs).
     #[test]
     fn every_role_has_a_non_blank_default_tools_grant() {
         for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
@@ -2067,14 +1227,6 @@ mod tests {
         }
     }
 
-    // ===================================================================
-    // `CodexAdapter` (issue #71) -- fixtures below match the JSON event
-    // schema documented on `CodexEvent`/`CodexEventMsg`, this adapter's own
-    // best-effort reading of `codex exec --json`, not a real captured
-    // transcript (see `CodexAdapter`'s own docs on why no such transcript
-    // exists here).
-    // ===================================================================
-
     #[test]
     fn codex_build_command_always_execs_in_json_never_ask_mode_with_the_prompt_last() {
         let command = CodexAdapter.build_command(&definition(None, None)).unwrap();
@@ -2092,10 +1244,6 @@ mod tests {
         );
     }
 
-    /// The `--` end-of-options separator (defensive against a system prompt
-    /// starting with `-`, see `CodexAdapter::build_command`'s own docs) must
-    /// sit immediately before the positional prompt, not merely somewhere in
-    /// argv.
     #[test]
     fn codex_build_command_places_the_end_of_options_separator_right_before_the_prompt() {
         let command = CodexAdapter.build_command(&definition(None, None)).unwrap();
@@ -2290,10 +1438,6 @@ mod tests {
         assert_eq!(CodexAdapter.extract_usage(""), None);
     }
 
-    /// Issue #84 scope: no rate-limit event is documented for this CLI --
-    /// no override, so this degrades to the trait's own legitimate `None`
-    /// default, exactly like `parse_progress_line`'s equivalent case for an
-    /// unmodeled line.
     #[test]
     fn codex_extract_rate_limit_uses_the_trait_default_of_none() {
         assert_eq!(CodexAdapter.extract_rate_limit("anything at all"), None);
@@ -2336,13 +1480,6 @@ mod tests {
         }
     }
 
-    // ===================================================================
-    // `MistralAdapter` (issue #71) -- no structured output format is
-    // assumed at all (see `MistralAdapter`'s own docs); these fixtures
-    // exercise the "whole trimmed stdout is the final answer" contract that
-    // choice implies, independent of any particular CLI wire format.
-    // ===================================================================
-
     #[test]
     fn mistral_build_command_passes_the_system_prompt_via_the_system_flag() {
         let command = MistralAdapter
@@ -2365,9 +1502,6 @@ mod tests {
 
     #[test]
     fn mistral_build_command_ignores_a_tools_grant_the_definition_sets() {
-        // No known equivalent of `--allowedTools`/`--sandbox` for this CLI
-        // (see `MistralAdapter`'s own docs) -- `tools` must not leak into
-        // argv as some unrecognized flag.
         let command = MistralAdapter
             .build_command(&definition(None, Some("Read, Write, Edit, Bash")))
             .unwrap();
@@ -2388,14 +1522,6 @@ mod tests {
         assert_eq!(findings[0].description, "flaky test");
     }
 
-    /// Unlike `ClaudeAdapter`/`CodexAdapter` (both of which treat a
-    /// genuinely empty stdout as an error -- their own envelopes always
-    /// carry at least *something*), a blank buffer is this adapter's
-    /// expected shape for "nothing to report" (see `MistralAdapter`'s own
-    /// docs on why this is only safe once the orchestrator has already
-    /// confirmed a zero exit code) -- exactly what a reviewer/tester
-    /// following the shared default NDJSON prompts is instructed to answer
-    /// with when it has nothing to flag.
     #[test]
     fn mistral_extract_findings_treats_blank_only_output_as_no_findings() {
         assert_eq!(
@@ -2416,25 +1542,15 @@ mod tests {
 
     #[test]
     fn mistral_extract_usage_always_returns_none() {
-        // No structured usage-reporting format is known for this CLI (see
-        // `MistralAdapter`'s own docs) -- "n/a" (`None`) regardless of
-        // input, never a fabricated zero.
         assert_eq!(MistralAdapter.extract_usage("anything at all"), None);
         assert_eq!(MistralAdapter.extract_usage(""), None);
     }
 
     #[test]
     fn mistral_parse_progress_line_uses_the_trait_default_of_none() {
-        // No override (see `MistralAdapter`'s own docs): every line
-        // degrades to the pre-issue-#33 silence, the trait's own
-        // legitimate default.
         assert_eq!(MistralAdapter.parse_progress_line("anything at all"), None);
     }
 
-    /// Issue #84 scope: no rate-limit signal is known for this CLI -- no
-    /// override, so this degrades to the trait's own legitimate `None`
-    /// default, the same convention `extract_usage`/`parse_progress_line`
-    /// already use above.
     #[test]
     fn mistral_extract_rate_limit_uses_the_trait_default_of_none() {
         assert_eq!(MistralAdapter.extract_rate_limit("anything at all"), None);
@@ -2450,10 +1566,6 @@ mod tests {
 
     #[test]
     fn every_role_has_no_mistral_default_tools_grant() {
-        // Legitimate `None` (see `MistralAdapter::default_tools`'s own
-        // docs), not an oversight -- pinned explicitly so a future change
-        // that starts returning `Some` here is a deliberate decision, not a
-        // silent one.
         for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
             assert_eq!(MistralAdapter.default_tools(role), None, "{role:?}");
         }

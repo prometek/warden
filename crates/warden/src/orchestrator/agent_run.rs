@@ -1,60 +1,10 @@
-//! The sandboxed subprocess seam every workflow step's invocation runs
-//! through: [`Orchestrator::run_agent`], its [`SandboxGuard`] create->destroy
-//! pairing (issue #50), and [`map_sandbox_error`].
+//! The sandboxed subprocess seam every workflow step's invocation runs through:
+//! [`Orchestrator::run_agent`], its [`SandboxGuard`] create->destroy pairing, and
+//! [`map_sandbox_error`].
 
 use super::*;
 
 impl Orchestrator {
-    /// Runs `command` through this orchestrator's [`Sandbox`] seam (issue
-    /// #50), persisting its PID to `agent_processes` before awaiting
-    /// completion so a crash of the orchestrator itself (not the agent) is
-    /// still detectable on restart via [`recover_crashed_runs`]. The sandbox
-    /// is created bound to `cwd` (the role's own worktree) and destroyed
-    /// again once this invocation is done, regardless of outcome --
-    /// structurally, via [`SandboxGuard`], not a single `destroy` call on
-    /// only the straight-line success path (issue #50 review, MEDIUM 1).
-    ///
-    /// `stdin_payload` is the serialized `warden_core::AgentInputMessage`
-    /// (ADR-0012) fed to the agent's stdin and then closed by the sandbox.
-    /// `env_allowlist` is this run's `--tool` adapter's own
-    /// `ToolAdapter::env_allowlist` (issue #24), forwarded to
-    /// [`warden_sandbox::Command::env_allowlist`] on top of whatever
-    /// baseline the backend applies. `runner` (issue #33) translates each
-    /// streamed stdout line into a progress detail via
-    /// [`ToolAdapter::parse_progress_line`], published live-only through
-    /// [`publish_progress_event`](Orchestrator::publish_progress_event)
-    /// (never [`publish_event`](Orchestrator::publish_event), which would
-    /// persist it -- see this module's own ADR-0008 amendment docs), and is
-    /// also asked for the token usage it reported once the invocation
-    /// completes (issue #53: [`ToolAdapter::extract_usage`]), persisted onto
-    /// this cycle's/the run's running totals and carried on the
-    /// `AgentFinished` event this function publishes.
-    ///
-    /// `repo_path` is the run's base repository; `run_worktrees_root` is
-    /// this run's own `<warden_home>/worktrees/<run_id>`. Both are passed
-    /// through to [`process::validate_agent_program`] (issue #26, extended
-    /// from `program` to path-like `args` entries by issue #59), the one
-    /// choke point every workflow step's spawn goes through, so a future
-    /// `ToolAdapter` that names a repo-relative or in-worktree
-    /// `command.program` -- or an `args` entry that resolves the same way,
-    /// e.g. `--wrapper ./reviewer.sh` -- for a gated step is refused here,
-    /// before the sandbox ever runs it.
-    ///
-    /// `trusted_arg_values` (issue #59 review, MEDIUM 4) is forwarded
-    /// verbatim to `validate_agent_program`'s own escape hatch --
-    /// `agents.rs` is the only caller that ever passes anything but `&[]`
-    /// here, and only `ResolvedAgent::trusted_arg_values`
-    /// (`trusted_arg_values_for_step`'s own docs), computed once per run
-    /// from a step's *own* `AgentDefinition`, never from anything a caller
-    /// constructs ad hoc at the call site.
-    ///
-    /// **Issue #73 (trio-unification follow-up)**: `role`/`is_producer`
-    /// replace the old `InvocationRole::Builtin`/`Custom` split -- every
-    /// step, built-in or custom, goes through this exact same body now,
-    /// including the `agent_processes` row and per-role token-usage
-    /// bookkeeping below (previously built-in-roles-only; see
-    /// [`recover_crashed_runs`](crate::orchestrator::recover_crashed_runs)'s
-    /// own docs on why no step's worktree leaks on crash anymore).
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_agent<R: ToolAdapter>(
         &self,
@@ -90,23 +40,9 @@ impl Orchestrator {
             .await
             .map_err(map_sandbox_error)?;
 
-        // Issue #50 review, MEDIUM 1: structural create->destroy pairing.
-        // Everything below that can exit early via `?` is inside the block
-        // this `guard` wraps -- `result` captures its `Ok`/`Err` instead of
-        // propagating it directly, so `guard.destroy()` always runs,
-        // awaited, right after, whichever way the block ended. See
-        // [`SandboxGuard`]'s own docs for why `Drop` is still needed on top,
-        // as a backstop for this whole `run_agent` future being dropped
-        // mid-`.await` instead of returning normally.
         let mut guard = SandboxGuard::new(Arc::clone(&self.sandbox), sandbox_id);
 
         let result: Result<AgentOutcome> = async {
-                // Issue #33: translates each streamed stdout line into a
-                // progress detail (this run's `ToolAdapter`'s own concern --
-                // e.g. `claude --output-format stream-json`'s NDJSON events,
-                // never a format this module itself understands) and broadcasts
-                // it live-only. Must stay synchronous (see
-                // `publish_progress_event`'s own docs).
                 let on_stdout_line = |line: &str| {
                     if let Some(detail) = runner.parse_progress_line(line) {
                         self.publish_progress_event(role.as_str(), detail);
@@ -131,21 +67,9 @@ impl Orchestrator {
                     .await
                     .map_err(map_sandbox_error)?;
 
-                // H1: never persist pid 0. A missing pid right after the sandbox
-                // started the process is a typed error, not a silent fallback —
-                // a persisted pid 0 would make `is_process_alive` misreport this
-                // run as having a live process forever (POSIX `kill(0, ...)`
-                // semantics), defeating crash recovery.
                 let pid = execution.pid.ok_or_else(|| ProcessError::MissingPid {
                     command: command.program.clone(),
                 })?;
-                // Issue #73 (trio-unification follow-up): every step,
-                // built-in or custom, gets an `agent_processes` row now --
-                // `agent_processes.role` was already a plain, unconstrained
-                // TEXT column (migrations/0001_initial.sql); only the
-                // orchestrator used to gate this on `InvocationRole::Builtin`.
-                // This is what lets `recover_crashed_runs` detect a crash
-                // mid-invocation of *any* step, not just the built-in three.
                 let process_id = Uuid::new_v4().to_string();
                 db::insert_agent_process(
                     &self.pool,
@@ -176,37 +100,15 @@ impl Orchestrator {
                 };
                 db::mark_agent_process_ended(&self.pool, &process_id, exit_code_for_db).await?;
 
-                // L1: log stderr on the success path too — previously only ever
-                // surfaced when findings-parsing failed, so a noisy-but-successful
-                // agent (warnings, debug chatter) left no trace anywhere.
                 if let Ok(outcome) = &outcome_result {
                     if !outcome.stderr.trim().is_empty() {
                         tracing::debug!(cycle_id, ?role, stderr = %outcome.stderr, "agent stderr output");
                     }
 
-                    // Issue #53: grafts onto the exact same captured stdout
-                    // `extract_findings` (the caller's own concern, once this
-                    // returns) reads -- never a second read of the stream, just a
-                    // second, tolerant parse of the buffer already in hand.
-                    // `extract_usage` is infallible (`Option`, "n/a" for a tool
-                    // that reports nothing) by design -- see its own docs -- so
-                    // this never fails an otherwise-successful invocation.
                     let usage = runner.extract_usage(&outcome.stdout);
                     if let Some(usage) = &usage {
-                        // Issue #73 (trio-unification follow-up): the
-                        // per-cycle *per-role* breakdown is recorded for
-                        // every step now, not just the built-in three (see
-                        // `cycle_token_usage`, migrations/0010) -- the
-                        // run-level running total just below always
-                        // accumulated every role's usage regardless.
                         db::add_cycle_role_token_usage(&self.pool, cycle_id, role.as_str(), usage)
                             .await?;
-                        // Only reachable with a run in progress (see
-                        // `publish_event`'s own docs on why a missing
-                        // `run_context` is a silent no-op here too): a test that
-                        // calls `run_agent` directly without going through
-                        // `run_convergence_loop` has no run id to attribute a
-                        // run-level total to.
                         if let Some(context) = self.run_context.get() {
                             db::add_run_token_usage(&self.pool, &context.run_id, usage).await?;
                         }
@@ -219,20 +121,9 @@ impl Orchestrator {
                     })
                     .await?;
 
-                    // Issue #84: same seam-grafting convention as `extract_usage`
-                    // just above -- reads the exact same captured stdout, no
-                    // second stream read. `extract_rate_limit` is infallible
-                    // (`Option`, "n/a" for a tool that reports nothing) by
-                    // design, so this never fails an otherwise-successful
-                    // invocation, and a run's last-known status is simply
-                    // overwritten (not accumulated, unlike token usage) with
-                    // whatever this invocation most recently reported.
+                    // same seam-grafting convention as `extract_usage` just above -- reads the
+                    // exact same captured stdout, no second stream read.
                     if let Some(rate_limit) = runner.extract_rate_limit(&outcome.stdout) {
-                        // Same "no run id to attribute this to" guard
-                        // `add_run_token_usage` uses above: a test that calls
-                        // `run_agent` directly without going through
-                        // `run_convergence_loop` has no run to persist this
-                        // status onto.
                         if let Some(context) = self.run_context.get() {
                             db::set_run_rate_limit_status(&self.pool, &context.run_id, &rate_limit)
                                 .await?;
@@ -249,13 +140,6 @@ impl Orchestrator {
             }
             .await;
 
-        // Best-effort: `LocalSandbox::destroy` only ever drops this
-        // invocation's own bookkeeping entry (no real OS resource to leak
-        // today, but a future `DockerSandbox`'s container very much is one)
-        // -- a failure here must never mask the agent's own outcome above,
-        // so it's logged, not propagated, the same "cleanup failure is
-        // secondary to the outcome already computed" convention this module
-        // already uses for worktree removal after a failed coder run.
         if let Err(error) = guard.destroy().await {
             tracing::warn!(cycle_id, ?role, %error, "failed to destroy sandbox after agent invocation");
         }
@@ -264,26 +148,6 @@ impl Orchestrator {
     }
 }
 
-/// RAII guard over one sandbox's `create`->`destroy` lifecycle (issue #50
-/// review, MEDIUM 1) -- see [`Orchestrator::run_agent`]'s own docs for why
-/// this needs to be structural rather than a single `destroy` call reachable
-/// only from the straight-line success path. The common case (still inside
-/// `run_agent`'s own future, `Ok` or `Err`) goes through the explicit,
-/// awaited [`SandboxGuard::destroy`]. `Drop` is only the backstop for the
-/// one path an awaited call can't cover: this whole future being dropped
-/// mid-await (run cancellation, `warden run --tui` exit) before
-/// [`SandboxGuard::destroy`] resolves -- `id` stays on `self` (never taken
-/// out up front) so `Drop` still has it to retry with even if it fires while
-/// an explicit `destroy(id).await` is itself in flight (issue #50 review,
-/// LOW D).
-///
-/// `pub(super)` (issue #79 review, cycle 3): `orchestrator::agents::
-/// Orchestrator::run_step_command` -- a `type: hook` workflow step's own
-/// sandboxed command -- needs the exact same structural create->destroy
-/// pairing `run_agent` gets here. A hand-paired `create`/`destroy` (that
-/// function's own shape before this fix) misses every early-return between
-/// the two and has no answer at all for the whole future being dropped
-/// mid-`.await` -- exactly the two gaps this guard exists to close.
 pub(super) struct SandboxGuard {
     sandbox: Arc<dyn Sandbox>,
     id: warden_sandbox::SandboxId,
@@ -304,11 +168,6 @@ impl SandboxGuard {
         &self.id
     }
 
-    /// Explicit, awaited teardown for the common (still-inside-the-owning-
-    /// future's-own-`.await`) exit path -- see this type's own docs on why
-    /// this is preferred over letting `Drop` handle it whenever the caller
-    /// can still `.await`, and on why `destroyed` is only set *after* the
-    /// `.await` resolves.
     pub(super) async fn destroy(&mut self) -> warden_sandbox::Result<()> {
         if self.destroyed {
             return Ok(());
@@ -325,20 +184,6 @@ impl Drop for SandboxGuard {
             return;
         }
         self.destroyed = true;
-        // Backstop only -- see this type's own docs. `Drop` cannot itself
-        // `.await`, so the destroy is dispatched onto the ambient tokio
-        // runtime instead -- but only if one is actually available (issue
-        // #50 review, LOW C): calling `tokio::spawn` with no runtime context
-        // panics outright, and a panic while already unwinding from a drop
-        // aborts the process. This is a best-effort backstop, not a
-        // guarantee: if this drop happens during runtime shutdown (the
-        // `warden run --tui` exit case this type's own docs cite), a
-        // successfully spawned task can still be cancelled before it runs,
-        // silently leaving the sandbox undestroyed -- for `LocalSandbox`
-        // that is only an in-memory bookkeeping entry, but a future
-        // `DockerSandbox` (#49) container leak here is a real, open
-        // limitation of this backstop, not one this guard can close on its
-        // own.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let sandbox = Arc::clone(&self.sandbox);
@@ -360,15 +205,6 @@ impl Drop for SandboxGuard {
     }
 }
 
-/// Translates a [`warden_sandbox::SandboxError`] into this crate's own
-/// [`ProcessError`] (issue #50): every existing caller/test downstream of
-/// [`Orchestrator::run_agent`] -- CLI error text, `assert_cmd` assertions --
-/// was written against `ProcessError`'s `Display` output, and a `LocalSandbox`
-/// invocation must remain indistinguishable from it (strict parity is this
-/// issue's own acceptance criterion). A `SandboxError` variant with no
-/// natural `ProcessError` counterpart (only `UnknownSandbox` today -- an
-/// internal bug, never expected from a well-behaved backend) still becomes a
-/// typed, actionable error rather than a panic or a silently swallowed one.
 fn map_sandbox_error(error: warden_sandbox::SandboxError) -> WardenError {
     use warden_sandbox::SandboxError;
     match error {
@@ -388,15 +224,6 @@ fn map_sandbox_error(error: warden_sandbox::SandboxError) -> WardenError {
             source,
         }
         .into(),
-        // Issue #50 review, LOW 6: no `ProcessError` counterpart exists for
-        // this one (an internal bug, never expected from a well-behaved
-        // backend) -- wrapped via `WardenError`'s own `#[from]` instead of a
-        // hand-rolled `reason: String` that would have discarded `#[source]`.
-        //
-        // Issue #49: `DockerUnavailable` has no `ProcessError` counterpart
-        // either -- a docker-specific configuration/precondition failure
-        // (a missing `~/.claude`, an unresolvable bind-mount path), not a
-        // spawn/wait/stdin-write/cancel shape `LocalSandbox` ever produces.
         error @ (SandboxError::UnknownSandbox { .. } | SandboxError::DockerUnavailable { .. }) => {
             WardenError::Sandbox(error)
         }
@@ -409,10 +236,6 @@ mod tests {
     use crate::orchestrator::test_support::*;
     use tempfile::TempDir;
 
-    /// Builds an `Orchestrator` wired to `sandbox` via
-    /// [`Orchestrator::with_sandbox`], plus the run/cycle rows `run_agent`'s
-    /// own `db::insert_agent_process` needs a valid `cycle_id` foreign key
-    /// for.
     async fn orchestrator_with_sandbox_and_cycle(
         pool: &SqlitePool,
         sandbox: Arc<dyn Sandbox>,
@@ -426,10 +249,6 @@ mod tests {
         Orchestrator::new(pool.clone()).with_sandbox(sandbox)
     }
 
-    /// `run_agent` must create, execute, and destroy through whatever
-    /// backend `with_sandbox` installed -- not always the default
-    /// `LocalSandbox` constructed by `Orchestrator::new` -- proving the
-    /// seam issue #50 promises is actually reachable.
     #[tokio::test]
     async fn with_sandbox_installs_a_custom_backend_and_routes_run_agent_through_it() {
         let dir = TempDir::new().unwrap();
@@ -470,12 +289,6 @@ mod tests {
         assert_eq!(sandbox.calls(), vec!["create", "execute", "destroy"]);
     }
 
-    /// Issue #73 (trio-unification follow-up): every step -- built-in or
-    /// custom -- goes through the exact same `validate_agent_program` call
-    /// now, keyed on `role.as_str()` directly rather than an
-    /// `AgentRole::Reviewer` stand-in rewritten after the fact. A custom
-    /// step's containment-check failure names its own real role from the
-    /// start.
     #[tokio::test]
     async fn a_custom_steps_containment_violation_names_its_own_real_role() {
         let worktree = TempDir::new().unwrap();
@@ -493,9 +306,6 @@ mod tests {
         )
         .await;
 
-        // Resolves inside `worktree` itself -- exactly the containment
-        // violation `process::validate_agent_program` refuses for any
-        // non-producer step.
         let program_inside_worktree = worktree.path().join("evil.sh");
         let techlead_role = Role::new("techlead").unwrap();
 
@@ -531,11 +341,6 @@ mod tests {
         );
     }
 
-    /// Issue #50 review, MEDIUM 1: a sandbox created for an invocation whose
-    /// `execute` call itself fails (one of the early-return `?`s `run_agent`
-    /// takes right after `create`) must still be destroyed -- not leaked on
-    /// the one path that used to skip straight past the single, positional
-    /// `destroy` call at the end of the function.
     #[tokio::test]
     async fn sandbox_is_destroyed_even_when_execute_fails() {
         let dir = TempDir::new().unwrap();
@@ -581,18 +386,6 @@ mod tests {
         );
     }
 
-    /// Genuine coverage gap, independently derived from issue #50's own
-    /// acceptance criteria (sandbox lifecycle "on cancellation"), distinct
-    /// from both neighbours: here the `CancellationToken` passed to
-    /// `run_agent` fires while its future keeps running to completion --
-    /// never dropped or aborted from outside, unlike
-    /// [`sandbox_is_destroyed_when_the_run_agent_future_itself_is_dropped_mid_flight`].
-    /// `execution.wait()` resolves on its own with
-    /// `SandboxError::Cancelled`, `run_agent`'s `result` plumbing turns that
-    /// into `Err(WardenError::Process(ProcessError::Cancelled { .. }))`
-    /// (`map_sandbox_error`, strict parity with pre-#50 error text), and the
-    /// explicit, awaited `guard.destroy()` right after the inner async block
-    /// -- not `SandboxGuard::drop`'s detached backstop -- is what must run.
     #[tokio::test]
     async fn sandbox_is_destroyed_when_cancellation_resolves_the_future_normally() {
         let dir = TempDir::new().unwrap();
@@ -651,15 +444,6 @@ mod tests {
         );
     }
 
-    /// Issue #50 review, MEDIUM 1's other named skip point: the whole
-    /// `run_agent` future being dropped mid-`.await` (run cancellation,
-    /// `warden run --tui` exit), not just an early `?` return. Aborts the
-    /// task running `run_agent` while it's parked on `execution.wait()` (a
-    /// long `sleep`, so the abort lands there rather than racing an already-
-    /// finished invocation) and asserts `SandboxGuard::drop`'s detached
-    /// backstop still destroys the sandbox -- polled for, since that
-    /// teardown runs on its own task, not awaited by anything after the
-    /// abort.
     #[tokio::test]
     async fn sandbox_is_destroyed_when_the_run_agent_future_itself_is_dropped_mid_flight() {
         let dir = TempDir::new().unwrap();
@@ -701,21 +485,10 @@ mod tests {
                 .await;
         });
 
-        // Give the task time to get past `create` and into the long
-        // `execution.wait()` await before dropping it mid-flight. Issue #50
-        // review, LOW E: this is a best-effort delay, not a synchronization
-        // point -- under load the abort can in principle land before
-        // `execute` itself has even recorded its call, so what this test
-        // asserts below is the property under test (the sandbox created for
-        // this invocation is destroyed), not the exact call vector, which a
-        // slow scheduler could otherwise make flaky for a reason that has
-        // nothing to do with the guard's actual correctness.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         handle.abort();
         let _ = handle.await;
 
-        // `SandboxGuard::drop`'s destroy is dispatched onto a detached
-        // task -- poll briefly rather than asserting immediately.
         for _ in 0..200 {
             if sandbox.calls().contains(&"destroy") {
                 break;

@@ -1,8 +1,6 @@
 use super::*;
 use warden_core::Severity;
 
-// ---- detect_linked_issue -------------------------------------------
-
 #[test]
 fn detects_fixes_keyword_case_insensitively() {
     let linked = detect_linked_issue("FIXES #123: handle token expiry").unwrap();
@@ -40,8 +38,6 @@ fn does_not_match_fixes_without_a_hash() {
     assert!(detect_linked_issue("fixes 123").is_none());
 }
 
-// ---- generate_pr_title ----------------------------------------------
-
 #[test]
 fn generates_a_title_from_the_first_non_blank_line() {
     let title = generate_pr_title("\n  Add JWT expiry handling\nmore detail below").unwrap();
@@ -64,8 +60,6 @@ fn rejects_a_blank_intent_rather_than_inventing_a_title() {
     ));
 }
 
-// ---- open_draft_pr_body ----------------------------------------------
-
 #[test]
 fn body_leads_with_the_issue_reference_when_linked() {
     let linked = LinkedIssue {
@@ -82,8 +76,6 @@ fn body_has_no_issue_reference_when_none_is_linked() {
     let body = open_draft_pr_body("Handle token expiry", None);
     assert!(!body.contains('#'));
 }
-
-// ---- trailer formatting -----------------------------------------------
 
 #[test]
 fn formats_trailers_matching_the_architecture_doc_example() {
@@ -157,8 +149,6 @@ fn append_trailers_trims_trailing_whitespace_before_the_blank_separator() {
     );
 }
 
-// ---- format_cycle_comment -----------------------------------------------
-
 fn reviewer_finding() -> Finding {
     Finding {
         source: FindingSource::role("reviewer"),
@@ -194,12 +184,6 @@ fn comment_lists_findings_grouped_by_source() {
     assert!(comment.contains("consider adding an e2e test"));
 }
 
-/// The bug the four-variant grouping fixed (issue #24 review, cycle 2):
-/// a cycle whose only findings came from a source outside the original
-/// `[Reviewer, Tester]` list rendered a **blank** comment -- header and
-/// "informational only" footer, no findings section at all. A silently
-/// empty report about a blocking tampering finding is worse than no
-/// report, since it reads as "nothing to see here".
 #[test]
 fn a_warden_sourced_finding_is_rendered_rather_than_silently_dropped() {
     let summary = CycleSummary {
@@ -227,7 +211,6 @@ fn a_warden_sourced_finding_is_rendered_rather_than_silently_dropped() {
     );
 }
 
-/// Same guarantee for the other non-agent source (ADR-0011).
 #[test]
 fn a_ci_sourced_finding_is_rendered_rather_than_silently_dropped() {
     let summary = CycleSummary {
@@ -270,12 +253,6 @@ fn comment_always_states_it_is_informational_only() {
     assert!(comment.contains("Informational only"));
 }
 
-// ---- orchestration functions -------------------------------------------
-
-/// In-memory `PrProvider` recording every call it receives -- stands in
-/// for a real PR provider so these tests exercise `pr_manager`'s
-/// orchestration logic without ever invoking `gh`/network I/O
-/// (code-standards.md: "pas d'appel réseau externe").
 struct RecordingProvider {
     calls: std::sync::Mutex<Vec<String>>,
     next_pr_number: u64,
@@ -339,14 +316,6 @@ fn run_git(dir: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
-/// The exact-match fix (issue #4 review, follow-up finding): `origin`
-/// has both `refs/heads/main` and `refs/heads/feat/main` (a sibling
-/// branch whose last path segment also happens to be "main"). Asking
-/// for `main` must resolve to `refs/heads/main`'s own sha, never
-/// `feat/main`'s -- `git ls-remote --heads <remote> main` alone would
-/// match both refs as a pattern, so this exercises `remote_branch_head`
-/// doing the exact-ref filtering itself rather than trusting the
-/// pattern match.
 #[tokio::test]
 async fn remote_branch_head_matches_the_exact_ref_not_a_sibling_suffix_match() {
     let origin = tempfile::TempDir::new().unwrap();
@@ -424,18 +393,6 @@ async fn remote_branch_head_matches_the_exact_ref_not_a_sibling_suffix_match() {
     );
 }
 
-/// A bare gate repo with `origin` pointed at a second local bare repo,
-/// plus the sha of a commit already present in the gate repo -- enough
-/// to exercise `push::push_to_origin` (which `open_draft`/`finalize`
-/// both call) without any network access.
-///
-/// `origin`'s `main` branch is seeded with this exact commit as its tip
-/// (pushed there before the fixture returns): `open_draft`'s content-
-/// free check (`skeleton_diff_against_base`) fetches `main` from
-/// `origin` and diffs the skeleton against it, so the returned commit
-/// must genuinely be content-free relative to whatever `origin` already
-/// has -- matching real usage, where `OpenDraft` fires before the coder
-/// has changed anything.
 fn gate_repo_fixture() -> (
     tempfile::TempDir,
     tempfile::TempDir,
@@ -494,18 +451,6 @@ fn gate_repo_fixture() -> (
     (origin, seed, gate_repo, commit_sha)
 }
 
-/// A bare gate repo whose local history has a skeleton commit followed
-/// by a second "business code" commit on top of it (standing in for
-/// content that -- through some later bug or race -- ended up in the
-/// gate's local history ahead of `Finalize`). `open_draft` must still
-/// only ever push the exact sha it's handed, never the branch tip, so
-/// this lets tests prove that invariant even when business code already
-/// exists locally.
-///
-/// Only the skeleton commit is pushed to `origin`'s `main` -- the
-/// business commit stays local-only, standing in for content that must
-/// never reach `origin` via `OpenDraft`. Returns `(origin, gate_repo,
-/// skeleton_sha, business_sha)`.
 fn gate_repo_with_business_commit_on_top_of_skeleton(
 ) -> (tempfile::TempDir, tempfile::TempDir, String, String) {
     let origin = tempfile::TempDir::new().unwrap();
@@ -676,12 +621,6 @@ async fn open_draft_never_pushes_content_beyond_the_given_skeleton_commit() {
     );
 }
 
-/// The security crux (issue #4 review, finding #1): `open_draft` must
-/// not blindly trust a caller-supplied sha to be a content-free
-/// skeleton. Here the caller (standing in for a buggy/compromised
-/// orchestrator) hands it the *business* commit instead of the
-/// skeleton -- `open_draft` must independently detect the extra file
-/// relative to `origin/main`, refuse, and push nothing at all.
 #[tokio::test]
 async fn open_draft_rejects_a_skeleton_sha_that_carries_business_content() {
     let (origin, gate_repo, _skeleton_sha, business_sha) =
@@ -724,16 +663,6 @@ async fn open_draft_rejects_a_skeleton_sha_that_carries_business_content() {
     );
 }
 
-/// The range-check follow-up (issue #4 review): an *endpoint-only* diff
-/// (skeleton tip tree vs. base tip tree) would miss this entirely --
-/// the skeleton's tip tree is identical to `origin/main`'s, because an
-/// intermediate commit adds `secret.rs` and a later commit removes it
-/// again. But `git push {skeleton}:refs/heads/<branch>` still transfers
-/// every object in that range, so `secret.rs`'s blob would land on
-/// `origin` and stay reachable via `git log`/`git show` on the pushed
-/// branch even though the tree at the tip never shows it. `open_draft`
-/// must catch this by checking every commit in the range individually,
-/// not just the range's net effect.
 #[tokio::test]
 async fn open_draft_rejects_a_skeleton_whose_tip_matches_base_but_whose_history_leaks_a_secret_file(
 ) {
@@ -757,15 +686,10 @@ async fn open_draft_rejects_a_skeleton_whose_tip_matches_base_but_whose_history_
         ],
     );
 
-    // Intermediate commit: adds a secret file that must never reach
-    // `origin`.
     std::fs::write(seed.path().join("secret.rs"), "const KEY: &str = \"x\";\n").unwrap();
     run_git(seed.path(), &["add", "."]);
     run_git(seed.path(), &["commit", "--quiet", "-m", "add secret.rs"]);
 
-    // Later commit: removes it again, so the *tip* tree is byte-for-
-    // byte identical to `main`'s -- an endpoint-only diff would see
-    // nothing wrong here.
     run_git(seed.path(), &["rm", "--quiet", "secret.rs"]);
     run_git(
         seed.path(),
@@ -842,15 +766,6 @@ async fn open_draft_rejects_a_skeleton_whose_tip_matches_base_but_whose_history_
     );
 }
 
-/// The merge-commit follow-up (issue #4 review, final finding): plain
-/// `git diff-tree` emits **nothing** for a merge commit by default, so
-/// a merge that introduces a file present in neither parent would
-/// otherwise slip straight through the per-commit range walk. Here,
-/// `branch-a` and `branch-b` each diverge from `main` with a
-/// content-free (`--allow-empty`) commit, so the *only* new content
-/// anywhere in the range is `evil.txt`, folded into the merge commit
-/// itself (present in neither parent) -- exactly the reviewer's
-/// reproduction. `open_draft` must still catch it and push nothing.
 #[tokio::test]
 async fn open_draft_rejects_a_skeleton_whose_merge_commit_introduces_a_file_absent_from_both_parents(
 ) {
@@ -911,8 +826,6 @@ async fn open_draft_rejects_a_skeleton_whose_merge_commit_introduces_a_file_abse
             "merge branch-b into branch-a",
         ],
     );
-    // Fold a file present in *neither* parent into the merge commit
-    // itself -- the reviewer's exact reproduction.
     std::fs::write(seed.path().join("evil.txt"), "not a skeleton\n").unwrap();
     run_git(seed.path(), &["add", "evil.txt"]);
     run_git(seed.path(), &["commit", "--quiet", "--amend", "--no-edit"]);
@@ -983,10 +896,6 @@ async fn open_draft_rejects_a_skeleton_whose_merge_commit_introduces_a_file_abse
     );
 }
 
-/// Exercises the other content-free path (finding #1's "e.g. ... or the
-/// empty tree" case): when `base_branch` doesn't exist on `origin` yet
-/// (a brand-new repo, first run ever), a skeleton with a genuinely
-/// empty tree is still accepted.
 #[tokio::test]
 async fn open_draft_accepts_an_empty_tree_skeleton_when_base_branch_does_not_exist_on_origin() {
     let origin = tempfile::TempDir::new().unwrap();
@@ -1008,8 +917,6 @@ async fn open_draft_accepts_an_empty_tree_skeleton_when_base_branch_does_not_exi
             .unwrap();
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
-    // Deliberately never pushed to `origin` -- `origin` stays empty, so
-    // `main` doesn't exist there yet.
 
     let gate_repo = tempfile::TempDir::new().unwrap();
     run_git(
@@ -1060,12 +967,6 @@ async fn open_draft_accepts_an_empty_tree_skeleton_when_base_branch_does_not_exi
     );
 }
 
-/// The other half of the empty-tree fallback (finding #1): when
-/// `base_branch` doesn't exist on `origin` yet, the *only* content-free
-/// skeleton is one with a genuinely empty tree -- a skeleton that adds
-/// real files must still be rejected, exactly as it would be against an
-/// existing base branch. Without this, a brand-new repo's very first
-/// run would let *any* skeleton content through unchecked.
 #[tokio::test]
 async fn open_draft_rejects_a_non_empty_skeleton_when_base_branch_does_not_exist_on_origin() {
     let origin = tempfile::TempDir::new().unwrap();
@@ -1089,8 +990,6 @@ async fn open_draft_rejects_a_non_empty_skeleton_when_base_branch_does_not_exist
             .unwrap();
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
-    // Deliberately never pushed to `origin` -- `main` doesn't exist
-    // there yet, same as the accept-case fixture.
 
     let gate_repo = tempfile::TempDir::new().unwrap();
     run_git(
@@ -1152,13 +1051,6 @@ async fn open_draft_rejects_a_non_empty_skeleton_when_base_branch_does_not_exist
     );
 }
 
-/// Ordering invariant (issue #4 review, finding #2): pure validation
-/// (here, a blank intent that `generate_pr_title` refuses) must surface
-/// *before* `open_draft` does anything irreversible -- no content-free
-/// check, no push, no provider call. Proven here against a real gate
-/// repo/origin pair rather than just unit-testing `generate_pr_title` in
-/// isolation, so the ordering itself (not just the pure function) is
-/// under test.
 #[tokio::test]
 async fn open_draft_rejects_a_blank_intent_before_touching_git_or_the_provider() {
     let (origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
@@ -1242,9 +1134,6 @@ async fn seeded_run_db(
 
     (dir, db_path)
 }
-
-// ---- finalize_pr_body: the reachable, production evidence-section
-// call site (HIGH code-review finding, issue #7) --------------------
 
 #[test]
 fn finalize_pr_body_leaves_summary_body_untouched_when_there_is_no_evidence() {
@@ -1333,11 +1222,6 @@ async fn finalize_pushes_and_marks_ready_when_converged_and_hash_matches() {
     );
 }
 
-/// End-to-end proof of the HIGH code-review finding's fix (issue #7):
-/// `finalize`/`update_body` -- the only code that actually sets a PR
-/// body in production -- genuinely calls the Evidence section renderer
-/// when evidence was captured, not just `finalize_pr_body` in
-/// isolation.
 #[tokio::test]
 async fn finalize_posts_an_evidence_section_when_evidence_was_captured() {
     let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
@@ -1446,10 +1330,6 @@ async fn finalize_blocks_and_never_touches_the_provider_on_hash_mismatch() {
         "a blocked finalize (hash mismatch) must never call the provider"
     );
 
-    // `gate_repo_fixture` seeds `origin`'s `main` with `commit_sha` up
-    // front (so `open_draft`'s content-free check has a real base to
-    // diff against elsewhere) -- a blocked finalize must leave that ref
-    // exactly as it already was, not add or move anything.
     let origin_head = std::process::Command::new("git")
         .current_dir(origin.path())
         .args(["log", "-1", "--format=%H", "refs/heads/main"])
@@ -1462,10 +1342,6 @@ async fn finalize_blocks_and_never_touches_the_provider_on_hash_mismatch() {
     );
 }
 
-/// Tracks a fake PR's actual `draft`/`body` state (not just a call log)
-/// -- lets this test assert the invariant itself ("the PR's draft status
-/// flips only at `Finalize`, never at `PostCycleUpdate`") rather than
-/// only that the right provider method got called.
 struct StatefulProvider {
     next_pr_number: u64,
     draft: std::sync::Mutex<bool>,
@@ -1513,12 +1389,6 @@ impl PrProvider for StatefulProvider {
     }
 }
 
-/// End-to-end across the full lifecycle a real run drives
-/// `pr_manager` through: `OpenDraft`, two `PostCycleUpdate`s, then
-/// `Finalize`. Asserts the ticket's core orchestration invariant --
-/// the PR never leaves draft, and its body never changes, until
-/// `Finalize` explicitly does both -- against a provider double that
-/// tracks real state rather than just recording calls.
 #[tokio::test]
 async fn pr_never_leaves_draft_or_changes_body_before_finalize_across_a_full_cycle_sequence() {
     let (_origin, _seed, gate_repo, skeleton_sha) = gate_repo_fixture();

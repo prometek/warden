@@ -1,81 +1,44 @@
-//! The I/O-bearing half of `warden-policy`'s wiring (issue #51, ADR-0016):
-//! resolves a [`warden_policy::Decision`] into something an orchestrator
-//! decision point can act on, suspending at a human-validation wait point
-//! for [`warden_policy::Decision::RequireApproval`].
-//!
-//! [`warden_policy`] itself never does I/O and never suspends -- it only
-//! evaluates rules. This module is where that pure verdict meets the run's
-//! actual lifecycle: [`PolicyGate::decide`] `.await`s an [`ApprovalGate`]
-//! when a decision needs one, which is the "wait point" ADR-0016 calls for.
-//! Two call sites use it today (see each's own docs):
-//! - `crate::hook::CommandHook::run` -- a `.warden/hooks.toml` shell command,
-//!   evaluated as [`warden_policy::Action::Shell`].
-//! - `crate::orchestrator::gate_tail` -- the push into the local bare gate
-//!   repo (never `origin` itself), evaluated as [`warden_policy::Action::GitPush`].
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use warden_policy::{Action, Decision, Evaluator};
 
-/// What is presented to a human when a [`Decision::RequireApproval`] needs
-/// their sign-off before Warden proceeds.
+/// What is presented to a human when a [`Decision::RequireApproval`] needs their sign-off before
+/// Warden proceeds.
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalRequest<'a> {
     pub run_id: &'a str,
-    /// Human-readable description of the action awaiting approval, e.g.
-    /// `"git_push to branch \"main\""` or `"shell: cargo publish"`.
     pub description: &'a str,
-    /// The matching rule's own reason (`Decision::RequireApproval`'s
-    /// `reason` field) -- e.g. `"push to branch \"main\" requires: tests,
-    /// review"`.
     pub reason: &'a str,
 }
 
-/// A human-validation wait point (ADR-0016): resolves one
-/// [`ApprovalRequest`] to `true` (approved, the action may proceed) or
-/// `false` (denied, the action is blocked exactly like a
-/// [`Decision::Deny`]). Implemented outside this crate's pure lib code path
-/// wherever the concrete approval channel needs to write to a terminal/UI --
-/// code-standards.md's "the lib emits tracing spans/events... it never
-/// writes to stdout/stderr directly" applies here exactly as it does to
-/// [`crate::orchestrator::Orchestrator`]'s own `on_run_started` callback: a
-/// real interactive implementation belongs in `main.rs`, this trait only
-/// names the seam.
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
     async fn approve(&self, request: ApprovalRequest<'_>) -> bool;
 }
 
-/// What [`PolicyGate::decide`] resolved a [`Decision`] to, for a caller to
-/// act on.
+/// What [`PolicyGate::decide`] resolved a [`Decision`] to, for a caller to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyOutcome {
     /// The action may proceed.
     Allowed,
-    /// The action must not proceed. `reason` is always actionable (why it
-    /// was denied, or why an approval was refused/unavailable).
+    /// The action must not proceed. `reason` is always actionable (why it was denied, or why an
+    /// approval was refused/unavailable).
     Blocked { reason: String },
 }
 
-/// Combines a [`warden_policy::Evaluator`] with an optional [`ApprovalGate`]
-/// into the single seam every decision point in `warden` goes through.
-/// Cloned cheaply (`Arc` internals) -- one instance is resolved per run
-/// (`main.rs`) and shared between the orchestrator's own push check and
-/// every `.warden/hooks.toml` `CommandHook`.
+/// Combines a [`warden_policy::Evaluator`] with an optional [`ApprovalGate`] into the single seam
+/// every decision point in `warden` goes through.
 #[derive(Clone)]
 pub struct PolicyGate {
     evaluator: Arc<Evaluator>,
-    /// `None` by default: no interactive approval channel configured. A
-    /// [`Decision::RequireApproval`] with no gate configured is **denied**
-    /// (fail-closed, code-standards.md's "no silent fallback") rather than
-    /// either silently allowed or left hanging forever.
+    /// `None` by default: no interactive approval channel configured.
     approval_gate: Option<Arc<dyn ApprovalGate>>,
 }
 
 impl std::fmt::Debug for PolicyGate {
-    /// `dyn ApprovalGate` is not `Debug`; whether one is configured at all
-    /// is the only externally interesting property.
+    /// `dyn ApprovalGate` is not `Debug`; whether one is configured at all is the only externally
+    /// interesting property.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyGate")
             .field("approval_gate_configured", &self.approval_gate.is_some())
@@ -91,26 +54,18 @@ impl PolicyGate {
         }
     }
 
-    /// A gate with no rules and no approval channel -- every action is
-    /// [`PolicyOutcome::Allowed`]. The default every [`crate::orchestrator::Orchestrator`]
-    /// and [`crate::hook_config::load_repo_hooks`] caller gets absent an
-    /// explicit `.warden/policy.yaml` (`crate::policy_config`'s own "no file
-    /// -> no rules" convention), a strict no-op exactly like
-    /// `warden_core::HookRegistry::new`'s empty registry.
+    /// A gate with no rules and no approval channel -- every action is [`PolicyOutcome::Allowed`].
     pub fn empty() -> Self {
         Self::new(Evaluator::empty())
     }
 
-    /// Installs `gate` as the human-validation wait point a
-    /// [`Decision::RequireApproval`] suspends on.
+    /// Installs `gate` as the human-validation wait point a [`Decision::RequireApproval`] suspends
+    /// on.
     pub fn with_approval_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
         self.approval_gate = Some(gate);
         self
     }
 
-    /// Evaluates `action` and resolves it to a [`PolicyOutcome`] a caller can
-    /// act on directly, suspending on the configured [`ApprovalGate`] (the
-    /// "wait point") when the decision is [`Decision::RequireApproval`].
     pub async fn decide(&self, run_id: &str, description: &str, action: &Action) -> PolicyOutcome {
         match self.evaluator.evaluate(action) {
             Decision::Allow => PolicyOutcome::Allowed,

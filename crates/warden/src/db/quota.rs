@@ -1,11 +1,5 @@
 use super::*;
 
-/// Issue #84: overwrites `run_id`'s last-known rate-limit/quota status with
-/// `status` -- a snapshot, not a running total (unlike
-/// [`add_run_token_usage`]'s accumulation): each new report from
-/// `ToolAdapter::extract_rate_limit` simply supersedes whatever was recorded
-/// before, the same "most recent wins" contract that seam's own docs
-/// describe for scanning a single invocation's own stdout.
 pub async fn set_run_rate_limit_status(
     pool: &SqlitePool,
     run_id: &str,
@@ -41,10 +35,6 @@ pub async fn set_run_rate_limit_status(
     Ok(())
 }
 
-/// The status last written by [`set_run_rate_limit_status`], or `None` if
-/// this run's tool never reported a rate-limit/quota signal at all
-/// (rendered "n/a" by every caller, never a fabricated status -- see
-/// [`row_to_rate_limit_status`]).
 pub async fn get_run_rate_limit_status(
     pool: &SqlitePool,
     run_id: &str,
@@ -72,11 +62,8 @@ pub async fn get_run_rate_limit_status(
     )
 }
 
-/// Removes a quota observation once its reset time has passed and issue #86
-/// is about to retry the recorded workflow boundary. Without this, the
-/// boundary's anticipation check would immediately re-read the stale,
-/// already-expired report and suspend again without giving the CLI a chance
-/// to publish its current quota status.
+/// Removes a quota observation once its reset time has passed and is about to retry the recorded
+/// workflow boundary.
 pub async fn clear_run_rate_limit_status(pool: &SqlitePool, run_id: &str) -> Result<()> {
     let now = now_rfc3339();
     sqlx::query!(
@@ -99,19 +86,15 @@ pub async fn clear_run_rate_limit_status(pool: &SqlitePool, run_id: &str) -> Res
     Ok(())
 }
 
-/// The two validated JSON documents needed to reconstruct one suspended
-/// convergence loop. Kept opaque to the database layer; decoding belongs at
-/// the orchestrator boundary.
+/// The two validated JSON documents needed to reconstruct one suspended convergence loop.
 #[derive(Debug)]
 pub struct QuotaContinuationRecord {
     pub config_json: String,
     pub state_json: String,
 }
 
-/// Atomically records both the continuation and the state transition that
-/// makes it eligible for startup resumption. A process can therefore never
-/// expose `AwaitingQuotaReset` without all deterministic continuation data
-/// already durable.
+/// Atomically records both the continuation and the state transition that makes it eligible for
+/// startup resumption.
 pub async fn suspend_run_with_quota_continuation(
     pool: &SqlitePool,
     run_id: &str,
@@ -152,8 +135,6 @@ pub async fn suspend_run_with_quota_continuation(
 }
 
 /// One exact generation of a quota wait observed by a startup recovery pass.
-/// The private comparison fields prevent callers from claiming a later
-/// re-suspension through a stale candidate.
 #[derive(Debug, Clone)]
 pub struct DueQuotaContinuation {
     pub run_id: String,
@@ -162,9 +143,7 @@ pub struct DueQuotaContinuation {
     expected_updated_at: String,
 }
 
-/// Materializes quota continuations due as of `now_unix` without claiming
-/// them. Recovery claims each candidate immediately before processing it, so
-/// a long or failed resume never strands later runs in `resuming_quota`.
+/// Materializes quota continuations due as of `now_unix` without claiming them.
 pub async fn list_due_quota_continuations(
     pool: &SqlitePool,
     now_unix: i64,
@@ -194,8 +173,6 @@ pub async fn list_due_quota_continuations(
 }
 
 /// Atomically changes one exact quota-wait generation to `resuming_quota`.
-/// Concurrent callers may hold the same candidate, but the compare-and-swap
-/// can affect one row once; only the caller receiving `true` owns the resume.
 pub async fn claim_due_quota_continuation(
     pool: &SqlitePool,
     candidate: &DueQuotaContinuation,
@@ -234,17 +211,14 @@ pub async fn claim_due_quota_continuation(
     Ok(result.rows_affected() == 1)
 }
 
-/// The Warden process that currently owns a `ResumingQuota` claim. Its PID
-/// fingerprint has the same PID-reuse protection as agent-process records.
+/// The Warden process that currently owns a `ResumingQuota` claim.
 #[derive(Debug, Clone, Copy)]
 pub struct QuotaResumeLease {
     pub owner_pid: u32,
     pub owner_started_at_unix: i64,
 }
 
-/// Reads a quota-resume lease at the persistence boundary. A partially
-/// written lease is invalid rather than treated as a live owner; claims are
-/// written atomically, so partial data signals database corruption.
+/// Reads a quota-resume lease at the persistence boundary.
 pub async fn get_quota_resume_lease(
     pool: &SqlitePool,
     run_id: &str,
@@ -282,9 +256,7 @@ pub async fn get_quota_resume_lease(
     }
 }
 
-/// Atomically fails a claimed quota resume before it has handed off to an
-/// agent process. The lease predicate prevents an unrelated later lifecycle
-/// state from being overwritten by cleanup of an earlier failed task.
+/// Atomically fails a claimed quota resume before it has handed off to an agent process.
 pub async fn fail_quota_resume_claim(pool: &SqlitePool, run_id: &str) -> Result<bool> {
     let now = now_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -331,9 +303,8 @@ pub async fn delete_quota_continuation(pool: &SqlitePool, run_id: &str) -> Resul
     Ok(())
 }
 
-/// Validates that an active-cycle id restored from a checkpoint still names
-/// a cycle belonging to the same run. Checkpoint JSON and relational rows
-/// must agree before any subprocess is launched.
+/// Validates that an active-cycle id restored from a checkpoint still names a cycle belonging to
+/// the same run.
 pub async fn cycle_belongs_to_run(pool: &SqlitePool, cycle_id: &str, run_id: &str) -> Result<bool> {
     let exists = sqlx::query_scalar!(
         "SELECT EXISTS(SELECT 1 FROM cycles WHERE id = ? AND run_id = ?)",
@@ -345,15 +316,8 @@ pub async fn cycle_belongs_to_run(pool: &SqlitePool, cycle_id: &str, run_id: &st
     Ok(exists != 0)
 }
 
-/// Converts the six possibly-`NULL` `rate_limit_*` columns read back from
-/// `runs` (issue #84) into `Option<RateLimitStatus>`. Unlike
-/// [`row_to_token_usage`]'s partial optionality (cache fields are
-/// independently optional from input/output), these six columns are always
-/// written together as one unit by [`set_run_rate_limit_status`] -- so `None`
-/// only when *every* column is `NULL` (never reported), and any other
-/// combination is a corrupted row, surfaced as a typed error rather than
-/// silently reconstructed from whatever happened to be present
-/// (code-standards.md: "no silent fallback").
+/// Converts the six possibly-`NULL` `rate_limit_*` columns read back from `runs` into
+/// `Option<RateLimitStatus>`.
 fn row_to_rate_limit_status(
     run_id: &str,
     status: Option<String>,

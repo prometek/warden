@@ -1,37 +1,9 @@
-//! Multi-intent batch mode (issue #72): "give N intents, `warden` processes
-//! one fully, then kills agents and restarts on a clean context for the
-//! next -- zero contamination between tickets".
-//!
-//! **Isolation strategy (default, chosen for this issue): a fresh `warden run`
-//! subprocess per intent.** A brand new OS process gets a brand new
-//! `Orchestrator` instance, a brand new `run_id`, and its own
-//! `<warden_home>/worktrees/<run_id>/` tree -- there is no in-memory state to
-//! carry over between intents by construction, and this crate's own
-//! agent-subprocess/worktree teardown (unchanged, exercised by every existing
-//! single-intent run) already guarantees agents are killed and worktrees
-//! removed once that subprocess's own convergence loop returns. This module
-//! only owns the *sequencing* concern layered on top: which intents to run,
-//! in what order, what to do when one fails (continue by default, `--fail-fast`
-//! to stop), and how to report the outcome -- never a second copy of the
-//! agent/worktree lifecycle itself.
-//!
-//! Everything here is pure (no subprocess spawning, no I/O beyond a single
-//! named file read) so it is testable without a real `warden` binary -- the
-//! actual spawn loop lives in `main.rs` (the binary), which is the only thing
-//! allowed to write to stdout/stderr directly (code-standards.md: "la
-//! lib... n'écrit jamais sur stdout/stderr directement").
+//! Multi-intent batch mode: "give N intents, `warden` processes one fully, then kills agents and
+//! restarts on a clean context for the next -- zero contamination between tickets".
 
 use std::path::Path;
 
-/// Parses an `--intents-file` (issue #72): one intent per non-blank line.
-/// A leading `#` marks a comment line (ignored) -- a convenience for
-/// annotating a checked-in intents file, not a format requirement. Blank
-/// lines (including whitespace-only ones) are skipped rather than rejected,
-/// so trailing newlines or spacing between intents don't need to be exact.
-///
-/// Never fails: there is no malformed input at this level, only "zero
-/// intents found", which the caller (combining this with any `--intent`
-/// flags) is responsible for rejecting if the combined total is still zero.
+/// Parses an `--intents-file`: one intent per non-blank line.
 pub fn parse_intents_file(contents: &str) -> Vec<String> {
     contents
         .lines()
@@ -41,17 +13,6 @@ pub fn parse_intents_file(contents: &str) -> Vec<String> {
         .collect()
 }
 
-/// Everything a single-intent `warden run` child invocation (issue #72's
-/// subprocess-per-intent isolation) needs, besides the intent itself --
-/// mirrors every other `Commands::Run` flag except `--intent`/
-/// `--intents-file`/`--fail-fast`, which are batch-level concerns that never
-/// forward as-is (each child gets exactly one `--intent`, no batch flags at
-/// all). Plain `&str`/`Option<&str>` rather than `Path`/`PathBuf`: a path
-/// that isn't valid UTF-8 can't be forwarded as a CLI argument string either
-/// way, so the caller (`main.rs`) converts once, with its own explicit,
-/// actionable error if that conversion fails -- the same
-/// `to_str().context(...)` shape `attach_warden_home_quoted` already uses,
-/// not silently mangled here via `Path::display()`.
 pub struct SingleIntentArgs<'a> {
     pub repo: &'a str,
     pub branch: &'a str,
@@ -73,16 +34,11 @@ pub struct SingleIntentArgs<'a> {
     pub tui_bin: Option<&'a str>,
     pub isolation: &'a str,
     pub isolation_image: &'a str,
-    /// Number of `-v` occurrences on the parent invocation, forwarded via
-    /// repeated `--verbose` so a child's own tracing verbosity matches.
+    /// Number of `-v` occurrences on the parent invocation, forwarded via repeated `--verbose` so a
+    /// child's own tracing verbosity matches.
     pub verbose: u8,
 }
 
-/// Builds the argv (everything after the child binary's own path) for one
-/// `warden run --intent <intent>` child invocation, from `args` plus the one
-/// intent this child is responsible for. Pure and deterministic -- no env
-/// reads, no filesystem access -- so the exact flags a batch run sends to
-/// each child are unit-testable without spawning a real process.
 pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Vec<String> {
     let mut out = vec!["run".to_string()];
     for _ in 0..args.verbose {
@@ -145,51 +101,20 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out
 }
 
-/// Parses a `warden run` child's `"run <id> started"` stdout line (see
-/// `main.rs::print_run_started_hint`), returning the run id. Lets the batch
-/// runner record which run a since-crashed/killed child was even attempting
-/// -- e.g. reporting a subprocess crash before it produced its own `"...
-/// finished: ..."` line -- without re-deriving the parsing convention `tests/
-/// cli.rs::extract_run_id` already established for it.
 pub fn parse_started_line(line: &str) -> Option<&str> {
     line.strip_prefix("run ")?.strip_suffix(" started")
 }
 
-/// Parses a `warden run` child's final `"run <id> finished: <State>"` stdout
-/// line (see `main.rs::run`'s own final `print_stdout_line_or_log` call),
-/// returning `(run_id, final_state)`. `final_state` is `RunState`'s `Debug`
-/// form (e.g. `"Converged"`, `"StepCyclesExceeded(1)"`) -- **display only**
-/// (issue #72 review, MEDIUM 1): `Debug`'s exact spelling carries no
-/// stability guarantee, so this batch never classifies an intent's success
-/// from it. Only used to give [`summarize`] a nicer label than
-/// [`parse_outcome_line`]'s `snake_case` stable form; the run_id captured
-/// here is likewise never the sole source of truth for a report's `run_id`
-/// (`main.rs::run_one_batch_intent` prefers [`parse_outcome_line`]'s copy).
 pub fn parse_finished_line(line: &str) -> Option<(&str, &str)> {
     line.strip_prefix("run ")?.split_once(" finished: ")
 }
 
-/// Parses a `warden run` child's `"run <id> outcome: <state>"` stdout line
-/// (see `main.rs::run`'s own final `print_stdout_line_or_log` call, printed
-/// right after the `"... finished: ..."` line [`parse_finished_line`]
-/// parses), returning `(run_id, final_state)`. `final_state` here is
-/// `warden_core::RunState::as_str()`'s stable, migration-guarded string form
-/// (e.g. `"converged"`, `"max_review_cycles_exceeded"`) -- issue #72 review,
-/// MEDIUM 1: this is the line [`is_converged_state`] classification is
-/// actually based on, deliberately never `RunState`'s `Debug` output (see
-/// [`parse_finished_line`]'s own docs on why that's display-only here).
 pub fn parse_outcome_line(line: &str) -> Option<(&str, &str)> {
     line.strip_prefix("run ")?.split_once(" outcome: ")
 }
 
-/// Whether `final_state` (a `RunState::as_str()` string, see
-/// [`parse_outcome_line`]) counts as this intent having actually converged.
-/// `"done"` (the post-gate terminal state, ADR-0011) counts alongside
-/// `"converged"` (the no-gate terminal state) -- both mean the run's own
-/// goal was reached, just with or without the post-`Converged` push/PR/CI
-/// tail configured. Every other value (`"step_cycles_exceeded:1"`,
-/// `"step_cycles_exceeded:2"`, `"failed"`, or anything else) is not a
-/// success.
+/// Whether `final_state` (a `RunState::as_str()` string, see [`parse_outcome_line`]) counts as this
+/// intent having actually converged.
 pub fn is_converged_state(final_state: &str) -> bool {
     matches!(final_state, "converged" | "done")
 }
@@ -199,45 +124,36 @@ pub fn is_converged_state(final_state: &str) -> bool {
 pub enum IntentStatus {
     /// The child exited successfully and its run reached `Converged`/`Done`.
     Converged { final_state: String },
-    /// The child exited successfully, but its run ended in a non-converged
-    /// terminal state (`StepCyclesExceeded(index)`/`Failed`/other) -- not a
-    /// crash, just "didn't converge".
+    /// The child exited successfully, but its run ended in a non-converged terminal state
+    /// (`StepCyclesExceeded(index)`/`Failed`/other) -- not a crash, just "didn't converge".
     NotConverged { final_state: String },
-    /// The child either exited non-zero, or exited zero but never printed a
-    /// parseable `"... outcome: ..."` line at all (a bug, or a crash after
-    /// that print but before flush -- either way, this batch run cannot
-    /// trust that intent's outcome).
+    /// The child either exited non-zero, or exited zero but never printed a parseable `"...
     SubprocessError { reason: String },
-    /// Never attempted: batch stopped before reaching this intent, either
-    /// because an earlier intent failed under `--fail-fast`, or the batch was
-    /// cancelled (Ctrl-C, issue #72 review, LOW 1). `reason` names which.
+    /// Never attempted: batch stopped before reaching this intent, either because an earlier intent
+    /// failed under `--fail-fast`, or the batch was cancelled.
     Skipped { reason: String },
 }
 
 impl IntentStatus {
-    /// Whether this intent counts as a success for the batch's own final
-    /// exit code and `X/N converged` tally.
+    /// Whether this intent counts as a success for the batch's own final exit code and `X/N
+    /// converged` tally.
     pub fn is_success(&self) -> bool {
         matches!(self, IntentStatus::Converged { .. })
     }
 }
 
-/// One intent's outcome within a batch run (issue #72's "per-intent status"
-/// acceptance criterion).
+/// One intent's outcome within a batch run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentReport {
     pub intent: String,
-    /// `None` only for [`IntentStatus::Skipped`], or a
-    /// [`IntentStatus::SubprocessError`] so early the child never even
-    /// printed its own `"... started"` line.
+    /// `None` only for [`IntentStatus::Skipped`], or a [`IntentStatus::SubprocessError`] so early
+    /// the child never even printed its own `"...
     pub run_id: Option<String>,
     pub status: IntentStatus,
 }
 
-/// Renders the final batch summary (issue #72's "final report listing each
-/// intent's result") as plain text -- the actual `println!` happens in
-/// `main.rs`, this only builds the string so its exact shape is unit
-/// testable.
+/// Renders the final batch summary as plain text -- the actual `println!` happens in `main.rs`,
+/// this only builds the string so its exact shape is unit testable.
 pub fn summarize(reports: &[IntentReport]) -> String {
     let converged = reports.iter().filter(|r| r.status.is_success()).count();
     let mut lines = vec![format!(
@@ -266,26 +182,12 @@ pub fn summarize(reports: &[IntentReport]) -> String {
     lines.join("\n")
 }
 
-/// Whether the whole batch should be reported as failed (issue #72: the
-/// batch's own final exit code) -- any intent that didn't converge, whether
+/// Whether the whole batch should be reported as failed -- any intent that didn't converge, whether
 /// skipped, crashed, or simply exhausted its budget.
 pub fn batch_failed(reports: &[IntentReport]) -> bool {
     reports.iter().any(|report| !report.status.is_success())
 }
 
-/// Decides whether `main.rs::run_batch`'s own loop should stop attempting
-/// further intents after the one that just finished, and why -- issue #72
-/// review, LOW 1. Kept as a pure decision, separate from the loop's own I/O
-/// (spawning children, reading Ctrl-C), so the two ways a batch can decide to
-/// stop early -- `--fail-fast` and a Ctrl-C cancellation -- and their
-/// interaction are unit-testable without a real subprocess or a real signal.
-///
-/// Cancellation always wins when both are true at once: the user asked to
-/// stop the whole batch outright, which is a more specific, more accurate
-/// reason than "the intent that just ran happened to fail under
-/// `--fail-fast`" -- and `intent_succeeded` is irrelevant once cancelled;
-/// even a *converged* intent still means "stop here", since there is no
-/// clean next intent to move on to once Ctrl-C has been requested.
 pub fn stop_reason(intent_succeeded: bool, fail_fast: bool, cancelled: bool) -> Option<String> {
     if cancelled {
         Some("batch was cancelled (Ctrl-C)".to_string())
@@ -296,10 +198,6 @@ pub fn stop_reason(intent_succeeded: bool, fail_fast: bool, cancelled: bool) -> 
     }
 }
 
-/// Reads and parses `path` as an `--intents-file` (issue #72). Kept as a thin
-/// wrapper around [`parse_intents_file`] so the one fallible part (the
-/// filesystem read) has a single, named call site -- `main.rs` maps its
-/// `io::Error` into its own `anyhow::Context`, naming `path`.
 pub fn read_intents_file(path: &Path) -> std::io::Result<Vec<String>> {
     let contents = std::fs::read_to_string(path)?;
     Ok(parse_intents_file(&contents))
@@ -459,9 +357,6 @@ mod tests {
         assert_eq!(parse_finished_line("attach: warden-tui attach ..."), None);
     }
 
-    /// Issue #72 review, MEDIUM 1: this is the line classification is
-    /// actually based on -- keyed off `RunState::as_str()`'s stable form,
-    /// never the `Debug` text [`parse_finished_line`] parses.
     #[test]
     fn parse_outcome_line_extracts_run_id_and_stable_final_state() {
         assert_eq!(
@@ -485,20 +380,6 @@ mod tests {
         assert!(!is_converged_state("failed"));
     }
 
-    /// Issue #72 review, MEDIUM 1: pins `is_converged_state`'s two success
-    /// literals directly against `warden_core::RunState::as_str()`'s own
-    /// output -- the actual value `main.rs::run` sends over the `"outcome:
-    /// ..."` line. `state.rs`'s own `state_round_trips_through_its_string_form`
-    /// test only checks that `parse`/`as_str` stay mutually consistent, which
-    /// would keep passing even if `Converged`/`Done`'s literal string changed
-    /// (as long as both sides changed together) -- this test would catch that
-    /// too, since it asserts the exact literals this module's own
-    /// classification depends on. `Done` specifically (the post-gate success
-    /// state, ADR-0011) has no dedicated end-to-end `warden run` test in this
-    /// crate today (it requires a real bare gate repo + `warden-gated` +
-    /// simulated CI, exercised instead at the unit level in
-    /// `orchestrator::gate_tail`'s own tests) -- this at least locks down the
-    /// one literal a batch's classification of a gated run actually turns on.
     #[test]
     fn is_converged_state_matches_the_literal_stable_strings_run_state_as_str_produces() {
         assert_eq!(warden_core::RunState::Converged.as_str(), "converged");
@@ -508,9 +389,6 @@ mod tests {
         ));
         assert!(is_converged_state(&warden_core::RunState::Done.as_str()));
         assert!(!is_converged_state(&warden_core::RunState::Failed.as_str()));
-        // Issue #73: the phase-specific `MaxReviewCyclesExceeded`/
-        // `MaxTestCyclesExceeded` variants became the generic per-step
-        // `StepCyclesExceeded(index)` (`step_cycles_exceeded:1`/`:2`).
         assert!(!is_converged_state(
             &warden_core::RunState::StepCyclesExceeded(1).as_str()
         ));
@@ -552,11 +430,6 @@ mod tests {
         assert!(batch_failed(&one_failed));
     }
 
-    /// Issue #72 review, LOW 1: `stop_reason`'s full decision table, covering
-    /// `--fail-fast` and Ctrl-C cancellation both independently and
-    /// interacting -- this is the logic `main.rs::run_batch`'s own loop
-    /// delegates to, made unit-testable here without a real subprocess or
-    /// signal.
     #[test]
     fn stop_reason_covers_fail_fast_and_cancellation_and_their_interaction() {
         assert_eq!(

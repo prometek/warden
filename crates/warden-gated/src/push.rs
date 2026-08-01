@@ -1,11 +1,5 @@
-//! Executes the actual push to `origin` -- the only place in the whole
-//! workspace that does this (Architecture.md §10: "seul `warden-gated` a le
-//! droit de pousser vers `origin`"). Only ever reached after
-//! `gate::verify_and_authorize` returns `GateDecision::Allow`; `origin`'s
-//! credentials themselves are never handled by this code (they're
-//! whatever's already configured for the `origin` remote inside the bare
-//! gate repo -- SSH agent, credential helper, etc. -- provisioned onto the
-//! machine `warden-gated` runs on, never onto `warden`'s).
+//! Executes the actual push to `origin` -- the only place in the whole workspace that does this
+//! (Architecture.md §10: "seul `warden-gated` a le droit de pousser vers `origin`").
 
 use std::path::Path;
 
@@ -13,11 +7,8 @@ use tokio::process::Command;
 
 use crate::error::{GatedError, Result};
 
-/// Pushes `commit_sha` from the local bare gate repo to `origin`, updating
-/// `refs/heads/<branch>` there. `bare_repo_path` is the gate's own bare
-/// repo (which already has the converged commit, since `warden` pushed it
-/// there to trigger the `post-receive` hook in the first place) -- this
-/// never touches `warden`'s worktrees or the user's repository.
+/// Pushes `commit_sha` from the local bare gate repo to `origin`, updating `refs/heads/<branch>`
+/// there.
 pub async fn push_to_origin(bare_repo_path: &Path, commit_sha: &str, branch: &str) -> Result<()> {
     let refspec = format!("{commit_sha}:refs/heads/{branch}");
     let output = Command::new("git")
@@ -53,9 +44,6 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    /// Two local bare-ish repos standing in for "the gate's bare repo" and
-    /// "the real remote" -- both plain local git repos, so this test needs
-    /// no network access (code-standards.md: "pas d'appel réseau externe").
     fn init_origin_and_gate_repo() -> (TempDir, TempDir, String) {
         let origin = TempDir::new().unwrap();
         run_git(origin.path(), &["init", "--bare", "--quiet"]);
@@ -87,9 +75,6 @@ mod tests {
                 ".",
             ],
         );
-        // `git clone --bare` already sets up an `origin` remote pointing at
-        // its source (the seed repo); repoint it at the fake `origin` repo
-        // instead of `remote add`, which would fail with "already exists".
         run_git(
             gate.path(),
             &[
@@ -126,7 +111,6 @@ mod tests {
     async fn a_failed_push_is_a_typed_error_with_the_git_stderr_attached() {
         let gate = TempDir::new().unwrap();
         run_git(gate.path(), &["init", "--bare", "--quiet"]);
-        // Deliberately no `origin` remote configured -- git must fail.
 
         let result = push_to_origin(gate.path(), "deadbeef", "main").await;
         assert!(matches!(result, Err(GatedError::PushFailed { .. })));

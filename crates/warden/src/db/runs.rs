@@ -1,13 +1,6 @@
 use super::*;
 
 /// A `runs` row, with `state` already validated into [`RunState`].
-///
-/// Issue #43 (#37.4) / ADR-0014: `max_cycles`/`current_cycle` are gone,
-/// replaced by two independent per-phase budgets/counters -- see
-/// `crates/warden/migrations/0007_phase_budgets.sql`. Issue #73:
-/// `total_steps`/`max_extra_step_cycles`/`current_extra_step_cycle` back the
-/// generic, step-indexed `warden_core::RunState::RunningStep`/
-/// `StepCyclesExceeded` -- see `crates/warden/migrations/0009_generic_workflow_state.sql`.
 #[derive(Debug, Clone)]
 pub struct Run {
     pub id: String,
@@ -19,27 +12,15 @@ pub struct Run {
     pub max_test_cycles: u32,
     pub current_review_cycle: u32,
     pub current_test_cycle: u32,
-    /// Issue #73: how many steps this run's own resolved
-    /// `warden_core::Workflow` has (`workflow.steps.len()`) -- what
-    /// `RunState::validate_transition` needs to decide whether a step is the
-    /// workflow's *last* one. `3` for every run driving the built-in default
-    /// workflow (coder, reviewer, tester).
+    /// how many steps this run's own resolved `warden_core::Workflow` has (`workflow.steps.len()`).
     pub total_steps: u32,
-    /// Issue #73: the single shared cycle budget for any workflow step
-    /// beyond the built-in reviewer/tester pair (e.g. a custom `techlead`
-    /// step) -- the built-in pair keeps its own `max_review_cycles`/
-    /// `max_test_cycles` above.
     pub max_extra_step_cycles: u32,
     pub current_extra_step_cycle: u32,
     pub created_at: String,
     pub updated_at: String,
-    /// The commit SHA the run converged on (see `set_run_converged_commit`,
-    /// M4) — `None` until the run reaches `RunState::Converged`.
     pub converged_commit_sha: Option<String>,
-    /// The PR `warden-gated` opened for this run (see `set_run_pr_number`,
-    /// issue #15/ADR-0011) — `None` until `Pushed`'s tail successfully opens
-    /// one. Read back by crash recovery to resume a stuck `AwaitingCi` watch
-    /// without needing any watch state of `warden-gated`'s own.
+    /// The PR `warden-gated` opened for this run — `None` until `Pushed`'s tail successfully opens
+    /// one.
     pub pr_number: Option<u64>,
 }
 
@@ -83,18 +64,6 @@ pub async fn insert_run(
     Ok(())
 }
 
-/// Writes a new state for `run_id`. Callers must call this *before*
-/// triggering the corresponding action (write-ahead of intention,
-/// ADR-0004) — this function itself does not validate the transition
-/// against [`RunState::validate_transition`]; that's the orchestrator's
-/// responsibility so the intent is recorded even if the action that
-/// follows fails.
-///
-/// A quota-resume lease intentionally survives an intermediate state write.
-/// Recovery can observe the restored write-ahead state before the resumed
-/// agent's process row exists; [`insert_agent_process`] clears the lease
-/// atomically with that first durable handoff. A terminal `Failed` write
-/// clears any remaining lease instead.
 pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunState) -> Result<()> {
     let now = now_rfc3339();
     let state = new_state.as_str();
@@ -128,10 +97,6 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
     Ok(())
 }
 
-/// Issue #43: records the run's current *review* cycle number -- the
-/// reviewer runs every cycle (Phase A gate, issue #41), so this tracks the
-/// run's overall cycle number exactly like the old, single `current_cycle`
-/// did.
 pub async fn set_run_current_review_cycle(
     pool: &SqlitePool,
     run_id: &str,
@@ -150,9 +115,6 @@ pub async fn set_run_current_review_cycle(
     Ok(())
 }
 
-/// Issue #43: records the run's current *test* cycle number -- unlike
-/// review, the tester only actually runs on a cycle whose review came back
-/// clean (issue #41's gate), so this only advances then.
 pub async fn set_run_current_test_cycle(
     pool: &SqlitePool,
     run_id: &str,
@@ -171,9 +133,6 @@ pub async fn set_run_current_test_cycle(
     Ok(())
 }
 
-/// Issue #73: records the run's current *extra-step* cycle number -- the
-/// single shared counter for any workflow step beyond the built-in
-/// reviewer/tester pair (see [`Run`]'s own docs on `max_extra_step_cycles`).
 pub async fn set_run_current_extra_step_cycle(
     pool: &SqlitePool,
     run_id: &str,
@@ -192,10 +151,7 @@ pub async fn set_run_current_extra_step_cycle(
     Ok(())
 }
 
-/// Records the commit SHA a run converged on (M4). Called once, when the
-/// run transitions to `RunState::Converged` — Phase 3's git gate reads this
-/// column to know what to push, without needing the (by then removed)
-/// coder worktree.
+/// Records the commit SHA a run converged on (M4).
 pub async fn set_run_converged_commit(
     pool: &SqlitePool,
     run_id: &str,
@@ -213,18 +169,10 @@ pub async fn set_run_converged_commit(
     Ok(())
 }
 
-/// Records the PR `warden-gated` opened for this run (issue #15/ADR-0011),
-/// once the post-Converged tail's `OpenDraft` succeeds. `warden` is still
-/// the sole writer of this column -- `warden-gated` only ever reads it back
-/// read-only (`get_run_view`-style query), e.g. to resume a stuck
-/// `AwaitingCi` watch after a crash without keeping any watch state itself.
+/// Records the PR `warden-gated` opened for this run, once the post-Converged tail's `OpenDraft`
+/// succeeds.
 pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) -> Result<()> {
     let now = now_rfc3339();
-    // Issue #15 review, L2: reports the real `u64` value that failed to
-    // convert -- `WardenError::InvalidStoredValue` (used elsewhere in this
-    // module for the *opposite* direction, i64 column -> smaller unsigned
-    // type) can only carry an `i64`, which would have silently misreported
-    // an overflowing pr_number as `i64::MAX` instead of its actual value.
     let stored_pr_number =
         i64::try_from(pr_number).map_err(|_| WardenError::PrNumberOverflow { pr_number })?;
     sqlx::query!(
@@ -238,20 +186,7 @@ pub async fn set_run_pr_number(pool: &SqlitePool, run_id: &str, pr_number: u64) 
     Ok(())
 }
 
-/// Issue #53: accumulates one agent invocation's token usage onto `run_id`'s
-/// running total -- the run-level half of the "per agent / per cycle / run
-/// total" aggregation (the cycle-level half is
-/// [`add_cycle_role_token_usage`]). Both are always called together, from
-/// the same call site (`orchestrator::Orchestrator::run_agent`), right after
-/// an invocation's `ToolAdapter::extract_usage` reports `Some`.
-///
-/// `input_tokens`/`output_tokens` are unconditionally summed
-/// (`COALESCE(column, 0) + ?`); the cache columns only advance when `usage`
-/// itself reports that dimension (`CASE WHEN ? IS NULL THEN <unchanged>
-/// ELSE ...`) -- an invocation that doesn't report caching must never reset
-/// a running cache total a prior invocation already built up. See
-/// [`row_to_token_usage`] for the read-back side of this same "`NULL` means
-/// never-reported, not zero" contract.
+/// accumulates one agent invocation's token usage onto `run_id`'s running total.
 pub async fn add_run_token_usage(
     pool: &SqlitePool,
     run_id: &str,
@@ -292,9 +227,8 @@ pub async fn add_run_token_usage(
     Ok(())
 }
 
-/// The run total accumulated so far by [`add_run_token_usage`], or `None` if
-/// this run's tool never reported any usage at all (rendered "n/a" by every
-/// caller, never `0` -- see [`row_to_token_usage`]).
+/// The run total accumulated so far by [`add_run_token_usage`], or `None` if this run's tool never
+/// reported any usage at all (rendered "n/a" by every caller, never `0`.
 pub async fn get_run_token_usage(pool: &SqlitePool, run_id: &str) -> Result<Option<TokenUsage>> {
     let row = sqlx::query!(
         r#"
@@ -316,9 +250,8 @@ pub async fn get_run_token_usage(pool: &SqlitePool, run_id: &str) -> Result<Opti
     )
 }
 
-/// Raw shape of a `runs` row as decoded by sqlx, before `state` has been
-/// validated into a [`RunState`]. Kept private: [`Run`] is the only form
-/// that ever leaves this module.
+/// Raw shape of a `runs` row as decoded by sqlx, before `state` has been validated into a
+/// [`RunState`].
 struct RunRow {
     id: String,
     repo_path: String,
@@ -381,15 +314,7 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Run>> {
     row.map(row_to_run).transpose()
 }
 
-/// Runs left in an intermediate state (`RunState::is_intermediate`) as of
-/// the last shutdown/crash. The `coder_running`/`awaiting_ci`/
-/// `resuming_quota` literals and
-/// the `running_step:%` pattern below must stay in sync with
-/// [`RunState::is_intermediate`] — enforced by a test in this module, since
-/// a `?`-parameterised `IN (...)` list isn't expressible in a
-/// macro-checked static query. `running_step:%` is a `LIKE` pattern rather
-/// than a literal list (issue #73): a step-indexed state can carry any
-/// index, so there is no fixed set of literal strings left to enumerate.
+/// Runs left in an intermediate state (`RunState::is_intermediate`) as of the last shutdown/crash.
 pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
@@ -405,21 +330,6 @@ pub async fn list_intermediate_runs(pool: &SqlitePool) -> Result<Vec<Run>> {
     rows.into_iter().map(row_to_run).collect()
 }
 
-/// `Failed` runs that may still have orphaned resources needing cleanup: an
-/// `agent_processes` row never marked ended, or a `cycles` row still
-/// recording a worktree path (only cleared once crash recovery successfully
-/// removes it — see [`clear_cycle_worktree_path`]).
-///
-/// This exists because [`list_intermediate_runs`] alone is not enough for
-/// crash-safe recovery (issue #6): `recover_crashed_runs` writes `Failed`
-/// *before* attempting orphan cleanup (write-ahead of intention, ADR-0004),
-/// so if the orchestrator crashes again in the window between that write and
-/// cleanup finishing, the run is already `Failed` — no longer
-/// `is_intermediate()` — and `list_intermediate_runs` would never surface it
-/// again, permanently leaking its worktree/process. A run whose cleanup
-/// already succeeded has neither an open process nor a recorded path left,
-/// so it naturally stops being returned here — no separate "cleanup done"
-/// flag needed.
 pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<Vec<Run>> {
     let rows = sqlx::query_as!(
         RunRow,
