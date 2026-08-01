@@ -5,9 +5,10 @@
 //! malicious agent exfiltrate Claude credentials and repository data. Other
 //! host credentials are not mounted. Host-side git commands disable hooks.
 //!
-//! Containers drop Linux capabilities, forbid privilege escalation, limit
-//! process count, and carry run labels for crash recovery. Docker daemon and
-//! host kernel remain trusted; network, CPU, and memory are not constrained.
+//! Containers keep only `CAP_DAC_OVERRIDE` for writable host-owned bind mounts,
+//! forbid privilege escalation, limit process count, and carry run labels for
+//! crash recovery. Docker daemon and host kernel remain trusted; network, CPU,
+//! and memory are not constrained.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -367,6 +368,8 @@ fn build_docker_run_argv(
         format!("{MANAGED_LABEL}=true"),
         "--cap-drop".to_string(),
         "ALL".to_string(),
+        "--cap-add".to_string(),
+        "DAC_OVERRIDE".to_string(),
         "--security-opt".to_string(),
         "no-new-privileges=true".to_string(),
         "--pids-limit".to_string(),
@@ -456,6 +459,7 @@ mod tests {
         assert!(has_pair("--label", "io.warden.managed=true"));
         assert!(has_pair("--label", "io.warden.run-id=run-123"));
         assert!(has_pair("--cap-drop", "ALL"));
+        assert!(has_pair("--cap-add", "DAC_OVERRIDE"));
         assert!(has_pair("--security-opt", "no-new-privileges=true"));
         assert!(has_pair("--pids-limit", "256"));
     }

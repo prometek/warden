@@ -354,9 +354,10 @@ Flags de `warden run` :
   **lecture seule** comme source d'authentification. Aucun `~/.ssh`, `~/.aws`,
   `~/.config/gh` ou `.env` hôte n'est bind-monté. `~/.claude` reste toutefois lisible et le
   réseau n'est pas filtré : un agent malveillant peut exfiltrer credentials Claude et données
-  du dépôt. Les conteneurs retirent leurs capabilities, interdisent l'escalade de privilèges,
-  limitent les processus à 256 et sont récupérés par label après crash. Docker daemon et
-  kernel hôte restent dans la base de confiance. `git push origin` échoue sans credentials git.
+  du dépôt. Les conteneurs conservent seulement `CAP_DAC_OVERRIDE` pour écrire dans les bind
+  mounts appartenant à l'hôte, interdisent l'escalade de privilèges, limitent les processus à
+  256 et sont récupérés par label après crash. Docker daemon et kernel hôte restent dans la
+  base de confiance. `git push origin` échoue sans credentials git.
   Nécessite Docker
   installé et démarré (Docker Desktop sur macOS, le démon Docker sur Linux) et l'image de
   référence déjà construite — voir `crates/warden-sandbox/docker/README.md`. Limite acceptée

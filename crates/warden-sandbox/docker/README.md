@@ -53,8 +53,9 @@ the host's `~/.claude` (read-only). No other host path is bind-mounted.
   networking permits exfiltration of Claude credentials and repository data.
 - `.git` is writable because linked worktrees require it. Agents can mutate
   repository metadata; host-side git commands disable repository hooks.
-- Containers drop all Linux capabilities, set `no-new-privileges`, and limit
-  processes to 256. CPU and memory remain unbounded.
+- Containers drop all Linux capabilities except `CAP_DAC_OVERRIDE`, required
+  to write host-owned worktree and `.git` bind mounts on Linux. They set
+  `no-new-privileges` and limit processes to 256. CPU and memory remain unbounded.
 - Docker daemon and host kernel remain trusted. This backend is not a boundary
   against daemon compromise or container-runtime/kernel vulnerabilities.
 - No egress allowlist exists. Agent APIs require network access; deploy an
