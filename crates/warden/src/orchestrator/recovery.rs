@@ -316,6 +316,15 @@ async fn reclaim_orphan_resources(pool: &SqlitePool, run: &db::Run) {
     if let Err(error) = terminate_orphan_processes(pool, &run.id).await {
         tracing::error!(run_id = %run.id, %error, "failed to terminate orphan agent processes during crash recovery");
     }
+    match warden_sandbox::reclaim_run_containers(&run.id).await {
+        Ok(0) => {}
+        Ok(count) => {
+            tracing::warn!(run_id = %run.id, count, "removed orphan Docker containers during crash recovery");
+        }
+        Err(error) => {
+            tracing::error!(run_id = %run.id, %error, "failed to remove orphan Docker containers during crash recovery");
+        }
+    }
     if let Err(error) = cleanup_orphan_worktrees(pool, run).await {
         tracing::error!(run_id = %run.id, %error, "failed to clean up orphaned worktrees during crash recovery");
     }

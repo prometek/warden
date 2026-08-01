@@ -386,9 +386,12 @@ impl Orchestrator {
 
         let sandbox_id = self
             .sandbox
-            .create(warden_sandbox::SandboxSpec {
-                cwd: cwd.to_path_buf(),
-            })
+            .create_for_run(
+                warden_sandbox::SandboxSpec {
+                    cwd: cwd.to_path_buf(),
+                },
+                run_id,
+            )
             .await?;
 
         let mut guard = SandboxGuard::new(Arc::clone(&self.sandbox), sandbox_id);

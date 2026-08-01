@@ -1,5 +1,13 @@
-//! [`DockerSandbox`]: containerised execution isolation -- the second [`crate::Sandbox`] backend,
-//! alongside [`crate::LocalSandbox`]'s host-process parity default.
+//! Docker isolation for agent processes.
+//!
+//! Worktree and common `.git` are mounted read-write. Host `~/.claude` is
+//! mounted read-only but remains readable, so default bridge networking lets a
+//! malicious agent exfiltrate Claude credentials and repository data. Other
+//! host credentials are not mounted. Host-side git commands disable hooks.
+//!
+//! Containers drop Linux capabilities, forbid privilege escalation, limit
+//! process count, and carry run labels for crash recovery. Docker daemon and
+//! host kernel remain trusted; network, CPU, and memory are not constrained.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +27,9 @@ use crate::{Command, ExecuteOptions, Execution, ExecutionResult, Sandbox, Sandbo
 const DOCKER_BIN: &str = "docker";
 
 const CONTAINER_HOME: &str = "/root";
+const MANAGED_LABEL: &str = "io.warden.managed";
+const RUN_ID_LABEL: &str = "io.warden.run-id";
+const CONTAINER_PIDS_LIMIT: &str = "256";
 
 /// What every [`DockerSandbox::execute`] call needs beyond the per-command [`Command`] itself: the
 /// image to run, and the two host paths this backend's mounts are built from.
@@ -30,7 +41,13 @@ pub struct DockerConfig {
 
 pub struct DockerSandbox {
     config: DockerConfig,
-    sandboxes: Mutex<HashMap<SandboxId, PathBuf>>,
+    sandboxes: Mutex<HashMap<SandboxId, DockerSandboxEntry>>,
+}
+
+#[derive(Clone)]
+struct DockerSandboxEntry {
+    cwd: PathBuf,
+    run_id: Option<String>,
 }
 
 impl DockerSandbox {
@@ -41,7 +58,7 @@ impl DockerSandbox {
         }
     }
 
-    fn cwd_for(&self, id: &SandboxId) -> Result<PathBuf> {
+    fn entry_for(&self, id: &SandboxId) -> Result<DockerSandboxEntry> {
         self.sandboxes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -49,17 +66,31 @@ impl DockerSandbox {
             .cloned()
             .ok_or_else(|| SandboxError::UnknownSandbox { id: id.clone() })
     }
+
+    fn create_entry(&self, spec: SandboxSpec, run_id: Option<&str>) -> SandboxId {
+        let id = SandboxId::new(format!("warden-{}", uuid::Uuid::new_v4()));
+        self.sandboxes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id.clone(),
+                DockerSandboxEntry {
+                    cwd: spec.cwd,
+                    run_id: run_id.map(str::to_owned),
+                },
+            );
+        id
+    }
 }
 
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId> {
-        let id = SandboxId::new(format!("warden-{}", uuid::Uuid::new_v4()));
-        self.sandboxes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), spec.cwd);
-        Ok(id)
+        Ok(self.create_entry(spec, None))
+    }
+
+    async fn create_for_run(&self, spec: SandboxSpec, run_id: &str) -> Result<SandboxId> {
+        Ok(self.create_entry(spec, Some(run_id)))
     }
 
     async fn execute<'a>(
@@ -68,10 +99,10 @@ impl Sandbox for DockerSandbox {
         command: Command,
         options: ExecuteOptions<'a>,
     ) -> Result<Execution<'a>> {
-        let cwd = self.cwd_for(id)?;
+        let entry = self.entry_for(id)?;
         let container_name = id.to_string();
 
-        let host_worktree = canonicalize_host_path(&cwd)?;
+        let host_worktree = canonicalize_host_path(&entry.cwd)?;
         let host_repo_git = canonicalize_host_path(&self.config.repo_path.join(".git"))?;
         let host_claude_dir = self.config.claude_config_dir.canonicalize().map_err(|_| {
             SandboxError::DockerUnavailable {
@@ -87,6 +118,7 @@ impl Sandbox for DockerSandbox {
         let forwarded_env = resolve_forwarded_env(&command.env_allowlist, &command.program);
         let argv = build_docker_run_argv(
             &container_name,
+            entry.run_id.as_deref(),
             &self.config.image,
             &host_worktree,
             &host_repo_git,
@@ -230,6 +262,49 @@ async fn remove_container(container_name: &str) -> Result<()> {
     })
 }
 
+/// Removes containers labeled for a crashed run.
+pub async fn reclaim_run_containers(run_id: &str) -> Result<usize> {
+    let managed_filter = format!("label={MANAGED_LABEL}=true");
+    let run_filter = format!("label={RUN_ID_LABEL}={run_id}");
+    let output = tokio::process::Command::new(DOCKER_BIN)
+        .args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            &managed_filter,
+            "--filter",
+            &run_filter,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|source| SandboxError::Spawn {
+            program: DOCKER_BIN.to_string(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(SandboxError::DockerUnavailable {
+            reason: format!(
+                "cannot list containers for run {run_id}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+
+    let container_ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    for container_id in &container_ids {
+        remove_container(container_id).await?;
+    }
+    Ok(container_ids.len())
+}
+
 fn is_benign_removal_race(stderr: &str) -> bool {
     stderr.contains("No such container")
         || stderr.contains("already in progress")
@@ -269,6 +344,7 @@ fn canonicalize_host_path(path: &Path) -> Result<PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn build_docker_run_argv(
     container_name: &str,
+    run_id: Option<&str>,
     image: &str,
     host_worktree: &Path,
     host_repo_git: &Path,
@@ -287,6 +363,14 @@ fn build_docker_run_argv(
         "--rm".to_string(),
         "--name".to_string(),
         container_name.to_string(),
+        "--label".to_string(),
+        format!("{MANAGED_LABEL}=true"),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--security-opt".to_string(),
+        "no-new-privileges=true".to_string(),
+        "--pids-limit".to_string(),
+        CONTAINER_PIDS_LIMIT.to_string(),
         "-i".to_string(),
         "--mount".to_string(),
         format!("type=bind,source={worktree},target={worktree}"),
@@ -304,6 +388,10 @@ fn build_docker_run_argv(
         "-e".to_string(),
         "GIT_CONFIG_VALUE_0=*".to_string(),
     ];
+    if let Some(run_id) = run_id {
+        argv.push("--label".to_string());
+        argv.push(format!("{RUN_ID_LABEL}={run_id}"));
+    }
     for (name, value) in forwarded_env {
         argv.push("-e".to_string());
         argv.push(format!("{name}={value}"));
@@ -327,6 +415,7 @@ mod tests {
     fn argv_contains_the_worktree_and_repo_git_mounts_at_identical_host_paths() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -346,9 +435,36 @@ mod tests {
     }
 
     #[test]
+    fn argv_labels_tracked_containers_and_applies_security_baseline() {
+        let argv = build_docker_run_argv(
+            "warden-test",
+            Some("run-123"),
+            "warden-agent:latest",
+            Path::new("/host/worktrees/coder"),
+            Path::new("/host/repo/.git"),
+            Path::new("/host/home/.claude"),
+            "/root",
+            &[],
+            "claude",
+            &[],
+        );
+        let has_pair = |flag: &str, value: &str| {
+            argv.windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+
+        assert!(has_pair("--label", "io.warden.managed=true"));
+        assert!(has_pair("--label", "io.warden.run-id=run-123"));
+        assert!(has_pair("--cap-drop", "ALL"));
+        assert!(has_pair("--security-opt", "no-new-privileges=true"));
+        assert!(has_pair("--pids-limit", "256"));
+    }
+
+    #[test]
     fn argv_uses_mount_not_the_colon_ambiguous_v_flag() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -367,6 +483,7 @@ mod tests {
     fn argv_mounts_claude_config_read_only_under_the_container_home() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -386,6 +503,7 @@ mod tests {
     fn argv_always_sets_home_to_the_container_home() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -410,6 +528,7 @@ mod tests {
     fn argv_never_mounts_ssh_aws_or_gh_config() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -431,6 +550,7 @@ mod tests {
     fn argv_disables_gits_dubious_ownership_guard_via_env_config() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -450,6 +570,7 @@ mod tests {
     fn argv_sets_no_network_flag_default_bridge() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -467,6 +588,7 @@ mod tests {
     fn argv_sets_working_directory_and_program_args_after_the_image() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -493,6 +615,7 @@ mod tests {
     fn argv_forwards_only_the_resolved_env_pairs_given() {
         let argv = build_docker_run_argv(
             "warden-test",
+            None,
             "warden-agent:latest",
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
@@ -670,6 +793,18 @@ mod tests {
     async fn docker_daemon_available() -> bool {
         tokio::process::Command::new(DOCKER_BIN)
             .arg("info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    async fn docker_image_available(image: &str) -> bool {
+        tokio::process::Command::new(DOCKER_BIN)
+            .args(["image", "inspect", image])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -918,6 +1053,61 @@ mod tests {
             !container_exists(&container_name).await,
             "no `{container_name}` container should remain after destroy"
         );
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_removes_a_container_after_its_docker_client_dies() {
+        if !docker_daemon_available().await {
+            eprintln!("skipping: no docker daemon reachable");
+            return;
+        }
+        if !docker_image_available(TEST_IMAGE).await {
+            eprintln!("skipping: {TEST_IMAGE} is not available locally");
+            return;
+        }
+
+        let (repo, worktree, claude_dir) = init_repo_with_worktree_and_claude_dir();
+        let sandbox = DockerSandbox::new(DockerConfig {
+            image: TEST_IMAGE.to_string(),
+            repo_path: repo.path().to_path_buf(),
+            claude_config_dir: claude_dir.path().to_path_buf(),
+        });
+        let run_id = format!("recovery-{}", uuid::Uuid::new_v4());
+        let id = sandbox
+            .create_for_run(
+                SandboxSpec {
+                    cwd: worktree.clone(),
+                },
+                &run_id,
+            )
+            .await
+            .unwrap();
+        let container_name = id.to_string();
+        let execution = sandbox
+            .execute(
+                &id,
+                Command {
+                    program: "sleep".to_string(),
+                    args: vec!["30".to_string()],
+                    env_allowlist: Vec::new(),
+                    stdin: None,
+                },
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..20 {
+            if container_exists(&container_name).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(container_exists(&container_name).await);
+
+        drop(execution);
+        assert_eq!(reclaim_run_containers(&run_id).await.unwrap(), 1);
+        assert!(!container_exists(&container_name).await);
     }
 
     #[tokio::test]
