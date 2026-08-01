@@ -1,10 +1,3 @@
-//! Evidence types and pure classification logic (ADR-0009, issue #7): the
-//! `EVIDENCE.type` values persisted in SQLite, the two capture tools Warden
-//! chooses between, and the project-type detection that picks a default
-//! between them. No I/O here -- gathering the filesystem facts a
-//! [`ProjectMarkers`] is built from is the `warden` crate's job (scanning a
-//! repo is I/O); this module only classifies facts it's handed.
-
 use crate::error::{CoreError, Result};
 
 /// Kind of artifact an evidence adapter produced (`EVIDENCE.type`).
@@ -37,10 +30,8 @@ impl EvidenceType {
     }
 }
 
-/// Which capture tool produces the evidence for a cycle's successful e2e
-/// test (ADR-0009): Playwright for web/UI projects, asciinema for CLI
-/// projects. Selected automatically from [`ProjectType`], with an explicit
-/// override always winning (`evidence.tool` config).
+/// Which capture tool produces the evidence for a cycle's successful e2e test: Playwright for
+/// web/UI projects, asciinema for CLI projects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceTool {
     Playwright,
@@ -64,32 +55,25 @@ impl EvidenceTool {
     }
 }
 
-/// Coarse classification of the target repository, used only to pick a
-/// default [`EvidenceTool`] (ADR-0009: "présence d'un serveur/framework
-/// front dans le repo → Playwright, sinon → asciinema").
+/// Coarse classification of the target repository, used only to pick a default [`EvidenceTool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectType {
     Web,
     Cli,
 }
 
-/// The filesystem facts [`detect_project_type`] classifies: a shallow scan
-/// of the repo root (marker files) plus, if present, the union of
-/// `package.json`'s `dependencies`/`devDependencies` keys. Gathering this is
-/// I/O and lives in the `warden` crate (`evidence::scan_project_markers`);
-/// this struct is the validated boundary value that crosses into pure logic.
+/// The filesystem facts [`detect_project_type`] classifies.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectMarkers {
-    /// Entry names found directly at the repo root (file or directory
-    /// names, not full paths).
+    /// Entry names found directly at the repo root (file or directory names, not full paths).
     pub root_entries: Vec<String>,
-    /// `package.json` dependency/dev-dependency keys, empty if the repo has
-    /// no `package.json` at its root.
+    /// `package.json` dependency/dev-dependency keys, empty if the repo has no `package.json` at
+    /// its root.
     pub package_json_dependencies: Vec<String>,
 }
 
-/// Root-level file/directory names that, on their own, indicate a web/UI
-/// project regardless of `package.json` contents.
+/// Root-level file/directory names that, on their own, indicate a web/UI project regardless of
+/// `package.json` contents.
 const WEB_MARKER_ENTRIES: &[&str] = &[
     "index.html",
     "next.config.js",
@@ -105,9 +89,7 @@ const WEB_MARKER_ENTRIES: &[&str] = &[
     "gatsby-config.js",
 ];
 
-/// `package.json` dependency names that indicate a web/UI or web-serving
-/// project (front-end frameworks and the servers that render for a
-/// browser -- ADR-0009's "serveur/framework front").
+/// `package.json` dependency names that indicate a web/UI or web-serving project.
 const WEB_FRAMEWORK_DEPENDENCIES: &[&str] = &[
     "react",
     "vue",
@@ -123,10 +105,8 @@ const WEB_FRAMEWORK_DEPENDENCIES: &[&str] = &[
     "@playwright/test",
 ];
 
-/// Classifies a repo as [`ProjectType::Web`] if any known web/UI marker is
-/// present, [`ProjectType::Cli`] otherwise. Deliberately simple ("détection
-/// simple" per ADR-0009) -- `evidence.tool` always overrides this when the
-/// heuristic guesses wrong.
+/// Classifies a repo as [`ProjectType::Web`] if any known web/UI marker is present,
+/// [`ProjectType::Cli`] otherwise.
 pub fn detect_project_type(markers: &ProjectMarkers) -> ProjectType {
     let has_web_marker_file = markers
         .root_entries
@@ -144,8 +124,7 @@ pub fn detect_project_type(markers: &ProjectMarkers) -> ProjectType {
     }
 }
 
-/// Picks the [`EvidenceTool`] to capture with: `override_tool` always wins
-/// (`evidence.tool` config, ADR-0009), otherwise it follows
+/// Picks the [`EvidenceTool`] to capture with: `override_tool` always wins, otherwise it follows
 /// [`ProjectType`]'s default mapping.
 pub fn select_evidence_tool(
     project_type: ProjectType,
@@ -160,11 +139,6 @@ pub fn select_evidence_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------
-    // Project-type detection (ADR-0009 acceptance criterion 1: "web
-    // project -> Playwright selected; CLI project -> asciinema selected").
-    // -----------------------------------------------------------------
 
     #[test]
     fn detect_project_type_returns_web_for_a_known_marker_file() {
@@ -195,10 +169,6 @@ mod tests {
 
     #[test]
     fn detect_project_type_ignores_unrelated_package_json_dependencies() {
-        // A package.json exists (e.g. a Node-based CLI tool) but declares
-        // none of the front-end/web-serving frameworks ADR-0009 lists --
-        // must not be misclassified as Web just because *some*
-        // package.json is present.
         let markers = ProjectMarkers {
             root_entries: vec!["package.json".to_string(), "bin".to_string()],
             package_json_dependencies: vec!["commander".to_string(), "chalk".to_string()],
@@ -213,11 +183,6 @@ mod tests {
             ProjectType::Cli
         );
     }
-
-    // -----------------------------------------------------------------
-    // Tool selection (acceptance criterion 2: "config override
-    // evidence.tool always wins over auto-detection").
-    // -----------------------------------------------------------------
 
     #[test]
     fn select_evidence_tool_follows_detected_project_type_when_no_override_is_given() {
@@ -248,12 +213,6 @@ mod tests {
             "an explicit evidence.tool override must always win over auto-detection"
         );
     }
-
-    // -----------------------------------------------------------------
-    // EvidenceTool / EvidenceType parse+as_str -- the closed-set
-    // boundary validation `main.rs`'s `--evidence-tool` and `db.rs`'s
-    // stored `evidence.type` column both rely on.
-    // -----------------------------------------------------------------
 
     #[test]
     fn evidence_tool_as_str_and_parse_round_trip() {

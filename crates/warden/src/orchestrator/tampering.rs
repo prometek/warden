@@ -1,53 +1,18 @@
-//! Issue #30: cross-run agent-definition-poisoning detection.
-//! [`agent_definition_tampering_finding`] re-resolves all three roles'
-//! raw `.warden/agents/*.md` bytes through a throwaway `git worktree`
-//! checkout of a cycle's resulting commit ([`AgentDefinitionSnapshot::capture`])
-//! and compares them against the run-start snapshot, raising a blocking
-//! finding on any divergence -- detect-and-block, not forbid (issue #24
-//! review, M4), since `.warden/agents/` must stay writable by the coder.
-
 use super::*;
 
-/// Issue #30: the raw, unparsed bytes each of the three roles'
-/// `.warden/agents/<role>.md` convention paths resolves to at some commit --
-/// through the OS, exactly like `agent_def::resolve_agent_definition`
-/// resolves them, but without a parsing step. Built by [`Self::capture`]
-/// both for the run-start baseline (once, before cycle 1) and for every
-/// cycle's own re-resolution (issue #30 review, HIGH) -- see that
-/// function's own docs for why both must be built the exact same way.
+/// the raw, unparsed bytes each of the three roles' `.warden/agents/<role>.md` convention paths
+/// resolves to at some commit.
 pub(super) struct AgentDefinitionSnapshot {
     coder: agent_def::RawDefinition,
     reviewer: agent_def::RawDefinition,
     tester: agent_def::RawDefinition,
 }
 
-/// The run-start baseline's own worktree "role" label (distinct from any
-/// [`AgentRole`]'s own `as_str()`, and from
-/// [`TAMPERING_CHECK_WORKTREE_ROLE`] below), so [`AgentDefinitionSnapshot::capture`]'s
-/// throwaway worktrees never collide with a real coder/reviewer/tester
-/// worktree or with each other.
 pub(super) const SNAPSHOT_WORKTREE_ROLE: &str = "agent-definition-snapshot";
 
-/// Issue #30 review (HIGH): the label for the throwaway worktree
-/// [`agent_definition_tampering_finding`] checks out at each cycle's own
-/// resulting commit, to re-resolve against. See [`SNAPSHOT_WORKTREE_ROLE`]'s
-/// own docs.
 const TAMPERING_CHECK_WORKTREE_ROLE: &str = "agent-definition-check";
 
 impl AgentDefinitionSnapshot {
-    /// Reads all three roles' raw definition bytes through a **throwaway
-    /// `git worktree` checkout of `commit_ish`** -- never `config.repo_path`'s
-    /// own (possibly dirty) working directory, and never a *role's own* live
-    /// worktree either (issue #30 review, HIGH), so every comparison
-    /// [`agent_definition_tampering_finding`] makes is between two clean
-    /// checkouts of a commit.
-    ///
-    /// Deliberately **not** recorded via `db::set_cycle_worktree_path`, so
-    /// it's exempt from crash recovery (issue #30 review, LOW): the
-    /// create-read-remove sequence here is synchronous and sub-second with
-    /// no subprocess/agent I/O in between (unlike a coder/reviewer/tester
-    /// worktree), so the exposure window for an orphan is negligible --
-    /// judged not worth a `cycles` schema change to cover.
     pub(super) async fn capture(
         worktree_manager: &WorktreeManager,
         run_id: &str,
@@ -66,8 +31,8 @@ impl AgentDefinitionSnapshot {
         Ok(snapshot)
     }
 
-    /// This snapshot's own state for `role`, for [`agent_definition_tampering_finding`]'s
-    /// per-role comparison loop.
+    /// This snapshot's own state for `role`, for [`agent_definition_tampering_finding`]'s per-role
+    /// comparison loop.
     fn for_role(&self, role: AgentRole) -> &agent_def::RawDefinition {
         match role {
             AgentRole::Coder => &self.coder,
@@ -77,56 +42,7 @@ impl AgentDefinitionSnapshot {
     }
 }
 
-/// Issue #30 (cross-run agent-definition poisoning). Builds the blocking
-/// finding a cycle's coder commit earns by leaving behind agent-definition
-/// bytes that no longer match `run_start_snapshot` -- `None` if all three
-/// still match.
-///
-/// `agent_def::resolve_agent_definition` snapshots each role's definition
-/// once, before the coder runs, so a coder can never rewrite the
-/// reviewer/tester judging its *own* run -- but nothing stops it from
-/// committing a `.warden/agents/` change that becomes the convention file
-/// the *next* `warden run` reads, unreviewed by anything but this cycle's
-/// own (already-configured) reviewer/tester. Per issue #24 review M4,
-/// `.warden/agents/` stays writable/committable (banning it outright would
-/// break the legitimate "improve our own agent prompts" workflow); this
-/// detects and blocks instead, via an ordinary blocking [`Finding`]
-/// (`FindingSource::Warden`) through the same findings/severity machinery a
-/// reviewer/tester/CI finding goes through -- a human must review the
-/// change before the run can converge.
-///
-/// # Implementation notes
-///
-/// - **Re-resolves through the OS rather than modeling path-matching
-///   rules**: [`agent_def::read_raw_definition`] re-reads the same three
-///   literal `.warden/agents/{coder,reviewer,tester}.md` paths
-///   `resolve_agent_definition` itself reads, so case folding, symlinks,
-///   Unicode normalization etc. are handled by construction rather than by
-///   a parallel (and inevitably incomplete) string-matching model.
-/// - **Both sides read a clean `git worktree` checkout of a commit, never a
-///   working tree** ([`AgentDefinitionSnapshot::capture`],
-///   `TAMPERING_CHECK_WORKTREE_ROLE`): comparing against the coder's own
-///   (mutable, possibly already-`rm -rf`'d) worktree would let a coder poison
-///   a file and then delete it before this check runs, or false-positive on
-///   uncommitted junk that never reaches a future run.
-/// - **Raw bytes, never parsed**: a poisoned/malformed definition must still
-///   raise a finding, not an `Err` this function has to propagate -- see
-///   [`agent_def::RawDefinition`].
-/// - **Compared against the run's original start, every cycle**:
-///   `run_start_snapshot` is fixed for the whole run, so a poisoned change
-///   introduced in cycle 1 and merely left in place is still caught in
-///   cycle 2; only an actual revert clears it.
-/// - **Unconditional regardless of `--trust-repo-agents`** (issue #30/#26
-///   reconciliation): that flag is per-run, so a coder poisoning
-///   `.warden/agents/reviewer.md` on a run started without it would
-///   otherwise leave the poison merely latent for a future run that does
-///   pass it. The trusted user-config directory itself is out of scope here
-///   since the coder can never commit to it.
-///
-/// # Known limitation
-///
-/// Defence in depth, not a boundary: a poisoned definition must still pass
-/// a human PR review to reach a future run.
+/// (cross-run agent-definition poisoning).
 pub(super) async fn agent_definition_tampering_finding(
     worktree_manager: &WorktreeManager,
     run_id: &str,
@@ -142,10 +58,6 @@ pub(super) async fn agent_definition_tampering_finding(
     .await?;
 
     let mut diverged_paths = Vec::new();
-    // Issue #30 review (LOW): a role that's now unreadable gets its OS
-    // error folded into the description text -- never into the equality
-    // check above (`RawDefinition`'s own `PartialEq`, agent_def.rs), which
-    // compares on `ErrorKind` alone.
     let mut unreadable_details = Vec::new();
     for role in [AgentRole::Coder, AgentRole::Reviewer, AgentRole::Tester] {
         let now = resolved_now.for_role(role);
@@ -198,10 +110,6 @@ mod tests {
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
-    /// Looks up the one cycle a single-cycle test run produced and returns
-    /// its findings, straight from SQLite -- there's no `db.rs` getter that
-    /// maps a run to its cycles yet, so a direct query is used here, the
-    /// same convention `tests/cli.rs` already uses for the same gap.
     async fn findings_for_the_only_cycle(pool: &SqlitePool, run_id: &str) -> Vec<Finding> {
         let (cycle_id,): (String,) = sqlx::query_as("SELECT id FROM cycles WHERE run_id = ?")
             .bind(run_id)
@@ -211,9 +119,6 @@ mod tests {
         db::list_findings_for_cycle(pool, &cycle_id).await.unwrap()
     }
 
-    /// Same convention as [`findings_for_the_only_cycle`], for a
-    /// multi-cycle test run -- the most recently started cycle's own
-    /// findings.
     async fn findings_for_the_last_cycle(pool: &SqlitePool, run_id: &str) -> Vec<Finding> {
         let (cycle_id,): (String,) = sqlx::query_as(
             "SELECT id FROM cycles WHERE run_id = ? ORDER BY cycle_number DESC LIMIT 1",
@@ -225,13 +130,6 @@ mod tests {
         db::list_findings_for_cycle(pool, &cycle_id).await.unwrap()
     }
 
-    /// A coder commit that adds a file under `.warden/agents/` must block
-    /// convergence: `max_review_cycles: 1` makes a blocking (`Warden`-sourced,
-    /// so review-phase per decision #37 Q1) finding at cycle 1 land straight
-    /// on `MaxReviewCyclesExceeded` (never `Converged`), deterministically in
-    /// one cycle. The reviewer/tester themselves raise nothing at all --
-    /// proving the block comes from the tampering check, not from either of
-    /// them independently objecting to the change.
     #[tokio::test]
     async fn a_coder_diff_adding_an_agent_definition_file_blocks_convergence() {
         let repo = init_test_repo();
@@ -299,16 +197,6 @@ mod tests {
         );
     }
 
-    /// Issue #73 review, finding F4: a **single-step** workflow (the
-    /// producer only, no gated step at all) used to jump straight to
-    /// `Converged` unconditionally, even when the producer's own cycle
-    /// raised a blocking `Warden`-sourced tampering finding -- there was no
-    /// later gated step left to catch it. This pins that a degenerate
-    /// one-step pipeline still refuses to converge over a poisoned
-    /// `.warden/agents/` diff, reboucling back to the producer (and
-    /// eventually exhausting `max_extra_step_cycles`, the only budget a
-    /// producer-only pipeline has) exactly like a multi-step workflow's own
-    /// gated step would.
     #[tokio::test]
     async fn a_single_step_workflow_still_blocks_convergence_on_a_tampering_finding() {
         let repo = init_test_repo();
@@ -379,12 +267,6 @@ mod tests {
         );
     }
 
-    /// The mirror-image control: a coder diff that never touches
-    /// `.warden/agents/` at all -- only an ordinary source file -- must
-    /// converge normally, with no `Warden`-sourced finding raised at all.
-    /// Without this, a bug that always fires the tampering check (rather
-    /// than only firing when it's actually warranted) would slip past the
-    /// blocking test above unnoticed.
     #[tokio::test]
     async fn a_coder_diff_touching_only_ordinary_source_files_still_converges() {
         let repo = init_test_repo();
@@ -438,13 +320,6 @@ mod tests {
         );
     }
 
-    /// The design's own explicitly-called-out evasion: deleting
-    /// `.warden/agents/reviewer.md` (to silently force the adapter's looser
-    /// default back on for the *next* run) must be caught exactly like an
-    /// add/modify -- re-resolving a deleted path returns
-    /// `agent_def::RawDefinition::Absent`, which no longer matches the
-    /// run-start snapshot's `Present(bytes)` just as readily as an outright
-    /// content change would.
     #[tokio::test]
     async fn a_coder_diff_deleting_an_agent_definition_file_blocks_convergence() {
         let repo = TempDir::new().expect("tempdir");
@@ -533,39 +408,11 @@ mod tests {
         );
     }
 
-    /// Issue #30: whether this filesystem folds a differently-cased path
-    /// onto the same file `probe`/`PROBE` would resolve to -- true on
-    /// macOS's default APFS volume format (case-insensitive, case-
-    /// preserving), false on a typical case-sensitive Linux filesystem. The
-    /// two tests below only reproduce a *real* poisoning attack when this
-    /// holds -- see `agent_definition_tampering_finding`'s own docs on why
-    /// the new detector is, by design, only as effective (and only as
-    /// permissive) as what the OS itself folds when `read_raw_definition`
-    /// opens the literal convention path: unlike the git-diff/string-based
-    /// detector this replaced, it deliberately does *not* flag a
-    /// differently-cased directory on a filesystem where that directory is
-    /// genuinely inert and unreadable through the canonical path.
     fn filesystem_folds_case(dir: &std::path::Path) -> bool {
         std::fs::write(dir.join("PROBE"), b"x").unwrap();
         dir.join("probe").exists()
     }
 
-    /// A coder commit that writes its poison under a *differently-cased*
-    /// `.warden/agents/` must still block convergence on a filesystem that
-    /// folds case when `agent_def::read_raw_definition` opens the literal,
-    /// canonical `.warden/agents/coder.md` path -- macOS's default APFS
-    /// (case-insensitive, case-preserving), verified directly. Skipped (not
-    /// failed) when the test filesystem doesn't fold case at all: on a
-    /// genuinely case-sensitive filesystem `.warden/Agents/coder.md` is an
-    /// inert, unrelated directory that `resolve_agent_definition` would
-    /// never read either, so there is nothing here for the detector to
-    /// (correctly) catch -- see `filesystem_folds_case`'s own docs.
-    ///
-    /// Issue #30 review (LOW): `#[cfg_attr(.., ignore)]` makes the skip
-    /// visible in `cargo test`'s own output (`... ignored`) on a
-    /// non-macOS/non-case-folding CI runner, rather than a silent `...
-    /// ok` that ran nothing -- the runtime check right below still covers
-    /// the case a macOS volume is itself configured case-sensitive.
     #[cfg_attr(
         not(target_os = "macos"),
         ignore = "reproduces a case-folding filesystem attack; only macOS's default APFS \
@@ -635,11 +482,6 @@ mod tests {
             .iter()
             .find(|f| f.source == warden_core::FindingSource::Warden)
             .expect("expected a Warden-sourced finding despite the capitalized directory name");
-        // The re-resolve-and-compare detector names the canonical literal
-        // path it re-resolved (`.warden/agents/coder.md`), not the
-        // attacker's differently-cased on-disk path -- unlike the removed
-        // git-diff/string-based detector, it never inspects the commit's
-        // own tree entries at all.
         assert!(
             tampering_finding
                 .description
@@ -649,10 +491,6 @@ mod tests {
         );
     }
 
-    /// The other capitalization the review flagged by name -- see
-    /// [`a_coder_diff_naming_the_agents_dir_with_a_capitalized_letter_still_blocks`]'s
-    /// own docs for the full rationale, including why this is skipped
-    /// rather than failed on a filesystem that doesn't fold case.
     #[cfg_attr(
         not(target_os = "macos"),
         ignore = "reproduces a case-folding filesystem attack; only macOS's default APFS \
@@ -731,14 +569,6 @@ mod tests {
         );
     }
 
-    /// Issue #30's own named bypass 1/2: `.warden/agentſ/coder.md` (U+017F,
-    /// Latin small letter long s) is already lowercase, so the *old*
-    /// detector's `str::to_lowercase` comparison was a no-op and missed it
-    /// entirely -- while APFS's Unicode-normalizing case folding maps
-    /// U+017F onto plain `s`, so `agent_def::read_raw_definition` opening
-    /// the literal, canonical `.warden/agents/coder.md` path reads the
-    /// poisoned file anyway. Skipped (not failed) when this filesystem
-    /// doesn't perform that fold.
     #[cfg_attr(
         not(target_os = "macos"),
         ignore = "reproduces a Unicode case-folding filesystem attack; only macOS's default \
@@ -758,8 +588,6 @@ mod tests {
             );
             return;
         }
-        // `.warden` is untracked at this point (the probe never touched
-        // git) -- just clean the directory back up before the coder runs.
         std::fs::remove_dir_all(&probe_dir).unwrap();
 
         let warden_home = TempDir::new().unwrap();
@@ -824,16 +652,6 @@ mod tests {
         );
     }
 
-    /// Issue #30's own named bypass 2/2: a symlinked parent component.
-    /// `ln -s stash .warden` plus `stash/agents/reviewer.md` makes git
-    /// report `.warden` (mode 120000) and `stash/agents/reviewer.md` in its
-    /// own tree -- neither path textually matches `agent_def::AGENTS_DIR`
-    /// at all, so the old string-based detector missed this unconditionally,
-    /// on every platform, while the OS resolves the literal
-    /// `.warden/agents/reviewer.md` path straight through the symlink to
-    /// the poison. Deliberately reproduced against a repo with *no*
-    /// `.warden/agents/` at all beforehand -- the exact zero-`.md` default
-    /// issue #24 exists to enable, and the case this bypass bites hardest.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_coder_diff_poisoning_a_definition_through_a_symlinked_parent_component_still_blocks()
@@ -907,11 +725,6 @@ mod tests {
         );
     }
 
-    /// The WIP branch's own known trap (issue #30): non-parsable bytes
-    /// written into a definition must still raise a blocking finding, never
-    /// an `Err` the run propagates. `read_raw_definition` never parses, so
-    /// this exercises that the whole convergence loop actually reaches a
-    /// finding rather than failing the run outright.
     #[tokio::test]
     async fn a_coder_diff_writing_non_parsable_bytes_into_a_definition_blocks_not_errors() {
         let repo = init_test_repo();
@@ -980,18 +793,6 @@ mod tests {
         );
     }
 
-    /// Issue #30 review (HIGH): the exact bypass a real coder was
-    /// reproduced running against the pre-fix version of this detector --
-    /// commit a poisoned `.warden/agents/reviewer.md`, then `rm -rf
-    /// .warden` in the *same* shell invocation before exiting. The
-    /// re-resolution used to read the coder worktree's own (now scrubbed)
-    /// working directory, so it saw `Absent`, matched a baseline that was
-    /// also absent, and the run converged with the poison sitting in
-    /// `new_commit`'s own tree the whole time. Re-resolving through a fresh
-    /// checkout of `new_commit` instead (`agent_definition_tampering_finding`,
-    /// `TAMPERING_CHECK_WORKTREE_ROLE`) reads exactly what that commit's own
-    /// tree holds, unaffected by anything the coder did to its own worktree
-    /// afterwards.
     #[tokio::test]
     async fn a_coder_committing_a_poisoned_definition_then_deleting_it_from_the_working_tree_still_blocks(
     ) {
@@ -1064,12 +865,6 @@ mod tests {
         );
     }
 
-    /// The mirror-image of the bypass above (issue #30 review, HIGH): a
-    /// coder that writes under `.warden/agents/` but never `git add`s /
-    /// commits it must **not** block -- those bytes can never reach a
-    /// future run (nothing propagates forward but the commit), so flagging
-    /// them would be a false positive over content that's discarded the
-    /// moment this cycle's worktree is removed.
     #[tokio::test]
     async fn uncommitted_junk_under_agents_dir_that_never_reaches_the_commit_does_not_block() {
         let repo = init_test_repo();
@@ -1133,10 +928,6 @@ mod tests {
         );
     }
 
-    /// Nice-to-have (issue #30 review): add/delete each have a dedicated
-    /// test above -- this pins the third shape, a plain content
-    /// modification of an already-committed definition
-    /// (`Present(a) -> Present(b)`).
     #[tokio::test]
     async fn a_coder_diff_modifying_an_existing_agent_definitions_content_blocks_convergence() {
         let repo = TempDir::new().expect("tempdir");
@@ -1227,26 +1018,6 @@ mod tests {
         );
     }
 
-    /// The design's own explicitly-flagged evasion path (issue #24 review,
-    /// M4): a coder that introduces the `.warden/agents/` change in cycle 1
-    /// and then, in cycle 2, leaves it untouched -- committing only an
-    /// unrelated fix that satisfies the reviewer -- must *still* be caught
-    /// at cycle 2. If the tampering check were (bug) diffed against each
-    /// cycle's own *incremental* base rather than the run's fixed original
-    /// start, cycle 2's own diff would show nothing under `.warden/agents/`
-    /// at all (it's already committed, and cycle 2's base has moved past
-    /// it), and the run would reach `Converged` with the poisoned
-    /// definition file sitting in the converged commit, never reviewed by
-    /// anything but the run's own (already-configured, non-adversarial)
-    /// reviewer/tester.
-    ///
-    /// The coder is a `status.txt`-flipping variant of [`flip_status_coder`]
-    /// that also plants `.warden/agents/reviewer.md` the first time it
-    /// finds `status.txt` absent, and never touches that file again on the
-    /// (idempotent) second run -- the reviewer is the ordinary
-    /// [`status_gated_reviewer`], gated purely on `status.txt`, with no
-    /// opinion whatsoever on `.warden/agents/`, so any block at cycle 2 can
-    /// only be coming from the tampering check itself.
     #[tokio::test]
     async fn a_definition_tampering_finding_still_fires_in_a_later_cycle_that_did_not_itself_touch_agents_dir(
     ) {
@@ -1300,10 +1071,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Cycle 1: the ordinary reviewer finding (status is broken) forces
-        // a reboucle -- confirms this run actually reached a second cycle,
-        // rather than the tampering finding alone (also blocking) masking a
-        // test that never got there.
         let cycle_1_findings = findings_for_cycle_number(&pool, &run_id, 1).await;
         assert!(
                 cycle_1_findings
@@ -1318,11 +1085,6 @@ mod tests {
                 "expected the tampering finding to fire in cycle 1, when the file is introduced: {cycle_1_findings:?}"
             );
 
-        // Cycle 2: status.txt is fixed (the ordinary reviewer finding is
-        // gone), and the coder's own diff for this cycle touches nothing
-        // under .warden/agents/ at all -- yet the tampering finding must
-        // still be present, because it's checked against the run's
-        // original start, not this cycle's incremental base.
         let cycle_2_findings = findings_for_cycle_number(&pool, &run_id, 2).await;
         assert!(
                 !cycle_2_findings

@@ -47,31 +47,14 @@ pub enum ProcessError {
         source: std::io::Error,
     },
 
-    /// `Child::id()` returned `None` right after spawn. This must never be
-    /// silently treated as pid 0 — POSIX `kill(0, ...)` signals the
-    /// caller's entire process group, so a pid-0 sentinel would make crash
-    /// recovery misreport that process as permanently alive (see
-    /// `process::is_process_alive`).
     #[error(
         "child process for `{command}` has no PID (already reaped before it could be observed)"
     )]
     MissingPid { command: String },
 
-    /// The OS reported the process still exists (fingerprint matched) but
-    /// refused to signal it — e.g. a permissions error, or it exited in the
-    /// instant between the liveness check and the kill attempt. Surfaced
-    /// explicitly rather than assumed-dead, so crash recovery logs it
-    /// instead of silently believing an orphan agent process was cleaned up.
     #[error("failed to terminate orphan process (pid {pid})")]
     KillFailed { pid: u32 },
 
-    /// Issue #20 review, H1: writing the `AgentInputMessage` payload to the
-    /// agent's stdin failed with something other than a broken pipe (an
-    /// agent that closes/never reads stdin is legitimate and handled
-    /// separately, see `process::wait`). The payload is a single JSON
-    /// object, so a partial write is unparsable by construction — running
-    /// the agent anyway would silently run it with no intent/context at
-    /// all, exactly the "no silent fallback" case code-standards.md forbids.
     #[error("failed to write payload to `{command}` stdin: {source}")]
     StdinWrite {
         command: String,
@@ -79,13 +62,6 @@ pub enum ProcessError {
         source: std::io::Error,
     },
 
-    /// Issue #26 (belt-and-braces): a reviewer/tester `command.program`
-    /// that would resolve to a path inside a repository the coder can write
-    /// to -- either a relative path (resolves against the role's own
-    /// worktree, a checkout of the repo under review) or an absolute path
-    /// that canonicalizes inside that worktree or the run's base repo. See
-    /// `process::validate_agent_program`'s own docs. Never raised for the
-    /// coder, which is already the repo's own untrusted role.
     #[error(
         "refusing to spawn {role} agent program {program:?}: {reason} -- this would let the \
          coder control what an independent role executes"
@@ -96,15 +72,6 @@ pub enum ProcessError {
         reason: String,
     },
 
-    /// Issue #59 (extends #26's belt-and-braces guard from `program` to
-    /// `args`): a reviewer/tester `args` entry that looks like a path (see
-    /// `process::path_like_candidate`) and would resolve the same way
-    /// [`ProcessError::UntrustedAgentProgram`] refuses `program` for --
-    /// e.g. a future `ToolAdapter` emitting `claude --wrapper
-    /// ./reviewer.sh` would otherwise reintroduce the exact hole #26 closed
-    /// for `program`, since the wrapper path still resolves against the
-    /// role's own worktree. Never raised for the coder, same as
-    /// `UntrustedAgentProgram`.
     #[error(
         "refusing to spawn {role} agent with argument {arg:?}: {reason} -- this would let the \
          coder control what an independent role executes"
@@ -116,12 +83,6 @@ pub enum ProcessError {
     },
 }
 
-/// Errors specific to the Evidence Capture Adapter (ADR-0009, issue #7).
-/// Spawn/wait failures for the underlying `npx`/`asciinema` subprocess reuse
-/// [`ProcessError`] (via `process::spawn_and_wait`) rather than duplicating
-/// that handling here -- these variants only cover outcomes that are valid
-/// from a subprocess point of view (it ran, it exited) but still mean no
-/// usable evidence was produced.
 #[derive(Debug, Error)]
 pub enum EvidenceError {
     #[error("evidence tool `{tool}` exited with status {exit_code:?}: {stderr}")]
@@ -134,19 +95,9 @@ pub enum EvidenceError {
     #[error("evidence tool `{tool}` produced no artifacts in {path}")]
     NoArtifactsProduced { tool: &'static str, path: PathBuf },
 
-    /// A `evidence.file_path` column value that isn't of the
-    /// `.warden/evidence/<cycle>/<filename>` shape `evidence::repo_relative_path`
-    /// always writes -- a row written by something other than this code, or a
-    /// corrupted database (code-standards.md: "no silent fallback").
     #[error("stored evidence file_path {file_path:?} has no file name component")]
     InvalidStoredEvidencePath { file_path: String },
 
-    /// Issue #24 review, M1: `AsciinemaAdapter` renders the tester's own
-    /// program/args back into a single string for `asciinema rec --command`,
-    /// which executes it via a shell -- every part must be shell-quoted
-    /// before joining (`evidence::shell_join`). The only way that quoting can
-    /// fail is a NUL byte in one of the parts (`shlex::QuoteError::Nul`; a
-    /// shell command line fundamentally cannot carry one, quoted or not).
     #[error("cannot shell-quote the recorded command for asciinema (part {part:?}): {source}")]
     UnshellableRecordCommand {
         part: String,
@@ -155,13 +106,6 @@ pub enum EvidenceError {
     },
 }
 
-/// Errors resolving a role's markdown agent definition (issue #24): the
-/// `<repo>/.warden/agents/<role>.md` convention file, when present (see
-/// `crate::agent_def::resolve_agent_definition`). Both variants name the
-/// path -- with three definitions per run, an error that doesn't say
-/// *which* file is barely actionable. A **missing** file is not one of these
-/// -- it falls back to the selected tool adapter's own default prompt
-/// instead.
 #[derive(Debug, Error)]
 pub enum AgentDefinitionError {
     #[error("failed to read agent definition {path}: {source}")]
@@ -171,10 +115,8 @@ pub enum AgentDefinitionError {
         source: std::io::Error,
     },
 
-    /// The file was read but isn't a valid definition (no frontmatter fence,
-    /// malformed YAML, an unknown key, a blank-but-present optional field, a
-    /// blank system prompt, ...). Wraps `warden_core`'s own reason rather
-    /// than restating it -- the boundary rules live there.
+    /// The file was read but isn't a valid definition (no frontmatter fence, malformed YAML, an
+    /// unknown key, a blank-but-present optional field, a blank system prompt,...).
     #[error("invalid agent definition {path}: {source}")]
     Invalid {
         path: PathBuf,
@@ -182,30 +124,12 @@ pub enum AgentDefinitionError {
         source: warden_core::CoreError,
     },
 
-    /// Issue #26: neither `XDG_CONFIG_HOME` nor `HOME` is usable, so the
-    /// user config directory the reviewer/tester's own trusted definitions
-    /// live under (`agent_def::default_user_config_agents_dir`) cannot be
-    /// resolved at all. Mirrors `main.rs::default_warden_home`'s own
-    /// `HOME`-not-set failure -- both are "tell the user to fix their
-    /// environment" errors, never a silent fallback to some other directory.
     #[error(
         "cannot resolve the user config directory for agent definitions: {reason} (checked \
          XDG_CONFIG_HOME, then HOME)"
     )]
     UserConfigDirUnresolvable { reason: String },
 
-    /// Issue #26 review (HIGH, extended by the owner's ruling on the
-    /// escalated asymmetry): canonicalizing `repo_path`,
-    /// `warden_home`/worktrees root, `user_config_agents_dir`, or the
-    /// resolved `<role>.md` path under it failed for a reason other than
-    /// simply "doesn't exist yet" while checking whether a reviewer/tester's
-    /// supposedly trusted user-config source actually resolves inside the
-    /// repo under review or a worktree
-    /// (`agent_def::user_config_resolves_inside_repo_or_worktrees`). Fails
-    /// closed rather than silently skipping the containment check it could
-    /// no longer perform (code-standards.md: "no silent fallback") --
-    /// mirrors [`ProcessError::UntrustedAgentProgram`]'s own fail-closed
-    /// contract for the analogous `command.program` check.
     #[error(
         "cannot verify agent definition source {path} is outside the repo under review: {source}"
     )]
@@ -215,13 +139,7 @@ pub enum AgentDefinitionError {
         source: std::io::Error,
     },
 
-    /// Issue #73: a custom workflow step (any role beyond the built-in
-    /// coder/reviewer/tester) names an `agent` with no matching
-    /// `.claude/agents/<agent>.md` file. Unlike the built-in roles, a custom
-    /// step has no adapter-default fallback to degrade to (see
-    /// [`resolve_custom_step_agent_definition`]'s own docs) -- a missing file
-    /// is always a hard, typed error naming the exact role/path expected,
-    /// never a silently skipped step.
+    /// a custom workflow step names an `agent` with no matching `.claude/agents/<agent>.md` file.
     #[error(
         "no agent definition found for custom workflow role {role:?}: expected {expected_path}"
     )]
@@ -254,22 +172,19 @@ pub enum WardenError {
     #[error(transparent)]
     Core(#[from] warden_core::CoreError),
 
-    /// An agent invocation was stopped by its CLI quota. This is a control
-    /// flow outcome, distinct from an ordinary agent/process failure.
+    /// An agent invocation was stopped by its CLI quota.
     #[error("agent invocation suspended until quota resets at {resets_at}")]
     QuotaSuspended { resets_at: i64 },
 
-    /// A durable issue-#86 continuation could not be encoded. Kept distinct
-    /// from event payload errors so a failure names the state that would
-    /// otherwise be lost before the process exits.
+    /// A durable issue-#86 continuation could not be encoded.
     #[error("failed to encode quota continuation checkpoint: {source}")]
     QuotaContinuationEncode {
         #[source]
         source: serde_json::Error,
     },
 
-    /// A checkpoint row is persisted input and is validated at the database
-    /// boundary before it can reconstruct workflow state.
+    /// A checkpoint row is persisted input and is validated at the database boundary before it can
+    /// reconstruct workflow state.
     #[error("failed to decode quota continuation checkpoint for run {run_id}: {source}")]
     QuotaContinuationDecode {
         run_id: String,
@@ -298,20 +213,13 @@ pub enum WardenError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The repo's `.warden/hooks.toml` could not be read as a hook config --
-    /// malformed TOML, or an entry naming a `point` that is not a known
-    /// [`warden_core::HookPoint`]. Per code-standards.md ("no silent
-    /// fallback"), a present-but-broken hook config aborts rather than being
-    /// quietly ignored, so a typo never leaves a setup hook silently not
-    /// running.
+    /// The repo's `.warden/hooks.toml` could not be read as a hook config -- malformed TOML, or an
+    /// entry naming a `point` that is not a known [`warden_core::HookPoint`].
     #[error("invalid hook config {path}: {reason}")]
     HookConfig { path: PathBuf, reason: String },
 
-    /// The repo's `.warden/policy.yaml` could not be read as a policy rule
-    /// set (issue #51, ADR-0016) -- malformed YAML, an unknown top-level
-    /// key, or a rule naming an unknown `action`. Per code-standards.md
-    /// ("no silent fallback"), a present-but-broken policy file aborts
-    /// rather than being quietly treated as "no rules at all".
+    /// The repo's `.warden/policy.yaml` could not be read as a policy rule set -- malformed YAML,
+    /// an unknown top-level key, or a rule naming an unknown `action`.
     #[error("invalid policy config {path}: {reason}")]
     PolicyConfig { path: PathBuf, reason: String },
 
@@ -343,9 +251,7 @@ pub enum WardenError {
         stderr: String,
     },
 
-    /// A pre-migration backup of the SQLite database file failed. Per
-    /// code-standards.md ("no silent fallback"), this must abort the
-    /// migration rather than proceed without a safety net.
+    /// A pre-migration backup of the SQLite database file failed.
     #[error("failed to back up database to {path} before applying migrations: {source}")]
     Backup {
         path: PathBuf,
@@ -353,25 +259,16 @@ pub enum WardenError {
         source: sqlx::Error,
     },
 
-    /// `RunEvent` serialization to `events.payload_json` failed on
-    /// `insert_event` (encode direction). The decode direction
-    /// (`list_events_for_run`) never propagates this: issue #58, a row that
-    /// fails to deserialize is surfaced as a
-    /// `warden_core::RunEventHistoryEntry::Undecodable` marker instead of
-    /// failing the whole query.
+    /// `RunEvent` serialization to `events.payload_json` failed on `insert_event` (encode
+    /// direction).
     #[error("event payload serialization failed: {0}")]
     EventPayload(#[from] serde_json::Error),
 
-    /// [`crate::orchestrator::Orchestrator::run_convergence_loop`] sets up
-    /// its Event Bus / run context exactly once per instance -- an
-    /// orchestrator is one-run-per-instance in this codebase (a fresh one is
-    /// constructed per CLI invocation). A second call on the same instance
-    /// is a programming error, not a runtime condition to paper over.
+    /// [`crate::orchestrator::Orchestrator::run_convergence_loop`] sets up its Event Bus / run
+    /// context exactly once per instance.
     #[error("this orchestrator instance already has an active run in progress")]
     RunAlreadyInProgress,
-    /// The target repo's root `package.json` exists but isn't valid JSON --
-    /// evidence project-type detection (ADR-0009) must not silently treat
-    /// this as "no dependencies" (code-standards.md: "no silent fallback").
+    /// The target repo's root `package.json` exists but isn't valid JSON.
     #[error("malformed package.json at {path}: {source}")]
     InvalidPackageJson {
         path: PathBuf,
@@ -379,81 +276,32 @@ pub enum WardenError {
         source: serde_json::Error,
     },
 
-    /// Issue #15 review, H1(b): `CiResultListener::receive` waited longer
-    /// than `timeout` for `warden-gated` to deliver a run's terminal CI
-    /// result. Never an infinite await -- the caller maps this to failing
-    /// the run outright rather than leaving it stuck in `AwaitingCi`.
     #[error("timed out after {timeout_secs}s waiting for a CI result on run {run_id}")]
     CiResultTimedOut { run_id: String, timeout_secs: u64 },
 
-    /// Issue #15 review, M-new-1: the triggered `warden-gated` subprocess for
-    /// this run exited without ever delivering a terminal CI result (a hard
-    /// crash/kill before it could send even a `GateFailed`). The caller maps
-    /// this to failing the run outright -- unlike a still-live child, whose
-    /// wait is bounded only by its own watch inactivity timeout, a dead child
-    /// will never deliver, so waiting further would hang the run forever.
     #[error("warden-gated for run {run_id} exited without delivering a CI result")]
     GateChildDiedWithoutResult { run_id: String },
 
-    /// Issue #15 review, L1: a reverse-channel payload exceeded the size
-    /// cap before `warden-gated` ever closed its write half -- refused
-    /// outright rather than buffered without bound (OOM risk).
     #[error("CI result payload exceeded the {max_bytes}-byte cap")]
     CiResultPayloadTooLarge { max_bytes: usize },
 
-    /// Issue #15 review, M5: a `CiResultMessage` delivered over a run's
-    /// *own* reverse socket named a different `run_id` than the run that
-    /// socket was bound for -- untrusted input at a process boundary, never
-    /// applied to the wrong run.
     #[error("CI result message run_id {actual:?} does not match the expected run {expected:?}")]
     CiResultRunIdMismatch { expected: String, actual: String },
 
-    /// Issue #15 review, L2: a `runs.pr_number` value too large for `i64`
-    /// (SQLite's native integer type) to hold -- surfaces the real `u64`
-    /// value that failed to convert, not a placeholder.
     #[error("PR number {pr_number} does not fit in the column's numeric type")]
     PrNumberOverflow { pr_number: u64 },
 
-    /// Issue #50 review, LOW 6: a `warden_sandbox::SandboxError` that has no
-    /// natural [`ProcessError`] counterpart to translate into (see
-    /// `orchestrator::map_sandbox_error`'s own docs) -- every spawn/wait/
-    /// cancel/stdin-write shape a `LocalSandbox` invocation can produce still
-    /// maps onto the existing `ProcessError` variants instead, for strict
-    /// parity with this crate's pre-issue-#50 error text. Everything else
-    /// (today: only `SandboxError::UnknownSandbox`, an internal bug never
-    /// expected from a well-behaved backend) is wrapped here via `#[from]`
-    /// rather than flattened into a hand-rolled `reason: String` -- keeping
-    /// `#[source]` intact so `anyhow`/log output still chains down to the
-    /// original typed error.
     #[error(transparent)]
     Sandbox(#[from] warden_sandbox::SandboxError),
 
-    /// Issue #53: a `warden_core::TokenUsage` field too large for `i64`
-    /// (SQLite's native integer type) to hold -- surfaces the real `u64`
-    /// value that failed to convert, not a placeholder. Same shape as
-    /// `PrNumberOverflow` above, for a token-count column instead of a PR
-    /// number.
+    /// a `warden_core::TokenUsage` field too large for `i64` (SQLite's native integer type) to hold
+    /// -- surfaces the real `u64` value that failed to convert, not a placeholder.
     #[error("token count {value} for column `{column}` does not fit in the column's numeric type")]
     TokenCountOverflow { column: &'static str, value: u64 },
 
-    /// Issue #84: a `runs` row's six `rate_limit_*` columns
-    /// (`set_run_rate_limit_status` always writes all of them together) came
-    /// back with some, but not all, of them `NULL` -- a row written by
-    /// something other than this code, or a corrupted database
-    /// (code-standards.md: "no silent fallback"). A genuinely absent status
-    /// (every column `NULL`) is `Ok(None)`, never this error.
     #[error("run {run_id} has a partially-populated rate_limit_* row (expected all six columns NULL or all six present)")]
     CorruptRateLimitStatusRow { run_id: String },
 
-    /// Issue #73 review (F5); issue #79: [`crate::orchestrator::run_convergence_loop`]
-    /// indexes `RunConfig::step_agents` against `RunConfig::workflow`'s own
-    /// `type: agent` steps in lockstep, by relative position (a `type: hook`
-    /// step carries no entry at all, `ResolvedAgents::resolve`'s own
-    /// invariant) -- a caller that ever builds a `RunConfig` with the two out
-    /// of sync (a bug in `main.rs`'s resolution loop, or a future caller)
-    /// must fail fast, here, with a clear count mismatch, rather than let the
-    /// loop panic mid-run on an out-of-bounds index into whichever list ran
-    /// out first.
     #[error(
         "workflow declares {agent_steps} type: agent step(s) but {step_agents} agent \
          definition(s) were resolved for it -- every type: agent step must have exactly one \

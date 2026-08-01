@@ -1,18 +1,3 @@
-//! Evidence Capture Adapter (ADR-0009, issue #7): after a cycle's tester
-//! reports a successful e2e run, captures a tangible, human-consultable
-//! proof of the observed behaviour -- a Playwright screenshot/video for
-//! web/UI projects, an asciinema terminal recording for CLI projects.
-//!
-//! Storage is two-phase (Architecture.md §7): artifacts land first on local
-//! scratch storage under `<warden_home>/evidence/<run_id>/<cycle_number>/`,
-//! outside any git working tree -- capture happens in the tester's own
-//! ephemeral worktree, which the orchestrator removes right after this
-//! returns, so nothing here can depend on that worktree surviving. Only
-//! later, at convergence ([`commit_evidence_into_repo`]), does
-//! `evidence.store_in_repo` (default `true`) copy those files into
-//! `.warden/evidence/<cycle_number>/` inside a dedicated worktree and commit
-//! them -- never pushed before `Finalize` (ADR-0007).
-
 use std::path::{Path, PathBuf};
 
 use tokio_util::sync::CancellationToken;
@@ -26,67 +11,52 @@ use crate::git_util::NO_HOST_HOOKS;
 use crate::process::{self, AgentCommand};
 use crate::worktree::WorktreeManager;
 
-/// One artifact an adapter produced, already copied onto local scratch
-/// storage and tagged with the repo-relative path it will occupy once
-/// `evidence.store_in_repo` commits it (see module docs).
 #[derive(Debug, Clone)]
 pub struct CapturedEvidence {
     pub evidence_type: EvidenceType,
-    /// Absolute path to the artifact's current, pre-commit location on
-    /// local scratch storage.
+    /// Absolute path to the artifact's current, pre-commit location on local scratch storage.
     pub scratch_path: PathBuf,
-    /// `.warden/evidence/<cycle_number>/<filename>` -- where this artifact
-    /// lands inside the repo once committed.
+    /// `.warden/evidence/<cycle_number>/<filename>` -- where this artifact lands inside the repo
+    /// once committed.
     pub repo_relative_path: String,
     pub description: String,
 }
 
-/// Everything an [`EvidenceAdapter`] needs to capture evidence for one
-/// cycle.
+/// Everything an [`EvidenceAdapter`] needs to capture evidence for one cycle.
 pub struct EvidenceCaptureContext<'a> {
-    /// The tester's own worktree, checked out at the cycle's commit --
-    /// still open when capture runs (the caller removes it right after).
+    /// The tester's own worktree, checked out at the cycle's commit -- still open when capture runs
+    /// (the caller removes it right after).
     pub worktree_path: &'a Path,
     /// Local scratch directory this cycle's artifacts are written to
-    /// (`<warden_home>/evidence/<run_id>/<cycle_number>/`); created by the
-    /// caller before capture starts.
+    /// (`<warden_home>/evidence/<run_id>/<cycle_number>/`); created by the caller before capture
+    /// starts.
     pub scratch_dir: &'a Path,
     pub cycle_number: u32,
-    /// The command whose execution asciinema records verbatim (the
-    /// project's own tester command, since that's the most faithful "what a
-    /// human would see" proxy Warden has). Playwright ignores this -- it
-    /// drives its own test runner instead.
+    /// The command whose execution asciinema records verbatim (the project's own tester command,
+    /// since that's the most faithful "what a human would see" proxy Warden has).
     pub record_command: &'a AgentCommand,
     pub cancel: CancellationToken,
 }
 
-/// A capture tool: runs whatever it needs to inside
-/// [`EvidenceCaptureContext::worktree_path`] and returns every artifact it
-/// produced, already staged on scratch storage.
+/// A capture tool: runs whatever it needs to inside [`EvidenceCaptureContext::worktree_path`] and
+/// returns every artifact it produced, already staged on scratch storage.
 #[allow(async_fn_in_trait)]
 pub trait EvidenceAdapter {
     async fn capture(&self, ctx: &EvidenceCaptureContext<'_>) -> Result<Vec<CapturedEvidence>>;
 }
 
-/// Repo-relative destination for one captured file, stable regardless of
-/// when (or whether) it's actually committed.
+/// Repo-relative destination for one captured file, stable regardless of when (or whether) it's
+/// actually committed.
 fn repo_relative_path(cycle_number: u32, file_name: &str) -> String {
     format!(".warden/evidence/{cycle_number}/{file_name}")
 }
-
-// ---------------------------------------------------------------------------
-// Playwright adapter (web/UI projects)
-// ---------------------------------------------------------------------------
 
 const PLAYWRIGHT_OUTPUT_DIR: &str = "test-results";
 const PLAYWRIGHT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg"];
 const PLAYWRIGHT_VIDEO_EXTENSIONS: &[&str] = &["webm", "mp4"];
 
-/// Runs Playwright's own test runner in headless mode and collects the
-/// screenshots/videos it wrote out. Assumes the target repo already has its
-/// own `playwright.config.*` with `screenshot`/`video` capture configured --
-/// Warden only invokes the runner and harvests its default output directory
-/// (`test-results/`); it does not configure Playwright itself.
+/// Runs Playwright's own test runner in headless mode and collects the screenshots/videos it wrote
+/// out.
 pub struct PlaywrightAdapter;
 
 impl EvidenceAdapter for PlaywrightAdapter {
@@ -146,15 +116,10 @@ impl EvidenceAdapter for PlaywrightAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// asciinema adapter (CLI projects)
-// ---------------------------------------------------------------------------
-
 const ASCIINEMA_CAST_FILE_NAME: &str = "session.cast";
 
-/// Records `ctx.record_command`'s terminal session via `asciinema rec`,
-/// writing the `.cast` file directly onto scratch storage -- no separate
-/// harvesting step needed, unlike Playwright.
+/// Records `ctx.record_command`'s terminal session via `asciinema rec`, writing the `.cast` file
+/// directly onto scratch storage.
 pub struct AsciinemaAdapter;
 
 impl EvidenceAdapter for AsciinemaAdapter {
@@ -202,37 +167,8 @@ impl EvidenceAdapter for AsciinemaAdapter {
     }
 }
 
-/// Renders `command` back into a single shell-invocable string, so the
-/// tester's program + args can be handed to `asciinema rec --command`
-/// (`asciinema` execs it via a shell).
-///
-/// # Every part is shell-quoted (issue #24 review, M1)
-///
-/// This sink predates issue #24, but issue #24 is what arms it: before this
-/// issue, `command`'s args always came from a user-authored, fixed argument
-/// list (ADR-0013), so a naive space-join was merely inelegant. Now
-/// `ClaudeAdapter::build_command` puts the full, potentially multi-line
-/// system prompt directly into `args` (`--append-system-prompt <prompt>`),
-/// and the default/convention-file prompts routinely contain shell
-/// metacharacters of their own (backticks around field names like `` `diff` ``,
-/// apostrophes in "Warden's tester agent", ...). A naive space-join would
-/// hand all of that straight to a shell via `asciinema rec --command`,
-/// making every prompt an arbitrary-command-injection vector into whatever
-/// account runs the evidence capture -- and, even without any adversarial
-/// intent, would simply break (mismatched quotes) on the very prompts this
-/// codebase ships by default, which is exactly what asciinema capture for a
-/// `--tool claude` CLI project hit in review.
-///
-/// Each part (`command.program`, then every `command.args` entry) is
-/// shell-quoted independently via `shlex::try_quote` (POSIX single-quote
-/// style, correctly re-quoting an embedded single quote by closing/
-/// reopening the quoted run) before being space-joined, so the resulting
-/// string round-trips through a shell as the exact same argv, with no part
-/// of it ever interpreted as shell syntax. The only way quoting can fail is
-/// a part containing a NUL byte (`shlex::QuoteError::Nul`) -- a shell
-/// command line cannot represent one at all, quoted or not -- surfaced as
-/// [`EvidenceError::UnshellableRecordCommand`] naming the offending part
-/// rather than silently truncating or stripping it.
+/// Renders `command` back into a single shell-invocable string, so the tester's program + args can
+/// be handed to `asciinema rec --command` (`asciinema` execs it via a shell).
 fn shell_join(command: &AgentCommand) -> Result<String> {
     std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
@@ -251,13 +187,7 @@ fn shell_join(command: &AgentCommand) -> Result<String> {
         .map(|parts| parts.join(" "))
 }
 
-// ---------------------------------------------------------------------------
-// Tool selection + top-level capture entry point
-// ---------------------------------------------------------------------------
-
-/// Selects an adapter from `override_tool` (`RunConfig::evidence_tool`, the
-/// `evidence.tool` config, ADR-0009) or the detected project type, then runs
-/// it.
+/// Selects an adapter from `override_tool` or the detected project type, then runs it.
 pub async fn capture_evidence(
     project_markers: &ProjectMarkers,
     override_tool: Option<EvidenceTool>,
@@ -272,10 +202,6 @@ pub async fn capture_evidence(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Project-type scanning (I/O boundary for warden_core::detect_project_type)
-// ---------------------------------------------------------------------------
-
 #[derive(serde::Deserialize, Default)]
 struct PackageJson {
     #[serde(default)]
@@ -284,10 +210,8 @@ struct PackageJson {
     dev_dependencies: std::collections::BTreeMap<String, String>,
 }
 
-/// Gathers the filesystem facts `warden_core::detect_project_type`
-/// classifies: the repo root's entry names, plus `package.json`'s
-/// dependency keys if present. A shallow, one-level scan is deliberate --
-/// ADR-0009 calls for "détection simple", not a full dependency-tree walk.
+/// Gathers the filesystem facts `warden_core::detect_project_type` classifies: the repo root's
+/// entry names, plus `package.json`'s dependency keys if present.
 pub async fn scan_project_markers(repo_path: &Path) -> Result<ProjectMarkers> {
     let mut root_entries = Vec::new();
     let mut entries = tokio::fs::read_dir(repo_path).await?;
@@ -305,10 +229,8 @@ pub async fn scan_project_markers(repo_path: &Path) -> Result<ProjectMarkers> {
     })
 }
 
-/// The union of `dependencies`/`devDependencies` keys from the repo root's
-/// `package.json`, or an empty list if that file doesn't exist. A malformed
-/// `package.json` is a boundary error, not silently treated as "no
-/// dependencies" (code-standards.md: "no silent fallback").
+/// The union of `dependencies`/`devDependencies` keys from the repo root's `package.json`, or an
+/// empty list if that file doesn't exist.
 async fn read_package_json_dependencies(repo_path: &Path) -> Result<Vec<String>> {
     let path = repo_path.join("package.json");
     if !tokio::fs::try_exists(&path).await? {
@@ -332,9 +254,6 @@ async fn read_package_json_dependencies(repo_path: &Path) -> Result<Vec<String>>
     Ok(dependencies)
 }
 
-/// Recursively lists every file (not directory) under `dir`, or an empty
-/// list if `dir` doesn't exist at all (Playwright's `test-results/` is only
-/// created when it actually captures something).
 async fn collect_files_recursively(dir: &Path) -> Result<Vec<PathBuf>> {
     if !tokio::fs::try_exists(dir).await? {
         return Ok(Vec::new());
@@ -357,10 +276,6 @@ async fn collect_files_recursively(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Copies `source` (found under `base_dir`) onto `scratch_dir`, flattening
-/// its path relative to `base_dir` into the file name (so nested Playwright
-/// output directories -- one per test -- can't collide once flattened), and
-/// returns the resulting [`CapturedEvidence`].
 async fn stage_on_scratch(
     source: &Path,
     base_dir: &Path,
@@ -387,23 +302,10 @@ async fn stage_on_scratch(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Committing captured evidence into the repo (ADR-0007/ADR-0009: never
-// pushed before Finalize, but committed locally beforehand so the converged
-// commit already carries it).
-// ---------------------------------------------------------------------------
+// Committing captured evidence into the repo.
 
-/// Commits every evidence artifact captured across `run_id`'s cycles into
-/// the repo, under `.warden/evidence/<cycle_number>/`, on top of
-/// `base_commit` -- the last step before a run's converged commit is
-/// recorded (ADR-0009: "poussés avec le contenu final au Finalize -- jamais
-/// avant", ADR-0007). Returns `base_commit` unchanged if `evidence` is
-/// empty, so callers can unconditionally treat the return value as "the
-/// commit to converge on" either way.
-///
-/// Creates its own dedicated worktree (role `"evidence"`) rather than
-/// reusing the coder's or tester's -- both are already removed by the time a
-/// run reaches `RunState::Converged`.
+/// Commits every evidence artifact captured across `run_id`'s cycles into the repo, under
+/// `.warden/evidence/<cycle_number>/`, on top of `base_commit`.
 pub async fn commit_evidence_into_repo(
     worktree_manager: &WorktreeManager,
     main_repo_path: &Path,
@@ -438,13 +340,6 @@ pub async fn commit_evidence_into_repo(
         tokio::fs::copy(&scratch_path, &destination).await?;
     }
 
-    // `-f`: the target repo may gitignore `.warden/` wholesale (a
-    // reasonable default for a repo that doesn't want Warden's own scratch
-    // state tracked) -- without it, `git add` silently no-ops on every
-    // evidence file under a gitignored `.warden/`, and the commit below
-    // either fails on "nothing to commit" or, worse, produces an empty
-    // commit that claims to carry evidence it doesn't (code-review MEDIUM
-    // finding #2, issue #7).
     run_git(worktree.path(), &["add", "-f", ".warden/evidence"]).await?;
     run_git(
         worktree.path(),
@@ -459,10 +354,6 @@ pub async fn commit_evidence_into_repo(
 
     let new_commit = git_head_commit(worktree.path()).await?;
 
-    // Same rationale as `orchestrator::protect_cycle_commit`: worktrees
-    // share the main repo's object store, so this commit becomes ordinary
-    // unreachable garbage the instant its worktree is removed unless
-    // something else points at it.
     run_git(
         main_repo_path,
         &[
@@ -481,11 +372,6 @@ pub async fn commit_evidence_into_repo(
 }
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH): this helper runs `git add`
-    // *and* `git commit` (pre-commit/commit-msg/post-commit) *and*
-    // `update-ref` (reference-transaction) against `cwd` -- always the
-    // evidence worktree or `main_repo_path`, both sharing the base repo's
-    // common `.git`/hooks. See `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -506,8 +392,6 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
 }
 
 async fn git_head_commit(cwd: &Path) -> Result<String> {
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
-    // `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -565,18 +449,6 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    // -----------------------------------------------------------------
-    // shell_join (issue #24 review, M1): every part must be shell-quoted,
-    // proven by actually executing the joined string through a real shell
-    // rather than just inspecting the escaped text.
-    // -----------------------------------------------------------------
-
-    /// A command whose args carry exactly the shell metacharacters review
-    /// finding M1 flagged as reachable in practice (backticks and an
-    /// apostrophe from the default prompts' own text, plus a `$(...)`
-    /// command substitution as the sharper adversarial case): the joined
-    /// string, run through a real `sh -c`, must echo the literal text back
-    /// -- proving none of it was interpreted as shell syntax.
     #[test]
     fn shell_join_quotes_every_part_so_shell_metacharacters_are_never_executed() {
         let dangerous = "it's `whoami` and $(id) and a trailing backtick `";
@@ -601,12 +473,6 @@ mod tests {
         );
     }
 
-    /// The exact shape review finding M1 named: `ClaudeAdapter::build_command`
-    /// puts the whole (potentially multi-line) system prompt into `args`
-    /// after `--append-system-prompt` -- this pins that a prompt with
-    /// embedded backticks and an unmatched apostrophe (like
-    /// `DEFAULT_TESTER_PROMPT`'s own text) still round-trips through a real
-    /// shell as the literal prompt, not a broken or hijacked command line.
     #[test]
     fn shell_join_handles_a_claude_style_multiline_prompt_with_backticks_and_an_apostrophe() {
         let prompt = "You are Warden's tester agent.\n\nRun `diff` at `target_commit`.";
@@ -621,9 +487,6 @@ mod tests {
 
         let joined = shell_join(&command).unwrap();
 
-        // `sh -n` parses without executing -- enough to prove the quoting
-        // produced syntactically valid shell input (the previous, unescaped
-        // space-join would fail here on the stray apostrophe alone).
         let output = SyncCommand::new("sh")
             .arg("-n")
             .arg("-c")
@@ -637,21 +500,9 @@ mod tests {
         );
     }
 
-    /// Combines both of the previous two tests' concerns in one prompt --
-    /// a `$(...)` command substitution *and* embedded newlines together
-    /// (a real `ClaudeAdapter`-built system prompt routinely has both at
-    /// once) -- and, unlike the multi-line test above (`sh -n`, parse-only),
-    /// actually executes the joined string through a real shell and checks
-    /// the literal text comes back byte-for-byte. Proves neither the
-    /// `$(...)` is evaluated nor a newline is left unquoted in a way that
-    /// could split the joined string into multiple shell commands.
     #[test]
     fn shell_join_executes_a_multiline_prompt_containing_a_command_substitution_as_pure_literal_text(
     ) {
-        // Deliberately a *benign* substitution/backtick payload (`$(echo
-        // pwned)`, not something destructive like `$(rm -rf /)`): if
-        // `shell_join`'s quoting ever regressed, this test would actually
-        // execute whatever's embedded here via the real `sh -c` below.
         let prompt =
             "You are Warden's tester agent.\n\nDo not run $(echo pwned) or `id`.\nLine three.";
         let command = AgentCommand::new("printf", ["%s".to_string(), prompt.to_string()]);
@@ -676,11 +527,6 @@ mod tests {
              commands: joined={joined:?}"
         );
     }
-
-    // -----------------------------------------------------------------
-    // scan_project_markers: the I/O boundary that feeds
-    // warden_core::detect_project_type.
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn scan_project_markers_collects_root_entries_and_merged_package_json_dependencies() {
@@ -744,19 +590,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // capture_evidence: tool selection dispatches to the right adapter,
-    // and a missing tool binary is a typed, non-panicking error
-    // (acceptance criterion 7 relies on this staying an ordinary `Err`).
-    // -----------------------------------------------------------------
-
     #[tokio::test]
     async fn capture_evidence_override_beats_web_detection_and_dispatches_to_asciinema() {
-        // Markers look unambiguously like a web project (an `index.html`
-        // marker file) -- without an override this would select
-        // Playwright. The override must still win (acceptance criterion
-        // 2), which we observe here by checking *which binary* capture
-        // actually tried to spawn: `asciinema`, not `npx`/playwright.
         let markers = warden_core::ProjectMarkers {
             root_entries: vec!["index.html".to_string()],
             package_json_dependencies: vec![],
@@ -799,19 +634,9 @@ mod tests {
             cancel: CancellationToken::new(),
         };
 
-        // acceptance criterion 7: a missing tool must surface as an
-        // ordinary Result::Err the caller can catch and log -- never a
-        // panic that would take the whole run down with it.
         let result = capture_evidence(&markers, None, &ctx).await;
         assert!(result.is_err());
     }
-
-    // -----------------------------------------------------------------
-    // commit_evidence_into_repo (acceptance criterion 4: artifacts are
-    // stored locally first and only committed at convergence, under
-    // `.warden/evidence/<cycle>/`, never touching the user's main repo
-    // working tree/branch before that).
-    // -----------------------------------------------------------------
 
     #[tokio::test]
     async fn commit_evidence_into_repo_returns_base_commit_unchanged_when_there_is_no_evidence() {
@@ -847,8 +672,6 @@ mod tests {
         let base_commit = head_commit(repo.path());
         let run_id = "run-with-evidence";
 
-        // Simulates what `capture_evidence_for_cycle` already staged on
-        // local scratch storage during the cycle, before this ever runs.
         let scratch_dir = warden_home.path().join("evidence").join(run_id).join("1");
         tokio::fs::create_dir_all(&scratch_dir).await.unwrap();
         tokio::fs::write(scratch_dir.join("screenshot.png"), b"fake-png-bytes")
@@ -884,7 +707,6 @@ mod tests {
             "committing evidence must produce a new commit on top of base_commit"
         );
 
-        // The artifact must actually be present in that commit's tree...
         let show = SyncCommand::new("git")
             .current_dir(repo.path())
             .args([
@@ -899,9 +721,6 @@ mod tests {
         );
         assert_eq!(show.stdout, b"fake-png-bytes");
 
-        // ...reachable via the protective ref (mirrors
-        // orchestrator::protect_cycle_commit's rationale: worktrees share
-        // the main repo's object store).
         let ref_lookup = SyncCommand::new("git")
             .current_dir(repo.path())
             .args(["rev-parse", &format!("refs/warden/runs/{run_id}/evidence")])
@@ -913,10 +732,6 @@ mod tests {
             new_commit
         );
 
-        // ...and the main repo's own checked-out branch/working tree must
-        // be completely untouched -- evidence is committed on an isolated
-        // ref, never merged/checked out into the user's repo (ADR-0007:
-        // "jamais avant Finalize").
         assert_eq!(
             head_commit(repo.path()),
             base_commit,
@@ -938,13 +753,6 @@ mod tests {
         );
     }
 
-    /// Issue #49 review, HIGH: `run_git` (used here for `git add`/`git
-    /// commit`) must never let a planted `pre-commit` hook run -- under
-    /// `--isolation docker`, `repo_path`'s `.git` (shared by the evidence
-    /// worktree this function commits into) is bind-mounted read-write into
-    /// the container, so an agent could otherwise plant one and have it run
-    /// here, on the host, the next time a run converges with evidence
-    /// captured.
     #[cfg(unix)]
     #[tokio::test]
     async fn commit_evidence_into_repo_disables_a_planted_pre_commit_hook() {

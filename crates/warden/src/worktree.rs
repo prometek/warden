@@ -1,10 +1,3 @@
-//! Worktree Manager (ADR-0001): isolates every agent's working copy in its
-//! own `git worktree add --detach`, under a dedicated directory that is
-//! never inside the user's main repository working tree. Cleanup happens
-//! automatically via `Drop`, with an explicit async `remove` available when
-//! the caller wants to observe/handle a cleanup failure instead of just
-//! logging it.
-
 use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
 
@@ -15,13 +8,6 @@ use crate::git_util::NO_HOST_HOOKS;
 use crate::path_util::canonicalize_best_effort;
 
 /// Creates isolated worktrees for a single main repository.
-///
-/// `main_repo_path` is the user's real, pre-existing repository — Warden
-/// only ever reads from it (to resolve `commit_ish` and to run
-/// `git worktree add/remove`, both of which touch `.git/worktrees/`
-/// metadata, never the checked-out working tree files). All actual agent
-/// I/O happens under `worktrees_root`, which is validated at construction
-/// time to never be the main repo path or a path inside it.
 #[derive(Debug, Clone)]
 pub struct WorktreeManager {
     main_repo_path: PathBuf,
@@ -29,10 +15,8 @@ pub struct WorktreeManager {
 }
 
 impl WorktreeManager {
-    /// Validates `main_repo_path` is a git repository and that
-    /// `worktrees_root` is disjoint from its working tree, then returns a
-    /// manager ready to create worktrees. Does not touch the filesystem
-    /// beyond this check.
+    /// Validates `main_repo_path` is a git repository and that `worktrees_root` is disjoint from
+    /// its working tree, then returns a manager ready to create worktrees.
     pub fn new(
         main_repo_path: impl Into<PathBuf>,
         worktrees_root: impl Into<PathBuf>,
@@ -44,19 +28,9 @@ impl WorktreeManager {
             return Err(WorktreeError::NotAGitRepo(main_repo_path));
         }
 
-        // Canonicalize before the containment check: a non-canonical
-        // worktrees_root (e.g. via `..` segments) must not be able to slip
-        // past this guard and land inside the main working tree.
         let canonical_repo = main_repo_path.canonicalize().map_err(WorktreeError::Io)?;
-        // worktrees_root doesn't need to exist yet; canonicalize its
-        // deepest existing ancestor instead. Issue #26 review, MEDIUM:
-        // shares `path_util::canonicalize_best_effort` with
-        // `process::validate_agent_program` and
-        // `agent_def::user_config_resolves_inside_repo_or_worktrees` rather
-        // than a separate copy -- see that module's own docs for why the
-        // earlier separate copy here quietly failed to fail closed (it kept
-        // popping path segments on *any* `canonicalize` error, not just
-        // `NotFound`).
+        // worktrees_root doesn't need to exist yet; canonicalize its deepest existing ancestor
+        // instead.
         let canonical_worktrees_root =
             canonicalize_best_effort(&worktrees_root).map_err(WorktreeError::Io)?;
 
@@ -75,10 +49,8 @@ impl WorktreeManager {
         })
     }
 
-    /// Creates a detached worktree at `<worktrees_root>/<run_id>/<role>`,
-    /// checked out at `commit_ish`. The parent directory is created if
-    /// needed; the leaf directory itself must not already exist (git
-    /// requires this for `worktree add`).
+    /// Creates a detached worktree at `<worktrees_root>/<run_id>/<role>`, checked out at
+    /// `commit_ish`.
     pub async fn create(
         &self,
         run_id: &str,
@@ -90,9 +62,6 @@ impl WorktreeManager {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // `NO_HOST_HOOKS` (issue #49 review, HIGH): `worktree add` is a
-        // checkout, which runs `post-checkout` -- see `crate::git_util`'s
-        // own docs.
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
@@ -119,19 +88,6 @@ impl WorktreeManager {
     }
 }
 
-/// Removes a worktree at `path` from `main_repo_path` that no longer has a
-/// [`Worktree`] guard owning it — used by crash recovery, where the
-/// orchestrator that would normally call [`Worktree::remove`] (or drop the
-/// guard) died before it got the chance (Architecture.md §9, Disaster
-/// Recovery).
-///
-/// Idempotent by design: if `path` doesn't exist on disk anymore (already
-/// cleaned up, or never fully created), this returns `Ok(())` without
-/// invoking git at all, rather than treating "already gone" as a recovery
-/// failure. A `path` that *does* exist but that git genuinely refuses to
-/// remove (corrupted worktree metadata, permissions, ...) still surfaces as
-/// [`WorktreeError::GitCommandFailed`] — only the "nothing there" case is
-/// swallowed.
 pub async fn remove_orphan_worktree(
     main_repo_path: &Path,
     path: &Path,
@@ -140,10 +96,6 @@ pub async fn remove_orphan_worktree(
         return Ok(());
     }
 
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth): `worktree
-    // remove` doesn't itself run a checkout, but shares `main_repo_path`'s
-    // common `.git`/hooks like every other invocation in this file -- see
-    // `crate::git_util`'s own docs.
     let output = Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
@@ -164,15 +116,7 @@ pub async fn remove_orphan_worktree(
     Ok(())
 }
 
-/// Runs `git worktree prune` against `main_repo_path`, clearing any
-/// remaining `.git/worktrees/<name>` administrative entries left behind by
-/// worktrees whose working directory is already gone (e.g. removed by
-/// [`remove_orphan_worktree`], or deleted out-of-band). Called once after
-/// processing all of a crashed run's recorded worktree paths, not per-path —
-/// pruning is a whole-repository operation.
 pub async fn prune_worktrees(main_repo_path: &Path) -> Result<(), WorktreeError> {
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
-    // `crate::git_util`'s own docs.
     let output = Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
@@ -192,9 +136,7 @@ pub async fn prune_worktrees(main_repo_path: &Path) -> Result<(), WorktreeError>
     Ok(())
 }
 
-/// A single isolated, detached git worktree. Removed via `git worktree
-/// remove --force` either explicitly (`remove`) or on `Drop` as a
-/// best-effort fallback.
+/// A single isolated, detached git worktree.
 #[derive(Debug)]
 pub struct Worktree {
     path: PathBuf,
@@ -207,12 +149,8 @@ impl Worktree {
         &self.path
     }
 
-    /// Explicitly removes the worktree, propagating any failure to the
-    /// caller. Prefer this over relying on `Drop` when the caller can
-    /// meaningfully react to a cleanup error.
+    /// Explicitly removes the worktree, propagating any failure to the caller.
     pub async fn remove(mut self) -> Result<(), WorktreeError> {
-        // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
-        // `crate::git_util`'s own docs.
         let output = Command::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
@@ -241,11 +179,6 @@ impl Drop for Worktree {
             return;
         }
         // Drop can't be async: fall back to a synchronous git invocation.
-        // Best-effort only — a failure here is logged, never panics, and
-        // never propagates (nothing to propagate to).
-        //
-        // `NO_HOST_HOOKS` (issue #49 review, HIGH, defense-in-depth) -- see
-        // `crate::git_util`'s own docs.
         match SyncCommand::new("git")
             .arg("-C")
             .arg(&self.main_repo_path)
@@ -281,8 +214,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Sets up a throwaway git repo with a single commit, suitable as
-    /// `main_repo_path` in tests.
     fn init_test_repo() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
         let run = |args: &[&str]| {
@@ -322,15 +253,6 @@ mod tests {
         ));
     }
 
-    /// Issue #26 review, MEDIUM: `new`'s containment check must fail closed
-    /// when it can no longer verify what `worktrees_root` actually resolves
-    /// to -- a permissions error on an ancestor must never be silently
-    /// walked past and compared as a truncated path. Before switching to the
-    /// shared `path_util::canonicalize_best_effort`, this module's own copy
-    /// popped path segments on *any* `canonicalize` error (not just
-    /// `NotFound`), so a case exactly like this one would have silently
-    /// succeeded instead of surfacing the permissions failure -- this test
-    /// pins the fixed behaviour.
     #[cfg(unix)]
     #[test]
     fn fails_closed_when_an_ancestor_of_worktrees_root_cannot_be_canonicalized() {
@@ -340,14 +262,6 @@ mod tests {
         let outside = TempDir::new().unwrap();
         let locked = outside.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
-        // Two non-existent path segments below `locked`: resolving the
-        // deeper one requires *searching inside* `locked` (execute
-        // permission on `locked` itself, not just on its parent), so
-        // stripping `locked`'s own permissions actually triggers a
-        // permission error partway up the ancestor walk -- a single
-        // non-existent segment directly under `locked` would only need
-        // execute permission on `locked`'s *parent* (`outside`, left
-        // untouched) to resolve, and wouldn't exercise this path at all.
         let worktrees_root = locked.join("nested").join("does-not-exist-yet");
 
         let mut perms = std::fs::metadata(&locked).unwrap().permissions();
@@ -356,8 +270,6 @@ mod tests {
 
         let result = WorktreeManager::new(repo.path(), &worktrees_root);
 
-        // Restore permissions before any assertion can panic and leave a
-        // directory `TempDir::drop` can't clean up.
         perms.set_mode(0o755);
         std::fs::set_permissions(&locked, perms).unwrap();
 
@@ -386,9 +298,6 @@ mod tests {
         let worktree = manager.create("run-1", "coder", "HEAD").await.unwrap();
         assert!(worktree.path().join("README.md").exists());
 
-        // The main repo's working tree must be byte-for-byte untouched by
-        // creating a worktree elsewhere — only its `.git/worktrees/`
-        // bookkeeping changes, never the checked-out files.
         let during = snapshot_dir_entries(repo.path());
         assert_eq!(before, during);
 
@@ -420,9 +329,6 @@ mod tests {
         let worktrees_root = TempDir::new().unwrap();
         let manager = WorktreeManager::new(repo.path(), worktrees_root.path()).unwrap();
 
-        // Simulates a crash: the `Worktree` guard is forgotten (never
-        // dropped, never `remove`d) rather than cleaned up normally, the way
-        // an orchestrator killed by SIGKILL would leave it.
         let worktree = manager.create("orphan-run", "coder", "HEAD").await.unwrap();
         let path = worktree.path().to_path_buf();
         std::mem::forget(worktree);
@@ -438,9 +344,6 @@ mod tests {
         let repo = init_test_repo();
         let never_existed = repo.path().join("never-existed");
 
-        // Idempotent: recovery may run this twice, or the worktree may
-        // already have been cleaned up by some other path — either way,
-        // "nothing there" must not surface as a recovery failure.
         remove_orphan_worktree(repo.path(), &never_existed)
             .await
             .unwrap();
@@ -456,9 +359,6 @@ mod tests {
         let path = worktree.path().to_path_buf();
         std::mem::forget(worktree);
 
-        // Delete the working directory out-of-band (as if the filesystem,
-        // not git, removed it) so `.git/worktrees/coder` is left dangling —
-        // exactly what `git worktree prune` exists to clear.
         std::fs::remove_dir_all(&path).unwrap();
 
         prune_worktrees(repo.path()).await.unwrap();

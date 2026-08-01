@@ -1,8 +1,5 @@
-//! Sends the one terminal [`CiResultMessage`] a run's post-`Converged` tail
-//! produces back to `warden`'s reverse socket (issue #15/ADR-0011). Mirrors
-//! `relay::relay`'s discipline exactly: connect, write the payload, shut the
-//! write half down -- no retry, no parsing here (that happens on `warden`'s
-//! side, at its own boundary).
+//! Sends the one terminal [`CiResultMessage`] a run's post-`Converged` tail produces back to
+//! `warden`'s reverse socket.
 
 use std::path::Path;
 
@@ -12,12 +9,7 @@ use warden_core::CiResultMessage;
 
 use crate::error::{GatedError, Result};
 
-/// Delivers `message` to `warden`'s reverse-channel listener at
-/// `socket_path`. A connection/write failure here is the "channel failure
-/// semantics" case ADR-0011 calls out explicitly: it must surface visibly
-/// (surfaced here as [`GatedError::CiResultDeliveryFailed`]) rather than
-/// being swallowed -- exactly like the forward relay already surfaces an
-/// undelivered push notification in the hook's exit code.
+/// Delivers `message` to `warden`'s reverse-channel listener at `socket_path`.
 pub async fn send_ci_result(socket_path: &Path, message: &CiResultMessage) -> Result<()> {
     let json = message.to_json()?;
     deliver(socket_path, json.as_bytes())
@@ -28,9 +20,8 @@ pub async fn send_ci_result(socket_path: &Path, message: &CiResultMessage) -> Re
         })
 }
 
-/// The actual connect-and-send, isolated from the error-wrapping above so
-/// `?` can be used freely across both fallible steps (connect, write) inside
-/// it.
+/// The actual connect-and-send, isolated from the error-wrapping above so `?` can be used freely
+/// across both fallible steps (connect, write) inside it.
 async fn deliver(socket_path: &Path, payload: &[u8]) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(payload).await?;

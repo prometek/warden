@@ -1,40 +1,13 @@
-//! Issue #15/ADR-0011's post-`Converged` tail: push into the local bare
-//! gate repo, trigger `warden-gated`'s `run-tail`, and await its terminal
-//! CI result.
+//! /'s post-`Converged` tail: push into the local bare gate repo, trigger `warden-gated`'s `run-
+//! tail`, and await its terminal CI result.
 
 use super::*;
 
-/// Issue #15 review, M-new-1: once the triggered `warden-gated` subprocess is
-/// observed to have exited, how long `warden` still waits for its terminal CI
-/// message to arrive over the reverse socket before concluding the child died
-/// without delivering. `warden-gated` writes the message and *then* exits, so
-/// on a local Unix socket the bytes are already buffered by the time the exit
-/// is observed -- this grace only covers the tiny window between the two, and
-/// is never the primary bound (a *live* child is waited on with no wall-clock
-/// cap at all, since `watch_pr`'s runtime is legitimately uncapped).
 const GATE_CHILD_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
-/// The ref prefix `warden` stages a converged run's commit under in the
-/// local bare gate repo (issue #15 review, H2).
-///
-/// **Deliberately outside `refs/heads/`, and specifically NOT
-/// `refs/heads/warden-run/`** (`warden_gated::notification::GATE_REF_PREFIX`,
-/// the ref the installed `post-receive` hook / `serve` daemon watch for a
-/// push-notification): this push exists *only* to transfer git objects into
-/// the bare repo's object store so `warden-gated run-tail`/`resume-watch`
-/// can find `commit_sha` by SHA (ADR-0002). It must never be treated as a
-/// push-notification -- staging under `GATE_REF_PREFIX` would make a
-/// *deployed* gate independently re-verify and force-push this content
-/// straight to `origin/<target_branch>`, bypassing PR review entirely
-/// (exactly what ADR-0002/issue #5 forbid). Only the PR-based path
-/// (`run_tail`/`Finalize`) ever pushes this content on to real `origin`.
+/// The ref prefix `warden` stages a converged run's commit under in the local bare gate repo.
 const GATE_STAGING_REF_PREFIX: &str = "refs/warden-staging/";
 
-/// Issue #15 review, M2: reads back every evidence row captured across
-/// `run_id`'s cycles and converts it into the shared wire shape
-/// `gate_trigger::RunTailTrigger::evidence` carries -- previously never
-/// read here at all, so the finalized PR body's Evidence section (ADR-0009)
-/// was always empty regardless of what the run actually captured.
 async fn evidence_rows_for_run(
     pool: &SqlitePool,
     run_id: &str,
@@ -51,15 +24,6 @@ async fn evidence_rows_for_run(
         .collect())
 }
 
-/// Pushes `commit_sha` (already reachable in `repo_path`'s object store --
-/// `protect_cycle_commit` keeps it so) into the local bare gate repo under
-/// this run's staging ref ([`GATE_STAGING_REF_PREFIX`]), transferring the
-/// objects `warden-gated`'s `run-tail`/`resume-watch` need before they can
-/// push anything onward to real `origin`. `--force`: a reboucled run pushes
-/// a new converged commit onto the same per-run ref repeatedly, and this
-/// ref is exclusively `warden`-managed, so a rejected non-fast-forward push
-/// here would only ever be a false alarm, never a real conflict with
-/// anything else touching it.
 async fn push_converged_commit_to_bare_repo(
     repo_path: &Path,
     bare_repo_path: &Path,
@@ -67,13 +31,6 @@ async fn push_converged_commit_to_bare_repo(
     run_id: &str,
 ) -> Result<()> {
     let refspec = format!("{commit_sha}:{GATE_STAGING_REF_PREFIX}{run_id}");
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH): `git push` runs `pre-push`
-    // in the *pushing* repo (`repo_path`, `-C` above) -- under `--isolation
-    // docker`, `repo_path`'s `.git` is bind-mounted read-write into the
-    // container (`warden_sandbox::docker`'s own docs), so an agent could
-    // plant a `pre-push` hook there and have it run here, on the host, with
-    // full host credentials/network access. See `crate::git_util`'s own
-    // docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo_path)
@@ -98,13 +55,8 @@ async fn push_converged_commit_to_bare_repo(
     Ok(())
 }
 
-/// Waits for `warden-gated`'s single terminal CI message on `listener`,
-/// bounded by `gate_child`'s liveness (issue #15 review, M-new-1) rather than
-/// any wall-clock timeout. A live child means the watch is still legitimately
-/// in progress, so `receive_no_timeout` is awaited with no cap of `warden`'s
-/// own; only if the child exits *without* delivering -- and a short grace for
-/// an in-flight message elapses -- is this a
-/// [`WardenError::GateChildDiedWithoutResult`].
+/// Waits for `warden-gated`'s single terminal CI message on `listener`, bounded by `gate_child`'s
+/// liveness rather than any wall-clock timeout.
 async fn await_ci_result(
     run_id: &str,
     listener: &CiResultListener,
@@ -112,9 +64,6 @@ async fn await_ci_result(
 ) -> Result<CiResultMessage> {
     tokio::select! {
         biased;
-        // Polled first: a delivered (or malformed) message always wins over
-        // the child-exit branch, including a message that lands during the
-        // grace period below.
         result = listener.receive_no_timeout() => result,
         () = wait_child_then_grace(gate_child) => {
             Err(WardenError::GateChildDiedWithoutResult {
@@ -124,27 +73,15 @@ async fn await_ci_result(
     }
 }
 
-/// Resolves once the triggered child has exited *and* [`GATE_CHILD_GRACE_PERIOD`]
-/// has since elapsed -- the grace covers the tiny window between
-/// `warden-gated` writing its final message and its process being observed to
-/// exit. The concurrently-awaited `receive_no_timeout` keeps running
-/// throughout, so a message that lands during the grace still wins.
+/// Resolves once the triggered child has exited *and* [`GATE_CHILD_GRACE_PERIOD`] has since
+/// elapsed.
 async fn wait_child_then_grace(gate_child: GateChild) {
     gate_child.wait_exit().await;
     tokio::time::sleep(GATE_CHILD_GRACE_PERIOD).await;
 }
 
-/// Best-effort removal of a run's staging ref from the bare gate repo once the
-/// run is terminal (issue #15 review, L-new-1) -- the ref is force-pushed on
-/// every pass and would otherwise accumulate (pinning objects) unbounded.
-/// Never propagates: failing to reclaim it must not fail an otherwise-finished
-/// run, and a lingering ref is harmless until a later GC.
+/// Best-effort removal of a run's staging ref from the bare gate repo once the run is terminal.
 pub(super) async fn delete_gate_staging_ref(bare_repo_path: &Path, run_id: &str) {
-    // No `NO_HOST_HOOKS` needed here (issue #49 review, HIGH): unlike
-    // `repo_path` or a role's own worktree, `bare_repo_path` (the local gate
-    // repo) is never bind-mounted into any sandbox and no agent process ever
-    // writes to it -- there is no hook an agent could have planted in its
-    // `.git` in the first place. See `crate::git_util`'s own docs.
     let ref_name = format!("{GATE_STAGING_REF_PREFIX}{run_id}");
     let result = tokio::process::Command::new("git")
         .arg("-C")
@@ -167,19 +104,6 @@ pub(super) async fn delete_gate_staging_ref(bare_repo_path: &Path, run_id: &str)
     }
 }
 
-/// Creates a local ref pointing at `commit_sha` in the main repository
-/// (M4), so the commit produced by a cycle's coder stays reachable — and
-/// therefore safe from `git gc` — after its worktree is removed. Worktrees
-/// share the main repo's object store, so a commit with nothing pointing
-/// at it becomes ordinary unreachable garbage the moment its worktree is
-/// gone.
-///
-/// This only ever writes to `.git/refs/...` (repository metadata), never to
-/// the main repo's checked-out working tree files, index, or current
-/// branch — the same category of write `git worktree add/remove` already
-/// makes to `.git/worktrees/...`. It is a purely local git operation: no
-/// push, no remote, no interaction with `origin` — that boundary belongs to
-/// Phase 3's git gate.
 pub(super) async fn protect_cycle_commit(
     main_repo_path: &Path,
     run_id: &str,
@@ -187,8 +111,6 @@ pub(super) async fn protect_cycle_commit(
     commit_sha: &str,
 ) -> Result<()> {
     let ref_name = format!("refs/warden/runs/{run_id}/cycle-{cycle_number}");
-    // `NO_HOST_HOOKS` (issue #49 review, HIGH): `update-ref` runs the
-    // `reference-transaction` hook -- see `crate::git_util`'s own docs.
     let output = tokio::process::Command::new("git")
         .arg("-C")
         .arg(main_repo_path)
@@ -212,19 +134,6 @@ pub(super) async fn protect_cycle_commit(
 }
 
 impl Orchestrator {
-    /// Drives issue #15/ADR-0011's post-`Converged` tail: pushes the
-    /// converged commit into the local bare gate repo (the ADR-0002 forward
-    /// channel), triggers `warden-gated`'s fresh `run-tail` (skeleton commit
-    /// plus `OpenDraft`, `Finalize`, and `watch_pr`), and awaits the one
-    /// terminal `CiResultMessage` it delivers back over a freshly bound
-    /// reverse socket. Generic over [`GateTrigger`] so tests can inject a
-    /// fake that delivers a scripted message without spawning a real
-    /// `warden-gated` subprocess (code-standards.md: no network/subprocess
-    /// in tests).
-    ///
-    /// Every state transition here is write-ahead of the action it
-    /// authorizes (ADR-0004): `Pushed` is persisted before the push,
-    /// `AwaitingCi` before the (possibly long) wait for a result.
     pub(super) async fn drive_post_convergence_tail<G: GateTrigger>(
         &self,
         run_id: &str,
@@ -236,29 +145,12 @@ impl Orchestrator {
             unreachable!("drive_post_convergence_tail is only called when config.gate is Some");
         };
 
-        // Issue #15 review, H3: a reboucle re-enters this method for a run
-        // that already has a PR (a prior pass through this same method
-        // already set it) -- `Some` here skips `OpenDraft` on the
-        // `warden-gated` side entirely.
         let existing_pr_number = db::get_run(&self.pool, run_id)
             .await?
             .and_then(|run| run.pr_number);
-        // Issue #15 review, M2: folded into the finalized PR body's
-        // Evidence section (ADR-0009) -- previously hardcoded to empty on
-        // the `warden-gated` side of this boundary.
         let evidence = evidence_rows_for_run(&self.pool, run_id).await?;
 
-        // Issue #51/ADR-0016: the policy decision layer's one wiring into
-        // this crate's push path. Evaluated while the run is still
-        // `Converged` (before the write-ahead transition below), so a
-        // `Deny`/unapproved `RequireApproval` can fail the run cleanly
-        // (`Converged -> Failed` is a legal transition precisely for this,
-        // see `warden_core::state`'s own docs) instead of either staging the
-        // commit anyway or leaving the run stuck `Converged` forever. This
-        // governs only the push into the *local bare gate repo* -- never
-        // `origin` itself, which stays `warden-gated`'s own, independently
-        // re-verified barrier (ADR-0002/0006), entirely untouched by this
-        // check.
+        // / the policy decision layer's one wiring into this crate's push path.
         if let PolicyOutcome::Blocked { reason } = self
             .policy_gate
             .decide(
@@ -272,24 +164,6 @@ impl Orchestrator {
         {
             tracing::warn!(run_id, reason, "policy blocked the push; failing the run");
             self.transition(run_id, RunState::Failed).await?;
-            // Issue #15 review, L-new-1 (same invariant a stateful
-            // `ApprovalGate` -- issue #51 -- makes reachable for the first
-            // time here): a reboucled run's *prior* pass through this method
-            // may already have staged a real commit under this run's own
-            // staging ref before a later pass gets denied/un-approved. This
-            // is the one `Terminal` outcome this function produces before
-            // reaching the shared cleanup at the bottom (below), so it
-            // reclaims the ref itself rather than leaving it to accumulate.
-            //
-            // Deliberately no `run_teardown`/`RunFinished` publish here:
-            // `run_convergence_loop` -- the sole caller, via
-            // `PostConvergenceOutcome::Terminal` -- already runs both exactly
-            // once for whatever final state it receives (see its own
-            // `on_run_start`/teardown comment block); duplicating either
-            // here would double-publish and, for teardown, run it before the
-            // loop's own bookkeeping settles. Every other terminal path this
-            // module returns (`fail_awaiting_ci_run`,
-            // `apply_ci_result_message`) follows the same contract.
             delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
             return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
         }
@@ -331,27 +205,14 @@ impl Orchestrator {
             .await_and_apply_ci_result(run_id, &listener, gate_child)
             .await?;
 
-        // Issue #15 review, L-new-1: the per-run staging ref
-        // (`push_converged_commit_to_bare_repo`) is force-pushed every pass
-        // and would otherwise accumulate unbounded in the bare gate repo. A
-        // reboucle (`Reboucle`) re-pushes the same ref next pass, so only
-        // reclaim it once the run has actually reached a terminal state.
         if let PostConvergenceOutcome::Terminal(_) = &outcome {
             delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
         }
         Ok(outcome)
     }
 
-    /// Waits for `warden-gated`'s one terminal CI message and applies it,
-    /// bounding the wait by the triggered child's *liveness* rather than a
-    /// wall-clock timeout (issue #15 review, M-new-1). While the child is
-    /// alive the watch is legitimately still in progress (bounded on the
-    /// gated side by `watch_pr`'s own inactivity timeout), so `warden` keeps
-    /// waiting with no cap of its own -- a wall-clock bound derived from that
-    /// inactivity timeout would spuriously fail a long-but-active CI, since
-    /// `watch_pr` has no absolute cap. Only if the child exits *without* ever
-    /// delivering (a hard crash before it could send even a `GateFailed`) is
-    /// the run failed outright, after a short grace for an in-flight message.
+    /// Waits for `warden-gated`'s one terminal CI message and applies it, bounding the wait by the
+    /// triggered child's *liveness* rather than a wall-clock timeout.
     pub(super) async fn await_and_apply_ci_result(
         &self,
         run_id: &str,
@@ -371,10 +232,6 @@ impl Orchestrator {
         }
     }
 
-    /// Fails a run still sitting in `AwaitingCi` (issue #15 review, H1(b)) --
-    /// a safe no-op (returns the run's actual current state) if it has
-    /// already left that state by the time this runs, mirroring
-    /// `apply_ci_result_message`'s own idempotency guard.
     async fn fail_awaiting_ci_run(&self, run_id: &str) -> Result<PostConvergenceOutcome> {
         let run =
             db::get_run(&self.pool, run_id)
@@ -389,27 +246,11 @@ impl Orchestrator {
         Ok(PostConvergenceOutcome::Terminal(RunState::Failed))
     }
 
-    /// Applies one received [`CiResultMessage`] to `run_id`'s persisted
-    /// state (issue #15/ADR-0011): maps `CiWatchOutcome` -> `CiOutcome`
-    /// (`GateFailed` maps to an unconditional `Failed`, having no CI signal
-    /// of its own to interpret), calls `decide_next_state_after_ci`, and
-    /// writes the transition.
-    ///
-    /// **Idempotency guard**: applies the outcome only if the run is still
-    /// `AwaitingCi`. A duplicate/stale delivery for a run that already left
-    /// that state (e.g. a crash-recovery resume racing an earlier delivery)
-    /// is a safe no-op, never an error (ADR-0011).
     async fn apply_ci_result_message(
         &self,
         run_id: &str,
         message: &CiResultMessage,
     ) -> Result<PostConvergenceOutcome> {
-        // Issue #15 review, M5: `run_id` is the identity of the socket this
-        // message was received on (bound per-run); `message.run_id` is
-        // whatever the sender's own payload claims. Never apply a message
-        // to a run other than the one its own transport already identifies
-        // -- untrusted input at the process boundary, cross-checked rather
-        // than silently taken on faith.
         if message.run_id != run_id {
             return Err(WardenError::CiResultRunIdMismatch {
                 expected: run_id.to_string(),
@@ -438,31 +279,16 @@ impl Orchestrator {
         }
 
         let next_state = match message.outcome.as_ci_outcome() {
-            // Issue #43: a CI `ChecksFailed` reboucle re-enters the loop at
-            // `CoderRunning` -> `Reviewing` exactly like any review-charged
-            // reboucle, so charge it to the review budget. The in-loop review
-            // counter never moves on a CI reboucle (the code passed review
-            // locally), so advance the persisted `current_review_cycle`
-            // *before* gating -- otherwise a persistently-red CI would gate on
-            // a counter that never grows and loop unboundedly instead of
-            // terminating at the budget. The main loop re-reads this value
-            // after the reboucle so its own clean-review write can't clobber
-            // it.
             Some(CiOutcome::ChecksFailed) => {
                 let charged = run.current_review_cycle + 1;
                 db::set_run_current_review_cycle(&self.pool, run_id, charged).await?;
                 decide_next_state_after_ci(CiOutcome::ChecksFailed, charged, run.max_review_cycles)
             }
-            // Merged/ChecksPassed/Closed/TimedOut: terminal outcomes with no
-            // reboucle and no budget to charge.
             Some(ci_outcome) => decide_next_state_after_ci(
                 ci_outcome,
                 run.current_review_cycle,
                 run.max_review_cycles,
             ),
-            // GateFailed: no CI signal to interpret, and no cycle-budget
-            // reboucle either -- an infrastructure failure (push/PR/finalize)
-            // is not something re-running the coder can fix.
             None => RunState::Failed,
         };
         self.transition(run_id, next_state).await?;
@@ -484,10 +310,6 @@ mod tests {
     use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
-    /// A local bare repo standing in for `warden-gated`'s own bare gate repo
-    /// (ADR-0002) -- real git, no network, so `push_converged_commit_to_bare_repo`
-    /// exercises an actual `git push` (code-standards.md: "pas d'appel
-    /// réseau externe").
     fn init_bare_repo_fixture() -> TempDir {
         let dir = TempDir::new().expect("tempdir");
         let status = SyncCommand::new("git")
@@ -499,13 +321,6 @@ mod tests {
         dir
     }
 
-    /// A [`GateTrigger`] fake that delivers a scripted [`CiResultMessage`]
-    /// synchronously within `trigger_run_tail`/`trigger_resume_watch`,
-    /// standing in for `warden-gated`'s real subprocess (which would need a
-    /// live `gh`/GitHub PR, code-standards.md: "pas d'appel réseau
-    /// externe"). Connecting before the caller's own `listener.receive()`
-    /// is safe: a Unix listener's accept backlog holds the connection
-    /// regardless of `accept()` timing.
     struct FakeGateTrigger {
         outcome: warden_core::CiWatchOutcome,
         pr_number: Option<u64>,
@@ -515,9 +330,6 @@ mod tests {
         async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
             self.deliver(request.run_id, request.ci_result_socket)
                 .await?;
-            // The message is already buffered on the socket, so the caller's
-            // `receive` wins immediately; modeling the child as still-alive
-            // keeps the grace path out of these success-case tests entirely.
             Ok(GateChild::never_exiting())
         }
 
@@ -549,11 +361,6 @@ mod tests {
         }
     }
 
-    /// Builds a run already sitting in `Converged` (the state
-    /// `drive_post_convergence_tail`'s first transition, `-> Pushed`,
-    /// requires) with a real commit -- `init_test_repo`'s own initial
-    /// commit -- reachable in `repo_path`'s object store, so
-    /// `push_converged_commit_to_bare_repo` has something real to push.
     async fn converged_run_fixture(
         pool: &SqlitePool,
         repo: &TempDir,
@@ -614,19 +421,11 @@ mod tests {
             }),
             untrusted_repo_agent_definitions: Vec::new(),
         };
-        // Leaked deliberately: `warden_home`'s TempDir must outlive the
-        // `CiResultListener` bound inside it for the duration of this test,
-        // and giving each test its own leaked TempDir is simpler than
-        // threading an extra return value through every caller.
         std::mem::forget(warden_home);
 
         (run_id, config, converged_commit)
     }
 
-    /// A [`GateTrigger`] that panics if invoked at all -- proves the policy
-    /// check (issue #51) short-circuits `drive_post_convergence_tail`
-    /// strictly before any `warden-gated` interaction, not just before the
-    /// state transition.
     struct UnreachableGateTrigger;
 
     impl GateTrigger for UnreachableGateTrigger {
@@ -644,8 +443,6 @@ mod tests {
         }
     }
 
-    /// Asserts `run_id` has no staging ref in `bare_repo` -- what a
-    /// policy-denied/un-approved push must never have reached (issue #51).
     fn assert_no_staging_ref(bare_repo: &TempDir, run_id: &str) {
         let check = SyncCommand::new("git")
             .current_dir(bare_repo.path())
@@ -662,12 +459,6 @@ mod tests {
         );
     }
 
-    /// Issue #51/ADR-0016, review MEDIUM 3: the flagship `git_push` decision
-    /// point, exercised end to end through the real `drive_post_convergence_tail`
-    /// (not just the pure `warden_core::state`/`warden_policy` unit tests a
-    /// `Deny` decision already has on their own). A denying `PolicyGate`
-    /// must fail the run, never invoke `warden-gated`, and never stage
-    /// anything into the bare gate repo.
     #[tokio::test]
     async fn drive_post_convergence_tail_fails_the_run_when_policy_denies_the_push() {
         let repo = init_test_repo();
@@ -703,9 +494,6 @@ mod tests {
         assert_no_staging_ref(&bare_repo, &run_id);
     }
 
-    /// A fake [`ApprovalGate`] that records whether it was asked and returns
-    /// a scripted answer -- standing in for the interactive TTY prompt
-    /// `main.rs`'s `TtyApprovalGate` provides in a real run.
     struct FakeApprovalGate {
         approve: bool,
     }
@@ -717,11 +505,6 @@ mod tests {
         }
     }
 
-    /// Issue #51/ADR-0016, review MEDIUM 3 + HIGH 1: the `git_push` decision
-    /// point's `RequireApproval` path, exercised end to end -- a granted
-    /// approval must let the push proceed exactly as an outright `Allow`
-    /// would (this reuses `FakeGateTrigger`'s existing success path, proving
-    /// `warden-gated` *is* reached once approved).
     #[tokio::test]
     async fn drive_post_convergence_tail_pushes_once_a_required_approval_is_granted() {
         let repo = init_test_repo();
@@ -756,9 +539,6 @@ mod tests {
         assert_eq!(run.state, RunState::Done);
     }
 
-    /// The mirror of the test above: a refused approval must fail the run
-    /// exactly like an outright `Deny`, never invoking `warden-gated` and
-    /// never staging the commit.
     #[tokio::test]
     async fn drive_post_convergence_tail_fails_the_run_when_a_required_approval_is_refused() {
         let repo = init_test_repo();
@@ -795,9 +575,6 @@ mod tests {
         assert_no_staging_ref(&bare_repo, &run_id);
     }
 
-    /// No `.warden/policy.yaml` at all -- `PolicyGate::empty` (the
-    /// orchestrator's own default) must never touch this path: strict parity
-    /// with pre-issue-#51 behaviour.
     #[tokio::test]
     async fn drive_post_convergence_tail_reaches_done_on_checks_passed() {
         let repo = init_test_repo();
@@ -827,18 +604,6 @@ mod tests {
         assert_eq!(run.pr_number, Some(42));
     }
 
-    /// Issue #15 review, H2: the staged commit must land under
-    /// `refs/warden-staging/`, never under `refs/heads/warden-run/` (the ref
-    /// `warden_gated::notification::parse_post_receive_line`/`serve.rs`
-    /// watch for a push-notification) -- otherwise a deployed gate (hook +
-    /// `serve` daemon) would independently re-verify and force-push this
-    /// business content straight to `origin/<target_branch>`, bypassing the
-    /// PR review flow entirely.
-    ///
-    /// Uses a `ChecksFailed` (reboucle, non-terminal) outcome deliberately:
-    /// the staging ref is reclaimed only once a run reaches a *terminal*
-    /// state (issue #15 review, L-new-1), so a reboucle leaves it in place
-    /// for this assertion to observe.
     #[tokio::test]
     async fn drive_post_convergence_tail_stages_the_commit_outside_the_notify_hooks_ref_namespace()
     {
@@ -897,9 +662,6 @@ mod tests {
         );
     }
 
-    /// Issue #15 review, L-new-1: once a run reaches a terminal outcome, its
-    /// per-run staging ref must be reclaimed from the bare gate repo (it is
-    /// force-pushed every pass and would otherwise pin objects unbounded).
     #[tokio::test]
     async fn drive_post_convergence_tail_reclaims_the_staging_ref_on_a_terminal_outcome() {
         let repo = init_test_repo();
@@ -1006,14 +768,6 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// Issue #15 review, M-new-1: the fresh-tail counterpart to
-    /// `resume_awaiting_ci_runs_fails_the_run_when_the_ci_result_never_arrives`.
-    /// If the triggered `warden-gated` subprocess exits without ever
-    /// delivering a terminal message, `drive_post_convergence_tail` must fail
-    /// the run once the grace period elapses -- bounded by the child's
-    /// liveness, not a wall-clock timeout derived from `watch_pr`'s
-    /// (uncapped) inactivity budget. Runs in real time in a couple of seconds
-    /// because the already-exited child, not a timer, is what ends the wait.
     #[tokio::test]
     async fn drive_post_convergence_tail_fails_the_run_when_warden_gated_dies_without_delivering() {
         let repo = init_test_repo();
@@ -1039,19 +793,10 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// A [`GateTrigger`] whose subprocess is reported as having *exited*
-    /// without ever connecting to `ci_result_socket` (an
-    /// already-exited [`GateChild`]) -- standing in for `warden-gated`
-    /// crashing/being killed *after* being triggered but *before* it could
-    /// deliver even a `GateFailed`. The liveness-bounded wait must fail the
-    /// run once its grace period elapses, never hang on it (issue #15 review,
-    /// M-new-1).
     struct NeverDeliversGateTrigger;
 
     impl GateTrigger for NeverDeliversGateTrigger {
         async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<GateChild> {
-            // Models a `warden-gated` that exited without ever delivering:
-            // the wait must fail the run once the grace period elapses.
             Ok(GateChild::already_exited())
         }
 
@@ -1065,16 +810,6 @@ mod tests {
         }
     }
 
-    /// Issue #15 review, M-new-1: if the triggered `warden-gated` subprocess
-    /// exits without ever delivering a terminal `CiResultMessage` (a hard
-    /// crash/kill before it could send even a `GateFailed`), the
-    /// liveness-bounded wait must fail the run outright once its grace period
-    /// elapses, never leave it hanging in `AwaitingCi` forever. The sibling
-    /// `drive_post_convergence_tail_fails_the_run_when_warden_gated_dies_without_delivering`
-    /// covers the identical branch on the fresh-tail path; both now run in
-    /// real time (a short grace, no wall-clock timeout and so no paused-clock
-    /// vs `SqlitePool` hazard) because the child-liveness signal, not a timer,
-    /// is what ends the wait.
     #[tokio::test]
     async fn resume_awaiting_ci_runs_fails_the_run_when_the_ci_result_never_arrives() {
         let db_dir = TempDir::new().unwrap();
@@ -1131,10 +866,6 @@ mod tests {
         );
     }
 
-    /// ADR-0011's idempotency guard: a run that has already left
-    /// `AwaitingCi` (e.g. a duplicate/stale delivery racing an earlier one)
-    /// must not have its state clobbered by a second `CiResultMessage` --
-    /// this is a safe no-op, never an error.
     #[tokio::test]
     async fn apply_ci_result_message_is_a_noop_once_the_run_already_left_awaiting_ci() {
         let db_dir = TempDir::new().unwrap();
@@ -1161,8 +892,6 @@ mod tests {
         db::update_run_state(&pool, &run_id, RunState::AwaitingCi)
             .await
             .unwrap();
-        // Already left AwaitingCi by the time this (stale/duplicate)
-        // message is applied.
         db::update_run_state(&pool, &run_id, RunState::Done)
             .await
             .unwrap();
@@ -1191,10 +920,6 @@ mod tests {
         );
     }
 
-    /// Issue #15 review, M5: a message delivered on `run-a`'s own reverse
-    /// socket but whose payload claims a different `run_id` must never be
-    /// applied to `run-a` -- rejected as a typed error, and `run-a`'s state
-    /// must be left completely untouched.
     #[tokio::test]
     async fn apply_ci_result_message_rejects_a_run_id_mismatch() {
         let db_dir = TempDir::new().unwrap();
@@ -1237,10 +962,6 @@ mod tests {
         assert_eq!(run.pr_number, None);
     }
 
-    /// The bug `recover_crashed_runs` alone would have: `AwaitingCi` has no
-    /// live *agent* process to find (it's waiting on `warden-gated`, not an
-    /// `agent_processes` row), so the blanket "no live process -> Failed"
-    /// rule would incorrectly fail it. Confirms it's left untouched instead.
     #[tokio::test]
     async fn recover_crashed_runs_leaves_awaiting_ci_runs_untouched() {
         let db_dir = TempDir::new().unwrap();
@@ -1318,9 +1039,6 @@ mod tests {
         assert_eq!(run.state, RunState::Done);
     }
 
-    /// A run crashed before `OpenDraft` ever returned a PR number: there is
-    /// nothing to resume watching, so this must fail the run rather than
-    /// hang forever waiting for a watch that was never started.
     #[tokio::test]
     async fn resume_awaiting_ci_runs_fails_a_run_with_no_recorded_pr_number() {
         let db_dir = TempDir::new().unwrap();
@@ -1372,17 +1090,6 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// A [`GateTrigger`] that independently re-reads `run_id`'s persisted
-    /// state from its own pool handle -- the same posture `warden-gated`
-    /// itself takes (ADR-0006: never trust the caller, re-verify from
-    /// SQLite) -- rather than trusting that `drive_post_convergence_tail`
-    /// merely *called* things in the right order. Proves the tail's state
-    /// transitions are durably persisted in order, not just issued in order:
-    /// `trigger_run_tail` snapshots whatever is persisted the instant it's
-    /// invoked (must already be `Pushed`), and delivery of the terminal
-    /// message is deliberately deferred until this trigger independently
-    /// observes `AwaitingCi` persisted -- so a successful delivery is only
-    /// possible if `AwaitingCi` was written to SQLite first.
     struct RecordingGateTrigger {
         pool: SqlitePool,
         run_id: String,
@@ -1408,12 +1115,6 @@ mod tests {
                 outcome: self.outcome.clone(),
             };
             tokio::spawn(async move {
-                // Bounded poll (real sleep used only as inter-task
-                // synchronization, never as a correctness assertion) for
-                // this trigger's own independent view of `run_id` to reach
-                // `AwaitingCi` before delivering -- caps at ~1s so a genuine
-                // regression (the transition never gets persisted) fails
-                // the test instead of hanging it.
                 for _ in 0..200 {
                     let run = db::get_run(&pool, &run_id).await.unwrap().unwrap();
                     if run.state == RunState::AwaitingCi {
@@ -1434,8 +1135,6 @@ mod tests {
                 stream.write_all(json.as_bytes()).await.unwrap();
                 stream.shutdown().await.unwrap();
             });
-            // Delivery happens later, from the spawned task above -- the
-            // child is still "alive" until then.
             Ok(GateChild::never_exiting())
         }
 
@@ -1486,12 +1185,6 @@ mod tests {
         assert_eq!(run.state, RunState::Done);
     }
 
-    /// `ChecksFailed` at the cycle budget must reach `Failed`, never
-    /// `MaxReviewCyclesExceeded` -- that transition is illegal from
-    /// `AwaitingCi` ([`RunState::validate_transition`]); if
-    /// `decide_next_state_after_ci` or its caller ever regressed to
-    /// returning it here, `self.transition` would reject it and this test
-    /// would fail loudly rather than silently accept a corrupted state.
     #[tokio::test]
     async fn drive_post_convergence_tail_maps_checks_failed_at_cycle_budget_to_failed_not_max_cycles_exceeded(
     ) {
@@ -1501,11 +1194,6 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let (run_id, config, converged_commit) =
             converged_run_fixture(&pool, &repo, &bare_repo).await;
-        // `converged_run_fixture` inserts with max_review_cycles = 5 and
-        // leaves current_review_cycle at its 0 default. Seed it to 4: this
-        // `ChecksFailed` charges the review budget by one (issue #43),
-        // advancing the counter to exactly 5 -- the budget -- so the gate
-        // lands precisely at the limit.
         db::set_run_current_review_cycle(&pool, &run_id, 4)
             .await
             .unwrap();
@@ -1536,16 +1224,6 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// Issue #43 (review HIGH): a persistently-red CI must terminate at the
-    /// review budget rather than loop unboundedly. Each `ChecksFailed`
-    /// reboucle is charged to the review budget (it re-enters at
-    /// `CoderRunning` -> `Reviewing` like any review-charged reboucle), and
-    /// the counter must advance on the CI path *itself* -- driven here through
-    /// the real `drive_post_convergence_tail`/`apply_ci_result_message` flow
-    /// with no manual seeding. Between passes the run is returned to
-    /// `Converged` exactly as the main loop does after a reboucle, so this
-    /// exercises the genuine counter progression, not the pure mapping
-    /// function. It never touches the test budget.
     #[tokio::test]
     async fn repeated_checks_failed_charges_the_review_budget_until_it_terminates_at_failed() {
         let repo = init_test_repo();
@@ -1554,7 +1232,6 @@ mod tests {
         let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
         let (run_id, config, converged_commit) =
             converged_run_fixture(&pool, &repo, &bare_repo).await;
-        // Fixture inserts max_review_cycles = 5, current_review_cycle = 0.
         let max = config.max_review_cycles;
 
         let orchestrator = Orchestrator::new(pool.clone());
@@ -1570,8 +1247,6 @@ mod tests {
             pr_number: Some(99),
         };
 
-        // The first `max - 1` CI failures each reboucle and charge one review
-        // cycle; the test budget's counter must never move.
         for expected_cycle in 1..max {
             let outcome = orchestrator
                 .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
@@ -1590,8 +1265,6 @@ mod tests {
                 run.current_test_cycle, 0,
                 "a CI reboucle is charged to the review budget, never the test budget"
             );
-            // The main loop returns the run to `Converged` before re-driving
-            // the tail (CoderRunning -> Reviewing -> Testing -> Converged).
             db::update_run_state(&pool, &run_id, RunState::RunningStep(1))
                 .await
                 .unwrap();
@@ -1603,8 +1276,6 @@ mod tests {
                 .unwrap();
         }
 
-        // The `max`-th CI failure lands exactly at the budget: it must
-        // terminate at `Failed`, never reboucle again.
         let outcome = orchestrator
             .drive_post_convergence_tail(&run_id, &config, &converged_commit, &trigger)
             .await
@@ -1625,9 +1296,6 @@ mod tests {
         );
     }
 
-    /// `Closed` (PR closed without merging) reaches `Failed` -- verified at
-    /// the orchestrator level (real DB, real push, real socket), not just
-    /// the pure `decide_next_state_after_ci` unit test.
     #[tokio::test]
     async fn drive_post_convergence_tail_maps_closed_to_failed() {
         let repo = init_test_repo();
@@ -1656,8 +1324,6 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// `TimedOut` (inactivity timeout inside `watch_pr`) reaches `Failed` --
-    /// verified at the orchestrator level, mirroring the `Closed` case above.
     #[tokio::test]
     async fn drive_post_convergence_tail_maps_timed_out_to_failed() {
         let repo = init_test_repo();
@@ -1686,10 +1352,6 @@ mod tests {
         assert_eq!(run.state, RunState::Failed);
     }
 
-    /// Plants an executable hook at `<repo_path>/.git/hooks/<name>` that
-    /// touches `marker` and exits successfully -- if `NO_HOST_HOOKS` were
-    /// ever missing from the invocation under test, `marker` would exist
-    /// afterwards.
     #[cfg(unix)]
     fn plant_marker_hook(repo_path: &Path, hook_name: &str, marker: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -1707,11 +1369,6 @@ mod tests {
         std::fs::set_permissions(&hook_path, perms).unwrap();
     }
 
-    /// The exact vector the review flagged: `push_converged_commit_to_bare_repo`
-    /// runs `git push` against `repo_path` (`-C` above) once a run
-    /// converges -- `pre-push` runs in the *pushing* repo, so a hook planted
-    /// there (as an agent could, under `--isolation docker`'s rw `.git`
-    /// mount) must never fire when `warden` itself pushes.
     #[cfg(unix)]
     #[tokio::test]
     async fn push_to_bare_repo_disables_a_planted_pre_push_hook() {
@@ -1750,9 +1407,6 @@ mod tests {
         );
     }
 
-    /// `protect_cycle_commit` runs `update-ref` against `repo_path`, which
-    /// runs the `reference-transaction` hook -- a hook planted there must
-    /// never fire either.
     #[cfg(unix)]
     #[tokio::test]
     async fn protect_cycle_commit_disables_a_planted_reference_transaction_hook() {
@@ -1778,10 +1432,6 @@ mod tests {
         );
     }
 
-    /// `WorktreeManager::create` runs `git worktree add`, a checkout --
-    /// `post-checkout` must never fire, since the hook lives in the main
-    /// repo's common `.git`, shared by every worktree an agent's own process
-    /// could otherwise have written to.
     #[cfg(unix)]
     #[tokio::test]
     async fn worktree_create_disables_a_planted_post_checkout_hook() {

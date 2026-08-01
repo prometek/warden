@@ -1,6 +1,4 @@
-//! `warden-tui` binary: CLI parsing + terminal setup/dispatch only. All
-//! actual logic (attach/replay/live merge, capability detection, evidence
-//! rendering) lives in the library crate.
+//! `warden-tui` binary: CLI parsing + terminal setup/dispatch only.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -26,8 +24,7 @@ use warden_tui::{capabilities, db, subscriber, ui};
     about = "Read-only run monitor: replays a run's history then follows it live (ADR-0008)"
 )]
 struct Cli {
-    /// Increase log verbosity (-v, -vv, -vvv). Logs go to stderr, never
-    /// stdout, so they never corrupt the headless NDJSON dump mode.
+    /// Increase log verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
@@ -37,23 +34,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Attaches to a run: replays its full `events` history, then follows
-    /// its Event Bus live if it's still running -- no gap between the two
-    /// (Architecture.md §5.4). Renders a full-screen TUI on a real
-    /// terminal; on a non-terminal stdout (piped/redirected), streams each
-    /// event as one NDJSON line instead.
+    /// Attaches to a run: replays its full `events` history, then follows its Event Bus live if
+    /// it's still running -- no gap between the two (Architecture.md §5.4).
     Attach {
         /// The run id to attach to (as printed by `warden run`).
         #[arg(long)]
         run_id: String,
 
-        /// `warden`'s SQLite database, opened read-only. Defaults to
-        /// `<warden-home>/state.db`.
+        /// `warden`'s SQLite database, opened read-only.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         db: Option<PathBuf>,
 
-        /// Warden's state directory, used to locate the database and the
-        /// run's Event Bus socket. Defaults to `~/.warden`.
+        /// Warden's state directory, used to locate the database and the run's Event Bus socket.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         warden_home: Option<PathBuf>,
     },
@@ -96,32 +88,7 @@ async fn attach_cmd(
     }
 }
 
-/// Streams every event as one line of NDJSON to stdout: history first, then
-/// live as it arrives. Used automatically when stdout isn't a terminal
-/// (piped/redirected) -- also what makes this crate's core replay/live
-/// behaviour scriptable and end-to-end testable without a real PTY.
-///
-/// **Stdout schema** (issue #58): two distinct line shapes, both plain JSON
-/// objects, one per line:
-///   - A decoded event: a bare `warden_core::RunEventRecord` --
-///     `{"id":..., "run_id":..., "event": {"kind": ..., ...}, "created_at":
-///     ...}`. Unchanged from before this issue, so an existing consumer that
-///     only ever expects this shape keeps working.
-///   - An undecodable history row (never produced by the live stream, only
-///     ever by the initial history replay -- see
-///     `warden_core::RunEventHistoryEntry`'s own docs): wrapped under a
-///     top-level `"undecodable"` key --
-///     `{"undecodable": {"id":..., "run_id":..., "event_type":..., "reason":
-///     {"kind": ...}, "created_at": ...}}`. A consumer discriminates the two
-///     shapes by which of `"event"`/`"undecodable"` is present at the top
-///     level -- never by line position, since a run's history can contain
-///     any mix of the two. This line is *also* logged at `warn` on stderr
-///     (see [`log_undecodable_event`]), the same "not fatal but must not be
-///     silent" treatment `log_subscribe_failure` already gives a failed
-///     live-bus subscribe -- but stdout is the channel a script actually
-///     consumes, so it must carry the marker too: a consumer that redirects
-///     stderr away (or filters it by level) must still be able to tell a
-///     truncated history from a complete one.
+/// Streams every event as one line of NDJSON to stdout: history first, then live as it arrives.
 async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
     for item in attachment.model.history() {
         match item {
@@ -137,19 +104,6 @@ async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
     }
     if let Some(mut live) = attachment.live.take() {
         while let Some(record) = live.recv().await {
-            // A live record can duplicate one already folded into history by
-            // `attach()`'s own best-effort drain (see `attach.rs`'s module
-            // docs on the "subscribe before querying history" race) --
-            // `RunModel::apply`'s id-based dedup is the single source of
-            // truth for "is this actually new", so it must gate what gets
-            // printed here exactly the way it gates what the interactive
-            // `app_loop` renders. Printing straight off the channel without
-            // going through the model first would print duplicates.
-            //
-            // The live Event Bus only ever carries already-decoded
-            // `RunEventRecord`s (see `warden_core::RunEventHistoryEntry`'s
-            // own docs) -- an `undecodable` line can only ever come from the
-            // initial history replay above, never from here.
             if attachment.model.apply(record.clone()) {
                 println!("{}", serde_json::to_string(&record)?);
             }
@@ -158,19 +112,12 @@ async fn run_headless(mut attachment: Attachment) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Wraps an [`UndecodableEvent`] under a distinguishing top-level
-/// `"undecodable"` key for [`run_headless`]'s NDJSON stream -- see that
-/// function's own doc comment for the resulting schema and why a plain,
-/// untagged serialization of `UndecodableEvent` wouldn't be safely
-/// distinguishable from a `RunEventRecord` line.
 #[derive(serde::Serialize)]
 struct UndecodableLine<'a> {
     undecodable: &'a UndecodableEvent,
 }
 
-/// Surfaces one undecodable `events` history row at `warn` (issue #58) --
-/// never a silent drop. Logged here in addition to (not instead of) the
-/// tagged stdout line [`run_headless`] prints for the same row.
+/// Surfaces one undecodable `events` history row at `warn` -- never a silent drop.
 fn log_undecodable_event(event: &UndecodableEvent) {
     tracing::warn!(
         id = %event.id,
@@ -181,19 +128,13 @@ fn log_undecodable_event(event: &UndecodableEvent) {
     );
 }
 
-/// Runs the full-screen ratatui app until the user quits (`q`/`Esc`) or the
-/// run's live channel closes and no more input is read. Terminal
-/// setup/teardown is paired so the error path always restores the user's
-/// shell, even if the app loop itself returns an error.
+/// Runs the full-screen ratatui app until the user quits (`q`/`Esc`) or the run's live channel
+/// closes and no more input is read.
 async fn run_tui(attachment: Attachment) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
 
-    // Must run after entering the alternate screen but before reading
-    // terminal events, per `ratatui_image::picker::Picker::from_query_stdio`'s
-    // own documented contract (ADR-0010). Kept alive for the whole app loop
-    // (not dropped) and threaded into `ui::draw`: it's what makes an inline
-    // `EvidenceCaptured` image actually reach the screen (acceptance
-    // criterion 3), not just get detected and discarded.
+    // Must run after entering the alternate screen but before reading terminal events, per
+    // `ratatui_image::picker::Picker::from_query_stdio`'s own documented contract.
     let (capability, picker) = capabilities::detect();
     tracing::info!(?capability, "detected terminal graphics capability");
 
@@ -224,10 +165,6 @@ async fn app_loop(
     capability: GraphicsCapability,
     picker: Option<&Picker>,
 ) -> anyhow::Result<()> {
-    // Crossterm's blocking event reader runs on its own OS thread and
-    // forwards decoded events over a channel -- keeps this async loop free
-    // to `select!` between terminal input and live run events without
-    // either one blocking the other.
     let (input_tx, mut input_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         while let Ok(event) = crossterm::event::read() {
@@ -250,11 +187,6 @@ async fn app_loop(
             }
             record = recv_live(&mut attachment.live) => {
                 match record {
-                    // The interactive view doesn't need to distinguish a
-                    // genuinely new event from a duplicate the way the
-                    // headless dump does (`run_headless`) -- every applied
-                    // event, new or not, simply results in a redraw of
-                    // whatever the model currently holds.
                     Some(record) => { attachment.model.apply(record); }
                     None => attachment.live = None, // run ended; stop selecting on it
                 }
@@ -265,9 +197,8 @@ async fn app_loop(
     }
 }
 
-/// Awaits the next live event, or never resolves if the run has no (or no
-/// longer has) a live channel -- lets `tokio::select!` cleanly fall through
-/// to the input branch only, without a busy-poll.
+/// Awaits the next live event, or never resolves if the run has no (or no longer has) a live
+/// channel.
 async fn recv_live(
     live: &mut Option<mpsc::UnboundedReceiver<RunEventRecord>>,
 ) -> Option<RunEventRecord> {
@@ -277,14 +208,6 @@ async fn recv_live(
     }
 }
 
-/// Issue #32: also treats Ctrl-C as a quit key. Raw mode (`setup_terminal`,
-/// via crossterm's `enable_raw_mode`) clears the terminal's `ISIG` flag along
-/// with canonical processing, so a Ctrl-C keypress no longer generates a
-/// `SIGINT` at all while this TUI holds the tty -- it only ever arrives here
-/// as an ordinary key event. Without this, `warden run --tui` (which cancels
-/// the run when this process exits, see `warden::process::spawn_tui_attach`'s
-/// docs) would leave Ctrl-C doing nothing: neither quitting the TUI nor
-/// cancelling the run.
 fn is_quit(event: &Event) -> bool {
     matches!(
         event,
@@ -314,8 +237,8 @@ fn init_tracing(verbosity: u8) {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("warden_tui={level}")));
-    // stderr, never stdout: stdout is reserved for the headless NDJSON dump
-    // (`run_headless`) so logs never corrupt it when piped.
+    // stderr, never stdout: stdout is reserved for the headless NDJSON dump (`run_headless`) so
+    // logs never corrupt it when piped.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -341,10 +264,6 @@ mod tests {
         assert!(is_quit(&key_press(KeyCode::Esc, KeyModifiers::NONE)));
     }
 
-    /// Issue #32: Ctrl-C must also quit -- see `is_quit`'s own docs for why
-    /// this is the only lever `warden run --tui` has to cancel a run once
-    /// its terminal is in raw mode (which disables `SIGINT` generation on
-    /// Ctrl-C entirely).
     #[test]
     fn is_quit_matches_ctrl_c() {
         assert!(is_quit(&key_press(
@@ -363,9 +282,6 @@ mod tests {
         assert!(!is_quit(&key_press(KeyCode::Char('a'), KeyModifiers::NONE)));
     }
 
-    /// A key *release* (as opposed to a press) must never trigger a quit --
-    /// unchanged by this issue, but worth pinning down alongside the new
-    /// Ctrl-C branch since both live in the same `matches!` guard.
     #[test]
     fn is_quit_ignores_a_key_release_event() {
         let release = Event::Key(KeyEvent::new_with_kind(

@@ -1,20 +1,3 @@
-//! End-to-end tests driving the actual `warden-tui` binary
-//! (`warden-tui attach --run-id ... --db ... --warden-home ...`), not the
-//! internal `attach()`/`RunModel` APIs directly -- issue #8 acceptance
-//! criterion 1: "a late attach on an already-running run shows the full
-//! past history, then switches to the live stream with no gap and no
-//! duplicated events."
-//!
-//! `main.rs::run_headless` (used automatically whenever stdout isn't a
-//! terminal, exactly the case for a piped `Command::output()` here) is what
-//! makes this reachable without a real PTY -- see its own doc comment.
-//! These tests stand up a bare `UnixListener` to play the Event Bus's role
-//! ourselves (same technique `src/attach.rs`'s own unit tests already use),
-//! rather than depending on the `warden` crate's `EventBus`/orchestrator
-//! (this crate deliberately never depends on `warden`'s I/O code, see
-//! `src/db.rs`'s module docs) -- but unlike those unit tests, everything
-//! here goes through the real `warden-tui attach` subprocess.
-
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -27,9 +10,6 @@ use tokio::net::UnixListener;
 use warden_core::{RunEvent, RunEventRecord};
 use warden_tui::subscriber::resolve_socket_path;
 
-/// Mirrors `src/attach.rs`'s own test fixture: a real SQLite file with the
-/// two tables `warden-tui` reads, built with a plain `CREATE TABLE` rather
-/// than `warden`'s migrations (this crate must never depend on those).
 async fn seeded_db(dir: &Path) -> (std::path::PathBuf, SqlitePool) {
     let db_path = dir.join("state.db");
     let options = SqliteConnectOptions::new()
@@ -83,12 +63,6 @@ async fn insert_event(pool: &SqlitePool, id: &str, event: &RunEvent, created_at:
     .unwrap();
 }
 
-/// Spawns `warden-tui attach` against `db_path`/`warden_home`/`run_id`,
-/// waits for it to exit (via a blocking-thread `wait_with_output`, so the
-/// concurrently spawned mock Event Bus task in the test can keep making
-/// progress on the same runtime instead of the whole thread blocking on the
-/// child), and returns its exit status, raw stdout (one NDJSON line per
-/// `Vec` entry), and raw stderr.
 async fn run_attach_cli_raw(
     run_id: &str,
     db_path: &Path,
@@ -124,11 +98,6 @@ async fn run_attach_cli_raw(
     (output.status, lines, stderr)
 }
 
-/// [`run_attach_cli_raw`], with stdout further parsed as one
-/// [`RunEventRecord`] per NDJSON line -- the shape every line has *unless*
-/// the history includes an undecodable row (issue #58), which
-/// `run_attach_cli_raw` itself is used for instead (see
-/// `attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_and_stderr_warnings`).
 async fn run_attach_cli(
     run_id: &str,
     db_path: &Path,
@@ -145,9 +114,6 @@ async fn run_attach_cli(
     (status, records)
 }
 
-/// Acceptance criterion 1 (issue #8), happy path: history is replayed in
-/// full, then the live event arriving after attach still shows up, with no
-/// gap and no duplicate.
 #[tokio::test]
 async fn attach_cli_replays_full_history_then_streams_live_events_with_no_gap() {
     let dir = TempDir::new().unwrap();
@@ -187,17 +153,10 @@ async fn attach_cli_replays_full_history_then_streams_live_events_with_no_gap() 
     let live_event_clone = live_event.clone();
     let server = tokio::spawn(async move {
         let (mut stream, _addr) = listener.accept().await.unwrap();
-        // Long enough that `attach()`'s own non-blocking history/live drain
-        // has certainly already returned to the caller by the time this
-        // event is sent -- this is genuinely a *live*-only event, not one
-        // racing the replay boundary (see the dedup test below for that
-        // case).
         tokio::time::sleep(Duration::from_millis(200)).await;
         let line = serde_json::to_string(&live_event_clone).unwrap();
         stream.write_all(line.as_bytes()).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
-        // Drop the connection shortly after so the CLI's headless loop sees
-        // EOF and exits instead of hanging forever.
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
@@ -213,10 +172,6 @@ async fn attach_cli_replays_full_history_then_streams_live_events_with_no_gap() 
     );
 }
 
-/// Acceptance criterion 1 (issue #8), history-only path: attaching to a run
-/// whose Event Bus socket doesn't exist (already finished, or never live)
-/// must still replay its full history through the CLI and exit cleanly --
-/// no hang waiting on a live stream that will never arrive.
 #[tokio::test]
 async fn attach_cli_to_a_finished_run_prints_history_only_and_exits() {
     let dir = TempDir::new().unwrap();
@@ -247,7 +202,6 @@ async fn attach_cli_to_a_finished_run_prints_history_only_and_exits() {
     tokio::fs::create_dir_all(warden_home.join("runs"))
         .await
         .unwrap();
-    // Deliberately no socket bound at all -- the run has already finished.
 
     let (status, records) = run_attach_cli("run-1", &db_path, &warden_home).await;
 
@@ -256,17 +210,6 @@ async fn attach_cli_to_a_finished_run_prints_history_only_and_exits() {
     assert_eq!(ids, vec!["e1", "e2"]);
 }
 
-/// Acceptance criterion 1 (issue #8), the exact race the "subscribe before
-/// querying history" ordering (`src/attach.rs`) is meant to guard against:
-/// an event that is *both* already recorded in `events` (so the history
-/// query returns it) *and* still in flight on the live Event Bus connection
-/// when `attach()`'s own best-effort drain runs. `attach()`'s in-process
-/// `RunModel` correctly dedupes this by id -- but `main.rs::run_headless`
-/// (the path this CLI test exercises) prints history from the model and
-/// then prints *every* subsequent live message unconditionally, without
-/// ever re-applying it to the model. Deterministically reproduced here by
-/// delaying the live delivery of an id that is already in history, rather
-/// than relying on real race timing.
 #[tokio::test]
 async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed_live() {
     let dir = TempDir::new().unwrap();
@@ -290,11 +233,6 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
     let socket_path = resolve_socket_path("run-1", &runs_dir);
     let listener = UnixListener::bind(&socket_path).unwrap();
 
-    // Same id/content as the history row above: simulates an event whose
-    // live delivery over the socket is slow enough to miss `attach()`'s
-    // synchronous, non-blocking drain (which runs essentially immediately
-    // after subscribing -- well under the delay below on any normal
-    // machine), while a genuinely new event ("e2") follows it.
     let already_historical_event = RunEventRecord {
         id: "e1".to_string(),
         run_id: "run-1".to_string(),
@@ -336,13 +274,6 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
     );
 }
 
-/// Issue #58 (PR review): a run whose history includes one row with
-/// malformed `payload_json` and one row with a kind-mismatched `event_type`
-/// must still exit 0 and replay every good event -- the two bad rows must
-/// show up on stdout as their own tagged `"undecodable"` NDJSON lines, in
-/// their rightful chronological place, *and* be logged at `warn` on stderr.
-/// Covers `main.rs::run_headless`'s new branch and `log_undecodable_event`,
-/// previously untested.
 #[tokio::test]
 async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_and_stderr_warnings()
 {
@@ -362,9 +293,6 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
     )
     .await;
 
-    // Malformed `payload_json` -- not even valid JSON for any `RunEvent`
-    // variant (simulates a reshape that changed the payload shape without a
-    // rewrite migration, issue #58's own motivating scenario).
     sqlx::query(
         "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
     )
@@ -376,7 +304,6 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
     .await
     .unwrap();
 
-    // Kind-mismatched row: valid JSON, but for the wrong `event_type`.
     let mismatched_payload =
         serde_json::to_string(&RunEvent::CycleStarted { cycle_number: 1 }).unwrap();
     sqlx::query(
@@ -402,8 +329,6 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
     tokio::fs::create_dir_all(warden_home.join("runs"))
         .await
         .unwrap();
-    // Deliberately no socket bound -- history-only path, exactly like
-    // `attach_cli_to_a_finished_run_prints_history_only_and_exits` above.
 
     let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
 
@@ -425,12 +350,9 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
         "every row (good and undecodable) must be represented on stdout: {parsed:?}"
     );
 
-    // event-good-1: an ordinary, unchanged RunEventRecord line.
     assert!(parsed[0].get("event").is_some(), "{:?}", parsed[0]);
     assert_eq!(parsed[0]["id"], "event-good-1");
 
-    // event-malformed: a tagged "undecodable" line, in its rightful
-    // chronological place (not appended at the end).
     assert!(parsed[1].get("undecodable").is_some(), "{:?}", parsed[1]);
     assert_eq!(parsed[1]["undecodable"]["id"], "event-malformed");
     assert_eq!(parsed[1]["undecodable"]["event_type"], "cycle_started");
@@ -439,7 +361,6 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
         "payload_deserialize"
     );
 
-    // event-mismatched: also tagged, carrying the mismatched payload kind.
     assert!(parsed[2].get("undecodable").is_some(), "{:?}", parsed[2]);
     assert_eq!(parsed[2]["undecodable"]["id"], "event-mismatched");
     assert_eq!(parsed[2]["undecodable"]["event_type"], "run_finished");
@@ -449,24 +370,14 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
         "cycle_started"
     );
 
-    // event-good-2: back to an ordinary line, after the two bad rows.
     assert!(parsed[3].get("event").is_some(), "{:?}", parsed[3]);
     assert_eq!(parsed[3]["id"], "event-good-2");
 
-    // Both bad rows must also be logged at `warn` on stderr (the default
-    // level with no `-v`, see `main.rs::init_tracing`) -- in addition to,
-    // never instead of, the stdout marker asserted above.
     assert!(stderr.contains("event-malformed"), "{stderr}");
     assert!(stderr.contains("event-mismatched"), "{stderr}");
     assert!(stderr.contains("could not be decoded"), "{stderr}");
 }
 
-/// Issue #58 test gap: a run whose history is *entirely* undecodable rows
-/// (not merely one bad row among good ones) must still exit 0 and surface
-/// every row as its own tagged "undecodable" NDJSON line -- the degenerate
-/// case where `list_events_for_run` has nothing genuinely decodable to fall
-/// back on at all, which is exactly the scenario the ticket's motivating bug
-/// report describes ("one stale row poisoned an entire run's history").
 #[tokio::test]
 async fn attach_cli_headless_still_exits_0_when_every_row_in_history_is_undecodable() {
     let dir = TempDir::new().unwrap();
@@ -497,7 +408,6 @@ async fn attach_cli_headless_still_exits_0_when_every_row_in_history_is_undecoda
     tokio::fs::create_dir_all(warden_home.join("runs"))
         .await
         .unwrap();
-    // Deliberately no socket bound -- history-only path.
 
     let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
 

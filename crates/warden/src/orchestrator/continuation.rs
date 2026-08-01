@@ -1,9 +1,4 @@
-//! Durable quota-continuation wire types (issue #86).
-//!
-//! Domain types with invariants (`Workflow`, `AgentDefinition`, findings)
-//! are represented by plain wire values here and reconstructed through their
-//! public parsers/constructors. A persisted row is external input at restore
-//! time; direct deserialization must not bypass those validation boundaries.
+//! Durable quota-continuation wire types.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,26 +1,17 @@
-//! Workflow step invocation (issue #73, trio-unification follow-up):
-//! [`Orchestrator::run_producer`] for `workflow.steps[0]`, and
-//! [`Orchestrator::run_gated_step`] for every step after it -- one uniform
-//! body for the built-in reviewer/tester and any custom role alike. No step
-//! is special-cased by role name in either function.
-
 use super::agent_run::SandboxGuard;
 use super::diff::{read_diff, read_head_commit};
 use super::gate_tail::protect_cycle_commit;
 use super::tampering::agent_definition_tampering_finding;
 use super::*;
 
-/// Bounds how much of an agent's stderr is embedded in an error message —
-/// full output is already logged via `tracing` before this is constructed;
-/// this is just what surfaces in `Display`/CLI output.
+/// Bounds how much of an agent's stderr is embedded in an error message — full output is already
+/// logged via `tracing` before this is constructed.
 const MAX_ERROR_STDERR_LEN: usize = 2000;
 
 fn truncate_for_error(stderr: &str) -> String {
     if stderr.len() <= MAX_ERROR_STDERR_LEN {
         return stderr.to_string();
     }
-    // Truncate on a char boundary — stderr is arbitrary agent output and
-    // may contain multi-byte UTF-8, so a byte-offset slice could panic.
     let boundary = stderr
         .char_indices()
         .map(|(i, _)| i)
@@ -30,14 +21,6 @@ fn truncate_for_error(stderr: &str) -> String {
     format!("{}… (truncated)", &stderr[..boundary])
 }
 
-/// "The cycle's e2e test succeeded" (ADR-0009: evidence is captured "après
-/// le succès du test e2e"), inferred as "the evidence-capturing step itself
-/// raised no blocking finding" -- there's no separate pass/fail signal in
-/// the findings protocol, so absence of a blocking finding sourced from
-/// `role` is the only available proxy. Generalized off `role` (issue #73
-/// review, finding F2) rather than hardcoding `FindingSource::role("tester")`,
-/// since the step this now watches is whichever one declared
-/// `captures_evidence: true`, not necessarily one named `"tester"`.
 fn step_succeeded(role: &Role, findings: &[Finding]) -> bool {
     !findings.iter().any(|finding| {
         finding.source == warden_core::FindingSource::role(role.as_str())
@@ -45,88 +28,9 @@ fn step_succeeded(role: &Role, findings: &[Finding]) -> bool {
     })
 }
 
-/// The environment variable *names* forwarded to a `type: hook` workflow
-/// step's command (issue #79 review, HIGH -- security).
-///
-/// # Trust model
-///
-/// **`run:` is repo-authored, not operator-authored.** A `type: hook` step's
-/// `run` line is declared in `<repo>/.warden/workflow.yaml` -- a file that
-/// lives in, and can be committed by, the repo under review (a prior run's
-/// own coder can write it), the same trust class as `.warden/hooks.toml`
-/// (`crate::hook_config`'s own "Trust model" docs, which this mirrors).
-/// Before issue #79, `workflow.yaml` could only *name* an agent definition;
-/// it can now carry arbitrary shell, honoured **by default**, with no opt-in
-/// flag -- the same "already running this repo's coder, already running a
-/// `Makefile`/npm `postinstall`'s commands" posture `hook_config`'s own docs
-/// argue for `.warden/hooks.toml`. This allowlist is what *bounds the blast
-/// radius* of that already-accepted trust decision, not what makes running
-/// repo-authored shell safe in the first place.
-///
-/// **Deliberately narrower than a lifecycle `CommandHook`'s own
-/// `full_env_allowlist`** (`crate::hook::CommandHook`'s own "Environment"
-/// docs, which forwards the operator's complete environment). The two
-/// differ because what each runs *against* differs: a `CommandHook` runs
-/// against the operator's own checkout (`HookContext::repo_path`); a `type:
-/// hook` workflow step runs against a worktree checked out at **this
-/// cycle's coder-authored commit** -- the first path in this codebase where
-/// agent-authored code (a `build.rs`, an `npm test` script, a `Makefile`
-/// target, ...) executes with *some* environment at all. Forwarding the
-/// operator's full environment here would hand that code
-/// `SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/`ANTHROPIC_API_KEY` -- exactly the
-/// exposure an agent subprocess is already denied via its own narrow
-/// `ToolAdapter::env_allowlist`.
-///
-/// **Under `--isolation docker`, this allowlist is not the whole story** --
-/// it bounds *environment variables* only. `DockerSandbox` unconditionally
-/// bind-mounts the role's own worktree read-write, the base repo's `.git`
-/// read-write, and the host's `~/.claude` read-only
-/// (`warden_sandbox::docker`'s own module docs), and applies no egress
-/// filtering (Docker's default bridge network) -- none of that is related
-/// to `env_allowlist` at all, and none of it is closed by this list. A
-/// `type: hook` step's command inherits exactly the same mount/network
-/// surface every `type: agent` step (the existing tester, say) already has
-/// under docker -- accepted parity with an existing exposure, not a new one
-/// this issue introduces, but not a claim that this allowlist alone makes a
-/// hook step's command sandboxed from host credentials.
-///
-/// Kept to what a deterministic build/lint/test command needs to run at
-/// all. `PATH` needs no entry here for `LocalSandbox` -- it is always
-/// forwarded regardless of any allowlist (`LocalSandbox::execute`'s own
-/// docs) -- but under `--isolation docker` there is no host `PATH` to
-/// forward at all; the container image's own `PATH` applies
-/// (`warden_sandbox::docker` never sets `-e PATH=`). `HOME`/`LANG`/`TERM`
-/// cover a well-behaved POSIX toolchain on either backend. `CARGO_HOME`/
-/// `RUSTUP_HOME` cover a non-default Rust toolchain layout on
-/// `LocalSandbox` -- harmless to list when unset, since an
-/// allowlisted-but-unset variable is simply never forwarded
-/// (`LocalSandbox::execute`'s own docs). **Known docker caveat**: under
-/// `--isolation docker`, an operator who *does* set a non-default
-/// `CARGO_HOME`/`RUSTUP_HOME` still has it forwarded verbatim as a **host**
-/// path, which does not exist inside the container -- `cargo`/`rustup`
-/// commands can then fail or misbehave rather than silently falling back to
-/// their container-default location. Not special-cased per backend here
-/// (the sandbox seam is deliberately backend-agnostic at this call site);
-/// an operator hitting this should use a `type: agent` step instead, or
-/// wait for a future per-step `env:` override (see below).
-///
-/// Verified empirically against this crate's own shipped example
-/// (`examples/workflows/with-lint-hook/workflow.yaml`, `cargo fmt --all --
-/// --check`, `LocalSandbox`) with nothing but `PATH`/`HOME` set in the
-/// invoking shell.
-///
-/// No per-step `env:` override ships yet -- a workflow step whose command
-/// needs something beyond this list fails with a clear, actionable "command
-/// not found"/tool-specific error, not a silent misconfiguration;
-/// broadening what a step can forward is a future, explicit opt-in
-/// (a `workflow.yaml` `env:` key with the same parse-time validation rigour
-/// as `type`/`run`), never a default this list should silently grow into.
+/// The environment variable *names* forwarded to a `type: hook` workflow step's command.
 const WORKFLOW_STEP_ENV_ALLOWLIST: &[&str] = &["HOME", "LANG", "TERM", "CARGO_HOME", "RUSTUP_HOME"];
 
-/// One blocking [`Finding`] sourced as `role`'s own `FindingSource` (issue
-/// #79) -- the shape both a policy-denied and a non-zero-exit `type: hook`
-/// step verdict reduce to, aggregated into the convergence loop exactly like
-/// a `type: agent` step's own findings already are.
 fn blocking_step_finding(role: &Role, reason: String) -> Finding {
     Finding {
         source: warden_core::FindingSource::role(role.as_str()),
@@ -140,21 +44,6 @@ fn blocking_step_finding(role: &Role, reason: String) -> Finding {
 }
 
 impl Orchestrator {
-    /// Invokes `workflow.steps[0]` -- the pipeline's producer (the coder in
-    /// the built-in default workflow) -- for one cycle: its own worktree,
-    /// its own agent spawn, the commit/diff it produced, and the tampering
-    /// check against the run's original agent-definition snapshot.
-    ///
-    /// **Issue #73 (trio-unification follow-up)**: `invocation.role` is the
-    /// producer step's own open [`Role`] rather than a hardcoded
-    /// `AgentRole::Coder` -- a workflow's first step is not necessarily
-    /// named `"coder"`. The one genuine, structural invariant this function
-    /// embodies (documented, not a role-name check): **only the producer
-    /// step may write a new commit** -- it is the one role whose payload
-    /// carries `intent` rather than `target_commit`/`diff`, and the one
-    /// role `run_convergence_loop` ever calls this for (`workflow.steps[0]`,
-    /// a positional fact enforced by [`warden_core::Workflow::parse_yaml`]
-    /// requiring the first step to be a plain pass-through).
     pub(super) async fn run_producer<R: ToolAdapter>(
         &self,
         runner: &R,
@@ -186,18 +75,8 @@ impl Orchestrator {
         )
         .await?;
 
-        // ADR-0012: resolved right after the worktree is created (before
-        // the producer runs), so it's a concrete SHA rather than the
-        // possibly ambiguous `base_commit` ref (e.g. the literal string
-        // `"HEAD"` on a run's first cycle) -- needed below to compute the
-        // diff this cycle's producer introduces, once it has run.
         let base_commit_sha = read_head_commit(worktree.path()).await?;
 
-        // ADR-0013: the producer's own definition (system prompt), the run
-        // intent, and -- A2 -- the findings it is being asked to fix. No
-        // `target_commit`/`diff`: this very worktree is already checked out
-        // at that commit, so the producer can `git diff` for itself rather
-        // than be handed a copy of what's on its own disk.
         let stdin_payload = warden_core::build_producer_input_json(
             role.as_str(),
             &agent.system_prompt,
@@ -221,10 +100,6 @@ impl Orchestrator {
             )
             .await?;
 
-        // M2: a producer that exits non-zero has not reliably produced a
-        // commit worth reviewing — `read_head_commit` below would just
-        // return the unchanged base commit, silently making the loop look
-        // like a no-op success. Fail the run explicitly instead.
         if outcome.exit_code != 0 {
             if self.suspend_for_exhausted_quota(run_id).await? {
                 return Err(WardenError::QuotaSuspended {
@@ -242,13 +117,8 @@ impl Orchestrator {
                 stderr = %outcome.stderr,
                 "producer step exited with a non-zero status; failing the run"
             );
-            // Write-ahead (ADR-0004): persist Failed before returning the
-            // error to the caller.
+            // Write-ahead: persist Failed before returning the error to the caller.
             self.transition(run_id, RunState::Failed).await?;
-            // A TUI observer must see a terminal event rather than the
-            // stream simply going silent -- this is the one place the run
-            // ends without ever reaching `run_convergence_loop`'s own
-            // `RunFinished` publish at the bottom of its loop.
             self.publish_event(RunEvent::RunFinished {
                 final_state: RunState::Failed.as_str().to_string(),
             })
@@ -266,21 +136,8 @@ impl Orchestrator {
 
         let new_commit = read_head_commit(worktree.path()).await?;
 
-        // ADR-0012: computed while the worktree still exists (both commits
-        // are reachable from it, since worktrees share the main repo's
-        // object store) -- this is what every gated step's
-        // `AgentInputMessage::diff` carries.
         let diff = read_diff(worktree.path(), &base_commit_sha, &new_commit).await?;
 
-        // Issue #30 (review, HIGH): re-resolves the built-in trio's raw
-        // definition bytes through a throwaway `git worktree` checkout of
-        // `new_commit` -- deliberately not this cycle's own producer
-        // worktree working directory, which is mutable and not what
-        // actually propagates forward -- and compares each against
-        // `run_agent_definition_snapshot` (the run's true original start,
-        // captured once in `run_convergence_loop`) -- see
-        // `agent_definition_tampering_finding`'s own docs for the full
-        // rationale.
         let definition_tampering_finding = agent_definition_tampering_finding(
             worktree_manager,
             run_id,
@@ -289,11 +146,6 @@ impl Orchestrator {
         )
         .await?;
 
-        // M4: protect the commit from `git gc` (worktrees share the main
-        // repo's object store, so this commit becomes unreachable garbage
-        // the moment its worktree is removed) and persist its SHA so it
-        // stays discoverable — both purely local git/DB operations, no
-        // push, no remote (that's Phase 3's git gate).
         protect_cycle_commit(&config.repo_path, run_id, cycle_number, &new_commit).await?;
         db::set_cycle_commit_sha(&self.pool, cycle_id, &new_commit).await?;
 
@@ -308,16 +160,6 @@ impl Orchestrator {
         })
     }
 
-    /// Invokes a single **gated** workflow step -- any step but the
-    /// producer (`workflow.steps[0]`), whether that's the built-in
-    /// reviewer/tester, a custom `type: agent` role like `techlead`, or a
-    /// `type: hook` step (issue #79). Dispatches on
-    /// [`GatedStepInvocation::kind`]: an agent-kind step spawns a subprocess
-    /// ([`Orchestrator::run_gated_agent_step`]); a hook-kind step runs a
-    /// deterministic command instead
-    /// ([`Orchestrator::run_gated_hook_step`]). Both return the exact same
-    /// `Vec<Finding>` shape, aggregated into the convergence loop identically
-    /// regardless of which kind actually ran.
     pub(super) async fn run_gated_step<R: ToolAdapter>(
         &self,
         runner: &R,
@@ -329,35 +171,7 @@ impl Orchestrator {
         }
     }
 
-    /// The `type: agent` half of [`Orchestrator::run_gated_step`]'s dispatch:
-    /// its own worktree, its own agent spawn, its own findings extraction,
-    /// validated against its own open [`Role`] -- no role name ever
-    /// branches this function's own behaviour.
-    ///
-    /// **Two narrow, documented exceptions:** `scope` may only be
-    /// [`warden_core::ReviewScope::Correctif`] for `invocation.step_index
-    /// == 1` (the first gated step, positional -- decision #37 Q2's original
-    /// scoped-re-review optimization, tied to *position*, not to a role
-    /// named `"reviewer"`), or for a step whose own declared `gate` is
-    /// [`warden_core::Gate::ScopedReReview`] (functional -- issue #81's
-    /// generalization, usable by any step at any position). `run_convergence_loop`
-    /// is the only caller that ever sets `Correctif`, and this is a
-    /// defensive re-check against a future caller doing so incorrectly,
-    /// mirroring this crate's existing "constructor invariant == defensive
-    /// re-check" convention. Issue #81 review, LOW: this step's own declared
-    /// gate is read straight off `invocation.config.workflow.steps[step_index]`
-    /// -- not a separate field on [`GatedStepInvocation`] -- so the re-check
-    /// stays independent of whatever the caller passes in for `step_index`/
-    /// `scope`; a field supplied by that same caller could never actually
-    /// catch that caller getting the two out of sync.
-    ///
-    /// Evidence capture (ADR-0009, issue #7) no longer keys on a literal
-    /// role name either (issue #73 review, finding F2): it fires whenever
-    /// `invocation.captures_evidence` is set, a property `run_convergence_loop`
-    /// reads straight off this step's own `workflow.yaml` declaration
-    /// (`WorkflowStep::captures_evidence`) -- `true` for the built-in
-    /// default's tester step (`Workflow::builtin_default`), for strict
-    /// retro-compat, and opt-in for any custom workflow's own step.
+    /// The `type: agent` half of [`Orchestrator::run_gated_step`]'s dispatch.
     async fn run_gated_agent_step<R: ToolAdapter>(
         &self,
         runner: &R,
@@ -387,11 +201,6 @@ impl Orchestrator {
              resolved agent -- ResolvedAgents::resolve's own invariant",
         );
 
-        // Issue #81 review, LOW: derived from `config` (this step's own
-        // declared `WorkflowStep::gate`) rather than trusted from a field
-        // `GatedStepInvocation` used to carry -- see this function's own
-        // docs above for why a caller-supplied value couldn't back this
-        // defensive re-check at all.
         let gate = config.workflow.steps[step_index as usize].gate;
         let scoping_is_legal_for_this_step =
             step_index == 1 || gate == warden_core::Gate::ScopedReReview;
@@ -416,9 +225,6 @@ impl Orchestrator {
         )
         .await?;
 
-        // ADR-0012: this step's own role, target commit, this cycle's
-        // diff, and the findings that triggered the cycle -- plus, since
-        // ADR-0013, its own definition's system prompt.
         let stdin_payload = warden_core::build_finding_agent_input_json(
             role.as_str(),
             &agent.system_prompt,
@@ -445,16 +251,6 @@ impl Orchestrator {
             )
             .await?;
 
-        // Issue #71 review (HIGH): a gated step that exited non-zero must
-        // never have its stdout trusted at all -- checked *before*
-        // `extract_findings` is ever called, independent of whatever that
-        // adapter's own mapping does with a blank/malformed buffer.
-        // Mirrors the producer path's own non-zero-exit check above (M2),
-        // but a blocking finding rather than failing the whole run: a
-        // crashed/misbehaving step is exactly the kind of problem a
-        // reboucle back to the producer can plausibly recover from (a
-        // transient invocation failure, a flaky sandbox, ...), unlike a
-        // producer that never produced a commit worth reviewing at all.
         let findings = if outcome.exit_code != 0 {
             if self.suspend_for_exhausted_quota(run_id).await? {
                 return Err(WardenError::QuotaSuspended {
@@ -486,25 +282,6 @@ impl Orchestrator {
                 ),
             }]
         } else {
-            // Agent stdout is untrusted input: a parse failure becomes a
-            // blocking finding describing the problem, never a run-ending
-            // panic (code-standards.md: "Ne jamais faire confiance à la
-            // sortie d'un agent CLI"). `runner.extract_findings` is this
-            // run's `--tool` adapter's own translation from its CLI's raw
-            // output into findings NDJSON (issue #24 point 1, third
-            // bullet).
-            //
-            // Issue #24 review, cycle 2, MAJOR 2: a shape-valid batch isn't
-            // necessarily an *honest* one -- `extract_findings` only checks
-            // that every finding's `source` is some known value, not that
-            // it's the one this role is entitled to claim.
-            // `validate_finding_sources_for_role` closes that gap (a forged
-            // `source: "warden"`, or a step mislabelling its own failure as
-            // a sibling step's own source to slip past `step_succeeded`
-            // below) with the exact same "reject the whole batch, describe
-            // why, never silently drop/relabel" treatment as an
-            // unparsable-output failure -- see that function's own docs
-            // for the full rationale.
             match runner
                 .extract_findings(&outcome.stdout)
                 .and_then(|findings| {
@@ -527,11 +304,8 @@ impl Orchestrator {
             }
         };
 
-        // ADR-0009 (issue #7): capture evidence right after a *successful*
-        // run of this step, still inside its worktree -- which is about to
-        // be removed below, so this must happen before that, not after.
-        // Gated on the step's own declared `captures_evidence` (issue #73
-        // review, finding F2), never on a literal role name.
+        // capture evidence right after a *successful* run of this step, still inside its worktree
+        // -- which is about to be removed below, so this must happen before that, not after.
         if captures_evidence && step_succeeded(role, &findings) {
             self.capture_evidence_for_cycle(EvidenceCapture {
                 run_id,
@@ -552,27 +326,6 @@ impl Orchestrator {
         Ok(findings)
     }
 
-    /// The `type: hook` half of [`Orchestrator::run_gated_step`]'s dispatch
-    /// (issue #79): no LLM -- runs `invocation.run`'s shell command
-    /// deterministically inside a worktree checked out at
-    /// `invocation.commit`, the same isolation and bookkeeping
-    /// (`db::set_cycle_worktree_path`) any other gated step gets.
-    ///
-    /// A clean run (policy-allowed, zero exit) returns no findings at all;
-    /// a blocked/failing one returns exactly one blocking
-    /// [`warden_core::Finding`] sourced as `FindingSource::role(role)` --
-    /// the same shape [`Orchestrator::run_gated_agent_step`] already
-    /// produces for a crashed agent, so the convergence loop's own gating
-    /// (`decide_next_state_for_step`) treats a failing hook step identically
-    /// to a failing agent step, with no change needed there at all. The
-    /// sandboxed execution itself (`agent_processes` bookkeeping,
-    /// cancellation, start/finish events) is
-    /// [`Orchestrator::run_step_command`]'s job -- see its own docs.
-    ///
-    /// Ignores `scope`/`diff`/`prior_findings`/`captures_evidence`: a
-    /// deterministic command takes no input payload and
-    /// [`warden_core::Workflow::parse_yaml`] already rejects `evidence: true`
-    /// on a `type: hook` step, so `captures_evidence` is always `false` here.
     async fn run_gated_hook_step(
         &self,
         invocation: GatedStepInvocation<'_>,
@@ -614,58 +367,8 @@ impl Orchestrator {
         Ok(findings)
     }
 
-    /// The sandboxed execution of one `type: hook` step's command (issue
-    /// #79 review, MEDIUM), split out of
-    /// [`Orchestrator::run_gated_hook_step`] purely for readability. Mirrors
-    /// [`Orchestrator::run_agent`]'s own shape rather than routing through a
-    /// shared free function: a hook step needs the identical sandbox
-    /// lifecycle ([`SandboxGuard`]), `agent_processes` bookkeeping,
-    /// cancellation, and start/finish event pair every agent invocation
-    /// already gets, which lives here, in the orchestrator layer that owns
-    /// `self.pool`/`self.publish_event` -- `crate::hook` stays scoped to
-    /// lifecycle hooks plus the two small, reusable pieces this borrows
-    /// (`evaluate_shell_policy`, the policy check; `trailing_chars`/
-    /// `format_tail_suffix`, tail-trimming for the failure reason).
-    ///
-    /// Policy-evaluated first (issue #51, ADR-0016) -- a denied command
-    /// never reaches the sandbox at all, so no `agent_processes` row is
-    /// recorded for it (there is no process to track). Otherwise a
-    /// [`SandboxGuard`] owns the sandbox from `create` onward (issue #79
-    /// review, cycle 3: a hand-paired `create`/`destroy`, this function's
-    /// own shape before this fix, missed every early return between the two
-    /// -- `db::insert_agent_process`'s and `self.publish_event`'s own `?`
-    /// included -- and had no answer at all for this whole future being
-    /// dropped mid-`.await`, e.g. a `warden run --tui` exit; under
-    /// `--isolation docker`, `destroy` is `docker rm -f`, so either gap
-    /// leaked a running container). The guard's own `Drop` is the backstop
-    /// for that last case; every other exit goes through the single,
-    /// explicit, awaited `guard.destroy()` at the end, whose own failure is
-    /// logged (`tracing::warn!`), never silently swallowed.
-    ///
-    /// Records the `agent_processes` row and publishes
-    /// [`RunEvent::AgentStarted`] right after the sandbox reports a pid --
-    /// *before* awaiting completion, exactly like [`Orchestrator::run_agent`]
-    /// does for an agent subprocess -- so
-    /// [`crate::orchestrator::recover_crashed_runs`] can detect and reap a
-    /// hook step's orphaned process on restart instead of leaving it
-    /// invisible. Marks the row ended and publishes
-    /// [`RunEvent::AgentFinished`] (`usage: None` -- a deterministic command
-    /// reports no LLM token usage) once the command completes, whichever
-    /// way.
-    ///
-    /// Full stdout/stderr are logged at `tracing::debug!` regardless of
-    /// outcome (mirrors [`Orchestrator::run_agent`]'s own L1 stderr
-    /// logging) -- otherwise the only durable record of a hook step's
-    /// output, since it is never itself an agent whose stdout a
-    /// `ToolAdapter` parses. On a non-zero exit, the returned finding's
-    /// description carries a trimmed tail of **whichever of stdout/stderr
-    /// are non-empty** (both, labeled, when both are -- issue #79 review,
-    /// cycle 3: a "stderr, else stdout" heuristic silently dropped stdout
-    /// diagnostics the moment a tool emitted *any* stderr noise, e.g. a
-    /// cargo manifest warning next to `rustfmt --check`'s own stdout diff);
-    /// most linters/formatters -- `rustfmt --check`, `eslint`, most test
-    /// runners -- write their diagnostics to stdout, not stderr, so a
-    /// reason that only ever carried the exit code was not actionable.
+    /// The sandboxed execution of one `type: hook` step's command, split out of
+    /// [`Orchestrator::run_gated_hook_step`] purely for readability.
     async fn run_step_command(
         &self,
         run_id: &str,
@@ -688,11 +391,6 @@ impl Orchestrator {
             })
             .await?;
 
-        // Issue #79 review, cycle 3: structural create->destroy pairing via
-        // `SandboxGuard`, the exact seam `run_agent` already uses -- see
-        // that struct's own docs. Everything that can exit early via `?` is
-        // inside the block `result` captures, so `guard.destroy()` always
-        // runs, awaited, right after, whichever way the block ended.
         let mut guard = SandboxGuard::new(Arc::clone(&self.sandbox), sandbox_id);
 
         let result: Result<Vec<Finding>> = async {
@@ -716,11 +414,6 @@ impl Orchestrator {
                 )
                 .await?;
 
-            // H1 (mirrors `run_agent`'s own invariant): never persist pid 0
-            // or skip recording -- a missing pid right after the sandbox
-            // started the process is a typed error, not a silent fallback
-            // that would leave this step's process invisible to crash
-            // recovery.
             let pid = execution.pid.ok_or_else(|| ProcessError::MissingPid {
                 command: command.to_string(),
             })?;
@@ -815,21 +508,6 @@ mod tests {
         Role::new("tester").unwrap()
     }
 
-    /// Acceptance criterion 1 (issue #2), updated for issue #40's
-    /// independent reviewer/tester invocations (the removed
-    /// `run_review_and_test` used to exercise this concurrently via
-    /// `tokio::join!`; reviewer and tester now run sequentially, see
-    /// `run_review_and_test_runs_...` below), further generalized by issue
-    /// #73's trio-unification follow-up (both now go through the single
-    /// generic [`Orchestrator::run_gated_step`]): reviewer and tester each
-    /// write to a DIFFERENT file in their own worktree, then read back the
-    /// *other* role's target file from their own worktree. Each gets a
-    /// fresh worktree checked out from the same base `commit`
-    /// (`WorktreeManager::create`, keyed by role), so if the two ever
-    /// shared a worktree/directory, the other role's write would already be
-    /// visible here instead of the original, untouched content -- regardless
-    /// of whether the two run concurrently or in sequence, this is what
-    /// distinguishes "isolated worktrees" from "shared worktree".
     #[tokio::test]
     async fn run_review_and_test_isolates_writes_to_different_worktree_files() {
         let repo = init_test_repo();
@@ -996,11 +674,6 @@ mod tests {
         );
     }
 
-    /// Issue #40 / decision #37 Q2, generalized by issue #73's trio-
-    /// unification follow-up: a step invoked at `step_index: 1` with
-    /// `ReviewScope::Correctif` must receive a payload scoped to the
-    /// correctif's own diff plus the findings that prompted it -- captured
-    /// directly from what the agent actually reads off stdin.
     #[tokio::test]
     async fn a_step_1_invocation_with_a_correctif_scope_sends_a_scoped_payload() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
@@ -1101,11 +774,6 @@ mod tests {
         assert_eq!(payload.findings, vec![originating_finding]);
     }
 
-    /// Issue #40, generalized by issue #73's trio-unification follow-up:
-    /// `run_gated_step` must refuse a `Correctif` scope for any step but
-    /// `step_index == 1` -- defense in depth against a future caller
-    /// constructing a `GatedStepInvocation` directly with a mismatched
-    /// index/scope pair.
     #[tokio::test]
     async fn run_gated_step_rejects_a_correctif_scope_for_a_non_first_gated_step() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
@@ -1187,26 +855,6 @@ mod tests {
         );
     }
 
-    /// Issue #40 (ADR-0003 amendment), generalized by issue #73's trio-
-    /// unification follow-up: reviewer and tester must now run
-    /// **sequentially** -- the opposite of what this test asserted before
-    /// the removed `run_review_and_test`'s `tokio::join!` path. Regression
-    /// coverage for "no one quietly reintroduces `tokio::join!`/`try_join!`
-    /// here": one `run_gated_step` call immediately followed by another,
-    /// each backed by a sleepy agent, must together take at least as long as
-    /// both sleeps combined, not just the slower one.
-    ///
-    /// Deliberately not a fixed wall-clock threshold (e.g. `elapsed >
-    /// 1.9 * SLEEP`): under cargo's default parallel test harness, `git
-    /// worktree add` contention and process-spawn overhead from other
-    /// worktree-creating tests running at the same time can push a single
-    /// absolute bound past its margin without anything actually being wrong
-    /// -- non-deterministic per code-standards.md line 17. Instead this
-    /// asserts on a *ratio* against `SLEEP` alone: a concurrent
-    /// (`tokio::join!`) path would land close to 1x `SLEEP` plus overhead; a
-    /// sequential one lands close to 2x. 1.5x is comfortably above the
-    /// concurrent case and comfortably below the sequential one regardless
-    /// of ambient load.
     #[tokio::test]
     async fn run_review_and_test_runs_reviewer_and_tester_sequentially_not_concurrently() {
         const SLEEP: Duration = Duration::from_millis(500);
@@ -1323,11 +971,6 @@ mod tests {
         );
     }
 
-    /// `db_dir` must be kept alive by the caller for as long as `pool` is
-    /// used -- dropping it deletes the SQLite file `pool` still points at
-    /// (the same reason every other fixture in this module holds its own
-    /// `TempDir`s for the test's whole body rather than a helper consuming
-    /// them internally).
     async fn finding_agent_test_fixture() -> (TempDir, TempDir, TempDir, SqlitePool, WorktreeManager)
     {
         let repo = init_test_repo();
@@ -1339,12 +982,6 @@ mod tests {
         (repo, warden_home, db_dir, pool, worktree_manager)
     }
 
-    /// A reviewer that forges `source: "warden"` -- impersonating the
-    /// structural finding only Warden's own `agent_definition_tampering_finding`
-    /// may raise (M4) -- must never have that claim honoured: the returned
-    /// finding is a *replacement*, correctly attributed back to
-    /// `FindingSource::role("reviewer")` (the role that actually produced this
-    /// stdout), not the forged `Warden` source passed through untouched.
     #[tokio::test]
     async fn a_reviewer_forging_the_warden_finding_source_is_rejected_not_accepted() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
@@ -1437,17 +1074,6 @@ mod tests {
         );
     }
 
-    /// The sharper, non-hypothetical case the review called out by name
-    /// (closing Minor 2, `step_succeeded` trusting an agent-controlled
-    /// `source`): a tester that mislabels its own failure as
-    /// `source: "reviewer"` must not have that failure hidden from
-    /// `step_succeeded` -- the gate `run_gated_step` uses to decide
-    /// whether to trigger evidence capture. Before the fix, a forged
-    /// `source: "reviewer"` finding from the tester would sail through
-    /// `extract_findings` unchanged, and `step_succeeded` (which only ever
-    /// looks for a `FindingSource::role("tester")` blocking finding) would report
-    /// "succeeded" -- triggering evidence capture for a cycle whose e2e test
-    /// actually failed.
     #[tokio::test]
     async fn a_tester_mislabelling_its_own_failure_as_the_reviewer_source_still_blocks_tester_succeeded(
     ) {
@@ -1542,21 +1168,6 @@ mod tests {
         );
     }
 
-    /// Issue #71 review (HIGH), tester side: the exit-code guard added to
-    /// `run_gated_step` closes the fail-open "for every `--tool` adapter at
-    /// once, not just mistral" (see this fix's own commit message) -- this
-    /// repo's only other regression coverage for that guard
-    /// (`e2e_mistral_reviewer_exiting_nonzero_with_no_output_never_converges`,
-    /// `crates/warden/tests/cli.rs`) drives it exclusively through the
-    /// **reviewer** role. Since every gated step shares the exact same
-    /// `run_gated_step` body now, the guard is structurally the same code
-    /// path for all of them -- but that's an implementation detail a future
-    /// refactor could break without any test failing today. This exercises
-    /// the **tester** side directly, with a tester that exits non-zero and
-    /// prints nothing to stdout: it must come back as a synthesized blocking
-    /// `Tester` finding naming the exit status, never as "zero findings"
-    /// (which `step_succeeded` would otherwise read as a passing test
-    /// suite and wrongly trigger evidence capture for).
     #[tokio::test]
     async fn a_tester_that_exits_nonzero_with_no_output_synthesizes_a_blocking_finding_not_a_silent_pass(
     ) {
@@ -1653,9 +1264,6 @@ mod tests {
         );
     }
 
-    /// The legitimate control: a reviewer emitting its own, correct source
-    /// must pass through completely unchanged -- proving the validation
-    /// added above rejects only a genuine mismatch, not every finding.
     #[tokio::test]
     async fn a_reviewer_finding_with_its_own_correct_source_passes_through_unchanged() {
         let (repo, warden_home, _db_dir, pool, worktree_manager) =
@@ -1746,11 +1354,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Issue #79 review: `run_step_command` -- a `type: hook` step's own
-    // sandboxed execution (cancellation, env allowlist).
-    // -----------------------------------------------------------------
-
     async fn orchestrator_with_run_and_cycle(
         pool: &SqlitePool,
         run_id: &str,
@@ -1763,12 +1366,6 @@ mod tests {
         Orchestrator::new(pool.clone())
     }
 
-    /// Issue #79 review, MEDIUM: the run's own `CancellationToken` must
-    /// actually reach a `type: hook` step's sandboxed command -- before this
-    /// fix it was silently dropped (`ExecuteOptions::default()`), so
-    /// Ctrl-C/TUI-exit never stopped a long-running hook command. Mirrors
-    /// `agent_run`'s own
-    /// `sandbox_is_destroyed_when_cancellation_resolves_the_future_normally`.
     #[tokio::test]
     async fn a_hook_steps_command_is_cancelled_when_the_run_cancellation_token_fires() {
         let db_dir = TempDir::new().unwrap();
@@ -1807,16 +1404,6 @@ mod tests {
         );
     }
 
-    /// Issue #79 review, HIGH: a `type: hook` step's command must forward
-    /// only [`WORKFLOW_STEP_ENV_ALLOWLIST`], never the operator's full
-    /// environment (`crate::hook::CommandHook::full_env_allowlist`).
-    /// `CARGO_MANIFEST_DIR` -- reliably set by `cargo test` in this
-    /// process's own environment, read-only here -- stands in for "a
-    /// variable not on that list", the same technique
-    /// `warden_sandbox::local`'s own `env_clear_means_an_unallowlisted_variable_never_reaches_the_child`/
-    /// `env_allowlist_forwards_only_the_named_variables` tests use, rather
-    /// than `std::env::set_var` (`unsafe`, and cross-test interference risk
-    /// under a parallel test runner -- see those tests' own docs).
     #[tokio::test]
     async fn a_hook_steps_command_only_forwards_the_narrow_workflow_step_allowlist() {
         assert!(
@@ -1850,12 +1437,6 @@ mod tests {
         );
     }
 
-    /// Issue #79 review, cycle 3: a failing command that writes to *both*
-    /// stdout and stderr must have both tails in its finding's description
-    /// -- before this fix, any non-empty stderr (a cargo manifest warning, a
-    /// deprecation notice) silently discarded stdout entirely, even though
-    /// most linters/formatters (`rustfmt --check`) put their actual
-    /// diagnostic there.
     #[tokio::test]
     async fn a_failing_command_with_both_stdout_and_stderr_includes_both_tails() {
         let db_dir = TempDir::new().unwrap();
@@ -1886,9 +1467,6 @@ mod tests {
         );
     }
 
-    /// Issue #79 review, cycle 3: pins the exact allowlist -- without this,
-    /// a future edit (e.g. adding `GH_TOKEN`) would silently widen a `type:
-    /// hook` step's own trust boundary with no test failing.
     #[test]
     fn workflow_step_env_allowlist_is_pinned() {
         assert_eq!(
@@ -1897,15 +1475,6 @@ mod tests {
         );
     }
 
-    /// Issue #79 review, cycle 3: the sandbox created for a `type: hook`
-    /// step's command must always be destroyed -- proven directly against a
-    /// `RecordingSandbox` (shared with `agent_run`'s own equivalent
-    /// coverage, `sandbox_is_destroyed_when_cancellation_resolves_the_future_normally`),
-    /// pinning the `create`/`execute`/`destroy` call order `SandboxGuard`
-    /// now guarantees here too, instead of the three hand-paired `destroy`
-    /// calls this function used before this fix (which missed the
-    /// `db::insert_agent_process`/`publish_event` early returns between
-    /// them).
     #[tokio::test]
     async fn a_hook_steps_sandbox_is_destroyed_after_its_command_completes() {
         let db_dir = TempDir::new().unwrap();
@@ -1951,21 +1520,6 @@ mod tests {
         );
     }
 
-    /// Independently-derived gap (test review of the fix above): the
-    /// happy-path `create`/`execute`/`destroy` assertion in
-    /// [`a_hook_steps_sandbox_is_destroyed_after_its_command_completes`] is
-    /// also satisfied by the pre-fix, hand-paired `create`/`destroy` code
-    /// this function used to have -- it never pins the actual property the
-    /// `SandboxGuard` migration exists for, which is teardown when
-    /// `run_step_command`'s own future is dropped mid-`.await`, never
-    /// resolving to completion or to an early `?` return at all (run
-    /// cancellation via `warden run --tui` exit, a task abort). Mirrors
-    /// `agent_run`'s own
-    /// [`sandbox_is_destroyed_when_the_run_agent_future_itself_is_dropped_mid_flight`]:
-    /// aborts the task running `run_step_command` while it's parked on a
-    /// long `sleep 30`, then polls `sandbox.calls()` for `destroy`, since
-    /// `SandboxGuard::drop`'s backstop teardown runs on its own detached
-    /// task, not awaited by anything after the abort.
     #[tokio::test]
     async fn a_hook_steps_sandbox_is_destroyed_when_run_step_command_is_dropped_mid_flight() {
         let db_dir = TempDir::new().unwrap();
@@ -2008,12 +1562,6 @@ mod tests {
                 .await;
         });
 
-        // Best-effort delay to let the task get past `create` and into the
-        // long `execute`/`wait()` await before dropping it mid-flight --
-        // mirrors `agent_run`'s own equivalent test, and its own LOW E note:
-        // this is not a synchronization point, only the property under test
-        // (the sandbox created for this invocation is destroyed) is
-        // asserted below, not the exact call vector.
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle.abort();
         let _ = handle.await;

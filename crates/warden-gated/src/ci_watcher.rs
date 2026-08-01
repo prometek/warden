@@ -1,26 +1,3 @@
-//! CI Watcher (issue #5): polls an already-opened PR's lifecycle and CI
-//! check status until a terminal outcome is reached (merged, closed,
-//! checks-passed, checks-failed, or an inactivity timeout), and reports that
-//! outcome for the orchestrator to act on.
-//!
-//! Security/scope boundary (issue #5 acceptance criterion, non-negotiable):
-//! this module only ever *reads* PR/CI status through [`CiProvider`]. There
-//! is no merge capability anywhere in `warden-gated`, and none must ever be
-//! added to this module -- "aucun merge automatique n'est déclenché par
-//! Warden". Once CI is green ([`WatchOutcome::ChecksPassed`]), the decision
-//! to actually merge the PR is left entirely to a human via the PR
-//! provider's own UI; Warden's own responsibility for the run ends there.
-//!
-//! This module never talks to a PR provider's API/CLI directly -- that's
-//! [`CiProvider`]'s job, implemented by `gh_provider::GhProvider` (GitHub)
-//! today, mirroring how `pr_manager::PrProvider` seams off provider access
-//! for the PR lifecycle actions.
-//!
-//! `decide_next_state_after_ci` in `warden-core` is the pure counterpart
-//! that turns a [`WatchOutcome`]'s *coarse* shape into the next `RunState` --
-//! deliberately not implemented here, since `warden-gated` only reports
-//! (issue #5: "gated only reports, the orchestrator decides").
-
 use std::time::Duration;
 
 use tokio::time::{sleep, Instant};
@@ -28,10 +5,6 @@ use warden_core::{Finding, FindingSource, Severity};
 
 use crate::error::{GatedError, Result};
 use crate::pr_manager::PrHandle;
-
-// ---------------------------------------------------------------------------
-// Domain types (pure)
-// ---------------------------------------------------------------------------
 
 /// Coarse GitHub PR lifecycle, independent of CI/check status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +14,6 @@ pub enum PrLifecycle {
     Closed,
 }
 
-/// One check's outcome, already reconciled across GitHub's two overlapping
-/// check-reporting APIs (the newer Checks API and the legacy commit
-/// Statuses API) -- `gh pr view --json statusCheckRollup` returns entries in
-/// either shape depending on which API a given CI integration uses, and
-/// [`CiProvider`] implementations are expected to normalize both into this
-/// one set before returning a [`PrStatus`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CheckConclusion {
     Pending,
@@ -54,8 +21,8 @@ pub enum CheckConclusion {
     Failed,
 }
 
-/// One CI check's name, outcome, and (if any) a link to its details --
-/// enough to describe a failure to a human or fold into a [`Finding`].
+/// One CI check's name, outcome, and (if any) a link to its details -- enough to describe a failure
+/// to a human or fold into a [`Finding`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckRun {
     pub name: String,
@@ -63,39 +30,33 @@ pub struct CheckRun {
     pub details_url: Option<String>,
 }
 
-/// A PR's full polled status: its lifecycle plus every CI check currently
-/// reported against its head commit.
+/// A PR's full polled status: its lifecycle plus every CI check currently reported against its head
+/// commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrStatus {
     pub lifecycle: PrLifecycle,
     pub checks: Vec<CheckRun>,
 }
 
-/// The net CI signal `PrStatus::checks_rollup` reduces `checks` to --
-/// `decide_step` only needs this coarser view, not every individual check.
+/// The net CI signal `PrStatus::checks_rollup` reduces `checks` to -- `decide_step` only needs this
+/// coarser view, not every individual check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksRollup {
-    /// No CI has reported anything against this PR yet -- either it hasn't
-    /// triggered, or it never will (the case the inactivity timeout guards
-    /// against).
+    /// No CI has reported anything against this PR yet -- either it hasn't triggered, or it never
+    /// will (the case the inactivity timeout guards against).
     NoChecksYet,
-    /// At least one check has reported, none have failed yet, but at least
-    /// one is still running.
+    /// At least one check has reported, none have failed yet, but at least one is still running.
     Pending,
-    /// Every reported check passed (a `Skipped`/`Neutral` conclusion counts
-    /// as passed, not blocking -- it never ran by design, not because it
-    /// failed).
+    /// Every reported check passed (a `Skipped`/`Neutral` conclusion counts as passed, not blocking
+    /// -- it never ran by design, not because it failed).
     AllPassed,
-    /// At least one check failed. Carries the failing checks themselves so
-    /// the caller can describe exactly what broke.
+    /// At least one check failed. Carries the failing checks themselves so the caller can describe
+    /// exactly what broke.
     SomeFailed(Vec<CheckRun>),
 }
 
 impl PrStatus {
     /// Reduces `checks` to the coarse [`ChecksRollup`] `decide_step` acts on.
-    /// A failed check always wins over a merely-pending one -- there's no
-    /// reason to keep waiting on other checks once at least one has already
-    /// failed.
     pub fn checks_rollup(&self) -> ChecksRollup {
         let failed: Vec<CheckRun> = self
             .checks
@@ -120,27 +81,11 @@ impl PrStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Provider seam
-// ---------------------------------------------------------------------------
-
-/// Thin seam over a PR provider's CI/PR status, mirroring
-/// `pr_manager::PrProvider`'s split between pure orchestration (this module)
-/// and provider-specific I/O (`gh_provider::GhProvider`). Read-only by
-/// construction -- see this module's top-level doc comment.
-///
-/// `async fn` in this trait is intentional for the same reason as
-/// `PrProvider`'s: every call site awaits it directly on its own task
-/// rather than boxing it into a `dyn` trait object.
 #[allow(async_fn_in_trait)]
 pub trait CiProvider {
     /// Fetches `pr`'s current lifecycle and CI check statuses.
     async fn pr_status(&self, pr: &PrHandle) -> Result<PrStatus>;
 }
-
-// ---------------------------------------------------------------------------
-// Watch outcome & configuration
-// ---------------------------------------------------------------------------
 
 /// The terminal result of one [`watch_pr`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,62 +94,31 @@ pub enum WatchOutcome {
     /// Closed without merging.
     Closed,
     ChecksPassed,
-    /// Carries one blocking [`Finding`] per failed check
-    /// (`FindingSource::Ci`), formatted the same way reviewer/tester
-    /// findings are, so the orchestrator can treat them uniformly.
     ChecksFailed(Vec<Finding>),
-    /// The polled status went unchanged for at least `inactivity_timeout` --
-    /// the only thing that bounds this loop when CI never triggers at all.
+    /// The polled status went unchanged for at least `inactivity_timeout` -- the only thing that
+    /// bounds this loop when CI never triggers at all.
     TimedOut,
 }
 
-/// Configuration for one [`watch_pr`] invocation. Both durations are
-/// explicit, caller-supplied inputs, never hardcoded constants (issue #5:
-/// "timeout d'inactivité configurable").
-///
-/// **The inactivity timeout has no absolute wall-clock cap.** Its clock
-/// resets on *any* observed status change (see [`watch_pr`]'s doc comment),
-/// so a PR whose status keeps changing on every single poll (e.g. a
-/// perpetually flapping check) never times out, no matter how long the
-/// watch has been running in total -- this is by design (issue #5's own
-/// framing is "si la CI ne se déclenche jamais", an idle condition, not a
-/// total-duration budget), not an oversight.
+/// Configuration for one [`watch_pr`] invocation.
 #[derive(Debug, Clone, Copy)]
 pub struct WatchConfig {
-    /// How long to sleep between two polls. `watch_pr` never busy-spins: it
-    /// always awaits `tokio::time::sleep(poll_interval)` between iterations.
+    /// How long to sleep between two polls.
     pub poll_interval: Duration,
-    /// How long the polled status may go completely unchanged before
-    /// `watch_pr` gives up and returns [`WatchOutcome::TimedOut`] (issue #5
-    /// acceptance criterion: "le timeout d'inactivité interrompt proprement
-    /// la surveillance si la CI ne se déclenche jamais"). See this struct's
-    /// top-level doc comment for the idle-vs-absolute distinction.
+    /// How long the polled status may go completely unchanged before `watch_pr` gives up and
+    /// returns [`WatchOutcome::TimedOut`].
     pub inactivity_timeout: Duration,
-    /// How many *consecutive* transient poll failures (a `gh` command or
-    /// I/O failure -- rate limit, network blip; never a malformed/
-    /// unparseable response, which always aborts immediately regardless of
-    /// this budget) `watch_pr` tolerates before giving up. Resets to zero on
-    /// any successful poll. Issue #5 fix-cycle 1: the ticket's own
-    /// flakiness motivation ("différences d'environnement, flakiness")
-    /// applies just as much to polling CI status as to CI itself.
     pub max_consecutive_poll_errors: u32,
 }
 
 impl WatchConfig {
-    /// A sensible default retry budget for transient poll failures: enough
-    /// to ride out a single rate-limit/network blip without masking a truly
-    /// broken `gh`/network setup forever.
+    /// A sensible default retry budget for transient poll failures: enough to ride out a single
+    /// rate-limit/network blip without masking a truly broken `gh`/network setup forever.
     pub const DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS: u32 = 3;
 }
 
-// ---------------------------------------------------------------------------
-// Pure decision logic
-// ---------------------------------------------------------------------------
-
-/// A comparable snapshot of a [`PrStatus`], used only to detect whether
-/// anything changed between two polls (the inactivity clock). Checks are
-/// sorted by name so GitHub returning the same checks in a different order
-/// between polls is never mistaken for a status change.
+/// A comparable snapshot of a [`PrStatus`], used only to detect whether anything changed between
+/// two polls (the inactivity clock).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusSnapshot {
     lifecycle: PrLifecycle,
@@ -226,16 +140,14 @@ impl StatusSnapshot {
     }
 }
 
-/// One [`watch_pr`] iteration's verdict: either the watch is over
-/// ([`Self::Terminal`]), or the caller should sleep and poll again.
+/// One [`watch_pr`] iteration's verdict: either the watch is over ([`Self::Terminal`]), or the
+/// caller should sleep and poll again.
 enum WatchStep {
     Terminal(WatchOutcome),
     KeepWaiting,
 }
 
-/// Decides one polling step purely from the latest status plus how long
-/// nothing has changed -- no clock/IO of its own; [`watch_pr`] is the only
-/// caller, and it supplies real elapsed time.
+/// Decides one polling step purely from the latest status plus how long nothing has changed.
 fn decide_step(
     status: &PrStatus,
     idle_elapsed: Duration,
@@ -262,9 +174,6 @@ fn decide_step(
     }
 }
 
-/// Turns failed CI checks into blocking findings, the same shape reviewer/
-/// tester findings already take (`warden_core::Finding`) so the orchestrator
-/// can treat a CI failure uniformly with any other blocking finding.
 fn failed_checks_to_findings(failed_checks: &[CheckRun]) -> Vec<Finding> {
     failed_checks
         .iter()
@@ -281,19 +190,6 @@ fn failed_checks_to_findings(failed_checks: &[CheckRun]) -> Vec<Finding> {
         .collect()
 }
 
-/// Whether `error` represents a transient failure to reach `gh`/the network
-/// (worth retrying a poll, up to [`WatchConfig::max_consecutive_poll_errors`]
-/// times in a row) rather than a malformed/unexpected response, which must
-/// abort `watch_pr` immediately and loudly regardless of that budget --
-/// code-standards.md: "ne jamais faire confiance à la sortie d'un agent
-/// CLI" applies just as much to a provider's own malformed output as to an
-/// agent's. `GhCommandFailed`/`Io` are the only variants `CiProvider::
-/// pr_status` implementations return for "couldn't even talk to `gh`"; every
-/// other `GatedError` variant a `pr_status` call could plausibly return
-/// (`UnparsablePrStatusJson`, `UnknownPrLifecycle`, `UnknownCheckConclusion`,
-/// `MalformedCheckEntry`) means `gh` *did* respond, just not with something
-/// this module understands -- never worth retrying, since the same
-/// malformed response would come back every time.
 fn is_transient_poll_error(error: &GatedError) -> bool {
     matches!(
         error,
@@ -301,28 +197,8 @@ fn is_transient_poll_error(error: &GatedError) -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Watch loop (I/O)
-// ---------------------------------------------------------------------------
-
-/// Polls `pr`'s status via `provider` until a terminal [`WatchOutcome`] is
-/// reached, sleeping `config.poll_interval` between polls -- never
-/// busy-spinning. The inactivity clock resets on every poll whose status
-/// differs from the previous one, so a CI run that's genuinely progressing
-/// (new checks appearing, a pending check finishing) is never cut off just
-/// because it takes a while; only a status that's been stuck unchanged for
-/// `config.inactivity_timeout` ends the watch as [`WatchOutcome::TimedOut`]
-/// (see [`WatchConfig`]'s doc comment for why that has no absolute
-/// wall-clock cap).
-///
-/// A transient poll failure (`is_transient_poll_error`) is tolerated and
-/// retried, up to `config.max_consecutive_poll_errors` times in a row --
-/// reset to zero on the next successful poll. Exceeding that budget, or any
-/// non-transient (malformed/unexpected) error, aborts the watch immediately
-/// with that error; a malformed response is never silently retried or
-/// swallowed.
-///
-/// Never merges the PR -- see this module's top-level doc comment.
+/// Polls `pr`'s status via `provider` until a terminal [`WatchOutcome`] is reached, sleeping
+/// `config.poll_interval` between polls -- never busy-spinning.
 pub async fn watch_pr<P: CiProvider>(
     pr: &PrHandle,
     provider: &P,
@@ -448,8 +324,6 @@ mod tests {
         }
     }
 
-    // ---- PrStatus::checks_rollup -------------------------------------------
-
     #[test]
     fn no_checks_rolls_up_to_no_checks_yet() {
         assert_eq!(
@@ -478,8 +352,6 @@ mod tests {
             ChecksRollup::SomeFailed(vec![failed("build")])
         );
     }
-
-    // ---- decide_step --------------------------------------------------------
 
     const SHORT: Duration = Duration::from_secs(1);
     const LONG: Duration = Duration::from_secs(3600);
@@ -559,12 +431,6 @@ mod tests {
         ));
     }
 
-    // ---- watch_pr (I/O loop, fake in-memory provider) -----------------------
-
-    /// A [`CiProvider`] that returns a fixed sequence of statuses, one per
-    /// call, standing in for real `gh` polling so `watch_pr`'s loop
-    /// (sleep-between-polls, inactivity clock, terminal detection) is
-    /// exercised without any network/subprocess I/O.
     struct ScriptedProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<PrStatus>>,
     }
@@ -586,18 +452,7 @@ mod tests {
         }
     }
 
-    /// A sensible retry budget for the loop tests below that don't
-    /// themselves exercise the transient-poll-error tolerance -- non-zero
-    /// so a genuinely unrelated transient failure wouldn't make these tests
-    /// flaky, but otherwise irrelevant to what each test is checking.
     const DEFAULT_ERROR_BUDGET: u32 = WatchConfig::DEFAULT_MAX_CONSECUTIVE_POLL_ERRORS;
-
-    // Fix-cycle 1 (issue #5 review): these loop tests now run under tokio's
-    // paused virtual clock (`start_paused = true`) instead of real
-    // sub-millisecond sleeps -- code-standards.md "tests déterministes, pas
-    // de temps réel non mocké". `sleep`/`Instant::now()` inside `watch_pr`
-    // still behave correctly (auto-advance fires pending timers instantly),
-    // so these run in effectively zero wall-clock time with no flakiness.
 
     #[tokio::test(start_paused = true)]
     async fn watch_pr_returns_checks_passed_once_all_checks_succeed() {
@@ -636,10 +491,6 @@ mod tests {
         assert_eq!(outcome, WatchOutcome::TimedOut);
     }
 
-    /// Acceptance criterion (issue #5): merged-PR detection, exercised
-    /// through the full polling loop (not just `decide_step` in isolation)
-    /// -- a PR that's still pending on one poll and reports `MERGED` on the
-    /// next must end the watch as `WatchOutcome::Merged`.
     #[tokio::test(start_paused = true)]
     async fn watch_pr_returns_merged_once_the_pr_lifecycle_flips_to_merged() {
         let provider = ScriptedProvider::new(vec![
@@ -661,8 +512,6 @@ mod tests {
         assert_eq!(outcome, WatchOutcome::Merged);
     }
 
-    /// Acceptance criterion (issue #5): closed-without-merging detection,
-    /// exercised through the full polling loop.
     #[tokio::test(start_paused = true)]
     async fn watch_pr_returns_closed_once_the_pr_is_closed_without_merging() {
         let provider = ScriptedProvider::new(vec![
@@ -684,9 +533,6 @@ mod tests {
         assert_eq!(outcome, WatchOutcome::Closed);
     }
 
-    /// Acceptance criterion (issue #5): a CI failure must surface findings
-    /// so the orchestrator can decide to reboucle vers le coder --
-    /// exercised through the full polling loop, not just `decide_step`.
     #[tokio::test(start_paused = true)]
     async fn watch_pr_returns_checks_failed_with_findings_once_a_check_fails() {
         let provider = ScriptedProvider::new(vec![
@@ -713,11 +559,6 @@ mod tests {
         }
     }
 
-    // ---- transient poll-error tolerance (issue #5 fix-cycle 1) -------------
-
-    /// A [`CiProvider`] whose scripted responses are full `Result`s rather
-    /// than always-`Ok` statuses, standing in for a `gh` invocation that
-    /// sometimes fails transiently before recovering (or doesn't).
     struct ScriptedResultProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<Result<PrStatus>>>,
     }
@@ -740,9 +581,6 @@ mod tests {
         }
     }
 
-    /// A `gh`-command failure -- the shape `is_transient_poll_error`
-    /// recognizes as transient/retryable (e.g. a rate limit or network
-    /// blip), not a malformed response.
     fn transient_error() -> GatedError {
         GatedError::GhCommandFailed {
             command: "gh pr view".to_string(),
@@ -753,9 +591,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watch_pr_tolerates_fewer_than_the_configured_consecutive_poll_errors_then_recovers() {
-        // K = 2 consecutive transient failures, N (budget) = 3 -- still
-        // within budget, so `watch_pr` must retry through them and still
-        // reach its terminal outcome from the next, successful poll.
         let provider = ScriptedResultProvider::new(vec![
             Err(transient_error()),
             Err(transient_error()),
@@ -775,9 +610,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watch_pr_aborts_after_more_than_the_configured_consecutive_poll_errors() {
-        // N + 1 = 4 consecutive transient failures against a budget of 3:
-        // the first three are tolerated/retried, the fourth exceeds the
-        // budget and must abort with that same typed error.
         let provider = ScriptedResultProvider::new(vec![
             Err(transient_error()),
             Err(transient_error()),
@@ -796,10 +628,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watch_pr_aborts_immediately_on_a_malformed_response_without_retrying() {
-        // A non-transient (malformed/unexpected) error must abort on the
-        // very first occurrence, never counted against the transient-error
-        // budget and never silently retried -- code-standards.md: never
-        // trust/paper over an unparseable provider response.
         let provider = ScriptedResultProvider::new(vec![Err(GatedError::UnknownPrLifecycle(
             "BOGUS".to_string(),
         ))]);
@@ -813,19 +641,6 @@ mod tests {
         assert!(matches!(result, Err(GatedError::UnknownPrLifecycle(_))));
     }
 
-    // ---- busy-spin proof (deterministic, virtual clock) --------------------
-
-    /// Issue #5: `watch_pr` "never busy-spins: it always awaits
-    /// `tokio::time::sleep(poll_interval)` between iterations" (this
-    /// module's own doc comment on `watch_pr`). Fix-cycle 1 (issue #5
-    /// review): proven deterministically under tokio's paused virtual
-    /// clock, rather than measuring real wall-clock gaps between polls
-    /// (code-standards.md: "tests déterministes, pas de temps réel non
-    /// mocké") -- a busy-spinning implementation would issue far more polls
-    /// than the virtual time budget allows (since none of its iterations
-    /// would ever await a timer to advance the paused clock), so bounding
-    /// the poll count against how much virtual time actually elapsed proves
-    /// each iteration genuinely waited on `sleep`.
     struct CountingProvider {
         poll_count: std::sync::Mutex<u32>,
     }
@@ -855,14 +670,6 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, WatchOutcome::TimedOut);
 
-        // Every poll but the first is preceded by one full `sleep(poll_interval)`
-        // (the loop only reaches a next poll via that await point), so the
-        // number of polls issued can never exceed
-        // `inactivity_timeout / poll_interval + 1` regardless of how much
-        // real wall-clock time this test takes to run -- a busy-spinning
-        // loop that never actually awaited the timer would instead issue an
-        // effectively unbounded number of polls before the virtual clock
-        // ever advanced past `inactivity_timeout`.
         let max_possible_polls =
             (inactivity_timeout.as_millis() / poll_interval.as_millis()) as u32 + 1;
         let poll_count = *provider.poll_count.lock().unwrap();
@@ -879,25 +686,12 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion (issue #5, non-negotiable): "aucun merge
-    /// automatique n'est déclenché par Warden". `CiProvider` (this module,
-    /// above) exposes only `pr_status` -- there is no method on the trait
-    /// that could merge a PR, so no `watch_pr` caller can trigger one
-    /// through this seam. This is a static regression guard for the actual
-    /// `gh` invocation in the watcher's only real implementation
-    /// (`gh_provider::GhProvider`): it fails loudly if a `gh pr merge` (or
-    /// equivalent "merge" argument) is ever wired into the CI-watching path.
     #[test]
     fn the_ci_watcher_path_never_issues_a_gh_merge_argument() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         for relative_path in ["src/ci_watcher.rs", "src/gh_provider.rs"] {
             let contents = std::fs::read_to_string(format!("{manifest_dir}/{relative_path}"))
                 .unwrap_or_else(|error| panic!("failed to read {relative_path}: {error}"));
-            // Scan production code only: this very test file's own source
-            // (read back via `relative_path == "src/ci_watcher.rs"`) quotes
-            // the literal it's guarding against in its own doc comments/
-            // assertion message, so scanning past the `#[cfg(test)]` module
-            // boundary would trivially match itself.
             let production_code = contents
                 .split_once("#[cfg(test)]")
                 .map(|(before, _)| before)

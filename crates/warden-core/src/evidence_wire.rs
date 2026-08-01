@@ -1,11 +1,5 @@
-//! Wire form of [`EvidenceRow`] for crossing the `warden` -> `warden-gated`
-//! process boundary (issue #15 review, M2): `run-tail`'s `--evidence-json`
-//! CLI argument. `EvidenceRow`/`EvidenceType` don't derive
-//! `Serialize`/`Deserialize` (mirrors the `source`/`severity` wire
-//! convention `ci_channel::CiFindingWire` already uses) so this is the
-//! validated string-based wire shape, re-parsed into a real `EvidenceType`
-//! at receipt -- never trusted as-is (code-standards.md: "valider toute
-//! entrée externe ... à la frontière").
+//! Wire form of [`EvidenceRow`] for crossing the `warden` -> `warden-gated` process boundary: `run-
+//! tail`'s `--evidence-json` CLI argument.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +35,8 @@ impl EvidenceRowWire {
     }
 }
 
-/// Serializes `rows` to the exact wire form [`parse_evidence_rows`] parses
-/// back -- one JSON array, suitable for a single CLI argument.
+/// Serializes `rows` to the exact wire form [`parse_evidence_rows`] parses back -- one JSON array,
+/// suitable for a single CLI argument.
 pub fn serialize_evidence_rows(rows: &[EvidenceRow]) -> Result<String> {
     let wire: Vec<EvidenceRowWire> = rows
         .iter()
@@ -53,9 +47,6 @@ pub fn serialize_evidence_rows(rows: &[EvidenceRow]) -> Result<String> {
 }
 
 /// Parses a `--evidence-json` argument into validated [`EvidenceRow`]s.
-/// Malformed JSON or an unknown `evidence_type` is a typed error, never
-/// silently dropped or partially trusted -- an empty array (`"[]"`, the CLI
-/// default) parses to an empty `Vec`, not an error.
 pub fn parse_evidence_rows(raw: &str) -> Result<Vec<EvidenceRow>> {
     let wire: Vec<EvidenceRowWire> = serde_json::from_str(raw)
         .map_err(|error| CoreError::MalformedEvidenceRows(error.to_string()))?;

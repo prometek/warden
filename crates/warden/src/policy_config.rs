@@ -1,38 +1,4 @@
-//! Declarative policy configuration: `<repo>/.warden/policy.yaml` (issue #51,
-//! ADR-0016).
-//!
-//! Mirrors `crate::hook_config::load_repo_hooks`'s own shape exactly: reads
-//! the repo's policy file (I/O -- `warden_policy` itself never touches the
-//! filesystem, see its own docs), parses it via
-//! `warden_policy::RuleSet::from_yaml`, and decides that an **absent** file
-//! means "no rules" while a **malformed** one is a hard error.
-//!
-//! ```yaml
-//! rules:
-//!   - action: git_push
-//!     branch: main
-//!     require: [tests, review]
-//!   - action: shell
-//!     deny: ["rm -rf /"]
-//! ```
-//!
-//! # Trust model
-//!
-//! `.warden/policy.yaml` lives **in the target repo**, exactly like
-//! `.warden/hooks.toml` (`crate::hook_config`'s own docs) and
-//! `.warden/agents/coder.md` -- honoured **by default**, no opt-in flag. A
-//! repo whose policy you have not read still applies before you run it, the
-//! same trust boundary every other `.warden/` convention file already
-//! carries.
-//!
-//! # Failure handling
-//!
-//! A present-but-broken file (malformed YAML, an unknown top-level key, an
-//! unknown `action`) is a hard [`WardenError::PolicyConfig`], never silently
-//! ignored (code-standards.md: "no silent fallback") -- a typo in a rule
-//! must not quietly leave a run with no governance at all. An absent file
-//! yields [`warden_policy::RuleSet::empty`] (no rules; every action is
-//! allowed, the same no-op an empty `HookRegistry` already is).
+//! Declarative policy configuration: `<repo>/.warden/policy.yaml`.
 
 use std::path::Path;
 
@@ -43,9 +9,7 @@ fn policy_file_path(repo_path: &Path) -> std::path::PathBuf {
     repo_path.join(".warden").join("policy.yaml")
 }
 
-/// Reads the exact policy document selected for a run. Keeping these bytes
-/// separate from parsing lets a quota checkpoint persist and later parse the
-/// same policy rather than consulting a mutable repository.
+/// Reads the exact policy document selected for a run.
 pub fn read_repo_policy(repo_path: &Path) -> Result<Option<String>> {
     let path = policy_file_path(repo_path);
     match std::fs::read_to_string(&path) {
@@ -58,8 +22,7 @@ pub fn read_repo_policy(repo_path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Parses an already-resolved policy document. `None` is the durable form of
-/// an absent file and therefore yields the empty rule set.
+/// Parses an already-resolved policy document.
 pub fn parse_repo_policy(
     repo_path: &Path,
     contents: Option<&str>,
@@ -76,8 +39,6 @@ pub fn parse_repo_policy(
 }
 
 /// Loads `<repo_path>/.warden/policy.yaml` into a [`warden_policy::RuleSet`].
-/// An absent file yields [`warden_policy::RuleSet::empty`]; a malformed one
-/// is a [`WardenError::PolicyConfig`].
 pub fn load_repo_policy(repo_path: &Path) -> Result<warden_policy::RuleSet> {
     let contents = read_repo_policy(repo_path)?;
     parse_repo_policy(repo_path, contents.as_deref())

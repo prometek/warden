@@ -1,12 +1,4 @@
 //! Independent, read-only view of the SQLite database written by `warden`.
-//!
-//! Deliberately **duplicated** from (rather than importing) `warden`'s own
-//! `db.rs` -- same rationale `warden_gated::db` already documents
-//! (Architecture.md §13, ADR-0006): `warden-tui` must never inherit a bug in
-//! `warden`'s own query/parsing logic, and the two crates only share
-//! `warden-core` (types), never each other's I/O code. `warden` is the sole
-//! writer (code-standards.md, "SQLite & sqlx") -- this module only ever
-//! opens the database read-only and never runs migrations.
 
 use std::path::Path;
 use std::time::Duration;
@@ -20,13 +12,11 @@ use warden_core::{
 
 use crate::error::{Result, TuiError};
 
-/// Matches `warden::db`'s own busy timeout: this read-only connection can
-/// still contend with `warden`'s writer under WAL.
+/// Matches `warden::db`'s own busy timeout: this read-only connection can still contend with
+/// `warden`'s writer under WAL.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Opens `db_path` strictly **read-only**. Fails loudly rather than
-/// creating the file -- an absent database means a misconfigured path or a
-/// `warden` that has never run, never a case to silently paper over.
+/// Opens `db_path` strictly **read-only**.
 pub async fn connect_read_only(db_path: &Path) -> Result<SqlitePool> {
     if !db_path.exists() {
         return Err(TuiError::DatabaseNotFound(db_path.to_path_buf()));
@@ -41,13 +31,7 @@ pub async fn connect_read_only(db_path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// The subset of a `runs` row the TUI header needs to render. Re-read from
-/// SQLite on demand, never trusted from a cached value that might have
-/// drifted (same discipline `warden_gated::db::GateRunView` follows).
-///
-/// Issue #43/ADR-0014: `max_cycles`/`current_cycle` are gone, replaced by two
-/// independent per-phase budgets/counters -- see
-/// `crates/warden/migrations/0007_phase_budgets.sql`.
+/// The subset of a `runs` row the TUI header needs to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunView {
     pub id: String,
@@ -107,16 +91,7 @@ struct EventRow {
     created_at: String,
 }
 
-/// Validates one row's `event_type`/`payload_json` into a
-/// [`RunEventHistoryEntry`] -- infallible (issue #58): a row that fails to
-/// decode/validate becomes an explicit `Undecodable` marker rather than an
-/// `Err`, so one bad row (e.g. an event-payload reshape that shipped without
-/// a migration rewriting existing rows) never fails
-/// [`list_events_for_run`]'s whole query and takes out the rest of the run's
-/// history with it (code-standards.md: "no silent fallback, no
-/// symptom-masking guards" -- the row is never silently dropped either).
-/// Mirrors `warden::db::row_to_history_entry` exactly (independently
-/// re-implemented, per this module's doc comment).
+/// Validates one row's `event_type`/`payload_json` into a [`RunEventHistoryEntry`].
 fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
     let reason = match EventKind::parse(&row.event_type) {
         Ok(declared_kind) => match serde_json::from_str::<RunEvent>(&row.payload_json) {
@@ -144,15 +119,8 @@ fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
     })
 }
 
-/// Every event recorded for `run_id`, oldest first -- the history a late
-/// attach replays before switching to the live socket stream
-/// (Architecture.md §5.4). Mirrors `warden::db::list_events_for_run`
-/// exactly (independently re-implemented, per this module's doc comment).
-///
-/// Issue #58: a row that can't be decoded/validated is returned as a typed
-/// [`RunEventHistoryEntry::Undecodable`] entry, never dropped and never a
-/// reason for the whole query to fail -- only a genuine query/connection
-/// error (`?` below) still does that.
+/// Every event recorded for `run_id`, oldest first -- the history a late attach replays before
+/// switching to the live socket stream (Architecture.md §5.4).
 pub async fn list_events_for_run(
     pool: &SqlitePool,
     run_id: &str,
@@ -188,9 +156,6 @@ mod tests {
         assert!(matches!(result, Err(TuiError::DatabaseNotFound(_))));
     }
 
-    /// Sets up a real SQLite file with the two tables this crate reads,
-    /// via a plain `CREATE TABLE` (this crate must not depend on `warden`'s
-    /// migrations either, same reasoning as `warden_gated::db`'s tests).
     async fn seed_db(dir: &Path) -> (std::path::PathBuf, SqlitePool) {
         let db_path = dir.join("state.db");
         let write_options = WriteOptions::new()
@@ -325,12 +290,6 @@ mod tests {
         assert_eq!(ids, vec!["event-a", "event-b"]);
     }
 
-    /// code-standards.md: "toute ligne relue est reparsée en type Rust
-    /// fort" -- a row whose `event_type` column disagrees with what its own
-    /// `payload_json` decodes to must never be silently trusted as
-    /// whichever of the two the reader happens to pick. Issue #58: this must
-    /// no longer fail the whole query -- it's surfaced as a typed
-    /// `Undecodable` entry instead.
     #[tokio::test]
     async fn mismatched_event_type_and_payload_kind_is_an_undecodable_entry_not_a_failed_query() {
         let dir = TempDir::new().unwrap();
@@ -371,11 +330,6 @@ mod tests {
         }
     }
 
-    /// Issue #58 acceptance: a run whose history includes one row with
-    /// malformed `payload_json` *and* one row with a kind-mismatched
-    /// `event_type` must still return the full history -- the good events
-    /// intact, both bad rows surfaced as typed `Undecodable` markers, never
-    /// dropped and never a reason for the whole query to fail.
     #[tokio::test]
     async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_every_good_event() {
         let dir = TempDir::new().unwrap();
@@ -414,9 +368,6 @@ mod tests {
             "2026-07-12T00:00:00+00:00",
         )
         .await;
-        // Malformed `payload_json` -- not even valid JSON for any `RunEvent`
-        // variant (simulates a reshape that changed the payload shape
-        // without a rewrite migration, issue #58's own motivating scenario).
         insert(
             "event-malformed",
             "cycle_started",
@@ -424,7 +375,6 @@ mod tests {
             "2026-07-12T00:00:01+00:00",
         )
         .await;
-        // Kind-mismatched row: valid JSON, but for the wrong `event_type`.
         insert(
             "event-mismatched",
             "run_finished",
@@ -483,13 +433,6 @@ mod tests {
         ));
     }
 
-    /// Issue #58 test gap: an `event_type` column this binary's own
-    /// [`EventKind::parse`] doesn't recognize at all must decode as
-    /// [`UndecodableReason::UnknownEventType`] specifically -- distinct from
-    /// `PayloadDeserialize`/`KindMismatch`, which both require `event_type`
-    /// to parse successfully first. Mirrors the same scenario covered in
-    /// `warden::db`'s own tests, since this module's `row_to_history_entry`
-    /// is an independent re-implementation (this module's own doc comment).
     #[tokio::test]
     async fn unrecognized_event_type_column_is_an_unknown_event_type_undecodable_entry() {
         let dir = TempDir::new().unwrap();
@@ -525,11 +468,6 @@ mod tests {
         }
     }
 
-    /// Issue #58's own motivating real-world scenario, issue #26's reshape:
-    /// a `UntrustedAgentDefinitionUsed` row persisted *before* that issue
-    /// added `canonical_path` has no such key in its `payload_json` at all
-    /// -- must decode as `Undecodable`, not panic or fabricate a value.
-    /// Mirrors `warden::db`'s own coverage of this exact scenario.
     #[tokio::test]
     async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_path_is_undecodable(
     ) {
@@ -567,11 +505,6 @@ mod tests {
         }
     }
 
-    /// Issue #58's own motivating real-world scenario, issue #43's reshape:
-    /// a `RunStarted` row persisted before that issue split the single
-    /// `max_cycles` field into `max_review_cycles`/`max_test_cycles` has
-    /// neither of the two new keys. Mirrors `warden::db`'s own coverage of
-    /// this exact scenario.
     #[tokio::test]
     async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_undecodable() {
         let dir = TempDir::new().unwrap();
@@ -609,9 +542,6 @@ mod tests {
         }
     }
 
-    /// Issue #58 test gap: a run whose *every* row is undecodable must still
-    /// return the full set (none dropped), not fail, and not be
-    /// indistinguishable from a run with no events at all.
     #[tokio::test]
     async fn history_where_every_row_is_undecodable_returns_all_of_them() {
         let dir = TempDir::new().unwrap();
@@ -668,19 +598,12 @@ mod tests {
         assert_eq!(ids, vec!["event-1-unknown-kind", "event-2-malformed"]);
     }
 
-    /// Issue #58 test gap: two rows sharing the exact same `created_at` --
-    /// one decodable, one not -- must still come back in a stable,
-    /// deterministic order (`id` ASC as the tiebreaker), regardless of which
-    /// of the two is undecodable.
     #[tokio::test]
     async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by_id() {
         let dir = TempDir::new().unwrap();
         let (db_path, write_pool) = seed_db(dir.path()).await;
         let same_timestamp = "2026-07-12T00:00:00+00:00";
 
-        // "event-a" (undecodable) sorts before "event-b" (decoded) by id --
-        // inserted in the opposite order here to prove the ordering comes
-        // from the SQL `ORDER BY`, not insertion order.
         sqlx::query(
             "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
         )

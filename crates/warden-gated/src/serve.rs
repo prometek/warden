@@ -1,9 +1,3 @@
-//! The long-running `warden-gated serve` daemon: accepts relayed
-//! `post-receive` payloads over a Unix socket, and for every ref update
-//! they contain, independently re-verifies the run via the read-only
-//! database before ever touching `origin` (ADR-0002/ADR-0006). This is the
-//! only place `origin`'s credentials are exercised in the whole workspace.
-
 use std::path::PathBuf;
 
 use sqlx::SqlitePool;
@@ -18,11 +12,10 @@ use crate::verify::GateDecision;
 
 /// Static configuration for one `serve` invocation.
 pub struct ServeConfig {
-    /// Unix socket the `notify` relay (invoked from the `post-receive`
-    /// hook) connects to.
+    /// Unix socket the `notify` relay (invoked from the `post-receive` hook) connects to.
     pub socket_path: PathBuf,
-    /// `warden`'s SQLite database, opened **read-only** (never created,
-    /// never migrated by this crate).
+    /// `warden`'s SQLite database, opened **read-only** (never created, never migrated by this
+    /// crate).
     pub db_path: PathBuf,
     /// The local bare gate repo `warden` pushes converged runs into.
     pub bare_repo_path: PathBuf,
@@ -30,12 +23,6 @@ pub struct ServeConfig {
     pub target_branch: String,
 }
 
-/// Runs the accept loop forever (until the process is killed/stopped by its
-/// managed service, e.g. systemd/launchd -- see `contrib/`). Each accepted
-/// connection is handled to completion before the next `accept()`: hook
-/// invocations are not expected to overlap in practice (one push at a
-/// time), and serializing them keeps the re-verification/push sequence for
-/// a given payload atomic with respect to other notifications.
 pub async fn serve(config: ServeConfig) -> Result<()> {
     let pool = db::connect_read_only(&config.db_path).await?;
     let listener = relay::bind(&config.socket_path).await?;
@@ -59,14 +46,8 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
     }
 }
 
-/// Processes one relayed payload (one or more `post-receive` lines): each
-/// line is re-verified and, if authorized, pushed independently. A single
-/// malformed line, or a single line whose re-verification/push fails, is
-/// logged and **skipped** rather than aborting the rest of the batch -- a
-/// multi-ref push could legitimately contain one bad ref alongside a good
-/// one, and a boundary-validation failure on untrusted input must never
-/// take down otherwise-valid work (code-standards.md: "valider ... à la
-/// frontière", not "tout annuler à la moindre entrée invalide").
+/// Processes one relayed payload (one or more `post-receive` lines): each line is re-verified and,
+/// if authorized, pushed independently.
 async fn handle_payload(pool: &SqlitePool, config: &ServeConfig, payload: &str) {
     for line in payload.lines().filter(|line| !line.trim().is_empty()) {
         if let Err(error) = handle_push_notification_line(pool, config, line).await {
@@ -75,8 +56,8 @@ async fn handle_payload(pool: &SqlitePool, config: &ServeConfig, payload: &str) 
     }
 }
 
-/// Re-verifies and, if authorized, pushes the single ref update described by
-/// one `post-receive` line.
+/// Re-verifies and, if authorized, pushes the single ref update described by one `post-receive`
+/// line.
 async fn handle_push_notification_line(
     pool: &SqlitePool,
     config: &ServeConfig,
@@ -124,10 +105,6 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    /// Sets up: a real temp SQLite db seeded with one run row, a bare gate
-    /// repo containing `commit_sha` reachable from `refs/heads/<branch>`,
-    /// and a fake local `origin` repo the gate can push to without network
-    /// access.
     async fn test_fixture(
         state: RunState,
         converged_commit_sha: Option<&str>,
@@ -188,9 +165,6 @@ mod tests {
                 ".",
             ],
         );
-        // `git clone --bare` already sets up an `origin` remote pointing at
-        // its source (the seed repo); repoint it at the fake `origin` repo
-        // instead of `remote add`, which would fail with "already exists".
         run_git(
             gate_repo.path(),
             &[
@@ -204,12 +178,6 @@ mod tests {
         (db_dir, origin, gate_repo, db_path, commit_sha)
     }
 
-    /// Acceptance criterion 1 (issue #3): even though the relayed
-    /// notification names the exact commit that (in the fixture) is
-    /// physically present in the bare gate repo, the run is genuinely
-    /// `CoderRunning` in the real SQLite -- simulating `warden` believing
-    /// (or asserting) convergence while the ground truth disagrees. No push
-    /// must reach `origin`.
     #[tokio::test]
     async fn handle_payload_blocks_the_push_when_the_real_run_state_is_not_converged() {
         let (_db_dir, origin, gate_repo, db_path, commit_sha) =
@@ -226,7 +194,6 @@ mod tests {
         let payload = format!("0000000 {commit_sha} refs/heads/warden-run/run-1\n");
         handle_payload(&pool, &config, &payload).await;
 
-        // `origin` must still have no `main` ref at all -- nothing was pushed.
         let output = SyncCommand::new("git")
             .current_dir(origin.path())
             .args(["rev-parse", "--verify", "refs/heads/main"])
@@ -243,9 +210,6 @@ mod tests {
         let (_db_dir, origin, gate_repo, db_path, commit_sha) =
             test_fixture(RunState::Converged, None).await;
 
-        // The fixture doesn't know its own commit sha ahead of time (it's
-        // computed while building the gate repo), so patch it into the
-        // seeded row now that we have it.
         let pool = db::connect_read_only(&db_path).await.unwrap();
         {
             let write_options = SqliteConnectOptions::new().filename(&db_path);
@@ -280,11 +244,6 @@ mod tests {
         assert_eq!(origin_head, commit_sha);
     }
 
-    /// LOW finding (issue #3 review): a malformed line earlier in the same
-    /// payload must not prevent a legitimate, later line from still being
-    /// processed -- a multi-ref push could contain one bad ref alongside a
-    /// good one, and boundary-validation failures are per-line, not
-    /// batch-wide.
     #[tokio::test]
     async fn a_malformed_line_does_not_prevent_a_later_valid_line_from_being_pushed() {
         let (_db_dir, origin, gate_repo, db_path, commit_sha) =
@@ -312,8 +271,6 @@ mod tests {
             target_branch: "main".to_string(),
         };
 
-        // First line is deliberately malformed (wrong ref prefix); second
-        // line is the real, valid, converged notification.
         let payload = format!(
             "old111 new222 refs/heads/not-a-warden-ref\n0000000 {commit_sha} refs/heads/warden-run/run-1\n"
         );

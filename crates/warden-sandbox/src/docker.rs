@@ -1,88 +1,5 @@
-//! [`DockerSandbox`]: containerised execution isolation (issue #49,
-//! ADR-0015/ADR-0019) -- the second [`crate::Sandbox`] backend, alongside
-//! [`crate::LocalSandbox`]'s host-process parity default. Where `LocalSandbox`
-//! is "the same isolation warden always applied, given a name", `DockerSandbox`
-//! actually changes what an agent's own process can reach: it runs inside a
-//! container, with nothing of the host mounted in except what this module
-//! documents below.
-//!
-//! # What is mounted, and why (locked decisions, not open questions)
-//!
-//! - **The role's own worktree** (`SandboxSpec::cwd`), host-absolute path,
-//!   bind-mounted **at the same absolute path** inside the container, `-w`
-//!   pointed at it. Read-write: it is the one place this invocation is
-//!   meant to write.
-//! - **The base repo's `.git` directory** (`DockerConfig::repo_path` joined
-//!   with `.git`), also bind-mounted at its own host-absolute path,
-//!   **read-write**. A git *worktree*'s own `.git` is a one-line file, not a
-//!   directory -- `gitdir: <absolute path into the parent repo's
-//!   .git/worktrees/<id>>` -- so every git operation inside the worktree
-//!   resolves that absolute pointer first. Mounting only the worktree and
-//!   leaving that pointer dangling would make `git status`/`git diff`/`git
-//!   commit` fail the moment they touch anything beyond the worktree's own
-//!   checked-out files. Mounting the parent `.git` at the *identical* host
-//!   path makes the pointer resolve inside the container exactly as it does
-//!   on the host, with no path rewriting anywhere.
-//! - **The host's `~/.claude` directory, read-only**, at
-//!   `<container_home>/.claude` -- the *only* host path mounted for
-//!   authentication. This is a deliberate narrowing of issue #49's literal
-//!   "no HOME mount at all": `claude` needs to find its own login state
-//!   somewhere, and the alternative (no auth at all, `docker run` failing
-//!   every invocation) is a worse outcome than mounting the one directory
-//!   that carries it, read-only. `~/.ssh`, `~/.aws`, `~/.config/gh`, any
-//!   `.env`, or the rest of the host's real `$HOME` are **never** mounted --
-//!   issue #25's guarantee (no ambient git/cloud credentials reachable by an
-//!   agent) holds for anything reachable *from inside the container*, since
-//!   none of those paths exist there by any name.
-//!
-//! # The rw `.git` mount and host-side git hooks (issue #49 review, HIGH)
-//!
-//! Hooks live in the *common* git dir, shared by the main repo and every one
-//! of its worktrees. Because the base repo's `.git` above is mounted
-//! **read-write**, a contained agent could write `.git/hooks/pre-push`,
-//! `post-checkout`, `reference-transaction`, etc. and have it run **on the
-//! host** -- as the host user, with real credentials -- the next time
-//! `warden` itself (never the agent) runs a git command against that same
-//! repo (a converged run's `git push` to the local gate repo, a
-//! `git worktree add` for the next role, an evidence commit). That would
-//! defeat issue #25's guarantee entirely on the host side, no matter how
-//! tight this module's own container-side mounts are. Every such host-side
-//! invocation passes `warden::git_util::NO_HOST_HOOKS` -- see that module's
-//! own docs (crate `warden`, not this one: the host-side git invocations
-//! this vector is about are `warden`'s, not `warden-sandbox`'s) for the full
-//! reasoning and the exact call sites.
-//!
-//! # Network: default bridge, no egress filtering yet (accepted v1 limit)
-//!
-//! No `--network` flag is passed -- the container gets Docker's normal
-//! default bridge network, so the Anthropic API `claude` itself calls stays
-//! reachable. `git push origin` still fails by construction (issue #28's
-//! guarantee): no ssh key, no `~/.config/gh`, no git credential helper is
-//! ever mounted or configured, so there is simply nothing for `git` to
-//! authenticate a push with, regardless of network reachability. Filtering
-//! *egress* itself (so a compromised/malicious agent process couldn't reach
-//! arbitrary hosts even if it somehow obtained credentials some other way)
-//! is explicitly deferred past v1 -- see ADR-0019.
-//!
-//! # Container home: fixed at `/root`
-//!
-//! [`CONTAINER_HOME`] is `/root` (the default `docker run` user for an
-//! unmodified base image) -- used consistently for `-e HOME=`, the `.claude`
-//! mount target, and (indirectly) for whichever allowlisted `USER` value is
-//! forwarded. `HOME` is **always** set to this, overriding whatever the
-//! adapter's `env_allowlist` would otherwise forward for it (a host `HOME`
-//! value would point nowhere useful inside the container, and would not be
-//! where `.claude` is mounted) -- see [`resolve_forwarded_env`].
-//!
-//! # Crash recovery still pid-based (known, pre-existing limit)
-//!
-//! [`Execution::pid`] is the *docker client's* own host pid, not the
-//! container's -- `ADR-0015` already flagged this as the one seam #49 would
-//! need to reopen properly: recovering a crashed run currently kills a host
-//! pid, which cannot reach a container. This issue does not fix that; it
-//! only makes sure [`Sandbox::destroy`] (the mechanism a real fix would sit
-//! on top of) reliably removes the container by name, on every teardown
-//! path this crate controls.
+//! [`DockerSandbox`]: containerised execution isolation -- the second [`crate::Sandbox`] backend,
+//! alongside [`crate::LocalSandbox`]'s host-process parity default.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -97,48 +14,20 @@ use crate::drain::drain_and_wait;
 use crate::error::{Result, SandboxError};
 use crate::{Command, ExecuteOptions, Execution, ExecutionResult, Sandbox, SandboxId, SandboxSpec};
 
-/// The `docker` CLI binary, resolved via `PATH` -- same convention
-/// [`crate::LocalSandbox`] uses for the agent's own `command.program`.
+/// The `docker` CLI binary, resolved via `PATH` -- same convention [`crate::LocalSandbox`] uses for
+/// the agent's own `command.program`.
 const DOCKER_BIN: &str = "docker";
 
-/// Fixed container home -- see this module's own docs for why this is a
-/// single constant rather than something derived per-invocation.
 const CONTAINER_HOME: &str = "/root";
 
-/// What every [`DockerSandbox::execute`] call needs beyond the per-command
-/// [`Command`] itself: the image to run, and the two host paths this
-/// backend's mounts are built from. Constructed once per `warden run`
-/// invocation (issue #49's `--isolation docker`) -- `repo_path` is the run's
-/// *base* repository (never a role's own worktree, which arrives per-call
-/// via [`SandboxSpec::cwd`]), so its `.git` directory can be resolved once
-/// here rather than threaded through every [`Sandbox::execute`] call.
+/// What every [`DockerSandbox::execute`] call needs beyond the per-command [`Command`] itself: the
+/// image to run, and the two host paths this backend's mounts are built from.
 pub struct DockerConfig {
-    /// The image every container runs -- must already contain `git` and
-    /// whatever CLI the run's `--tool` adapter execs (e.g. `claude`); see
-    /// `crates/warden-sandbox/docker/Dockerfile` for the reference image
-    /// this crate is validated against.
     pub image: String,
-    /// The run's base repository (`RunConfig::repo_path`) -- its `.git`
-    /// directory is what gets bind-mounted alongside each role's own
-    /// worktree, so worktree-relative git pointers resolve inside the
-    /// container (see this module's own docs).
     pub repo_path: PathBuf,
-    /// Host path to the Claude Code login/config directory (normally
-    /// `~/.claude`) -- bind-mounted read-only into every container as the
-    /// sole source of authentication (see this module's own docs). Resolved
-    /// by the caller (`warden`'s CLI), not by this crate, so a missing
-    /// `HOME` is the caller's own `--warden-home`-style error, not a
-    /// sandbox-layer one.
     pub claude_config_dir: PathBuf,
 }
 
-/// [`Sandbox`] backed by `docker run --rm` -- see this module's own docs for
-/// the exact mount/network/auth shape and the limits accepted for v1.
-/// Bookkeeping-only `create`/`destroy` bind an id to a `cwd` exactly like
-/// [`crate::LocalSandbox`]; unlike Local, the id doubles as the actual
-/// `docker run --name` this backend passes, since there is no separate
-/// `docker create` step to mint a daemon-assigned container id from (each
-/// [`DockerSandbox::execute`] is a single, self-contained `docker run --rm`).
 pub struct DockerSandbox {
     config: DockerConfig,
     sandboxes: Mutex<HashMap<SandboxId, PathBuf>>,
@@ -165,11 +54,6 @@ impl DockerSandbox {
 #[async_trait]
 impl Sandbox for DockerSandbox {
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId> {
-        // Issue #49: the id *is* the `docker run --name` this backend uses
-        // (see this type's own docs) -- prefixed so `docker ps -a`/`docker
-        // rm -f` output is identifiable as warden's own, the same
-        // expectation the issue's own acceptance criteria (no leftover
-        // `warden-*` containers) are phrased against.
         let id = SandboxId::new(format!("warden-{}", uuid::Uuid::new_v4()));
         self.sandboxes
             .lock()
@@ -226,12 +110,6 @@ impl Sandbox for DockerSandbox {
         })?;
         let pid = child.id();
 
-        // Issue #49: `pid` is `docker run`'s own client process, the host
-        // pid `Execution::pid` has always meant for `LocalSandbox` too --
-        // see this module's own docs on why crash recovery against it
-        // cannot reach the container this client is proxying, and why that
-        // is an accepted, pre-existing limit rather than something this
-        // issue fixes.
         let program_label = format!("docker (container {container_name})");
         let stdin_payload = command.stdin;
         let cancel = options.cancel;
@@ -258,27 +136,12 @@ impl Sandbox for DockerSandbox {
             .remove(&id)
             .is_some();
         if !removed {
-            // Same "already gone is not an error" convention
-            // `warden::process::kill_pid`/`LocalSandbox::destroy` use --
-            // nothing left to tear down.
             return Ok(());
         }
         remove_container(&id.to_string()).await
     }
 }
 
-/// Wraps the shared [`drain_and_wait`] with the one piece of cleanup only a
-/// container backend needs: killing the local `docker run` client
-/// (`drain_and_wait`'s own cancel branch, via `child.kill()`) does **not**
-/// stop the daemon-side container -- `--rm` only removes a container once it
-/// exits on its own, and a killed client leaves it running, detached, on the
-/// daemon. On the cancelled path (and only that path -- a normal exit is
-/// already reaped by `--rm`), this best-effort force-removes the container
-/// by name right away, rather than relying solely on
-/// `warden::orchestrator::SandboxGuard`'s own, always-run `Sandbox::destroy`
-/// call to catch it later (issue #49: a cancelled execution must never leave
-/// a container running even for the window before that guard's `destroy`
-/// resolves).
 async fn drain_and_wait_with_container_cleanup(
     child: Child,
     program: String,
@@ -293,18 +156,6 @@ async fn drain_and_wait_with_container_cleanup(
     }
     let result = result?;
 
-    // Issue #49 review, MEDIUM: `docker run` reserves exit code 125 for a
-    // failure of the `docker` client/daemon itself (daemon unreachable,
-    // image missing, invalid flags) -- never for whatever ran *inside* the
-    // container, which exits through this same path with its own code. Left
-    // unclassified, this surfaced downstream as an ordinary (if puzzling)
-    // agent failure -- "produced no parseable output", with the real reason
-    // buried in a stderr nobody inspected -- instead of the actionable,
-    // typed error a daemon-down/image-missing case deserves (image-missing
-    // in particular is the most likely first-run error, since the image is
-    // hand-built, not published anywhere). See
-    // [`classify_docker_startup_failure`]'s own docs for why exit code
-    // alone is not enough to make this call.
     if let Some(reason) = classify_docker_startup_failure(result.exit_code, &result.stderr) {
         return Err(SandboxError::DockerUnavailable { reason });
     }
@@ -312,15 +163,8 @@ async fn drain_and_wait_with_container_cleanup(
     Ok(result)
 }
 
-/// Distinguishes a `docker run` startup failure (daemon down, image
-/// missing) from a normal -- if non-zero -- exit of whatever ran *inside*
-/// the container. Exit code 125 alone is not a reliable enough signal on
-/// its own: nothing stops a contained process from legitimately choosing to
-/// exit with 125 for its own reasons, and that outcome must still reach the
-/// caller as a normal [`ExecutionResult`], not a fabricated
-/// [`SandboxError::DockerUnavailable`]. Corroborating against `docker`'s own
-/// stderr markers (verified directly against real `docker run`, issue #49
-/// review) keeps this specific to an actual client/daemon-level failure.
+/// Distinguishes a `docker run` startup failure (daemon down, image missing) from a normal -- if
+/// non-zero -- exit of whatever ran *inside* the container.
 fn classify_docker_startup_failure(exit_code: i32, stderr: &str) -> Option<String> {
     if exit_code != 125 {
         return None;
@@ -342,10 +186,6 @@ fn classify_docker_startup_failure(exit_code: i32, stderr: &str) -> Option<Strin
     None
 }
 
-/// Best-effort `docker rm -f` for the cancellation cleanup path above --
-/// deliberately never fails the execution it's called from (the caller is
-/// already returning `SandboxError::Cancelled`; a cleanup failure on top of
-/// that is logged, not compounded into a second error).
 async fn force_remove_container(container_name: &str) {
     let output = tokio::process::Command::new(DOCKER_BIN)
         .args(["rm", "-f", container_name])
@@ -354,9 +194,6 @@ async fn force_remove_container(container_name: &str) {
         .await;
     match output {
         Ok(output) if output.status.success() => {}
-        // Same benign race as `remove_container` -- see
-        // `is_benign_removal_race`'s own docs. Not worth even a `debug!`
-        // here: this is the expected shape on a clean cancellation.
         Ok(output) if is_benign_removal_race(&String::from_utf8_lossy(&output.stderr)) => {}
         Ok(output) => {
             tracing::warn!(
@@ -372,15 +209,6 @@ async fn force_remove_container(container_name: &str) {
     }
 }
 
-/// `docker rm -f <name>`, idempotent: "No such container" (the container
-/// already exited and `--rm` already reaped it, or was already destroyed) is
-/// not an error -- the same "already gone is not an error" convention
-/// [`crate::error::SandboxError::UnknownSandbox`]'s own docs and
-/// `warden::process::kill_pid` both use. Any other failure (daemon
-/// unreachable, permission denied) is a real, typed
-/// [`SandboxError::DockerUnavailable`] -- surfaced to
-/// `warden::orchestrator::SandboxGuard::destroy`'s own caller, which already
-/// logs (rather than fails the run on) a teardown failure.
 async fn remove_container(container_name: &str) -> Result<()> {
     let output = tokio::process::Command::new(DOCKER_BIN)
         .args(["rm", "-f", container_name])
@@ -402,30 +230,12 @@ async fn remove_container(container_name: &str) -> Result<()> {
     })
 }
 
-/// Whether `docker rm -f`'s stderr indicates there is nothing left to do,
-/// rather than a real failure -- the same "already gone is not an error"
-/// convention [`crate::error::SandboxError::UnknownSandbox`]'s own docs and
-/// `warden::process::kill_pid` both use. Two distinct benign cases (issue
-/// #49 review, LOW): "No such container" (already fully gone -- `--rm`
-/// already reaped it, or a prior `destroy` already ran), and "already in
-/// progress"/"is being removed" (`--rm`'s own async removal is racing this
-/// exact call on the happy path -- `docker rm -f` reliably reports this
-/// verbatim wording when it loses that race, verified directly against real
-/// `docker`, issue #49 review). Both mean the container is going away (or
-/// gone) regardless of what this call does.
 fn is_benign_removal_race(stderr: &str) -> bool {
     stderr.contains("No such container")
         || stderr.contains("already in progress")
         || stderr.contains("is being removed")
 }
 
-/// Resolves `env_allowlist` against this process's own environment,
-/// mirroring `LocalSandbox::execute`'s identical resolution loop one-for-one
-/// (a missing variable is `tracing::warn!`ed, not fatal -- the tool's own
-/// error downstream is more actionable than a fabricated one here). `HOME`
-/// is always skipped: [`CONTAINER_HOME`] is what `-e HOME=` is unconditionally
-/// set to (see this module's own docs), regardless of whether `HOME` is even
-/// in `env_allowlist` or what this process's own `HOME` resolves to.
 fn resolve_forwarded_env(env_allowlist: &[String], program: &str) -> Vec<(String, String)> {
     env_allowlist
         .iter()
@@ -445,13 +255,7 @@ fn resolve_forwarded_env(env_allowlist: &[String], program: &str) -> Vec<(String
         .collect()
 }
 
-/// Resolves a host path this backend needs to bind-mount to its canonical,
-/// absolute form -- a relative or symlinked path would otherwise produce a
-/// `--mount` whose host side does not match what git/the worktree actually
-/// resolve to. Any failure here (path does not exist, permission denied) is
-/// a configuration problem, not a docker daemon one -- typed as
-/// [`SandboxError::DockerUnavailable`] rather than `Spawn`/`Wait`, neither of
-/// which fits a failure that happens before anything is even spawned.
+/// Resolves a host path this backend needs to bind-mount to its canonical, absolute form.
 fn canonicalize_host_path(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .map_err(|source| SandboxError::DockerUnavailable {
@@ -462,13 +266,6 @@ fn canonicalize_host_path(path: &Path) -> Result<PathBuf> {
         })
 }
 
-/// Pure `docker run` argv construction, split out of
-/// [`DockerSandbox::execute`] so the exact flag/mount shape is unit-testable
-/// without a daemon (this crate's own testing convention -- see
-/// [`crate::LocalSandbox`]'s tests, which need no daemon either).
-/// `forwarded_env` is already resolved (host env lookups are
-/// [`resolve_forwarded_env`]'s job) -- this function only ever formats
-/// strings, no I/O of its own.
 #[allow(clippy::too_many_arguments)]
 fn build_docker_run_argv(
     container_name: &str,
@@ -500,26 +297,6 @@ fn build_docker_run_argv(
         "-e".to_string(),
         format!("HOME={container_home}"),
         // Neutralise git's "dubious ownership" guard *inside the container*.
-        // The worktree and `.git` are bind-mounted from the host, where they
-        // are owned by the host user (uid != 0); the container runs git as
-        // root. Without this, every git command the agent runs in the mounted
-        // worktree aborts with `fatal: detected dubious ownership` (exit 128)
-        // -- reproducible only on Linux, since Docker Desktop for macOS remaps
-        // bind-mount ownership so the mismatch never surfaces there.
-        //
-        // `safe.directory=*` (rather than the exact mounted paths) is the
-        // correct scope here: a linked worktree makes git check ownership of
-        // three separate directories -- the worktree itself, its gitdir
-        // (`<repo>/.git/worktrees/<id>`, whose `<id>` is dynamic), and the
-        // common dir (`<repo>/.git`) -- and `safe.directory` matches by exact
-        // path or `*`, never by prefix, so no fixed set of entries covers the
-        // dynamic gitdir. The blanket form is safe because it applies only to
-        // this single-purpose, throwaway container's own process environment
-        // (via `GIT_CONFIG_*`, never a written file), never to the host git
-        // config, and it does not touch the credential isolation this backend
-        // exists for. Passed as env-based config so it cannot be overridden by
-        // an agent editing `.git/config`, exactly like the host-side
-        // `core.hooksPath=/dev/null` guard.
         "-e".to_string(),
         "GIT_CONFIG_COUNT=1".to_string(),
         "-e".to_string(),
@@ -544,19 +321,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Plain `alpine`, deliberately *not* `alpine/git` -- that image sets
-    /// `ENTRYPOINT ["git"]`, which would silently prepend `git` in front of
-    /// whatever `program`/`args` this backend passes as `CMD` (this crate's
-    /// contract is a plain `<image> <program> <args...>` invocation, with no
-    /// entrypoint override -- see [`build_docker_run_argv`]'s own docs),
-    /// breaking every behavioural test below in a way that has nothing to do
-    /// with what they're actually asserting. `git` itself is installed
-    /// inline (`apk add`) only in the one test that needs it.
     const TEST_IMAGE: &str = "alpine:latest";
-
-    // -----------------------------------------------------------------
-    // Pure argv construction -- no daemon required.
-    // -----------------------------------------------------------------
 
     #[test]
     fn argv_contains_the_worktree_and_repo_git_mounts_at_identical_host_paths() {
@@ -580,11 +345,6 @@ mod tests {
         );
     }
 
-    /// Issue #49 review, LOW: the legacy `-v {p}:{p}` field-separator syntax
-    /// is ambiguous the moment a host path contains a colon (legal on Linux,
-    /// and `--repo`/a role's own worktree path are external input) --
-    /// `--mount` has no such ambiguity (`source=`/`target=` are exact
-    /// strings, not colon-split fields).
     #[test]
     fn argv_uses_mount_not_the_colon_ambiguous_v_flag() {
         let argv = build_docker_run_argv(
@@ -631,11 +391,6 @@ mod tests {
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
             "/root",
-            // Real callers never pass a `HOME` entry here at all --
-            // `resolve_forwarded_env` strips it before `forwarded_env`
-            // reaches this function (see that function's own test coverage)
-            // -- so this pins down the one entry a real invocation actually
-            // produces: exactly the container's own baseline `HOME=`.
             &[],
             "claude",
             &[],
@@ -672,12 +427,6 @@ mod tests {
         assert!(!joined.contains(".env"));
     }
 
-    /// The mounted worktree/`.git` are host-owned (uid != 0) while the
-    /// container runs git as root; without `safe.directory` every in-container
-    /// git command aborts with `fatal: detected dubious ownership` (exit 128)
-    /// on Linux. Asserts the env-based `safe.directory=*` config is injected
-    /// (see [`build_docker_run_argv`]'s own docs on why `*` and why env, not a
-    /// written config file).
     #[test]
     fn argv_disables_gits_dubious_ownership_guard_via_env_config() {
         let argv = build_docker_run_argv(
@@ -757,14 +506,6 @@ mod tests {
         assert!(argv.contains(&"USER=alice".to_string()));
     }
 
-    // -----------------------------------------------------------------
-    // `resolve_forwarded_env` -- no daemon required.
-    // -----------------------------------------------------------------
-
-    /// Same `CARGO_MANIFEST_DIR` technique `LocalSandbox`'s own
-    /// `env_allowlist_forwards_only_the_named_variables` test uses --
-    /// reliably set by `cargo test`, read-only here, avoiding the
-    /// cross-test-interference hazard of mutating global process env state.
     #[test]
     fn resolve_forwarded_env_forwards_a_set_allowlisted_variable() {
         let expected = std::env::var("CARGO_MANIFEST_DIR")
@@ -789,11 +530,6 @@ mod tests {
         assert!(forwarded.is_empty());
     }
 
-    // -----------------------------------------------------------------
-    // `classify_docker_startup_failure` (issue #49 review, MEDIUM) -- no
-    // daemon required, pure function.
-    // -----------------------------------------------------------------
-
     #[test]
     fn classifies_exit_125_with_daemon_unreachable_stderr_as_docker_unavailable() {
         let reason = classify_docker_startup_failure(
@@ -817,10 +553,6 @@ mod tests {
         assert!(reason.unwrap().contains("Dockerfile"));
     }
 
-    /// A contained process is free to legitimately exit 125 for its own
-    /// reasons -- without a corroborating docker-level stderr marker, this
-    /// must stay a normal (if puzzling) exit code, not a fabricated
-    /// `DockerUnavailable`.
     #[test]
     fn does_not_classify_exit_125_without_a_docker_level_stderr_marker() {
         assert!(classify_docker_startup_failure(125, "some unrelated agent error").is_none());
@@ -831,18 +563,11 @@ mod tests {
         assert!(classify_docker_startup_failure(1, "Unable to find image 'x' locally").is_none());
     }
 
-    // -----------------------------------------------------------------
-    // `is_benign_removal_race` (issue #49 review, LOW) -- no daemon
-    // required, pure function.
-    // -----------------------------------------------------------------
-
     #[test]
     fn treats_already_gone_and_removal_races_as_benign() {
         assert!(is_benign_removal_race(
             "Error: No such container: warden-abc123"
         ));
-        // Exact wording verified against real docker (issue #49 review): two
-        // concurrent `docker rm -f` calls on the same container.
         assert!(is_benign_removal_race(
             "Error response from daemon: removal of container warden-abc123 is already in \
              progress"
@@ -858,12 +583,6 @@ mod tests {
             "Error response from daemon: permission denied"
         ));
     }
-
-    // -----------------------------------------------------------------
-    // `create`/`destroy` bookkeeping -- no daemon required (these never
-    // actually invoke `docker`; `destroy` on an id that was never `create`d
-    // returns early).
-    // -----------------------------------------------------------------
 
     fn config(dir: &TempDir) -> DockerConfig {
         DockerConfig {
@@ -948,14 +667,6 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------
-    // Behavioural tests against a real daemon -- gated (issue #49 spec):
-    // auto-skip with an eprintln when no daemon is reachable, rather than
-    // failing the whole suite on a machine without Docker installed/running.
-    // -----------------------------------------------------------------
-
-    /// Probes `docker info` once -- the cheapest daemon-reachability check
-    /// available, mirroring how a human would sanity-check the same thing.
     async fn docker_daemon_available() -> bool {
         tokio::process::Command::new(DOCKER_BIN)
             .arg("info")
@@ -968,10 +679,6 @@ mod tests {
             .unwrap_or(false)
     }
 
-    /// Builds a throwaway repo (with a worktree, since that's what
-    /// `DockerSandbox` actually mounts) plus a fake `~/.claude` dir --
-    /// returns `(repo_dir, worktree_dir, claude_dir)`, all `TempDir`s the
-    /// caller must keep alive for the test's duration.
     fn init_repo_with_worktree_and_claude_dir() -> (TempDir, PathBuf, TempDir) {
         let repo = TempDir::new().unwrap();
         let run = |args: &[&str]| {
@@ -1008,14 +715,6 @@ mod tests {
         (repo, worktree, claude_dir)
     }
 
-    /// Issue #49 review, MEDIUM: a missing image (the most likely first-run
-    /// error, since the image is hand-built, never published anywhere) must
-    /// surface as a typed, actionable `DockerUnavailable` -- not exit code
-    /// 125 silently reinterpreted downstream as "the agent produced no
-    /// parseable output". Requires a reachable daemon (to actually get as
-    /// far as `docker`'s own "image not found" path) but mutates nothing on
-    /// it -- `docker run` against a nonexistent image never touches
-    /// anything persistent.
     #[tokio::test]
     async fn execute_reports_docker_unavailable_when_the_image_does_not_exist() {
         if !docker_daemon_available().await {
@@ -1059,11 +758,6 @@ mod tests {
         sandbox.destroy(id).await.unwrap();
     }
 
-    /// Issue #49 acceptance criterion (issue #28): from inside the
-    /// container, `git push origin` must fail -- no ssh key, no
-    /// `~/.config/gh`, no credential helper is ever mounted, so there is
-    /// nothing for git to authenticate a push with, regardless of network
-    /// reachability.
     #[tokio::test]
     async fn e2e_git_push_origin_fails_inside_the_container_no_credentials_mounted() {
         if !docker_daemon_available().await {
@@ -1112,15 +806,6 @@ mod tests {
         sandbox.destroy(id).await.unwrap();
     }
 
-    /// Issue #49 acceptance criterion (issue #25): the host's real `~/.ssh`,
-    /// `~/.aws`, `~/.config/gh`, and `~/.env` must not be reachable by
-    /// absolute path from inside the container -- only `~/.claude` is ever
-    /// mounted, nothing else of the host's real `$HOME`. `~/.config/gh` (the
-    /// `gh` CLI's own credential store) and `~/.env` close a gap the
-    /// argv-level `argv_never_mounts_ssh_aws_or_gh_config` test only
-    /// asserted indirectly (no `--mount` flag *string* naming it) -- this
-    /// proves it from inside a real, running container, the same way
-    /// `~/.ssh`/`~/.aws` already were.
     #[tokio::test]
     async fn e2e_host_ssh_aws_gh_and_env_are_not_reachable_inside_the_container() {
         if !docker_daemon_available().await {
@@ -1191,8 +876,6 @@ mod tests {
         sandbox.destroy(id).await.unwrap();
     }
 
-    /// Issue #49: after `destroy`, no `warden-*` container is left behind --
-    /// `docker ps -a` must show nothing under this test's own id.
     #[tokio::test]
     async fn destroy_leaves_no_container_behind() {
         if !docker_daemon_available().await {
@@ -1237,9 +920,6 @@ mod tests {
         );
     }
 
-    /// Issue #49: a cancelled execution must not leak a running container --
-    /// see [`drain_and_wait_with_container_cleanup`]'s own docs for why
-    /// killing the `docker run` client alone is not enough.
     #[tokio::test]
     async fn cancelling_an_execution_leaves_no_container_behind() {
         if !docker_daemon_available().await {
@@ -1279,16 +959,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Give the container a moment to actually start before cancelling,
-        // so this test exercises "kill a running container", not "the
-        // container never started at all".
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         cancel.cancel();
         let result = execution.wait().await;
         assert!(matches!(result, Err(SandboxError::Cancelled { .. })));
 
-        // Best-effort cleanup can race the daemon actually finishing the
-        // removal -- poll briefly rather than asserting immediately.
         let mut still_there = container_exists(&container_name).await;
         for _ in 0..20 {
             if !still_there {
@@ -1305,9 +980,6 @@ mod tests {
         sandbox.destroy(id).await.unwrap();
     }
 
-    /// `docker ps -a --filter name=<exact>` -- exact-name filtered so a
-    /// prefix match against another test's container never produces a false
-    /// positive.
     async fn container_exists(container_name: &str) -> bool {
         let output = tokio::process::Command::new(DOCKER_BIN)
             .args([

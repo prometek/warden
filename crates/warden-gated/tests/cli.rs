@@ -1,7 +1,3 @@
-//! Integration tests against the compiled `warden-gated` binary
-//! (code-standards.md: "Tests d'intégration dans `tests/`. `assert_cmd` +
-//! `predicates` pour tester les binaires compilés").
-
 use std::path::Path;
 use std::process::Command as SyncCommand;
 
@@ -43,10 +39,6 @@ async fn seed_db(
     db_path
 }
 
-/// Acceptance criterion 1 (issue #3), exercised against the actual compiled
-/// binary: a run that is genuinely `coder_running` in the real SQLite file
-/// is blocked by `verify-run`, even when the `--commit` argument (standing
-/// in for whatever `warden` might claim) names a plausible-looking commit.
 #[tokio::test]
 async fn verify_run_blocks_and_exits_non_zero_when_the_real_state_is_not_converged() {
     let dir = TempDir::new().unwrap();
@@ -110,10 +102,6 @@ async fn verify_run_fails_loudly_when_the_database_does_not_exist() {
         .failure();
 }
 
-/// End-to-end: `init-bare` installs a hook script that, when git actually
-/// runs it on a real push, relays the notification to a listening `serve`
-/// daemon, which independently re-verifies against SQLite and (since the
-/// seeded run is not converged) must not push anything to `origin`.
 #[tokio::test]
 async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
     let warden_home = TempDir::new().unwrap();
@@ -142,7 +130,6 @@ async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
         .assert()
         .success();
 
-    // Start the daemon in the background, targeting the same bare repo/db.
     let mut serve_child = std::process::Command::new(bin_path)
         .args([
             "serve",
@@ -158,12 +145,8 @@ async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
         .spawn()
         .unwrap();
 
-    // Give the daemon a moment to bind its socket before pushing.
     wait_for_socket(&socket_path);
 
-    // A seed working copy that pushes into the bare gate repo under the
-    // `refs/heads/warden-run/run-1` convention the hook/notification parser
-    // expects -- this is what triggers the real `post-receive` hook.
     let seed = TempDir::new().unwrap();
     run_git_sync(seed.path(), &["init", "--quiet"]);
     run_git_sync(seed.path(), &["config", "user.email", "test@warden.local"]);
@@ -180,7 +163,6 @@ async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
         ],
     );
 
-    // Give the hook a moment to relay + the daemon a moment to process.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
     let origin_head = std::process::Command::new("git")
@@ -197,11 +179,6 @@ async fn a_real_git_push_through_the_installed_hook_is_blocked_end_to_end() {
     let _ = serve_child.wait();
 }
 
-/// End-to-end positive case (issue #3, acceptance criterion 2): when the run
-/// genuinely is `converged` in the real SQLite and the commit that git
-/// actually wrote into the bare gate repo matches `converged_commit_sha`,
-/// the real installed `post-receive` hook, relayed to a real running `serve`
-/// daemon, must relay the push all the way to `origin`.
 #[tokio::test]
 async fn a_real_git_push_through_the_installed_hook_reaches_origin_when_converged_and_hash_matches()
 {
@@ -230,9 +207,6 @@ async fn a_real_git_push_through_the_installed_hook_reaches_origin_when_converge
         .assert()
         .success();
 
-    // Build the commit that will be pushed *before* seeding the DB, so the
-    // seeded `converged_commit_sha` can be the real sha rather than a
-    // guessed value.
     let seed = TempDir::new().unwrap();
     run_git_sync(seed.path(), &["init", "--quiet"]);
     run_git_sync(seed.path(), &["config", "user.email", "test@warden.local"]);
@@ -306,11 +280,6 @@ async fn a_real_git_push_through_the_installed_hook_reaches_origin_when_converge
     let _ = serve_child.wait();
 }
 
-/// End-to-end negative case (issue #3, acceptance criterion 2): the run is
-/// genuinely `converged`, but the commit actually written into the bare gate
-/// repo by this push does not match the persisted `converged_commit_sha`
-/// (standing in for a stale/tampered validated hash). The real installed
-/// hook must still not let anything reach `origin`.
 #[tokio::test]
 async fn a_real_git_push_through_the_installed_hook_is_blocked_when_hash_does_not_match() {
     let warden_home = TempDir::new().unwrap();

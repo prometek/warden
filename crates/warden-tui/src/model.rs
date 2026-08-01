@@ -1,9 +1,4 @@
-//! The pure projection of a run's event stream into whatever [`crate::ui`]
-//! renders. No I/O, no terminal, no clock -- [`RunModel::apply`] is a plain
-//! synchronous function over already-decoded [`RunEventRecord`]s, fed by
-//! [`crate::attach`] (which owns the actual replay/live merge). Kept
-//! separate and dependency-free by design (code-standards.md, "TUI
-//! (ratatui)": "la couche modèle ... testable sans terminal").
+//! The pure projection of a run's event stream into whatever [`crate::ui`] renders.
 
 use warden_core::RunEvent;
 use warden_core::RunEventHistoryEntry;
@@ -15,13 +10,6 @@ use warden_core::UndecodableEvent;
 pub struct RunModel {
     seen_ids: std::collections::HashSet<String>,
     events: Vec<RunEventRecord>,
-    /// Issue #58: `events` history rows that couldn't be decoded/validated
-    /// (see `warden_core::RunEventHistoryEntry::Undecodable`'s own docs).
-    /// Kept separate from `events` rather than interleaved into it: every
-    /// business-logic derivation below (`workflow_tree`, `current_progress`,
-    /// token usage, ...) only ever needs to reason about real, decoded
-    /// `RunEvent`s -- [`Self::history`] is what merges the two back into one
-    /// chronological sequence for rendering.
     undecodable: Vec<UndecodableEvent>,
 }
 
@@ -30,18 +18,6 @@ impl RunModel {
         Self::default()
     }
 
-    /// Applies one event to the model. Deduplicates by `id`: a `warden-tui`
-    /// that subscribes to the live Event Bus *before* querying `events` for
-    /// history (Architecture.md §5.4, to avoid a gap) can see the same
-    /// event delivered from both sources, and this must be a no-op the
-    /// second time, not a duplicated log line.
-    ///
-    /// Returns `true` if `record` was newly inserted, `false` if it was
-    /// already known (a duplicate). Every caller that turns applied events
-    /// into user-visible output -- not just the interactive `app_loop`, but
-    /// also the headless NDJSON dump -- must gate on this return value
-    /// rather than re-deriving "is this new" some other way, or the two
-    /// paths can disagree about what counts as a duplicate.
     pub fn apply(&mut self, record: RunEventRecord) -> bool {
         if !self.seen_ids.insert(record.id.clone()) {
             return false;
@@ -50,15 +26,8 @@ impl RunModel {
         true
     }
 
-    /// Records one `events` history row that could not be decoded (issue
-    /// #58) -- never silently dropped, so [`Self::history`] can still
-    /// surface it to a renderer. Deduplicates by `id`, same rationale as
-    /// [`Self::apply`], though in practice an `Undecodable` row is only ever
-    /// seen once, from the history replay (never re-delivered live: the live
-    /// Event Bus only ever carries already-decoded `RunEventRecord`s).
-    ///
-    /// Returns `true` if `event` was newly inserted, `false` if its `id` was
-    /// already known.
+    /// Records one `events` history row that could not be decoded -- never silently dropped, so
+    /// [`Self::history`] can still surface it to a renderer.
     pub fn apply_undecodable(&mut self, event: UndecodableEvent) -> bool {
         if !self.seen_ids.insert(event.id.clone()) {
             return false;
@@ -67,10 +36,6 @@ impl RunModel {
         true
     }
 
-    /// Applies one `list_events_for_run` history row, whichever outcome it
-    /// is (issue #58) -- the single entry point [`crate::attach::attach`]
-    /// replays a run's full history through, so it never has to know which
-    /// of [`Self::apply`]/[`Self::apply_undecodable`] a given row needs.
     pub fn apply_history_entry(&mut self, entry: RunEventHistoryEntry) -> bool {
         match entry {
             RunEventHistoryEntry::Decoded(record) => self.apply(record),
@@ -78,10 +43,7 @@ impl RunModel {
         }
     }
 
-    /// The run this model has observed events for, if any have arrived yet
-    /// -- falls back to an undecodable row's own `run_id` so a run whose
-    /// *entire* history failed to decode still isn't reported as "no run
-    /// observed at all" (issue #58).
+    /// The run this model has observed events for, if any have arrived yet.
     pub fn run_id(&self) -> Option<&str> {
         self.events
             .first()
@@ -89,24 +51,18 @@ impl RunModel {
             .or_else(|| self.undecodable.first().map(|event| event.run_id.as_str()))
     }
 
-    /// Every event applied so far, in the order they were applied -- the
-    /// scrollable log view renders this directly.
+    /// Every event applied so far, in the order they were applied -- the scrollable log view
+    /// renders this directly.
     pub fn events(&self) -> &[RunEventRecord] {
         &self.events
     }
 
-    /// Every `events` history row that failed to decode/validate, in the
-    /// order they were applied (issue #58) -- see [`Self::apply_undecodable`].
+    /// Every `events` history row that failed to decode/validate, in the order they were applied --
+    /// see [`Self::apply_undecodable`].
     pub fn undecodable_events(&self) -> &[UndecodableEvent] {
         &self.undecodable
     }
 
-    /// [`Self::events`] and [`Self::undecodable_events`] merged back into
-    /// one chronological sequence (`created_at` then `id`, matching
-    /// `list_events_for_run`'s own `ORDER BY`) -- what a renderer that must
-    /// show "this event could not be decoded" in its rightful place, rather
-    /// than as an afterthought at the end, iterates over instead of
-    /// [`Self::events`] alone.
     pub fn history(&self) -> Vec<HistoryItem<'_>> {
         let mut items: Vec<HistoryItem> = self
             .events
@@ -118,8 +74,7 @@ impl RunModel {
         items
     }
 
-    /// The most recently started cycle's number, or `0` before any cycle
-    /// has started.
+    /// The most recently started cycle's number, or `0` before any cycle has started.
     pub fn current_cycle_number(&self) -> u32 {
         self.events
             .iter()
@@ -131,9 +86,6 @@ impl RunModel {
             .unwrap_or(0)
     }
 
-    /// The run's intent/branch/per-phase budgets (issue #43), from its
-    /// `RunStarted` event -- `None` until that event has been applied (e.g. a
-    /// late attach whose history query hasn't returned yet).
     pub fn run_started(&self) -> Option<(&str, &str, u32, u32)> {
         self.events.iter().find_map(|record| match &record.event {
             RunEvent::RunStarted {
@@ -151,10 +103,7 @@ impl RunModel {
         })
     }
 
-    /// `true` once the latest event is a terminal `RunFinished` event. A
-    /// quota suspension also publishes `RunFinished` to close that event
-    /// stream, but is not terminal: a resumed run appends fresh events after
-    /// it and this immediately becomes `false` again.
+    /// `true` once the latest event is a terminal `RunFinished` event.
     pub fn is_finished(&self) -> bool {
         self.final_state().is_some_and(|state| {
             !matches!(
@@ -164,10 +113,7 @@ impl RunModel {
         })
     }
 
-    /// The run's current final-state record, when `RunFinished` is its latest
-    /// event. A resumed quota-suspended run retains the old suspension event
-    /// in history, but later live events supersede it rather than leaving the
-    /// TUI falsely labelled suspended or finished.
+    /// The run's current final-state record, when `RunFinished` is its latest event.
     pub fn final_state(&self) -> Option<&str> {
         self.events.last().and_then(|record| match &record.event {
             RunEvent::RunFinished { final_state } => Some(final_state.as_str()),
@@ -182,12 +128,8 @@ impl RunModel {
             .filter(|record| matches!(record.event, RunEvent::FindingRaised { .. }))
     }
 
-    /// The most recently captured evidence, if any -- what `crate::ui`'s
-    /// evidence pane shows right now. `None` until an `EvidenceCaptured`
-    /// event has actually been applied; nothing in this codebase currently
-    /// emits one (Phase 7 / issue #7's Evidence Capture Adapter hasn't
-    /// landed), but the rendering path this feeds (`crate::ui`,
-    /// `crate::evidence`) is fully wired and exercised the moment one is.
+    /// The most recently captured evidence, if any -- what `crate::ui`'s evidence pane shows right
+    /// now.
     pub fn latest_evidence(&self) -> Option<&RunEventRecord> {
         self.events
             .iter()
@@ -195,20 +137,6 @@ impl RunModel {
             .find(|record| matches!(record.event, RunEvent::EvidenceCaptured { .. }))
     }
 
-    /// "What is the currently running agent reporting right now" (issue
-    /// #33): the `(role, detail)` of the most recent `AgentProgress` event,
-    /// but only if no `AgentFinished` has arrived since -- once an agent
-    /// finishes, its last progress line is stale and must stop being shown
-    /// as current. Scans back from the most recent event and stops at the
-    /// first of either variant, so an `AgentFinished` with no intervening
-    /// `AgentProgress` correctly reports `None` too (an agent that finished
-    /// without ever reporting progress has nothing "current" to show).
-    ///
-    /// **Live-only** (ADR-0008 amendment, this issue): this can only ever be
-    /// non-`None` while attached live -- a late attach's `events` history
-    /// replay never contains an `AgentProgress` at all (never persisted),
-    /// so this always starts `None` after a pure-history replay and only
-    /// becomes populated once a live one actually arrives.
     pub fn current_progress(&self) -> Option<(&str, &str)> {
         for record in self.events.iter().rev() {
             match &record.event {
@@ -222,20 +150,6 @@ impl RunModel {
         None
     }
 
-    /// Issue #53: every `(cycle_number, role, usage)` an `AgentFinished`
-    /// event has reported non-`None` usage for, oldest first -- the raw
-    /// "per agent" facts [`token_usage_by_cycle`](RunModel::token_usage_by_cycle)
-    /// and [`total_token_usage`](RunModel::total_token_usage) roll up from.
-    /// `cycle_number` is the most recent `CycleStarted` seen before that
-    /// `AgentFinished` (`0` before any cycle has started -- not reachable in
-    /// a real run, since no agent runs before its own cycle's
-    /// `CycleStarted`).
-    ///
-    /// A tool that reported no usage at all for a given invocation
-    /// contributes nothing here (its `AgentFinished { usage: None, .. }` is
-    /// simply skipped) rather than a fabricated zero entry -- see
-    /// `warden_core::TokenUsage`'s own docs on why "n/a" and "zero" are
-    /// different facts.
     pub fn token_usage_entries(&self) -> Vec<(u32, &str, warden_core::TokenUsage)> {
         let mut cycle_number: u32 = 0;
         let mut entries = Vec::new();
@@ -255,10 +169,6 @@ impl RunModel {
         entries
     }
 
-    /// [`token_usage_entries`](RunModel::token_usage_entries), rolled up per
-    /// cycle -- the "per cycle" half of issue #53's aggregation. Ordered by
-    /// first appearance (cycle numbers only ever increase within a run, so
-    /// this is already ascending in practice).
     pub fn token_usage_by_cycle(&self) -> Vec<(u32, warden_core::TokenUsage)> {
         let mut by_cycle: Vec<(u32, warden_core::TokenUsage)> = Vec::new();
         for (cycle_number, _role, usage) in self.token_usage_entries() {
@@ -273,9 +183,8 @@ impl RunModel {
         by_cycle
     }
 
-    /// The run-wide grand total across every invocation that has reported
-    /// usage so far (issue #53) -- `None` until at least one has, never a
-    /// fabricated `0` (rendered "n/a" by [`crate::ui`]).
+    /// The run-wide grand total across every invocation that has reported usage so far -- `None`
+    /// until at least one has, never a fabricated `0` (rendered "n/a" by [`crate::ui`]).
     pub fn total_token_usage(&self) -> Option<warden_core::TokenUsage> {
         let usages: Vec<warden_core::TokenUsage> = self
             .token_usage_entries()
@@ -286,11 +195,6 @@ impl RunModel {
     }
 
     /// Last quota report delivered by the tool CLI, if that CLI exposes one.
-    ///
-    /// This is intentionally a snapshot, not an aggregation: each report
-    /// describes the account's current quota window, so adding reports from
-    /// separate agent invocations would fabricate consumption. `None` means
-    /// no observed invocation exposed quota data and must render as `n/a`.
     pub fn latest_rate_limit_status(&self) -> Option<&warden_core::RateLimitStatus> {
         self.events
             .iter()
@@ -301,10 +205,7 @@ impl RunModel {
             })
     }
 
-    /// Reset instant carried by the final `AwaitingQuotaReset` state, if the
-    /// run is suspended. This is deliberately derived from the event stream,
-    /// so a live `RunFinished` event updates the read-only TUI immediately;
-    /// it never needs to write or poll the orchestrator's database.
+    /// Reset instant carried by the final `AwaitingQuotaReset` state, if the run is suspended.
     pub fn quota_suspension_resets_at(&self) -> Option<i64> {
         self.final_state()
             .and_then(|state| warden_core::RunState::parse(state).ok())
@@ -314,28 +215,10 @@ impl RunModel {
             })
     }
 
-    /// Derives the run's workflow tree (issue #54): one branch per cycle,
-    /// each carrying its agent-invocation nodes (coder/reviewer/tester, in
-    /// the order the orchestrator actually runs them within a cycle --
-    /// `warden::orchestrator`'s main loop: coder, then reviewer, then
-    /// tester only if the review came back clean) plus, if the cycle
-    /// reboucled into another one, *why* (a distinct "return edge" per
-    /// issue #54's acceptance criteria).
-    ///
-    /// Pure projection over already-applied events, recomputed on every
-    /// call -- cheap enough at the event volumes a single run produces, and
-    /// keeps this in the same "no incremental derived state to keep in
-    /// sync" shape as the rest of this module (`token_usage_entries` and
-    /// friends).
+    /// Derives the run's workflow tree: one branch per cycle, each carrying its agent-invocation
+    /// nodes plus, if the cycle reboucled into another one, *why*.
     pub fn workflow_tree(&self) -> WorkflowTree {
         let mut cycles: Vec<CycleNode> = Vec::new();
-        // Issue #37: `RunEvent` carries no explicit phase/cycle field on
-        // `AgentStarted`/`AgentFinished` (verified by reading `event.rs` --
-        // it doesn't exist), so, exactly like `token_usage_entries` already
-        // does, an invocation is attributed to whichever `CycleStarted` most
-        // recently preceded it -- the orchestrator always runs a cycle's
-        // agents strictly between that cycle's own `CycleStarted` and the
-        // next one's, so this is exact, not a heuristic.
         let mut findings_by_cycle: std::collections::HashMap<u32, Vec<(String, String)>> =
             std::collections::HashMap::new();
 
@@ -378,13 +261,6 @@ impl RunModel {
                                 node.status = status;
                                 node.tokens = *usage;
                             }
-                            // Defensive (code-standards.md: validate at the
-                            // boundary, never trust a gap in the stream to
-                            // mean "nothing happened"): an `AgentFinished`
-                            // with no matching `AgentStarted` in this cycle
-                            // -- e.g. a late attach whose history replay
-                            // started mid-invocation -- still surfaces as a
-                            // node rather than being silently dropped.
                             None => cycle.agents.push(AgentNode {
                                 role: role.clone(),
                                 status,
@@ -408,12 +284,6 @@ impl RunModel {
             }
         }
 
-        // Second pass: elevate a reviewer/tester node from `Clean` to
-        // `Findings` where a blocking finding attributed to that role
-        // landed in the same cycle -- findings are only known in full once
-        // the whole cycle (which may include both the reviewer and the
-        // tester) has been walked, so this can't be decided during the
-        // first pass above.
         for cycle in &mut cycles {
             if let Some(findings) = findings_by_cycle.get(&cycle.cycle_number) {
                 for agent in &mut cycle.agents {
@@ -428,12 +298,6 @@ impl RunModel {
             }
         }
 
-        // Third pass: a cycle only actually "returned" if there is a next
-        // cycle to return *to* -- a cycle that hit its budget
-        // (`MaxReviewCyclesExceeded`/`MaxTestCyclesExceeded`) also raised a
-        // blocking finding but the run stopped right there, and drawing a
-        // return edge to a cycle that never happened would be fabricating
-        // structure the event stream never showed.
         let cycle_count = cycles.len();
         for i in 0..cycle_count {
             if i + 1 >= cycle_count {
@@ -457,12 +321,6 @@ impl RunModel {
             } else if test_blocking {
                 Some(ReloopCause::TestFinding)
             } else {
-                // Issue #15/ADR-0011: a `ChecksFailed` CI outcome reboucles
-                // to the coder one step later in the pipeline than a
-                // reviewer/tester finding does -- its `FindingRaised` (see
-                // `warden::orchestrator`, `pending_ci_findings`) is
-                // attributed to the *next* cycle it seeds, not to this one,
-                // so it's detected by looking there instead.
                 let next_cycle_has_ci_finding = findings_by_cycle
                     .get(&next_cycle_number)
                     .is_some_and(|findings| findings.iter().any(|(source, _)| source == "ci"));
@@ -478,10 +336,6 @@ impl RunModel {
     }
 }
 
-/// One entry of [`RunModel::history`]'s merged chronological sequence
-/// (issue #58): either a decoded event, or a row that couldn't be
-/// decoded/validated -- see `warden_core::UndecodableEvent`'s own docs for
-/// why that happens.
 #[derive(Debug, Clone, Copy)]
 pub enum HistoryItem<'a> {
     Event(&'a RunEventRecord),
@@ -504,14 +358,8 @@ impl<'a> HistoryItem<'a> {
     }
 }
 
-/// `true` if a blocking finding from `source` (a raw `FindingSource::as_str`
-/// value, per `warden_core::convergence`) is charged to `role`'s gate --
-/// mirrors `warden_core::decide_next_state`'s own imputation rule
-/// (`Reviewer`/`Warden` sourced findings gate the reviewer, decision #37
-/// Q1's tampering-finding carve-out included; only `Tester`-sourced
-/// findings gate the tester). The coder never owns a finding source itself
-/// (it doesn't raise findings, only the roles reviewing/testing its work
-/// do), so this is always `false` for any other role.
+/// `true` if a blocking finding from `source` (a raw `FindingSource::as_str` value, per
+/// `warden_core::convergence`) is charged to `role`'s gate.
 fn role_owns_finding_source(role: &str, source: &str) -> bool {
     match role {
         "reviewer" => source == "reviewer" || source == "warden",
@@ -520,22 +368,17 @@ fn role_owns_finding_source(role: &str, source: &str) -> bool {
     }
 }
 
-/// The outcome of one agent invocation node in [`WorkflowTree`] (issue #54).
+/// The outcome of one agent invocation node in [`WorkflowTree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
-    /// `AgentStarted` seen, no matching `AgentFinished` yet -- the
-    /// invocation is still running.
+    /// `AgentStarted` seen, no matching `AgentFinished` yet -- the invocation is still running.
     Running,
-    /// Finished with a zero exit code and, for the reviewer/tester, no
-    /// blocking finding attributed to that role in this cycle.
     Clean,
-    /// Finished with a zero exit code, but at least one blocking finding
-    /// attributed to this role landed in this cycle (reviewer/tester
-    /// only -- the coder never carries this status, see
-    /// `role_owns_finding_source`).
+    /// Finished with a zero exit code, but at least one blocking finding attributed to this role
+    /// landed in this cycle.
     Findings,
-    /// Finished with a non-zero exit code -- the agent process itself
-    /// failed, independent of any finding.
+    /// Finished with a non-zero exit code -- the agent process itself failed, independent of any
+    /// finding.
     Failed,
 }
 
@@ -544,36 +387,21 @@ pub enum NodeStatus {
 pub struct AgentNode {
     pub role: String,
     pub status: NodeStatus,
-    /// Issue #53: `None` both while `status` is [`NodeStatus::Running`]
-    /// (no `AgentFinished` yet) and for a tool that reported no usage at
-    /// all once finished -- rendered "n/a" either way by [`crate::ui`],
-    /// never a fabricated `0`.
+    /// `None` both while `status` is [`NodeStatus::Running`] (no `AgentFinished` yet) and for a
+    /// tool that reported no usage at all once finished.
     pub tokens: Option<warden_core::TokenUsage>,
 }
 
-/// Why a cycle reboucled into the next one -- what makes a "return edge"
-/// (issue #54's acceptance criteria: "Reloops (coder<->reviewer, scoped
-/// re-review, tester return) are visually distinct") distinguishable from a
-/// plain fresh cycle by [`crate::ui`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloopCause {
-    /// A reviewer- or tampering-sourced blocking finding (decision #37 Q1)
-    /// -- charged to the review budget; the next cycle's reviewer only
-    /// re-reviews the coder's latest correctif (`ReviewScope::Correctif`),
-    /// never the whole diff again.
     ReviewFinding,
-    /// A tester-sourced blocking finding -- charged to the test budget; the
-    /// next cycle still runs a scoped re-review before the tester is
-    /// allowed to run again (Phase A gate, issue #41), so this reboucle is
-    /// coder -> reviewer -> tester, not a direct return to the tester.
     TestFinding,
-    /// A `ChecksFailed` CI outcome (issue #15/ADR-0011) reboucling a
-    /// post-convergence run back to the coder.
+    /// A `ChecksFailed` CI outcome reboucling a post-convergence run back to the coder.
     CiFailure,
 }
 
-/// One cycle's worth of agent-invocation nodes, plus (if this cycle
-/// reboucled into another one) why.
+/// One cycle's worth of agent-invocation nodes, plus (if this cycle reboucled into another one)
+/// why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CycleNode {
     pub cycle_number: u32,
@@ -581,10 +409,7 @@ pub struct CycleNode {
     pub reloop: Option<ReloopCause>,
 }
 
-/// The whole run projected as a tree (issue #54): the run itself is the
-/// implicit root: `crate::ui` renders that root from
-/// [`RunModel::run_started`] directly, so this only carries the branches
-/// (cycles) hanging off it.
+/// The whole run projected as a tree: the run itself is the implicit root.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkflowTree {
     pub cycles: Vec<CycleNode>,
@@ -698,9 +523,6 @@ mod tests {
         }
     }
 
-    /// Issue #58: an undecodable history row is never silently dropped --
-    /// it must show up through its own accessor, separate from
-    /// [`RunModel::events`] (which only ever holds real, decoded events).
     #[test]
     fn apply_undecodable_surfaces_the_row_without_touching_the_decoded_event_log() {
         let mut model = RunModel::new();
@@ -716,8 +538,6 @@ mod tests {
         assert_eq!(model.undecodable_events()[0].id, "e2");
     }
 
-    /// Same dedup contract as [`RunModel::apply`], applied to undecodable
-    /// rows -- a duplicate delivery must not be recorded twice.
     #[test]
     fn apply_undecodable_deduplicates_by_id() {
         let mut model = RunModel::new();
@@ -728,10 +548,6 @@ mod tests {
         assert_eq!(model.undecodable_events().len(), 1);
     }
 
-    /// A run whose history includes at least one undecodable row must still
-    /// expose every other, genuinely decoded event (issue #58's actual
-    /// acceptance criterion): applying a mix of `Decoded`/`Undecodable`
-    /// history entries keeps both halves intact and queryable.
     #[test]
     fn apply_history_entry_dispatches_decoded_and_undecodable_rows_correctly() {
         let mut model = RunModel::new();
@@ -759,10 +575,6 @@ mod tests {
         assert!(model.is_finished(), "RunFinished must still be reachable");
     }
 
-    /// [`RunModel::history`] merges both halves back into one chronological
-    /// sequence by `created_at`, regardless of the order they were applied
-    /// in -- what a renderer needs to show the undecodable marker in its
-    /// rightful place rather than always last.
     #[test]
     fn history_merges_events_and_undecodable_rows_by_created_at() {
         let mut model = RunModel::new();
@@ -784,8 +596,6 @@ mod tests {
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
     }
 
-    /// Falls back to an undecodable row's own `run_id` so a run whose entire
-    /// history failed to decode still reports a run rather than "none".
     #[test]
     fn run_id_falls_back_to_an_undecodable_row_when_no_event_decoded_at_all() {
         let mut model = RunModel::new();
@@ -794,11 +604,6 @@ mod tests {
         assert_eq!(model.run_id(), Some("run-1"));
     }
 
-    /// Issue #58 test gap: a run whose *every* history row is undecodable
-    /// still has a well-defined, non-panicking view -- no decoded events,
-    /// not "finished" (no `RunFinished` was ever decoded), empty workflow
-    /// tree, but every undecodable row still present in
-    /// [`RunModel::history`], in order.
     #[test]
     fn a_run_whose_entire_history_is_undecodable_still_reports_a_coherent_empty_view() {
         let mut model = RunModel::new();
@@ -816,11 +621,6 @@ mod tests {
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
     }
 
-    /// Issue #58 test gap: the very first and very last rows of a run's
-    /// history can each individually be undecodable (not just an interior
-    /// row, as the other mixed-history tests exercise) -- `history()` must
-    /// still place them at the start/end respectively, with the decoded
-    /// events in between intact.
     #[test]
     fn history_keeps_a_leading_and_trailing_undecodable_row_in_their_chronological_place() {
         let mut model = RunModel::new();
@@ -852,8 +652,6 @@ mod tests {
             matches!(model.history()[3], HistoryItem::Undecodable(_)),
             "the run's last row is undecodable"
         );
-        // The decoded events in between are still fully usable despite the
-        // undecodable rows bracketing them on both sides.
         assert!(model.is_finished());
         assert_eq!(model.final_state(), Some("converged"));
     }
@@ -994,10 +792,6 @@ mod tests {
         );
     }
 
-    /// Issue #33: once an agent has finished, its last progress line is
-    /// stale and must stop being shown as "current" -- a header still
-    /// reading "running cargo test" after the agent already exited would be
-    /// actively misleading, worse than showing nothing.
     #[test]
     fn current_progress_is_cleared_once_the_agent_finishes() {
         let mut model = RunModel::new();
@@ -1020,9 +814,6 @@ mod tests {
         assert_eq!(model.current_progress(), None);
     }
 
-    /// A fresh agent's own progress, arriving after a previous agent's
-    /// `AgentFinished`, must be shown again -- `current_progress` isn't
-    /// permanently latched off by the first finish it ever sees.
     #[test]
     fn current_progress_resumes_once_a_new_agent_reports_progress_after_a_prior_one_finished() {
         let mut model = RunModel::new();
@@ -1054,10 +845,6 @@ mod tests {
             Some(("reviewer", "reviewing the diff"))
         );
     }
-
-    // -----------------------------------------------------------------
-    // Token usage aggregation (issue #53)
-    // -----------------------------------------------------------------
 
     fn agent_finished(role: &str, usage: Option<warden_core::TokenUsage>) -> RunEvent {
         RunEvent::AgentFinished {
@@ -1161,10 +948,6 @@ mod tests {
         assert_eq!(total.cache_read_tokens, Some(5));
     }
 
-    // -----------------------------------------------------------------
-    // Workflow tree derivation (issue #54)
-    // -----------------------------------------------------------------
-
     fn agent_started(role: &str) -> RunEvent {
         RunEvent::AgentStarted {
             role: role.to_string(),
@@ -1261,10 +1044,6 @@ mod tests {
         assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Failed);
     }
 
-    /// A blocking reviewer finding elevates the reviewer node to `Findings`
-    /// and reboucles review-driven (decision #37 Q1) -- the coder never
-    /// carries a `Findings` status, only a role that actually raises
-    /// findings does.
     #[test]
     fn workflow_tree_attributes_a_blocking_reviewer_finding_to_the_reviewer_node_and_reloops() {
         let mut model = RunModel::new();
@@ -1287,9 +1066,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
     }
 
-    /// A tampering finding (`FindingSource::Warden`) is charged to the
-    /// review gate exactly like a real reviewer finding (decision #37 Q1's
-    /// carve-out, code review issue #24 M4).
     #[test]
     fn workflow_tree_attributes_a_warden_sourced_tampering_finding_to_the_review_reloop() {
         let mut model = RunModel::new();
@@ -1304,9 +1080,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
     }
 
-    /// Phase B (issue #42): a review-clean cycle whose tester raises a
-    /// blocking finding reboucles test-driven, distinct from a review
-    /// reloop -- the tester node (not the reviewer) is the one elevated.
     #[test]
     fn workflow_tree_attributes_a_blocking_tester_finding_to_the_tester_node_and_reloops() {
         let mut model = RunModel::new();
@@ -1328,9 +1101,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::TestFinding));
     }
 
-    /// A non-blocking (warning) finding must never elevate a node's status
-    /// or trigger a reloop -- only a `Severity::Blocking` finding gates
-    /// anything (`warden_core::decide_next_state`'s own rule).
     #[test]
     fn workflow_tree_ignores_a_non_blocking_finding() {
         let mut model = RunModel::new();
@@ -1344,10 +1114,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, None);
     }
 
-    /// A cycle that hit its budget still raised a blocking finding, but the
-    /// run never actually reboucled (no next `CycleStarted` follows) -- a
-    /// return edge to a cycle that never happened would be fabricated
-    /// structure, not something the event stream actually showed.
     #[test]
     fn workflow_tree_shows_no_reloop_when_a_blocking_finding_is_this_run_s_last_cycle() {
         let mut model = RunModel::new();
@@ -1368,10 +1134,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, None);
     }
 
-    /// Issue #15/ADR-0011: a `ChecksFailed` CI reboucle's `FindingRaised` is
-    /// attributed to the cycle it seeds (the next one), not the converged
-    /// cycle it reboucles from -- so the return edge on the *prior* cycle
-    /// must still be detected from there.
     #[test]
     fn workflow_tree_detects_a_ci_driven_reloop_seeded_into_the_next_cycle() {
         let mut model = RunModel::new();
@@ -1380,8 +1142,6 @@ mod tests {
         model.apply(record("e3", agent_finished_with_exit("reviewer", 0, None)));
         model.apply(record("e4", agent_started("tester")));
         model.apply(record("e5", agent_finished_with_exit("tester", 0, None)));
-        // Cycle 1 itself is entirely clean -- it only reboucles because of
-        // what CI reported after convergence.
         model.apply(record("e6", RunEvent::CycleStarted { cycle_number: 2 }));
         model.apply(record("e7", finding(2, "ci", "blocking")));
 
@@ -1389,9 +1149,6 @@ mod tests {
         assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::CiFailure));
     }
 
-    /// An `AgentFinished` with no preceding `AgentStarted` in the same
-    /// cycle (a late attach whose history replay started mid-invocation)
-    /// still surfaces as a node instead of being silently dropped.
     #[test]
     fn workflow_tree_surfaces_an_agent_finished_with_no_matching_started_event() {
         let mut model = RunModel::new();
@@ -1404,8 +1161,6 @@ mod tests {
         assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Clean);
     }
 
-    /// A converged run's final cycle (review clean, test clean, no
-    /// following cycle) never reboucles.
     #[test]
     fn workflow_tree_shows_no_reloop_for_a_fully_clean_final_cycle() {
         let mut model = RunModel::new();

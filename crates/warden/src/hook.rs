@@ -1,25 +1,3 @@
-//! The **lifecycle-hook seam** (issue #55, ADR-0017): the I/O-bearing half of
-//! the deterministic-action foundation whose *pure* half
-//! ([`warden_core::HookPoint`]/[`HookContext`]/[`HookOutcome`]) lives in
-//! `warden-core`.
-//!
-//! A [`Hook`] is a deterministic action Warden runs itself at a fixed
-//! [`HookPoint`] of a run -- format, test, lint, commit-check -- instead of
-//! delegating it to an agent's prompt. Foundation only: this ships the trait,
-//! the [`HookRegistry`], and the dispatch ([`HookRegistry::run_hooks`]) the
-//! orchestrator calls at its transition seam. The registry is **empty by
-//! default**, so the seam is a strict no-op and behaviour is unchanged; no
-//! concrete hook ships here.
-//!
-//! A hook that runs a command is meant to go through the same
-//! [`warden_sandbox::Sandbox`] an agent does -- same isolation, fixed action,
-//! no LLM. That wiring, and consuming a [`HookOutcome::Block`] /
-//! [`HookOutcome::EmitFindings`] in the convergence loop, is issue #51; this
-//! module only defines the seam and propagates the outcome.
-//!
-//! **Disambiguation**: a Warden *lifecycle* hook, distinct from the git
-//! `post-receive` hook `warden-gated` installs (`warden-gated`'s `hook.rs`).
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,42 +7,25 @@ use warden_sandbox::{Command, ExecuteOptions, Sandbox, SandboxSpec};
 use crate::error::Result;
 use crate::policy_gate::{PolicyGate, PolicyOutcome};
 
-/// A deterministic action bound to one or more [`HookPoint`]s. Runs inside the
-/// `warden` crate (where FS/process/sandbox live), never in `warden-core`.
+/// A deterministic action bound to one or more [`HookPoint`]s.
 #[async_trait]
 pub trait Hook: Send + Sync {
-    /// The points at which this hook fires. Consulted once per dispatch; a
-    /// hook may declare several.
+    /// The points at which this hook fires.
     fn points(&self) -> &[HookPoint];
 
-    /// Runs the hook for `ctx` (whose [`HookContext::point`] is one of
-    /// [`Hook::points`]) and reports what it decided. An `Err` is a genuine
-    /// failure to *run* the action (a spawn failed, I/O broke) and propagates;
-    /// a hook that ran fine but wants to stop or reboucle the run says so with
-    /// [`HookOutcome`], not `Err`.
+    /// Runs the hook for `ctx` (whose [`HookContext::point`] is one of [`Hook::points`]) and
+    /// reports what it decided.
     async fn run(&self, ctx: &HookContext<'_>) -> Result<HookOutcome>;
 }
 
 /// The set of [`Hook`]s a run dispatches, in **registration order**.
-///
-/// Order matters and is deterministic: [`HookRegistry::run_hooks`] runs the
-/// hooks registered for a point in the order they were [`HookRegistry::register`]ed
-/// (issue #55's "ordre d'exécution multi-hooks... déterministe : ordre
-/// d'enregistrement"). A single flat `Vec` preserves that global order; a
-/// point's hooks are simply the registered ones whose [`Hook::points`] contain
-/// it.
-///
-/// Empty by default ([`HookRegistry::new`]) -- the state the orchestrator ships
-/// with, which is what makes the dispatch seam a strict no-op.
 #[derive(Default)]
 pub struct HookRegistry {
     hooks: Vec<Arc<dyn Hook>>,
 }
 
 impl std::fmt::Debug for HookRegistry {
-    /// A `dyn Hook` is not `Debug` (and need not be); a registry's only
-    /// externally interesting property is how many hooks it holds, which is
-    /// enough for a test's `unwrap_err` message or a `tracing` field.
+    /// A `dyn Hook` is not `Debug` (and need not be).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HookRegistry")
             .field("hooks", &self.hooks.len())
@@ -73,42 +34,25 @@ impl std::fmt::Debug for HookRegistry {
 }
 
 impl HookRegistry {
-    /// A registry with no hooks -- dispatch is a strict no-op
-    /// ([`HookOutcome::Continue`]).
+    /// A registry with no hooks -- dispatch is a strict no-op ([`HookOutcome::Continue`]).
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }
 
-    /// Appends `hook` to the registry. Its position here fixes its execution
-    /// order relative to every other hook that shares one of its points.
+    /// Appends `hook` to the registry. Its position here fixes its execution order relative to
+    /// every other hook that shares one of its points.
     pub fn register(&mut self, hook: Arc<dyn Hook>) {
         self.hooks.push(hook);
     }
 
-    /// Whether any hook is registered at all -- lets a caller (the
-    /// orchestrator) skip building a [`HookContext`] when there is provably
-    /// nothing to dispatch to.
+    /// Whether any hook is registered at all -- lets a caller (the orchestrator) skip building a
+    /// [`HookContext`] when there is provably nothing to dispatch to.
     pub fn is_empty(&self) -> bool {
         self.hooks.is_empty()
     }
 
-    /// Runs every hook registered for `point`, in registration order, and
-    /// aggregates their [`HookOutcome`]s into one:
-    ///
-    /// - the **first** [`HookOutcome::Block`] short-circuits -- no later hook
-    ///   on the point runs, and its reason is returned (a block is a hard
-    ///   stop; running further deterministic actions past it would be
-    ///   meaningless);
-    /// - otherwise every [`HookOutcome::EmitFindings`] is concatenated (in
-    ///   order) and returned as one `EmitFindings`, so a hook's findings feed
-    ///   the convergence loop the same way reviewer/tester/CI findings do
-    ///   (ADR-0011), never a parallel channel;
-    /// - if no hook blocked and none emitted findings, the result is
-    ///   [`HookOutcome::Continue`] -- always the case for the default empty
-    ///   registry.
-    ///
-    /// An `Err` from any hook propagates immediately (a real failure to run
-    /// the action).
+    /// Runs every hook registered for `point`, in registration order, and aggregates their
+    /// [`HookOutcome`]s into one
     pub async fn run_hooks(&self, point: HookPoint, ctx: &HookContext<'_>) -> Result<HookOutcome> {
         let mut emitted: Vec<warden_core::Finding> = Vec::new();
         for hook in self.hooks.iter().filter(|h| h.points().contains(&point)) {
@@ -126,45 +70,8 @@ impl HookRegistry {
     }
 }
 
-/// A [`Hook`] that runs one shell command through the [`Sandbox`], at the
-/// [`HookPoint`]s it is bound to. This is the concrete hook a declarative
-/// entry in `.warden/hooks.toml` compiles down to -- the deterministic
-/// environment prep (`docker compose up -d`, `git fetch`/pull, dependency
-/// install) that Warden runs itself rather than spending as agent tokens.
-///
-/// The command runs against [`HookContext::repo_path`] (the run's repository,
-/// the natural cwd for a run-level setup/teardown action), via `sh -c "<run>"`
-/// so a full shell line -- pipes, `&&`, env expansion -- works as written.
-///
-/// # Environment
-///
-/// Unlike an *agent* invocation -- which the sandbox runs with a cleared
-/// environment plus a narrow adapter allowlist, so a coder never inherits the
-/// operator's shell -- a `CommandHook` forwards the operator's **full**
-/// environment. These are the operator's own trusted infra commands, and they
-/// must behave exactly as they would in the operator's shell: `docker` needs
-/// `DOCKER_HOST`, `git pull` over SSH needs `SSH_AUTH_SOCK`, everything needs
-/// `HOME`. `LocalSandbox` provides no isolation from this host regardless (it
-/// is the same OS user), so forwarding the full environment changes nothing
-/// about the trust boundary -- it only makes the commands work.
-///
-/// # Failure
-///
-/// A non-zero exit is a [`HookOutcome::Block`] when `block_on_failure` is set
-/// (a setup step that failed means the environment is not ready -- there is
-/// nothing to run against), otherwise a logged `Continue`. An error actually
-/// *running* the command (the sandbox failed to spawn) propagates as `Err`,
-/// per the [`Hook::run`] contract.
-///
-/// # Policy (issue #51, ADR-0016)
-///
-/// Before the command ever reaches the sandbox, it is evaluated as a
-/// `warden_policy::Action::Shell` against this hook's [`PolicyGate`]. A
-/// [`crate::policy_gate::PolicyOutcome::Blocked`] outcome -- whether from an
-/// outright `Deny`, or an unapproved/unconfigured `RequireApproval` -- turns
-/// into a [`HookOutcome::Block`] with the policy's own reason, and the
-/// command is never run at all. With no `.warden/policy.yaml` present
-/// (`PolicyGate::empty`, the default), this check is a strict no-op.
+/// A [`Hook`] that runs one shell command through the [`Sandbox`], at the [`HookPoint`]s it is
+/// bound to.
 pub struct CommandHook {
     points: Vec<HookPoint>,
     /// The raw shell line, kept for log/block messages.
@@ -175,9 +82,8 @@ pub struct CommandHook {
 }
 
 impl CommandHook {
-    /// Binds `run` (a shell line) to `points`, executed through `sandbox`
-    /// once `policy_gate` allows it. `block_on_failure` decides whether a
-    /// non-zero exit blocks the run.
+    /// Binds `run` (a shell line) to `points`, executed through `sandbox` once `policy_gate` allows
+    /// it.
     pub fn new(
         points: Vec<HookPoint>,
         run: impl Into<String>,
@@ -194,9 +100,8 @@ impl CommandHook {
         }
     }
 
-    /// The operator's full environment, as an allowlist of variable *names*
-    /// (the sandbox resolves the values). See this type's own docs on why a
-    /// hook forwards everything where an agent forwards almost nothing.
+    /// The operator's full environment, as an allowlist of variable *names* (the sandbox resolves
+    /// the values).
     fn full_env_allowlist() -> Vec<String> {
         std::env::vars().map(|(name, _)| name).collect()
     }
@@ -244,12 +149,8 @@ impl Hook for CommandHook {
     }
 }
 
-/// The last `max_chars` characters of `text`, trimmed of trailing
-/// whitespace -- shared tail-truncation so a reason/log line never dumps a
-/// whole build log, just its actionable end. `pub(crate)`: reused by
-/// `orchestrator::agents::run_gated_hook_step` (issue #79) for a `type:
-/// hook` workflow step's own failure reason, the same trimming
-/// [`run_sandboxed_shell`] already applies to a lifecycle hook's.
+/// The last `max_chars` characters of `text`, trimmed of trailing whitespace -- shared tail-
+/// truncation so a reason/log line never dumps a whole build log, just its actionable end.
 pub(crate) fn trailing_chars(text: &str, max_chars: usize) -> String {
     let reversed: String = text.trim_end().chars().rev().take(max_chars).collect();
     reversed.chars().rev().collect()
@@ -258,24 +159,9 @@ pub(crate) fn trailing_chars(text: &str, max_chars: usize) -> String {
 /// The outcome of running one shell command through [`run_sandboxed_shell`].
 struct SandboxedCommandOutput {
     exit_code: i32,
-    /// The last 500 characters of stderr -- see [`run_sandboxed_shell`]'s own
-    /// docs.
     stderr_tail: String,
 }
 
-/// Runs `command` via `sh -c "<command>"` inside `sandbox`, cwd `cwd`,
-/// forwarding the operator's full environment ([`CommandHook::full_env_allowlist`]
-/// -- see [`CommandHook`]'s own "Environment" docs for why a deterministic
-/// action forwards everything where an agent forwards almost nothing). Used
-/// by [`CommandHook::run`] (a lifecycle hook, issue #55) only -- **not**
-/// shared with a `type: hook` workflow step's own command execution (issue
-/// #79 review, HIGH): a `type: hook` step runs against a worktree checked
-/// out at *this cycle's coder-authored commit* rather than the operator's
-/// own checkout, and needs a narrower, explicit allowlist, cancellation, and
-/// `agent_processes` bookkeeping this helper doesn't provide -- see
-/// `orchestrator::agents::run_gated_hook_step`'s and
-/// `orchestrator::agents::WORKFLOW_STEP_ENV_ALLOWLIST`'s own "Trust model"
-/// docs.
 async fn run_sandboxed_shell(
     sandbox: &Arc<dyn Sandbox>,
     cwd: &std::path::Path,
@@ -287,13 +173,6 @@ async fn run_sandboxed_shell(
         })
         .await?;
 
-    // The sandbox is always destroyed, on the error path as on the success
-    // one (the create->destroy pairing `run_agent`'s `SandboxGuard` makes
-    // structural -- kept explicit and simpler here since there is no long
-    // streaming await to be dropped mid-flight). `execute` borrows `id`
-    // until the returned `Execution` is consumed by `wait`; collapsing both
-    // into one owned `Result<ExecutionResult>` here ends that borrow before
-    // `id` is moved into `destroy`.
     let exec = sandbox
         .execute(
             &id,
@@ -313,18 +192,13 @@ async fn run_sandboxed_shell(
     let _ = sandbox.destroy(id.clone()).await;
     let output = waited?;
 
-    // A trimmed stderr tail makes the reason actionable without dumping a
-    // whole build log into the event/log line.
     Ok(SandboxedCommandOutput {
         exit_code: output.exit_code,
         stderr_tail: trailing_chars(&output.stderr, 500),
     })
 }
 
-/// `": <tail>"` when `tail` is non-empty, otherwise an empty string -- the
-/// shared suffix [`CommandHook::run`]'s and
-/// `orchestrator::agents::run_gated_hook_step`'s (issue #79) own failure
-/// reasons append. `pub(crate)` for the latter.
+/// `": <tail>"` when `tail` is non-empty, otherwise an empty string.
 pub(crate) fn format_tail_suffix(tail: &str) -> String {
     if tail.is_empty() {
         String::new()
@@ -333,14 +207,7 @@ pub(crate) fn format_tail_suffix(tail: &str) -> String {
     }
 }
 
-/// Evaluates `command` as a `warden_policy::Action::Shell` against
-/// `policy_gate` (issue #51, ADR-0016) -- the exact policy check
-/// [`CommandHook::run`] and `orchestrator::agents::run_gated_hook_step`
-/// (issue #79) both apply before ever handing `command` to the sandbox.
-/// `pub(crate)` for the latter, which is not itself part of this module (the
-/// sandbox lifecycle and `agent_processes` bookkeeping a `type: hook`
-/// workflow step needs live in `orchestrator::agents`, alongside every other
-/// step's own bookkeeping, rather than being duplicated here).
+/// Evaluates `command` as a `warden_policy::Action::Shell` against `policy_gate`.
 pub(crate) async fn evaluate_shell_policy(
     policy_gate: &PolicyGate,
     run_id: &str,
@@ -369,8 +236,6 @@ mod tests {
 
     use super::*;
 
-    /// Records that it ran (and the order in which it did) and returns a
-    /// preset outcome. `points` scopes which [`HookPoint`]s it fires on.
     struct FakeHook {
         points: Vec<HookPoint>,
         outcome: HookOutcome,
@@ -443,7 +308,6 @@ mod tests {
             ran_at: ran_at.clone(),
         }));
 
-        // Fires on its point, its outcome is propagated...
         assert_eq!(
             registry
                 .run_hooks(HookPoint::BeforeReview, &ctx(HookPoint::BeforeReview))
@@ -455,7 +319,6 @@ mod tests {
         );
         assert_eq!(ran_at.load(Ordering::SeqCst), 1, "hook should have run");
 
-        // ...but not on a point it did not register for.
         ran_at.store(0, Ordering::SeqCst);
         assert_eq!(
             registry
@@ -561,8 +424,6 @@ mod tests {
         );
     }
 
-    /// A `HookContext` whose `repo_path` is a real directory, for the
-    /// [`CommandHook`] tests that actually run a command against it.
     fn ctx_in<'a>(point: HookPoint, repo_path: &'a Path) -> HookContext<'a> {
         HookContext {
             point,
@@ -576,10 +437,6 @@ mod tests {
         }
     }
 
-    /// No `.warden/policy.yaml` -- every `CommandHook` test below that isn't
-    /// specifically exercising issue #51's policy gate uses this, so the
-    /// policy check stays a strict no-op exactly like it does with no file
-    /// present in a real run.
     fn empty_policy_gate() -> Arc<PolicyGate> {
         Arc::new(PolicyGate::empty())
     }
@@ -673,9 +530,6 @@ mod tests {
         );
     }
 
-    /// Issue #51: a `.warden/policy.yaml` rule denying this exact shell
-    /// command must block the hook -- and the command must never actually
-    /// run (the file it would create must not exist).
     #[tokio::test]
     async fn command_hook_is_blocked_by_a_policy_deny_and_never_runs_the_command() {
         let sandbox = Arc::new(LocalSandbox::new());
@@ -707,11 +561,6 @@ mod tests {
         );
     }
 
-    /// Issue #51 end-to-end: a policy-denied `on_run_start` hook command,
-    /// consumed through the *existing* `HookOutcome::Block` handling
-    /// `run_convergence_loop` already applies for that point, fails the run
-    /// before the coder ever spawns -- exactly the same path a non-zero
-    /// exit already took, now reachable from a policy decision instead.
     #[tokio::test]
     async fn a_policy_denied_on_run_start_hook_still_blocks_via_the_existing_dispatch() {
         let sandbox = Arc::new(LocalSandbox::new());

@@ -1,10 +1,5 @@
-//! Unix domain socket transport between the `post-receive` hook (via the
-//! `notify` relay subcommand) and the long-running `serve` daemon.
-//! Strictly a byte pipe in both directions -- whatever arrives on the
-//! hook's stdin is forwarded verbatim, and it's the daemon side
-//! (`serve::handle_payload`) that parses and decides, never this module
-//! (code-standards.md: "aucune logique métier dans les ... callbacks
-//! d'event").
+//! Unix domain socket transport between the `post-receive` hook (via the `notify` relay subcommand)
+//! and the long-running `serve` daemon.
 
 use std::path::Path;
 
@@ -16,11 +11,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::error::Result;
 
-/// Relays `payload` (the hook's raw stdin) to the daemon listening on
-/// `socket_path`. No parsing, no retry -- a connection failure surfaces
-/// directly to the hook's exit code rather than being swallowed, so a
-/// misconfigured/dead daemon is visible as a failed `git push` instead of a
-/// silently dropped notification.
+/// Relays `payload` (the hook's raw stdin) to the daemon listening on `socket_path`.
 pub async fn relay(socket_path: &Path, payload: &[u8]) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path).await?;
     stream.write_all(payload).await?;
@@ -28,18 +19,8 @@ pub async fn relay(socket_path: &Path, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Binds a fresh listener at `socket_path`, removing a stale socket file
-/// left over from a previous run first -- a Unix socket path can't be
-/// re-bound while the old inode still exists.
-///
-/// This socket is an unauthenticated local trigger into the sole holder of
-/// `origin`'s credentials: anyone who can connect to it can make the daemon
-/// attempt a push (the actual push decision is still independently
-/// re-verified against SQLite, but there's no reason to let another local
-/// user even attempt it). Hardened to `0600` right after bind, matching the
-/// `0600` permission ADR-0008 already mandates for the analogous
-/// `warden-tui` event bus socket -- `bind(2)` creates the socket file with
-/// the umask-derived default mode, which is not narrow enough on its own.
+/// Binds a fresh listener at `socket_path`, removing a stale socket file left over from a previous
+/// run first -- a Unix socket path can't be re-bound while the old inode still exists.
 pub async fn bind(socket_path: &Path) -> Result<UnixListener> {
     if socket_path.exists() {
         tokio::fs::remove_file(socket_path).await?;
@@ -53,10 +34,7 @@ pub async fn bind(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Restricts `socket_path` to owner-only read/write (`0600`). The
-/// containing directory's permissions are the deployment's responsibility
-/// (e.g. `~/.warden` is expected to already be private to its owner) --
-/// this module only narrows the one file it creates.
+/// Restricts `socket_path` to owner-only read/write (`0600`).
 #[cfg(unix)]
 async fn harden_socket_permissions(socket_path: &Path) -> Result<()> {
     let mut permissions = tokio::fs::metadata(socket_path).await?.permissions();
@@ -65,9 +43,8 @@ async fn harden_socket_permissions(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reads a relayed payload to completion (the hook side always shuts its
-/// write half down after sending, see [`relay`], so EOF marks the end of
-/// one notification).
+/// Reads a relayed payload to completion (the hook side always shuts its write half down after
+/// sending, see [`relay`], so EOF marks the end of one notification).
 pub async fn read_payload(stream: &mut UnixStream) -> Result<String> {
     let mut buffer = String::new();
     stream.read_to_string(&mut buffer).await?;
@@ -102,17 +79,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket_path = dir.path().join("gated.sock");
 
-        // Simulate a leftover socket file from a daemon that didn't clean up.
         std::fs::write(&socket_path, b"not a real socket").unwrap();
 
         let listener = bind(&socket_path).await;
         assert!(listener.is_ok());
     }
 
-    /// MEDIUM finding (issue #3 review): the socket is an unauthenticated
-    /// local trigger into the sole credential holder -- must be `0600` so
-    /// only its owner can even attempt to connect, matching ADR-0008's
-    /// `0600` for the analogous TUI socket.
     #[cfg(unix)]
     #[tokio::test]
     async fn bind_restricts_the_socket_file_to_owner_only_read_write() {

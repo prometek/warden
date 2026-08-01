@@ -1,7 +1,5 @@
-//! Creates and configures the local bare gate repository (ADR-0002) that
-//! `warden` pushes converged runs into, and that this crate later relays
-//! from `origin`. Used by the `init-bare` CLI subcommand; a thin wrapper
-//! around a couple of `git` invocations, no decision logic of its own.
+//! Creates and configures the local bare gate repository that `warden` pushes converged runs into,
+//! and that this crate later relays from `origin`.
 
 use std::path::Path;
 
@@ -9,11 +7,8 @@ use tokio::process::Command;
 
 use crate::error::{GatedError, Result};
 
-/// Initializes a bare repo at `bare_repo_path` (idempotent: does nothing if
-/// one already exists there) and, if `origin_url` is given, points its
-/// `origin` remote at it. The `origin` remote's credentials themselves are
-/// never handled here -- whatever the machine's git/SSH config already
-/// provides at push time (Architecture.md §10).
+/// Initializes a bare repo at `bare_repo_path` (idempotent: does nothing if one already exists
+/// there) and, if `origin_url` is given, points its `origin` remote at it.
 pub async fn init(bare_repo_path: &Path, origin_url: Option<&str>) -> Result<()> {
     if !bare_repo_path.join("HEAD").exists() {
         tokio::fs::create_dir_all(bare_repo_path).await?;
@@ -21,10 +16,6 @@ pub async fn init(bare_repo_path: &Path, origin_url: Option<&str>) -> Result<()>
     }
 
     if let Some(origin_url) = origin_url {
-        // `git remote add` fails if `origin` is already configured (e.g. a
-        // second `init-bare` run); check explicitly instead of swallowing
-        // whatever error `add` returns, so a genuinely unexpected git
-        // failure still surfaces (code-standards.md: no silent fallback).
         if remote_exists(bare_repo_path, "origin").await? {
             run_git(bare_repo_path, &["remote", "set-url", "origin", origin_url]).await?;
         } else {

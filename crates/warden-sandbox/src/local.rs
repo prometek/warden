@@ -1,12 +1,5 @@
-//! [`LocalSandbox`]: strict behavioural parity with the process isolation
-//! `warden::process` applied by hand before this issue -- `env_clear()`,
-//! `cwd` pointed at the worktree, `kill_on_drop`, stdin/stdout/stderr piped.
-//! **No container, on purpose** -- "Local" means exactly what it says: the
-//! agent's process runs directly on this host, under this same OS user, the
-//! same isolation warden always applied. `DockerSandbox` (#49) is where
-//! actual container isolation is added; this type exists so today's default
-//! behaviour has a name and a seam to be selected through, not to change
-//! what that behaviour is.
+//! [`LocalSandbox`]: strict behavioural parity with the process isolation `warden::process` applied
+//! by hand before this issue.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,14 +12,6 @@ use crate::drain::drain_and_wait;
 use crate::error::{Result, SandboxError};
 use crate::{Command, ExecuteOptions, Execution, Sandbox, SandboxId, SandboxSpec};
 
-/// [`Sandbox`] backed by nothing but [`tokio::process::Command`] -- see this
-/// module's own docs on why that is a deliberate parity requirement, not a
-/// placeholder. Holds an in-memory `id -> cwd` table rather than any real OS
-/// resource: [`LocalSandbox::create`]/[`LocalSandbox::destroy`] are pure
-/// bookkeeping (no container to create or tear down), but the seam still
-/// requires an id to bind a [`Command`] to *which* worktree it runs against,
-/// exactly as a container backend will need one to bind a `docker exec` to
-/// *which* container.
 #[derive(Default)]
 pub struct LocalSandbox {
     sandboxes: Mutex<HashMap<SandboxId, PathBuf>>,
@@ -66,14 +51,6 @@ impl Sandbox for LocalSandbox {
     ) -> Result<Execution<'a>> {
         let cwd = self.cwd_for(id)?;
 
-        // Mirrors the now-deleted `warden::process::spawn_with_extra_env`
-        // exactly: `env_clear()` always runs first (agents never inherit the
-        // orchestrator's own shell environment), `PATH` is always forwarded
-        // on top, and `command.env_allowlist` is resolved from *this*
-        // process's own environment one variable at a time -- a missing
-        // allowlisted var is logged, not fatal (the tool's own error is
-        // downstream, e.g. `claude`'s "Not logged in" if `HOME` never made
-        // it through).
         let mut cmd = tokio::process::Command::new(&command.program);
         cmd.args(&command.args)
             .current_dir(&cwd)
@@ -240,18 +217,6 @@ mod tests {
         assert!(matches!(result, Err(SandboxError::Cancelled { .. })));
     }
 
-    /// Distinct from [`cancellation_kills_the_child_and_returns_cancelled_error`]:
-    /// that test exercises the explicit `cancel.cancel()` path inside
-    /// `drain_and_wait`, whose `select!` branch calls `child.kill()` by
-    /// hand. This test instead drops the `Execution` (and the `Child` it
-    /// owns) mid-flight *without* ever cancelling -- via
-    /// `tokio::time::timeout`, whose combinator drops the inner future once
-    /// the deadline elapses, the same "future torn down mid-poll rather than
-    /// explicitly cancelled" shape `warden::orchestrator`'s `SandboxGuard::drop`
-    /// backstop relies on -- isolating `kill_on_drop` itself (set on the
-    /// underlying `tokio::process::Command` in [`LocalSandbox::execute`]) as
-    /// the thing actually terminating the process, independent of the
-    /// cancellation machinery.
     #[tokio::test]
     async fn dropping_the_execution_mid_flight_kills_the_child_via_kill_on_drop_not_the_cancel_path(
     ) {
@@ -277,11 +242,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Times out mid the child's own `sleep 1`, well before it would
-        // otherwise touch `marker` -- `tokio::time::timeout` drops the inner
-        // `execution.wait()` future (and therefore the `Child` it owns) the
-        // moment the deadline elapses, without this test ever calling
-        // `cancel()` on anything.
         let timed_out =
             tokio::time::timeout(std::time::Duration::from_millis(200), execution.wait())
                 .await
@@ -292,10 +252,6 @@ mod tests {
              anything"
         );
 
-        // Wait well past the child's own `sleep 1` -- if `kill_on_drop` had
-        // not fired, the child would keep running on its own and create
-        // `marker` regardless of anything on this side having stopped
-        // waiting for it.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(
             !marker.exists(),
@@ -327,11 +283,6 @@ mod tests {
         assert_eq!(outcome.stdout, "hello from warden-sandbox");
     }
 
-    /// Same regression scenario as
-    /// `warden::process::writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`
-    /// -- a large stdin payload and a large stdout write, deliberately
-    /// sequenced so a naive "write the whole payload, then read stdout"
-    /// implementation would hang.
     #[tokio::test]
     async fn writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout() {
         let dir = TempDir::new().unwrap();
@@ -390,13 +341,6 @@ mod tests {
         assert_eq!(seen.into_inner().unwrap(), vec!["one", "two"]);
     }
 
-    /// Ported from `warden::process`'s own
-    /// `wait_with_progress_skips_blank_lines` (issue #50 review, LOW 8):
-    /// `process::wait_with_progress`'s callback support is now dead in
-    /// production (every remaining call site passes `None`), so this
-    /// coverage moved here, the only place the behaviour still runs for
-    /// real. Blank lines carry nothing worth surfacing and must not reach
-    /// the callback at all.
     #[tokio::test]
     async fn on_stdout_line_skips_blank_lines() {
         let dir = TempDir::new().unwrap();
@@ -427,13 +371,6 @@ mod tests {
         assert_eq!(seen.into_inner().unwrap(), vec!["a", "b"]);
     }
 
-    /// Ported from `warden::process`'s own
-    /// `wait_with_progress_invokes_the_callback_for_a_final_line_with_no_trailing_newline`
-    /// (issue #50 review, LOW 8; see [`on_stdout_line_skips_blank_lines`]'s
-    /// own docs on why this moved here). A line with no trailing newline
-    /// (the child exits without flushing one, e.g. the very last line of
-    /// output) must still reach the callback -- `read_until` returns it on
-    /// EOF even without the delimiter.
     #[tokio::test]
     async fn on_stdout_line_is_invoked_for_a_final_line_with_no_trailing_newline() {
         let dir = TempDir::new().unwrap();
@@ -464,16 +401,6 @@ mod tests {
         assert_eq!(seen.into_inner().unwrap(), vec!["no newline at the end"]);
     }
 
-    /// Ported from `warden::process`'s own
-    /// `wait_with_progress_does_not_deadlock_on_large_newline_free_stdout`
-    /// (issue #50 review, LOW 8; see [`on_stdout_line_skips_blank_lines`]'s
-    /// own docs on why this moved here). Same regression scenario as
-    /// [`writing_a_large_stdin_payload_does_not_deadlock_on_large_stdout`],
-    /// but with an `on_stdout_line` callback attached and stdout that has no
-    /// newline until EOF -- proves the line-buffered reader still drains
-    /// continuously rather than blocking on a delimiter that never arrives
-    /// mid-stream, and that the single oversized "line" is delivered whole,
-    /// in one callback invocation, right at EOF.
     #[tokio::test]
     async fn does_not_deadlock_on_large_newline_free_stdout_with_a_callback_attached() {
         let dir = TempDir::new().unwrap();
@@ -565,13 +492,6 @@ mod tests {
         assert!(matches!(result, Err(SandboxError::Spawn { .. })));
     }
 
-    /// Uses `CARGO_MANIFEST_DIR` -- reliably set by `cargo test` in this
-    /// process's own environment, read-only here -- rather than
-    /// `std::env::set_var`: mutating global process environment state would
-    /// be both `unsafe` and carry cross-test interference risk under a
-    /// parallel test runner (same reasoning
-    /// `warden::process`'s own `spawn_tui_attach_inherits_the_full_parent_environment`
-    /// test documents for the identical trade-off).
     #[tokio::test]
     async fn env_clear_means_an_unallowlisted_variable_never_reaches_the_child() {
         assert!(
