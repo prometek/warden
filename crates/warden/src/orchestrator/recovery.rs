@@ -1257,7 +1257,9 @@ mod tests {
         .await
         .unwrap();
 
-        let failed = recover_crashed_runs(&pool).await.unwrap();
+        let failed = recover_crashed_runs_with(&pool, docker_cleanup_succeeds)
+            .await
+            .unwrap();
         assert_eq!(failed, vec!["idempotent-recovery-run".to_string()]);
         assert!(
             !worktree_path.exists(),
@@ -1272,7 +1274,9 @@ mod tests {
             "precondition: first pass must leave nothing pending"
         );
 
-        let failed_again = recover_crashed_runs(&pool).await.unwrap();
+        let failed_again = recover_crashed_runs_with(&pool, docker_cleanup_succeeds)
+            .await
+            .unwrap();
         assert!(
             failed_again.is_empty(),
             "a run already Failed with nothing pending must not be reported as newly \
