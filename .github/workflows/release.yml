@@ -15,7 +15,7 @@ env:
 jobs:
   check-version:
     name: Verify tag matches Cargo.toml version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -45,22 +45,19 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-15
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      # dtolnay/rust-toolchain is versioned by branch, not tag; `stable`
-      # always resolves the actual Rust toolchain dynamically at run time --
-      # pinning below only freezes the *action's* code for supply-chain
-      # safety, not the Rust version installed.
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: 1.95.0
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build artifacts
@@ -68,9 +65,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # `--target` on macos-latest builds both Apple Silicon and Intel from
-      # the same arm64 runner (Xcode's toolchain supports both natively) --
-      # no cross toolchain from Linux, per the issue's technical notes.
+      # macos-15 supports both Apple targets.
       - name: Build release binaries
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
@@ -112,7 +107,7 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
