@@ -18,7 +18,7 @@ use warden::policy_config::{parse_repo_policy, read_repo_policy};
 use warden::policy_gate::PolicyGate;
 use warden::tool_adapter::ToolName;
 use warden_core::AgentRole;
-use warden_sandbox::{LocalSandbox, Sandbox};
+use warden_sandbox::{DockerEgressConfig, DockerRunOptions, LocalSandbox, Sandbox};
 
 use crate::cli::{Isolation, IsolationConfig, TrustRepoAgents};
 
@@ -425,10 +425,30 @@ async fn run_foreground(
     };
 
     let sandbox_config = match isolation_config.isolation {
-        Isolation::Worktree => SandboxConfig::Worktree,
+        Isolation::Worktree => {
+            if isolation_config.cpus.is_some()
+                || isolation_config.memory.is_some()
+                || isolation_config.network.is_some()
+                || isolation_config.egress_proxy.is_some()
+            {
+                bail!("--docker-* options require --isolation docker");
+            }
+            SandboxConfig::Worktree
+        }
         Isolation::Docker => SandboxConfig::Docker {
             image: isolation_config.image,
             claude_config_dir: default_claude_config_dir()?,
+            run_options: DockerRunOptions {
+                cpus: isolation_config.cpus,
+                memory: isolation_config.memory,
+                egress: match (isolation_config.network, isolation_config.egress_proxy) {
+                    (None, None) => None,
+                    (Some(network), Some(proxy)) => Some(DockerEgressConfig { network, proxy }),
+                    _ => bail!(
+                        "Docker egress requires both --docker-network and --docker-egress-proxy"
+                    ),
+                },
+            },
         },
     };
     let sandbox = sandbox_config.build(&config.repo_path);

@@ -33,6 +33,10 @@ pub(crate) struct BatchCommand<'a> {
     pub(crate) tool: &'a str,
     pub(crate) isolation: &'a str,
     pub(crate) isolation_image: String,
+    pub(crate) docker_cpus: Option<String>,
+    pub(crate) docker_memory: Option<String>,
+    pub(crate) docker_network: Option<String>,
+    pub(crate) docker_egress_proxy: Option<String>,
 }
 
 pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
@@ -60,6 +64,10 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
         tool,
         isolation,
         isolation_image,
+        docker_cpus,
+        docker_memory,
+        docker_network,
+        docker_egress_proxy,
     } = command;
     let warden_home = match warden_home {
         Some(warden_home) => warden_home,
@@ -122,6 +130,10 @@ pub(crate) async fn run_batch(command: BatchCommand<'_>) -> anyhow::Result<()> {
         tui_bin: tui_bin_str,
         isolation,
         isolation_image: &isolation_image,
+        docker_cpus: docker_cpus.as_deref(),
+        docker_memory: docker_memory.as_deref(),
+        docker_network: docker_network.as_deref(),
+        docker_egress_proxy: docker_egress_proxy.as_deref(),
         verbose,
     };
 

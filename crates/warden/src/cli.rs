@@ -112,6 +112,22 @@ pub(crate) enum Commands {
         /// Docker image used by `--isolation docker`.
         #[arg(long, default_value = DEFAULT_DOCKER_IMAGE)]
         isolation_image: String,
+
+        /// Optional CPU quota for each Docker agent container.
+        #[arg(long, value_parser = parse_docker_cpus)]
+        docker_cpus: Option<String>,
+
+        /// Optional memory limit for each Docker agent container.
+        #[arg(long, value_parser = parse_docker_memory)]
+        docker_memory: Option<String>,
+
+        /// Internal Docker network containing the configured egress proxy.
+        #[arg(long, requires = "docker_egress_proxy", value_parser = parse_docker_network)]
+        docker_network: Option<String>,
+
+        /// HTTP(S) proxy reachable through `--docker-network`.
+        #[arg(long, requires = "docker_network", value_parser = parse_docker_egress_proxy)]
+        docker_egress_proxy: Option<String>,
     },
 }
 
@@ -162,6 +178,78 @@ pub(crate) fn tool_as_str(tool: ToolName) -> &'static str {
 pub(crate) struct IsolationConfig {
     pub(crate) isolation: Isolation,
     pub(crate) image: String,
+    pub(crate) cpus: Option<String>,
+    pub(crate) memory: Option<String>,
+    pub(crate) network: Option<String>,
+    pub(crate) egress_proxy: Option<String>,
+}
+
+impl IsolationConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let has_docker_options = self.cpus.is_some()
+            || self.memory.is_some()
+            || self.network.is_some()
+            || self.egress_proxy.is_some();
+        if self.isolation == Isolation::Worktree && has_docker_options {
+            return Err("--docker-* options require --isolation docker".to_string());
+        }
+        if self.network.is_some() != self.egress_proxy.is_some() {
+            return Err(
+                "Docker egress requires both --docker-network and --docker-egress-proxy"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_docker_cpus(raw: &str) -> Result<String, String> {
+    let cpus = raw
+        .parse::<f64>()
+        .map_err(|_| "Docker CPU limit must be a positive number".to_string())?;
+    if cpus.is_finite() && cpus > 0.0 {
+        Ok(raw.to_string())
+    } else {
+        Err("Docker CPU limit must be a finite positive number".to_string())
+    }
+}
+
+pub(crate) fn parse_docker_memory(raw: &str) -> Result<String, String> {
+    let digit_count = raw.bytes().take_while(u8::is_ascii_digit).count();
+    let (amount, unit) = raw.split_at(digit_count);
+    let valid_amount = amount.parse::<u64>().is_ok_and(|value| value > 0);
+    let unit = unit.to_ascii_lowercase();
+    if valid_amount && matches!(unit.as_str(), "b" | "k" | "m" | "g" | "kb" | "mb" | "gb") {
+        Ok(format!("{amount}{unit}"))
+    } else {
+        Err("Docker memory limit must be a positive integer followed by b, k, m, or g".to_string())
+    }
+}
+
+pub(crate) fn parse_docker_network(raw: &str) -> Result<String, String> {
+    if !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        Ok(raw.to_string())
+    } else {
+        Err("Docker network must contain only letters, digits, '.', '_', or '-'".to_string())
+    }
+}
+
+pub(crate) fn parse_docker_egress_proxy(raw: &str) -> Result<String, String> {
+    let authority = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next());
+    if !raw.chars().any(char::is_whitespace)
+        && authority.is_some_and(|value| !value.is_empty() && !value.contains('@'))
+    {
+        Ok(raw.to_string())
+    } else {
+        Err("Docker egress proxy must be an HTTP(S) URL without embedded credentials".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

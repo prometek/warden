@@ -34,6 +34,10 @@ pub struct SingleIntentArgs<'a> {
     pub tui_bin: Option<&'a str>,
     pub isolation: &'a str,
     pub isolation_image: &'a str,
+    pub docker_cpus: Option<&'a str>,
+    pub docker_memory: Option<&'a str>,
+    pub docker_network: Option<&'a str>,
+    pub docker_egress_proxy: Option<&'a str>,
     /// Number of `-v` occurrences on the parent invocation, forwarded via repeated `--verbose` so a
     /// child's own tracing verbosity matches.
     pub verbose: u8,
@@ -98,6 +102,22 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out.push(args.isolation.to_string());
     out.push("--isolation-image".to_string());
     out.push(args.isolation_image.to_string());
+    if let Some(cpus) = args.docker_cpus {
+        out.push("--docker-cpus".to_string());
+        out.push(cpus.to_string());
+    }
+    if let Some(memory) = args.docker_memory {
+        out.push("--docker-memory".to_string());
+        out.push(memory.to_string());
+    }
+    if let Some(network) = args.docker_network {
+        out.push("--docker-network".to_string());
+        out.push(network.to_string());
+    }
+    if let Some(proxy) = args.docker_egress_proxy {
+        out.push("--docker-egress-proxy".to_string());
+        out.push(proxy.to_string());
+    }
     out
 }
 
@@ -245,8 +265,12 @@ mod tests {
             gate_inactivity_timeout_secs: 1800,
             tui: false,
             tui_bin: None,
-            isolation: "worktree",
+            isolation: "docker",
             isolation_image: "warden-agent:0.1.0",
+            docker_cpus: Some("2"),
+            docker_memory: Some("4g"),
+            docker_network: Some("warden-egress"),
+            docker_egress_proxy: Some("http://warden-proxy:3128"),
             verbose: 2,
         };
 
@@ -292,9 +316,17 @@ mod tests {
                 "--gate-inactivity-timeout-secs",
                 "1800",
                 "--isolation",
-                "worktree",
+                "docker",
                 "--isolation-image",
                 "warden-agent:0.1.0",
+                "--docker-cpus",
+                "2",
+                "--docker-memory",
+                "4g",
+                "--docker-network",
+                "warden-egress",
+                "--docker-egress-proxy",
+                "http://warden-proxy:3128",
             ]
         );
     }
@@ -322,6 +354,10 @@ mod tests {
             tui_bin: Some("/bin/warden-tui"),
             isolation: "docker",
             isolation_image: "warden-agent:0.1.0",
+            docker_cpus: None,
+            docker_memory: None,
+            docker_network: None,
+            docker_egress_proxy: None,
             verbose: 0,
         };
 
@@ -333,6 +369,10 @@ mod tests {
         assert!(!built.contains(&"--gate-gated-bin".to_string()));
         assert!(!built.contains(&"--gate-repo-slug".to_string()));
         assert!(!built.contains(&"--verbose".to_string()));
+        assert!(!built.contains(&"--docker-cpus".to_string()));
+        assert!(!built.contains(&"--docker-memory".to_string()));
+        assert!(!built.contains(&"--docker-network".to_string()));
+        assert!(!built.contains(&"--docker-egress-proxy".to_string()));
         assert!(built.contains(&"--tui".to_string()));
         assert!(built.contains(&"--tui-bin".to_string()));
         assert!(built.contains(&"/bin/warden-tui".to_string()));

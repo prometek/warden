@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use warden_core::{AgentDefinition, AgentRole, EvidenceTool, Workflow};
-use warden_sandbox::{DockerConfig, DockerSandbox, LocalSandbox, Sandbox};
+use warden_sandbox::{DockerConfig, DockerRunOptions, DockerSandbox, LocalSandbox, Sandbox};
 
 use crate::tool_adapter::ToolName;
 
@@ -29,6 +29,7 @@ pub enum SandboxConfig {
     Docker {
         image: String,
         claude_config_dir: PathBuf,
+        run_options: DockerRunOptions,
     },
 }
 
@@ -39,10 +40,12 @@ impl SandboxConfig {
             Self::Docker {
                 image,
                 claude_config_dir,
+                run_options,
             } => Arc::new(DockerSandbox::new(DockerConfig {
                 image: image.clone(),
                 repo_path: repo_path.to_path_buf(),
                 claude_config_dir: claude_config_dir.clone(),
+                run_options: run_options.clone(),
             })),
         }
     }
