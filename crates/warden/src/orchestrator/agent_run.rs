@@ -32,13 +32,18 @@ impl Orchestrator {
             trusted_arg_values,
         )?;
 
-        let sandbox_id = self
-            .sandbox
-            .create(warden_sandbox::SandboxSpec {
-                cwd: cwd.to_path_buf(),
-            })
-            .await
-            .map_err(map_sandbox_error)?;
+        let sandbox_spec = warden_sandbox::SandboxSpec {
+            cwd: cwd.to_path_buf(),
+        };
+        let sandbox_id = match self.run_context.get() {
+            Some(context) => {
+                self.sandbox
+                    .create_for_run(sandbox_spec, &context.run_id)
+                    .await
+            }
+            None => self.sandbox.create(sandbox_spec).await,
+        }
+        .map_err(map_sandbox_error)?;
 
         let mut guard = SandboxGuard::new(Arc::clone(&self.sandbox), sandbox_id);
 

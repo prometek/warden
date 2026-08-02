@@ -12,7 +12,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-pub use docker::{DockerConfig, DockerSandbox};
+pub use docker::{reclaim_run_containers, DockerConfig, DockerSandbox};
 pub use error::{Result, SandboxError};
 pub use local::LocalSandbox;
 
@@ -119,6 +119,11 @@ impl<'a> Execution<'a> {
 pub trait Sandbox: Send + Sync {
     /// Provisions a sandbox bound to `spec` and returns its id.
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId>;
+
+    /// Provisions a sandbox recoverable by its owning run after a process crash.
+    async fn create_for_run(&self, spec: SandboxSpec, _run_id: &str) -> Result<SandboxId> {
+        self.create(spec).await
+    }
 
     /// Runs `command` inside the sandbox named `id`, applying `options`.
     async fn execute<'a>(

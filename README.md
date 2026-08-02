@@ -351,10 +351,14 @@ Flags de `warden run` :
   l'outil. `docker` est `DockerSandbox` : chaque invocation tourne dans un conteneur
   `docker run --rm` séparé, avec seulement le worktree du rôle et le `.git` du dépôt de base
   montés en lecture-écriture (pour que git fonctionne), et `~/.claude` de l'hôte monté en
-  **lecture seule** comme unique source d'authentification — rien d'autre de l'hôte n'est
-  jamais atteignable (pas de `~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`). `git push origin`
-  échoue par construction (aucun credential monté, ferme l'issue #28) et les secrets réels de
-  l'hôte sont inatteignables par chemin absolu (ferme l'issue #25). Nécessite Docker
+  **lecture seule** comme source d'authentification. Aucun `~/.ssh`, `~/.aws`,
+  `~/.config/gh` ou `.env` hôte n'est bind-monté. `~/.claude` reste toutefois lisible et le
+  réseau n'est pas filtré : un agent malveillant peut exfiltrer credentials Claude et données
+  du dépôt. Les conteneurs conservent seulement `CAP_DAC_OVERRIDE` pour écrire dans les bind
+  mounts appartenant à l'hôte, interdisent l'escalade de privilèges, limitent les processus à
+  256 et sont récupérés par label après crash. Docker daemon et kernel hôte restent dans la
+  base de confiance. `git push origin` échoue sans credentials git.
+  Nécessite Docker
   installé et démarré (Docker Desktop sur macOS, le démon Docker sur Linux) et l'image de
   référence déjà construite — voir `crates/warden-sandbox/docker/README.md`. Limite acceptée
   pour cette version : pas de filtrage d'egress (le conteneur garde un accès réseau normal

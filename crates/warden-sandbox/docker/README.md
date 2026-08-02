@@ -44,23 +44,26 @@ other `docker run` failure would.
 
 See `crates/warden-sandbox/src/docker.rs`'s own module docs for the
 authoritative, up-to-date list and the reasoning behind each mount. In
-short: the role's own worktree and the base repo's `.git` (read-write, so
-git operations work), plus the host's `~/.claude` (read-only, the only
-credential surface) -- nothing else of the host is ever reachable from
-inside the container (no `~/.ssh`, `~/.aws`, `~/.config/gh`, `.env`, or the
-rest of the host's real `$HOME`).
+short: the role's own worktree and the base repo's `.git` (read-write), plus
+the host's `~/.claude` (read-only). No other host path is bind-mounted.
 
-## Accepted v1 limits
+## Security model
 
-- **No egress filtering.** The container runs on Docker's default bridge
-  network, so it can reach the Anthropic API. `git push origin` still fails
-  by construction (no credentials are ever mounted/configured), but nothing
-  prevents outbound connections to other hosts. Deferred to a follow-up --
-  see ADR-0019.
-- **Crash recovery is still pid-based.** Recovering a run after `warden`
-  itself crashes mid-run kills a host pid (the `docker run` client's own
-  pid); it does not yet reach into the daemon to reclaim an orphaned
-  container by name. `Sandbox::destroy` reliably removes a container on
-  every teardown path this crate controls (normal exit, cancellation,
-  explicit destroy) -- only the crash-recovery path itself does not use it
-  yet. See ADR-0015/ADR-0019.
+- `~/.claude` is read-only, not secret from the agent. Default bridge
+  networking permits exfiltration of Claude credentials and repository data.
+- `.git` is writable because linked worktrees require it. Agents can mutate
+  repository metadata; host-side git commands disable repository hooks.
+- Containers drop all Linux capabilities except `CAP_DAC_OVERRIDE`, required
+  to write host-owned worktree and `.git` bind mounts on Linux. They set
+  `no-new-privileges` and limit processes to 256. CPU and memory remain unbounded.
+- Docker daemon and host kernel remain trusted. This backend is not a boundary
+  against daemon compromise or container-runtime/kernel vulnerabilities.
+- No egress allowlist exists. Agent APIs require network access; deploy an
+  outbound proxy or Docker network policy when domain restriction is needed.
+
+## Crash recovery
+
+Every agent container carries managed/run labels. Startup recovery queries
+Docker by run label and force-removes matching containers before deleting
+orphan worktrees. Cleanup errors are explicit; a daemon unavailable during
+that pass requires manual cleanup after Docker returns.
