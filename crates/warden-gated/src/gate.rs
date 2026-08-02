@@ -60,7 +60,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_is_blocked_when_the_real_db_disagrees_with_what_the_notification_claims() {
-        let (_dir, db_path) = seeded_db(RunState::CoderRunning, None).await;
+        let (_dir, db_path) = seeded_db(RunState::RunningStep(0), None).await;
         let ro_pool = db::connect_read_only(std::path::Path::new(&db_path))
             .await
             .unwrap();
@@ -76,7 +76,7 @@ mod tests {
         assert_eq!(
             decision,
             GateDecision::Blocked(GateBlockReason::NotConverged {
-                actual_state: RunState::CoderRunning
+                actual_state: RunState::RunningStep(0)
             })
         );
     }

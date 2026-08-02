@@ -20,7 +20,7 @@ pub async fn insert_cycle(
     Ok(())
 }
 
-/// Records the commit SHA the coder produced during this cycle (M4).
+/// Records the commit SHA produced during this cycle.
 pub async fn set_cycle_commit_sha(
     pool: &SqlitePool,
     cycle_id: &str,

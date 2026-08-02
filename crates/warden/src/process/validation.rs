@@ -3,7 +3,6 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub fn validate_agent_program(
     role_name: &str,
-    is_producer: bool,
     program: &str,
     args: &[String],
     worktree_path: &Path,
@@ -11,10 +10,6 @@ pub fn validate_agent_program(
     run_worktrees_root: &Path,
     trusted_arg_values: &[String],
 ) -> Result<(), ProcessError> {
-    if is_producer {
-        return Ok(());
-    }
-
     if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
         // Any path separator at all -- a bare name has neither, and resolves via `PATH`, never
         // against `worktree_path`.
@@ -60,7 +55,7 @@ fn check_containment(
     if !candidate_path.is_absolute() {
         return Err(format!(
             "relative path -- would resolve against {}, the role's own worktree (a checkout of \
-             the repo the coder can write to)",
+             the repository an agent can modify)",
             worktree_path.display()
         ));
     }
@@ -95,22 +90,20 @@ fn check_containment(
 
     if canonical_candidate.starts_with(&canonical_worktree) {
         return Err(format!(
-            "resolves inside the role's own worktree ({}) -- a checkout of the repo the coder \
-             can write to",
+            "resolves inside the step's own worktree ({}) -- a mutable repository checkout",
             worktree_path.display()
         ));
     }
     if canonical_candidate.starts_with(&canonical_run_worktrees_root) {
         return Err(format!(
-            "resolves inside this run's own worktrees ({}) -- e.g. the coder's, which the \
-             coder writes to freely via Bash, including files it never commits",
+            "resolves inside this run's own worktrees ({}) -- agents may modify these paths, \
+             including uncommitted files",
             run_worktrees_root.display()
         ));
     }
     if canonical_candidate.starts_with(&canonical_repo) {
         return Err(format!(
-            "resolves inside the run's base repository ({}), which the coder can write to and \
-             commit into",
+            "resolves inside the run's base repository ({}), which workflow agents may modify",
             repo_path.display()
         ));
     }

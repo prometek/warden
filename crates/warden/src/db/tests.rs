@@ -28,7 +28,7 @@ async fn suspend_test_quota_run(
     )
     .await
     .unwrap();
-    update_run_state(pool, run_id, RunState::CoderRunning)
+    update_run_state(pool, run_id, RunState::RunningStep(0))
         .await
         .unwrap();
     suspend_run_with_quota_continuation(pool, run_id, resets_at, config_json, state_json)
@@ -40,7 +40,7 @@ async fn suspend_test_quota_run(
 fn intermediate_state_literals_match_run_state_is_intermediate() {
     for state in [
         RunState::Pending,
-        RunState::CoderRunning,
+        RunState::RunningStep(0),
         RunState::RunningStep(1),
         RunState::RunningStep(2),
         RunState::RunningStep(7),
@@ -143,12 +143,12 @@ async fn update_run_state_persists_and_list_intermediate_finds_it() {
         .await
         .unwrap();
 
-    update_run_state(&pool, "run-2", RunState::CoderRunning)
+    update_run_state(&pool, "run-2", RunState::RunningStep(0))
         .await
         .unwrap();
 
     let run = get_run(&pool, "run-2").await.unwrap().unwrap();
-    assert_eq!(run.state, RunState::CoderRunning);
+    assert_eq!(run.state, RunState::RunningStep(0));
 
     let intermediate = list_intermediate_runs(&pool).await.unwrap();
     assert_eq!(intermediate.len(), 1);
@@ -454,7 +454,7 @@ async fn converged_run_is_not_listed_as_intermediate() {
     insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
         .await
         .unwrap();
-    update_run_state(&pool, "run-3", RunState::CoderRunning)
+    update_run_state(&pool, "run-3", RunState::RunningStep(0))
         .await
         .unwrap();
     update_run_state(&pool, "run-3", RunState::RunningStep(1))
@@ -1507,7 +1507,7 @@ async fn failed_run_with_no_open_process_and_no_recorded_worktree_needs_no_clean
     )
     .await
     .unwrap();
-    update_run_state(&pool, "run-clean-failed", RunState::CoderRunning)
+    update_run_state(&pool, "run-clean-failed", RunState::RunningStep(0))
         .await
         .unwrap();
     update_run_state(&pool, "run-clean-failed", RunState::Failed)
@@ -1832,7 +1832,7 @@ async fn intermediate_runs_are_not_returned_by_the_failed_cleanup_query() {
     )
     .await
     .unwrap();
-    update_run_state(&pool, "run-still-running", RunState::CoderRunning)
+    update_run_state(&pool, "run-still-running", RunState::RunningStep(0))
         .await
         .unwrap();
 
@@ -2017,8 +2017,7 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 3,
-            max_test_cycles: 3,
+            max_cycles: 3,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -2083,8 +2082,7 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
         RunEventHistoryEntry::Decoded(ref record) if record.event == RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 3,
-            max_test_cycles: 3,
+            max_cycles: 3,
         }
     ));
     assert!(matches!(
@@ -2197,7 +2195,7 @@ async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_
 }
 
 #[tokio::test]
-async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_undecodable() {
+async fn run_started_payload_with_max_cycles_is_decoded() {
     let (_dir, pool) = test_pool().await;
     insert_run(
         &pool,
@@ -2229,19 +2227,18 @@ async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_unde
 
     let events = list_events_for_run(&pool, "run-pre-43")
         .await
-        .expect("a stale pre-issue-43 payload must never fail the whole query");
+        .expect("max_cycles payload must decode");
 
     assert_eq!(events.len(), 1);
-    match &events[0] {
-        RunEventHistoryEntry::Undecodable(event) => {
-            assert_eq!(event.id, "event-pre-43");
-            assert_eq!(event.event_type, "run_started");
-            assert_eq!(event.reason, UndecodableReason::PayloadDeserialize);
-        }
-        RunEventHistoryEntry::Decoded(record) => {
-            panic!("expected an Undecodable entry, got a decoded record: {record:?}")
-        }
-    }
+    assert!(matches!(
+        &events[0],
+        RunEventHistoryEntry::Decoded(record)
+            if record.event == RunEvent::RunStarted {
+                intent: "do the thing".to_string(),
+                branch: "main".to_string(),
+                max_cycles: 5,
+            }
+    ));
 }
 
 #[tokio::test]

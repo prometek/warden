@@ -1,5 +1,5 @@
 use super::*;
-use warden_core::Severity;
+use warden_core::{FindingSource, Severity};
 
 #[test]
 fn detects_fixes_keyword_case_insensitively() {
@@ -82,7 +82,7 @@ fn formats_trailers_matching_the_architecture_doc_example() {
     let trailers = CommitTrailers {
         cycle: 3,
         findings_resolved: vec!["r-042".to_string()],
-        agent: TrailerAgent::Coder,
+        agent: "coder".to_string(),
     };
     assert_eq!(
         trailers.format(),
@@ -95,7 +95,7 @@ fn omits_findings_resolved_trailer_when_nothing_was_resolved_yet() {
     let trailers = CommitTrailers {
         cycle: 1,
         findings_resolved: vec![],
-        agent: TrailerAgent::Coder,
+        agent: "coder".to_string(),
     };
     assert_eq!(trailers.format(), "Warden-Cycle: 1\nWarden-Agent: coder");
 }
@@ -105,7 +105,7 @@ fn joins_multiple_resolved_finding_ids() {
     let trailers = CommitTrailers {
         cycle: 2,
         findings_resolved: vec!["r-001".to_string(), "t-002".to_string()],
-        agent: TrailerAgent::Doc,
+        agent: "doc".to_string(),
     };
     assert_eq!(
         trailers.format(),
@@ -121,7 +121,7 @@ fn append_trailers_matches_the_full_architecture_doc_example() {
     let trailers = CommitTrailers {
         cycle: 3,
         findings_resolved: vec!["r-042".to_string()],
-        agent: TrailerAgent::Coder,
+        agent: "coder".to_string(),
     };
 
     let full = append_trailers(message, &trailers);
@@ -140,7 +140,7 @@ fn append_trailers_trims_trailing_whitespace_before_the_blank_separator() {
     let trailers = CommitTrailers {
         cycle: 1,
         findings_resolved: vec![],
-        agent: TrailerAgent::Coder,
+        agent: "coder".to_string(),
     };
     let full = append_trailers("fix: something\n\n\n", &trailers);
     assert_eq!(
@@ -1265,7 +1265,7 @@ async fn finalize_posts_an_evidence_section_when_evidence_was_captured() {
 #[tokio::test]
 async fn finalize_blocks_and_never_touches_the_provider_when_not_converged() {
     let (_origin, _seed, gate_repo, commit_sha) = gate_repo_fixture();
-    let (_db_dir, db_path) = seeded_run_db(warden_core::RunState::CoderRunning, None).await;
+    let (_db_dir, db_path) = seeded_run_db(warden_core::RunState::RunningStep(0), None).await;
     let pool = crate::db::connect_read_only(&db_path).await.unwrap();
     let provider = RecordingProvider::new(1);
     let pr = PrHandle { number: 7 };
@@ -1285,7 +1285,7 @@ async fn finalize_blocks_and_never_touches_the_provider_when_not_converged() {
     assert_eq!(
         outcome,
         FinalizeOutcome::Blocked(GateBlockReason::NotConverged {
-            actual_state: warden_core::RunState::CoderRunning
+            actual_state: warden_core::RunState::RunningStep(0)
         })
     );
     assert!(

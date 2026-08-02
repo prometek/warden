@@ -57,18 +57,15 @@ impl EventKind {
     }
 }
 
-/// A single structured event describing one significant transition of a run (Architecture.md
-/// §5.4/§6).
+/// One structured run transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunEvent {
     RunStarted {
         intent: String,
         branch: String,
-        /// the run's two independent per-phase budgets -- replaces the single `max_cycles` this
-        /// event used to carry.
-        max_review_cycles: u32,
-        max_test_cycles: u32,
+        #[serde(alias = "max_review_cycles")]
+        max_cycles: u32,
     },
     CycleStarted {
         cycle_number: u32,
@@ -259,8 +256,7 @@ mod tests {
             EventKind::RunStarted => RunEvent::RunStarted {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 5,
-                max_test_cycles: 5,
+                max_cycles: 5,
             },
             EventKind::CycleStarted => RunEvent::CycleStarted { cycle_number: 1 },
             EventKind::AgentStarted => RunEvent::AgentStarted {

@@ -1,7 +1,6 @@
 use super::*;
 
-/// Detects `fixes #123` / `closes #123` / `resolves #123` (any case) inside a run's intent, per
-/// ("liée à l'issue détectée dans l'intent").
+/// Linked issue parsed from run intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkedIssue {
     pub number: u64,
@@ -46,8 +45,6 @@ pub fn generate_pr_title(intent: &str) -> Result<String> {
     Ok(format!("{truncated}…"))
 }
 
-/// Builds the draft PR body: the linked-issue reference (if any, so GitHub auto-links/auto-closes
-/// it on merge), the intent verbatim, and a fixed note marking this as a skeleton draft.
 pub fn open_draft_pr_body(intent: &str, linked_issue: Option<&LinkedIssue>) -> String {
     let mut sections = Vec::new();
     if let Some(issue) = linked_issue {
@@ -56,40 +53,21 @@ pub fn open_draft_pr_body(intent: &str, linked_issue: Option<&LinkedIssue>) -> S
     sections.push(intent.trim().to_string());
     sections.push(
         "---\n_Opened automatically by Warden as a draft skeleton branch. Business code lands \
-         only once this run converges (ADR-0007)._"
+         only once this run converges._"
             .to_string(),
     );
     sections.join("\n\n")
 }
 
-/// Role of the commit's author agent, embedded in the `Warden-Agent` trailer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrailerAgent {
-    Coder,
-    Doc,
-}
-
-impl TrailerAgent {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TrailerAgent::Coder => "coder",
-            TrailerAgent::Doc => "doc",
-        }
-    }
-}
-
-/// The three structured commit trailers coder/doc commits carry locally (Architecture.md §5.3) --
-/// no remote access needed to produce these.
+/// Structured metadata carried by an agent commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitTrailers {
     pub cycle: u32,
     pub findings_resolved: Vec<String>,
-    pub agent: TrailerAgent,
+    pub agent: String,
 }
 
 impl CommitTrailers {
-    /// Renders just the trailer block, one `Key: value` line per trailer, in the order shown in
-    /// Architecture.md §5.3's table.
     pub fn format(&self) -> String {
         let mut lines = vec![format!("Warden-Cycle: {}", self.cycle)];
         if !self.findings_resolved.is_empty() {
@@ -98,7 +76,7 @@ impl CommitTrailers {
                 self.findings_resolved.join(", ")
             ));
         }
-        lines.push(format!("Warden-Agent: {}", self.agent.as_str()));
+        lines.push(format!("Warden-Agent: {}", self.agent));
         lines.join("\n")
     }
 }
@@ -121,22 +99,16 @@ pub fn format_cycle_comment(summary: &CycleSummary) -> String {
     if summary.findings.is_empty() {
         body.push_str("No findings raised this cycle.\n\n");
     } else {
-        for source in [
-            FindingSource::role("reviewer"),
-            FindingSource::role("tester"),
-            FindingSource::Warden,
-            FindingSource::Ci,
-        ] {
-            let from_source: Vec<&Finding> = summary
-                .findings
-                .iter()
-                .filter(|finding| finding.source == source)
-                .collect();
-            if from_source.is_empty() {
-                continue;
-            }
-            body.push_str(&format!("**{}**\n\n", title_case(source.as_str())));
-            for finding in from_source {
+        let mut by_source = std::collections::BTreeMap::<&str, Vec<&Finding>>::new();
+        for finding in &summary.findings {
+            by_source
+                .entry(finding.source.as_str())
+                .or_default()
+                .push(finding);
+        }
+        for (source, findings) in by_source {
+            body.push_str(&format!("**{}**\n\n", title_case(source)));
+            for finding in findings {
                 body.push_str(&format_finding_line(finding));
                 body.push('\n');
             }

@@ -201,8 +201,7 @@ mod tests {
             &RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 5,
-                max_test_cycles: 5,
+                max_cycles: 5,
             },
             "2026-07-12T00:00:00+00:00",
         )

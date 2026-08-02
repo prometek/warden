@@ -9,22 +9,9 @@ use crate::state::RunState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {
     OnRunStart,
-    /// A new coder cycle is about to begin (entering [`RunState::CoderRunning`]).
-    OnCycleStart,
-    /// Just before the coder agent runs.
-    BeforeCoder,
-    /// Just after the coder agent produced its commit.
-    AfterCoder,
+    BeforeStep,
+    AfterStep,
     OnCommit,
-    BeforeReview,
-    AfterReview,
-    /// Just before the tester agent runs (entering `RunState::RunningStep(2)` in the built-in
-    /// default workflow -- see [`HookPoint::on_entering`]).
-    BeforeTest,
-    /// Just after the tester agent produced its findings.
-    AfterTest,
-    /// A cycle has fully closed (findings recorded, next state decided).
-    OnCycleEnd,
     /// The run converged (entering [`RunState::Converged`]).
     OnConverged,
     /// Just before the converged commit is pushed (entering [`RunState::Pushed`]).
@@ -39,15 +26,9 @@ impl HookPoint {
     pub fn as_str(self) -> &'static str {
         match self {
             HookPoint::OnRunStart => "on_run_start",
-            HookPoint::OnCycleStart => "on_cycle_start",
-            HookPoint::BeforeCoder => "before_coder",
-            HookPoint::AfterCoder => "after_coder",
+            HookPoint::BeforeStep => "before_step",
+            HookPoint::AfterStep => "after_step",
             HookPoint::OnCommit => "on_commit",
-            HookPoint::BeforeReview => "before_review",
-            HookPoint::AfterReview => "after_review",
-            HookPoint::BeforeTest => "before_test",
-            HookPoint::AfterTest => "after_test",
-            HookPoint::OnCycleEnd => "on_cycle_end",
             HookPoint::OnConverged => "on_converged",
             HookPoint::BeforePush => "before_push",
             HookPoint::OnRunEnd => "on_run_end",
@@ -58,15 +39,9 @@ impl HookPoint {
     pub fn parse(s: &str) -> Option<HookPoint> {
         Some(match s {
             "on_run_start" => HookPoint::OnRunStart,
-            "on_cycle_start" => HookPoint::OnCycleStart,
-            "before_coder" => HookPoint::BeforeCoder,
-            "after_coder" => HookPoint::AfterCoder,
+            "before_step" => HookPoint::BeforeStep,
+            "after_step" => HookPoint::AfterStep,
             "on_commit" => HookPoint::OnCommit,
-            "before_review" => HookPoint::BeforeReview,
-            "after_review" => HookPoint::AfterReview,
-            "before_test" => HookPoint::BeforeTest,
-            "after_test" => HookPoint::AfterTest,
-            "on_cycle_end" => HookPoint::OnCycleEnd,
             "on_converged" => HookPoint::OnConverged,
             "before_push" => HookPoint::BeforePush,
             "on_run_end" => HookPoint::OnRunEnd,
@@ -76,17 +51,11 @@ impl HookPoint {
 
     /// Every point, in declaration order -- for config validation error messages (listing the valid
     /// `point` names) and exhaustiveness tests.
-    pub const ALL: [HookPoint; 13] = [
+    pub const ALL: [HookPoint; 7] = [
         HookPoint::OnRunStart,
-        HookPoint::OnCycleStart,
-        HookPoint::BeforeCoder,
-        HookPoint::AfterCoder,
+        HookPoint::BeforeStep,
+        HookPoint::AfterStep,
         HookPoint::OnCommit,
-        HookPoint::BeforeReview,
-        HookPoint::AfterReview,
-        HookPoint::BeforeTest,
-        HookPoint::AfterTest,
-        HookPoint::OnCycleEnd,
         HookPoint::OnConverged,
         HookPoint::BeforePush,
         HookPoint::OnRunEnd,
@@ -95,13 +64,10 @@ impl HookPoint {
     /// The hook point that firing *on entering* `state` corresponds to, if any.
     pub fn on_entering(state: RunState) -> Option<HookPoint> {
         match state {
-            RunState::CoderRunning => Some(HookPoint::OnCycleStart),
-            RunState::RunningStep(1) => Some(HookPoint::BeforeReview),
-            RunState::RunningStep(2) => Some(HookPoint::BeforeTest),
+            RunState::RunningStep(_) => Some(HookPoint::BeforeStep),
             RunState::Converged => Some(HookPoint::OnConverged),
             RunState::Pushed => Some(HookPoint::BeforePush),
             RunState::Pending
-            | RunState::RunningStep(_)
             | RunState::AwaitingCi
             | RunState::AwaitingQuotaReset { .. }
             | RunState::ResumingQuota
@@ -154,16 +120,8 @@ mod tests {
     #[test]
     fn on_entering_maps_the_lifecycle_milestone_states() {
         assert_eq!(
-            HookPoint::on_entering(RunState::CoderRunning),
-            Some(HookPoint::OnCycleStart)
-        );
-        assert_eq!(
-            HookPoint::on_entering(RunState::RunningStep(1)),
-            Some(HookPoint::BeforeReview)
-        );
-        assert_eq!(
-            HookPoint::on_entering(RunState::RunningStep(2)),
-            Some(HookPoint::BeforeTest)
+            HookPoint::on_entering(RunState::RunningStep(0)),
+            Some(HookPoint::BeforeStep)
         );
         assert_eq!(
             HookPoint::on_entering(RunState::Converged),
@@ -179,7 +137,6 @@ mod tests {
     fn on_entering_has_no_hook_for_non_milestone_states() {
         for state in [
             RunState::Pending,
-            RunState::RunningStep(3),
             RunState::AwaitingCi,
             RunState::Done,
             RunState::StepCyclesExceeded(1),

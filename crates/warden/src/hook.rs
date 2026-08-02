@@ -262,7 +262,7 @@ mod tests {
         HookContext {
             point,
             run_id: "run-1",
-            state: RunState::CoderRunning,
+            state: RunState::RunningStep(0),
             repo_path: Path::new("/tmp/repo"),
             cycle: Some(0),
             worktree: None,
@@ -287,7 +287,7 @@ mod tests {
         assert!(registry.is_empty());
         assert_eq!(
             registry
-                .run_hooks(HookPoint::OnCycleStart, &ctx(HookPoint::OnCycleStart))
+                .run_hooks(HookPoint::BeforeStep, &ctx(HookPoint::BeforeStep))
                 .await
                 .unwrap(),
             HookOutcome::Continue
@@ -300,7 +300,7 @@ mod tests {
         let ran_at = Arc::new(AtomicUsize::new(0));
         let mut registry = HookRegistry::new();
         registry.register(Arc::new(FakeHook {
-            points: vec![HookPoint::BeforeReview],
+            points: vec![HookPoint::BeforeStep],
             outcome: HookOutcome::Block {
                 reason: "nope".to_string(),
             },
@@ -310,7 +310,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .run_hooks(HookPoint::BeforeReview, &ctx(HookPoint::BeforeReview))
+                .run_hooks(HookPoint::BeforeStep, &ctx(HookPoint::BeforeStep))
                 .await
                 .unwrap(),
             HookOutcome::Block {
@@ -322,7 +322,7 @@ mod tests {
         ran_at.store(0, Ordering::SeqCst);
         assert_eq!(
             registry
-                .run_hooks(HookPoint::BeforeTest, &ctx(HookPoint::BeforeTest))
+                .run_hooks(HookPoint::AfterStep, &ctx(HookPoint::AfterStep))
                 .await
                 .unwrap(),
             HookOutcome::Continue
@@ -337,20 +337,20 @@ mod tests {
         let second_at = Arc::new(AtomicUsize::new(0));
         let mut registry = HookRegistry::new();
         registry.register(Arc::new(FakeHook {
-            points: vec![HookPoint::OnCycleEnd],
+            points: vec![HookPoint::AfterStep],
             outcome: HookOutcome::Continue,
             order: order.clone(),
             ran_at: first_at.clone(),
         }));
         registry.register(Arc::new(FakeHook {
-            points: vec![HookPoint::OnCycleEnd],
+            points: vec![HookPoint::AfterStep],
             outcome: HookOutcome::Continue,
             order: order.clone(),
             ran_at: second_at.clone(),
         }));
 
         registry
-            .run_hooks(HookPoint::OnCycleEnd, &ctx(HookPoint::OnCycleEnd))
+            .run_hooks(HookPoint::AfterStep, &ctx(HookPoint::AfterStep))
             .await
             .unwrap();
 
@@ -403,13 +403,13 @@ mod tests {
         let order = Arc::new(AtomicUsize::new(0));
         let mut registry = HookRegistry::new();
         registry.register(Arc::new(FakeHook {
-            points: vec![HookPoint::AfterTest],
+            points: vec![HookPoint::AfterStep],
             outcome: HookOutcome::EmitFindings(vec![blocking_finding("a")]),
             order: order.clone(),
             ran_at: Arc::new(AtomicUsize::new(0)),
         }));
         registry.register(Arc::new(FakeHook {
-            points: vec![HookPoint::AfterTest],
+            points: vec![HookPoint::AfterStep],
             outcome: HookOutcome::EmitFindings(vec![blocking_finding("b")]),
             order: order.clone(),
             ran_at: Arc::new(AtomicUsize::new(0)),
@@ -417,7 +417,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .run_hooks(HookPoint::AfterTest, &ctx(HookPoint::AfterTest))
+                .run_hooks(HookPoint::AfterStep, &ctx(HookPoint::AfterStep))
                 .await
                 .unwrap(),
             HookOutcome::EmitFindings(vec![blocking_finding("a"), blocking_finding("b")])

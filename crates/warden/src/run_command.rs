@@ -1,7 +1,7 @@
 //! Runtime implementation for `warden run` command.
 
 use std::io::{IsTerminal, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context};
@@ -17,10 +17,9 @@ use warden::orchestrator::{
 use warden::policy_config::{parse_repo_policy, read_repo_policy};
 use warden::policy_gate::PolicyGate;
 use warden::tool_adapter::ToolName;
-use warden_core::AgentRole;
 use warden_sandbox::{DockerEgressConfig, DockerRunOptions, LocalSandbox, Sandbox};
 
-use crate::cli::{Isolation, IsolationConfig, TrustRepoAgents};
+use crate::cli::{Isolation, IsolationConfig};
 
 mod batch;
 
@@ -57,9 +56,12 @@ async fn load_workflow(repo: &std::path::Path) -> anyhow::Result<warden_core::Wo
     match tokio::fs::read_to_string(&workflow_path).await {
         Ok(raw) => warden_core::Workflow::parse_yaml(&raw)
             .with_context(|| format!("invalid workflow file at {}", workflow_path.display())),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok(warden_core::Workflow::builtin_default())
-        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(source).with_context(|| {
+            format!(
+                "workflow file is required at {} (copy an example and define explicit entry/transitions)",
+                workflow_path.display()
+            )
+        }),
         Err(source) => Err(source).with_context(|| {
             format!(
                 "failed to read workflow file at {}",
@@ -140,13 +142,10 @@ pub(crate) async fn run(
     repo: PathBuf,
     intent: String,
     branch: String,
-    max_review_cycles: u32,
-    max_test_cycles: u32,
     max_cycles: u32,
     quota_anticipation_threshold: f64,
     warden_home: Option<PathBuf>,
     adapter: ToolName,
-    trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
@@ -197,13 +196,10 @@ pub(crate) async fn run(
         repo,
         intent,
         branch,
-        max_review_cycles,
-        max_test_cycles,
         max_cycles,
         quota_anticipation_threshold,
         warden_home,
         adapter,
-        trust_repo_agents,
         evidence_tool,
         evidence_store_in_repo,
         gate,
@@ -243,13 +239,10 @@ async fn run_foreground(
     repo: PathBuf,
     intent: String,
     branch: String,
-    max_review_cycles: u32,
-    max_test_cycles: u32,
     max_cycles: u32,
     quota_anticipation_threshold: f64,
     warden_home: PathBuf,
     adapter: ToolName,
-    trust_repo_agents: TrustRepoAgents,
     evidence_tool: Option<warden_core::EvidenceTool>,
     evidence_store_in_repo: bool,
     gate: Option<orchestrator::GateConfig>,
@@ -293,104 +286,23 @@ async fn run_foreground(
         });
     }
 
-    let mut user_config_agents_dir: Option<PathBuf> = None;
-
     let workflow = load_workflow(&repo).await?;
 
-    // (trio-unification follow-up): every step's agent is resolved here, uniformly, in
-    // `workflow.steps` order -- no ordering restriction on the workflow itself.
     let mut step_agents = Vec::with_capacity(workflow.steps.len());
-    let mut untrusted_repo_agent_definitions = Vec::new();
     for step in &workflow.steps {
-        if step.kind == warden_core::StepKind::Hook {
+        if step.kind == warden_core::StepKind::Command {
             continue;
         }
-        let definition = match step.role.as_str() {
-            "coder" => {
-                let (definition, _source) = resolve_agent_definition(
-                    &repo,
-                    AgentRole::Coder,
-                    &adapter,
-                    Path::new(""),
-                    &warden_home,
-                    trust_repo_agents.0,
+        let agent_name = step.agent.as_deref().expect("validated agent step");
+        let definition = resolve_agent_definition(&repo, step.role.as_str(), agent_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to resolve workflow step {:?} agent {:?}",
+                    step.role.as_str(),
+                    agent_name
                 )
-                .await?;
-                definition
-            }
-            "reviewer" => {
-                let user_config_dir =
-                    resolve_lazy_user_config_agents_dir(&mut user_config_agents_dir)?;
-                let (definition, source) = resolve_agent_definition(
-                    &repo,
-                    AgentRole::Reviewer,
-                    &adapter,
-                    user_config_dir,
-                    &warden_home,
-                    trust_repo_agents.0,
-                )
-                .await?;
-                if let warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
-                    path,
-                    canonical_path,
-                } = source
-                {
-                    untrusted_repo_agent_definitions.push(
-                        orchestrator::UntrustedRepoAgentDefinition {
-                            role: AgentRole::Reviewer,
-                            path,
-                            canonical_path,
-                        },
-                    );
-                }
-                definition
-            }
-            "tester" => {
-                let user_config_dir =
-                    resolve_lazy_user_config_agents_dir(&mut user_config_agents_dir)?;
-                let (definition, source) = resolve_agent_definition(
-                    &repo,
-                    AgentRole::Tester,
-                    &adapter,
-                    user_config_dir,
-                    &warden_home,
-                    trust_repo_agents.0,
-                )
-                .await?;
-                if let warden::agent_def::AgentDefinitionSource::UntrustedRepoOverride {
-                    path,
-                    canonical_path,
-                } = source
-                {
-                    untrusted_repo_agent_definitions.push(
-                        orchestrator::UntrustedRepoAgentDefinition {
-                            role: AgentRole::Tester,
-                            path,
-                            canonical_path,
-                        },
-                    );
-                }
-                definition
-            }
-            custom_role => {
-                let agent_name = step.agent.as_deref().expect(
-                    "Workflow::parse_yaml guarantees a type: agent step always carries a \
-                     non-blank \"agent\"",
-                );
-                warden::agent_def::resolve_custom_step_agent_definition(
-                    &repo,
-                    custom_role,
-                    agent_name,
-                )
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve the agent for custom workflow role {custom_role:?} \
-                         (agent {agent_name:?})"
-                    )
-                })?
-            }
-        };
+            })?;
         step_agents.push(definition);
     }
 
@@ -413,15 +325,12 @@ async fn run_foreground(
         warden_home,
         branch,
         intent,
-        max_review_cycles,
-        max_test_cycles,
+        max_cycles,
         workflow,
-        max_extra_step_cycles: max_cycles,
         step_agents,
         evidence_tool,
         evidence_store_in_repo,
         gate,
-        untrusted_repo_agent_definitions,
     };
 
     let sandbox_config = match isolation_config.isolation {
@@ -628,15 +537,6 @@ fn print_isolation_worktree_warning() {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
             tracing::warn!(%error, "failed to print isolation warning to stderr");
         }
-    }
-}
-
-fn resolve_lazy_user_config_agents_dir(cache: &mut Option<PathBuf>) -> anyhow::Result<&Path> {
-    match cache {
-        Some(dir) => Ok(dir.as_path()),
-        None => Ok(cache
-            .insert(warden::agent_def::default_user_config_agents_dir()?)
-            .as_path()),
     }
 }
 

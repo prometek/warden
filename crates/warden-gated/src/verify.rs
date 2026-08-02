@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn blocks_when_persisted_state_is_not_converged_even_if_the_notification_claims_success() {
         let run = GateRunView {
-            state: RunState::CoderRunning,
+            state: RunState::RunningStep(0),
             converged_commit_sha: None,
         };
 
@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(
             decision,
             GateDecision::Blocked(GateBlockReason::NotConverged {
-                actual_state: RunState::CoderRunning
+                actual_state: RunState::RunningStep(0)
             })
         );
     }

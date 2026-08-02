@@ -1,0 +1,16 @@
+name: local-checks
+entry: format
+steps:
+  format:
+    type: command
+    run: cargo fmt --all -- --check
+    on_clean: test
+    on_blocking: failed
+    on_error: failed
+
+  test:
+    type: command
+    run: cargo test --workspace
+    on_clean: converged
+    on_blocking: failed
+    on_error: failed
