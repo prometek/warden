@@ -3,6 +3,21 @@ use super::*;
 
 /// Crash recovery (Architecture.md §6 "Règle de récupération" / §9 Disaster Recovery).
 pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
+    recover_crashed_runs_with(pool, reclaim_run_containers).await
+}
+
+async fn reclaim_run_containers(run_id: String) -> warden_sandbox::Result<usize> {
+    warden_sandbox::reclaim_run_containers(&run_id).await
+}
+
+async fn recover_crashed_runs_with<F, Fut>(
+    pool: &SqlitePool,
+    reclaim_containers: F,
+) -> Result<Vec<String>>
+where
+    F: Fn(String) -> Fut + Copy,
+    Fut: std::future::Future<Output = warden_sandbox::Result<usize>>,
+{
     let intermediate_runs = db::list_intermediate_runs(pool).await?;
     let mut failed_run_ids = Vec::new();
 
@@ -33,18 +48,18 @@ pub async fn recover_crashed_runs(pool: &SqlitePool) -> Result<Vec<String>> {
 
         run.state
             .validate_transition(RunState::Failed, run.total_steps)?;
-        db::update_run_state(pool, &run.id, RunState::Failed).await?;
+        db::fail_run_with_pending_cleanup(pool, &run.id).await?;
         db::delete_quota_continuation(pool, &run.id).await?;
         tracing::warn!(run_id = %run.id, previous_state = run.state.as_str(), "run recovered as Failed: no live process found");
 
-        reclaim_orphan_resources(pool, &run).await;
+        reclaim_orphan_resources_with(pool, &run, reclaim_containers).await?;
         failed_run_ids.push(run.id);
     }
 
     let failed_runs_needing_cleanup = db::list_failed_runs_with_pending_cleanup(pool).await?;
     for run in failed_runs_needing_cleanup {
         tracing::warn!(run_id = %run.id, "resuming orphan cleanup for a run already marked Failed by an earlier, interrupted recovery pass");
-        reclaim_orphan_resources(pool, &run).await;
+        reclaim_orphan_resources_with(pool, &run, reclaim_containers).await?;
     }
 
     Ok(failed_run_ids)
@@ -72,8 +87,8 @@ pub async fn resume_awaiting_ci_runs<G: GateTrigger>(
             );
             run.state
                 .validate_transition(RunState::Failed, run.total_steps)?;
-            db::update_run_state(&pool, &run.id, RunState::Failed).await?;
-            reclaim_orphan_resources(&pool, &run).await;
+            db::fail_run_with_pending_cleanup(&pool, &run.id).await?;
+            reclaim_orphan_resources(&pool, &run).await?;
             delete_gate_staging_ref(&bare_repo_path, &run.id).await;
             resumed_run_ids.push(run.id);
             continue;
@@ -307,62 +322,87 @@ async fn fail_quota_continuation_recovery(
             reason: "quota resume claim disappeared before it could be failed".to_string(),
         });
     }
-    reclaim_orphan_resources(pool, run).await;
+    reclaim_orphan_resources(pool, run).await?;
     Ok(())
 }
 
 /// Reclaims both kinds of resources a crashed run may have left orphaned.
-async fn reclaim_orphan_resources(pool: &SqlitePool, run: &db::Run) {
-    if let Err(error) = terminate_orphan_processes(pool, &run.id).await {
-        tracing::error!(run_id = %run.id, %error, "failed to terminate orphan agent processes during crash recovery");
-    }
-    match warden_sandbox::reclaim_run_containers(&run.id).await {
-        Ok(0) => {}
+async fn reclaim_orphan_resources(pool: &SqlitePool, run: &db::Run) -> Result<()> {
+    reclaim_orphan_resources_with(pool, run, reclaim_run_containers).await
+}
+
+async fn reclaim_orphan_resources_with<F, Fut>(
+    pool: &SqlitePool,
+    run: &db::Run,
+    reclaim_containers: F,
+) -> Result<()>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = warden_sandbox::Result<usize>>,
+{
+    db::mark_run_cleanup_pending(pool, &run.id).await?;
+    let processes_clean = terminate_orphan_processes(pool, &run.id).await?;
+    let containers_clean = match reclaim_containers(run.id.clone()).await {
+        Ok(0) => true,
         Ok(count) => {
             tracing::warn!(run_id = %run.id, count, "removed orphan Docker containers during crash recovery");
+            true
         }
         Err(error) => {
             tracing::error!(run_id = %run.id, %error, "failed to remove orphan Docker containers during crash recovery");
+            false
         }
+    };
+    let worktrees_clean = cleanup_orphan_worktrees(pool, run).await?;
+    if processes_clean && containers_clean && worktrees_clean {
+        db::clear_run_cleanup_pending(pool, &run.id).await?;
+    } else {
+        tracing::warn!(run_id = %run.id, "orphan cleanup remains pending for a later recovery pass");
     }
-    if let Err(error) = cleanup_orphan_worktrees(pool, run).await {
-        tracing::error!(run_id = %run.id, %error, "failed to clean up orphaned worktrees during crash recovery");
-    }
+    Ok(())
 }
 
-async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<()> {
+async fn cleanup_orphan_worktrees(pool: &SqlitePool, run: &db::Run) -> Result<bool> {
     let entries = db::list_cycle_worktree_entries_for_run(pool, &run.id).await?;
     if entries.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let main_repo_path = Path::new(&run.repo_path);
+    let mut complete = true;
+    let mut removed_entries = Vec::new();
     for entry in &entries {
         match worktree::remove_orphan_worktree(main_repo_path, Path::new(&entry.path)).await {
-            Ok(()) => {
-                if let Err(error) =
-                    db::clear_cycle_worktree_path(pool, &entry.cycle_id, &entry.role).await
-                {
-                    tracing::error!(run_id = %run.id, cycle_id = %entry.cycle_id, %error, "failed to clear recorded worktree path after removing it");
-                }
-            }
+            Ok(()) => removed_entries.push(entry),
             Err(error) => {
                 tracing::error!(run_id = %run.id, worktree_path = %entry.path, %error, "failed to remove orphaned worktree");
+                complete = false;
             }
         }
     }
 
     if let Err(error) = worktree::prune_worktrees(main_repo_path).await {
         tracing::error!(run_id = %run.id, %error, "git worktree prune failed during crash recovery");
+        complete = false;
+    } else {
+        for entry in removed_entries {
+            if let Err(error) =
+                db::clear_cycle_worktree_path(pool, &entry.cycle_id, &entry.role).await
+            {
+                tracing::error!(run_id = %run.id, cycle_id = %entry.cycle_id, %error, "failed to clear recorded worktree path after removing it");
+                complete = false;
+            }
+        }
     }
 
-    Ok(())
+    Ok(complete)
 }
 
 const RECOVERY_TERMINATED_EXIT_CODE: i32 = -1;
 
-async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<()> {
+async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<bool> {
     let open_processes = db::list_open_agent_processes_for_run(pool, run_id).await?;
+    let mut complete = true;
 
     for open_process in open_processes {
         if let Err(error) = process::kill_pid(open_process.pid, open_process.pid_started_at_unix) {
@@ -372,6 +412,7 @@ async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<(
                 %error,
                 "failed to terminate a live orphan agent process; leaving its row open for a later recovery pass"
             );
+            complete = false;
             continue;
         }
 
@@ -385,17 +426,62 @@ async fn terminate_orphan_processes(pool: &SqlitePool, run_id: &str) -> Result<(
                 %error,
                 "failed to mark a terminated orphan agent process ended"
             );
+            complete = false;
         }
     }
 
-    Ok(())
+    Ok(complete)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestrator::test_support::*;
+    use std::process::Command as SyncCommand;
     use tempfile::TempDir;
+
+    const TEST_IMAGE: &str =
+        "alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+    const TEST_IMAGE_DIGEST: &str =
+        "sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+
+    async fn docker_cleanup_fails(_: String) -> warden_sandbox::Result<usize> {
+        Err(warden_sandbox::SandboxError::DockerUnavailable {
+            reason: "daemon unavailable".to_string(),
+        })
+    }
+
+    async fn docker_cleanup_succeeds(_: String) -> warden_sandbox::Result<usize> {
+        Ok(0)
+    }
+
+    fn docker_available() -> bool {
+        SyncCommand::new("docker")
+            .arg("info")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            && SyncCommand::new("docker")
+                .args(["images", "--digests", "--format", "{{.Digest}}", "alpine"])
+                .output()
+                .map(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|digest| digest == TEST_IMAGE_DIGEST)
+                })
+                .unwrap_or(false)
+    }
+
+    struct ContainerGuard(String);
+
+    impl Drop for ContainerGuard {
+        fn drop(&mut self) {
+            let _ = SyncCommand::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
 
     #[tokio::test]
     async fn corrupt_quota_checkpoint_fails_closed_and_is_deleted() {
@@ -1198,5 +1284,98 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(run.state, RunState::Failed);
+    }
+
+    #[tokio::test]
+    async fn docker_cleanup_failure_stays_queued_until_a_later_pass_succeeds() {
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(
+            &pool,
+            "durable-cleanup-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        db::fail_run_with_pending_cleanup(&pool, "durable-cleanup-run")
+            .await
+            .unwrap();
+
+        recover_crashed_runs_with(&pool, docker_cleanup_fails)
+            .await
+            .unwrap();
+        let pending = db::list_failed_runs_with_pending_cleanup(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "durable-cleanup-run");
+
+        recover_crashed_runs_with(&pool, docker_cleanup_succeeds)
+            .await
+            .unwrap();
+        assert!(db::list_failed_runs_with_pending_cleanup(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_cleanup_removes_a_real_labeled_docker_container() {
+        if !docker_available() {
+            eprintln!("skipping: Docker daemon or pinned test image unavailable");
+            return;
+        }
+
+        let run_id = format!("durable-cleanup-{}", uuid::Uuid::new_v4());
+        let container_name = format!("warden-recovery-test-{}", uuid::Uuid::new_v4());
+        let output = SyncCommand::new("docker")
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &container_name,
+                "--label",
+                "io.warden.managed=true",
+                "--label",
+                &format!("io.warden.run-id={run_id}"),
+                TEST_IMAGE,
+                "sleep",
+                "300",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create Docker recovery fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _guard = ContainerGuard(container_name.clone());
+
+        let db_dir = TempDir::new().unwrap();
+        let pool = db::connect(&db_dir.path().join("state.db")).await.unwrap();
+        db::insert_run(&pool, &run_id, "/tmp/repo", "main", "intent", 3, 3, 3, 5)
+            .await
+            .unwrap();
+        db::fail_run_with_pending_cleanup(&pool, &run_id)
+            .await
+            .unwrap();
+
+        recover_crashed_runs(&pool).await.unwrap();
+
+        let inspect = SyncCommand::new("docker")
+            .args(["inspect", &container_name])
+            .output()
+            .unwrap();
+        assert!(!inspect.status.success());
+        assert!(db::list_failed_runs_with_pending_cleanup(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

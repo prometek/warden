@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR IGNORE INTO run_cleanup_queue (run_id) VALUES (?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "192a2f4ae7c2e0c50798fc3bc9a0501596a76e9d55e3f95f23e1364fe7b8da08"
+}

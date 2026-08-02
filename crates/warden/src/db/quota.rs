@@ -271,6 +271,12 @@ pub async fn fail_quota_resume_claim(pool: &SqlitePool, run_id: &str) -> Result<
     .execute(&mut *transaction)
     .await?;
     if result.rows_affected() == 1 {
+        sqlx::query!(
+            "INSERT OR IGNORE INTO run_cleanup_queue (run_id) VALUES (?)",
+            run_id,
+        )
+        .execute(&mut *transaction)
+        .await?;
         sqlx::query!("DELETE FROM quota_continuations WHERE run_id = ?", run_id)
             .execute(&mut *transaction)
             .await?;

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE runs SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = NULL, quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, updated_at = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "de6f316ee9463574612e07284e09fbb0d817dd86b88e55b36758d73e79281edf"
+}

@@ -399,6 +399,56 @@ async fn awaiting_quota_reset_migration_keeps_legacy_runs_coherent() {
 }
 
 #[tokio::test]
+async fn durable_cleanup_migration_queues_existing_failed_runs() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let migrations: Vec<_> = MIGRATOR.iter().collect();
+    let cleanup_migration_index = migrations
+        .iter()
+        .position(|migration| migration.description.contains("durable cleanup queue"))
+        .expect("0015_durable_cleanup_queue.sql must remain in the migration set");
+    let previous_version = migrations[cleanup_migration_index - 1].version;
+
+    {
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .unwrap();
+        MIGRATOR.run_to(previous_version, &pool).await.unwrap();
+        insert_run(
+            &pool,
+            "legacy-failed-run",
+            "/tmp/repo",
+            "main",
+            "intent",
+            3,
+            3,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        update_run_state(&pool, "legacy-failed-run", RunState::Failed)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    let pool = connect(&db_path).await.unwrap();
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM run_cleanup_queue WHERE run_id = 'legacy-failed-run'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued, 1);
+}
+
+#[tokio::test]
 async fn converged_run_is_not_listed_as_intermediate() {
     let (_dir, pool) = test_pool().await;
     insert_run(&pool, "run-3", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
@@ -1469,6 +1519,40 @@ async fn failed_run_with_no_open_process_and_no_recorded_worktree_needs_no_clean
         pending.is_empty(),
         "a Failed run with nothing recorded to clean up must not be returned"
     );
+}
+
+#[tokio::test]
+async fn cleanup_queue_keeps_a_failed_run_pending_until_cleared() {
+    let (_dir, pool) = test_pool().await;
+    insert_run(
+        &pool,
+        "run-queued-cleanup",
+        "/tmp/repo",
+        "main",
+        "intent",
+        3,
+        3,
+        3,
+        5,
+    )
+    .await
+    .unwrap();
+
+    fail_run_with_pending_cleanup(&pool, "run-queued-cleanup")
+        .await
+        .unwrap();
+    let pending = list_failed_runs_with_pending_cleanup(&pool).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "run-queued-cleanup");
+    assert_eq!(pending[0].state, RunState::Failed);
+
+    clear_run_cleanup_pending(&pool, "run-queued-cleanup")
+        .await
+        .unwrap();
+    assert!(list_failed_runs_with_pending_cleanup(&pool)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM run_cleanup_queue WHERE run_id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d94b482e8e436dfc7c5d8adf4c7a1488eb0674e0398288501a22a9de672e95d3"
+}
