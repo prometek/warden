@@ -97,6 +97,46 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
     Ok(())
 }
 
+pub async fn fail_run_with_pending_cleanup(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    let now = now_rfc3339();
+    let mut transaction = pool.begin().await?;
+    sqlx::query!(
+        "UPDATE runs SET state = ?, quota_resets_at = NULL, quota_resume_owner_pid = NULL, \
+         quota_resume_owner_started_at_unix = NULL, quota_resume_claimed_at = NULL, \
+         updated_at = ? WHERE id = ?",
+        RunState::Failed.as_str(),
+        now,
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query!(
+        "INSERT OR IGNORE INTO run_cleanup_queue (run_id) VALUES (?)",
+        run_id,
+    )
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+pub async fn mark_run_cleanup_pending(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    sqlx::query!(
+        "INSERT OR IGNORE INTO run_cleanup_queue (run_id) VALUES (?)",
+        run_id,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_run_cleanup_pending(pool: &SqlitePool, run_id: &str) -> Result<()> {
+    sqlx::query!("DELETE FROM run_cleanup_queue WHERE run_id = ?", run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_run_current_review_cycle(
     pool: &SqlitePool,
     run_id: &str,
@@ -339,6 +379,10 @@ pub async fn list_failed_runs_with_pending_cleanup(pool: &SqlitePool) -> Result<
         WHERE runs.state = 'failed'
           AND (
             EXISTS (
+                SELECT 1 FROM run_cleanup_queue
+                WHERE run_cleanup_queue.run_id = runs.id
+            )
+            OR EXISTS (
                 SELECT 1 FROM agent_processes
                 JOIN cycles ON cycles.id = agent_processes.cycle_id
                 WHERE cycles.run_id = runs.id AND agent_processes.ended_at IS NULL
