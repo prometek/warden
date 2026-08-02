@@ -41,3 +41,5 @@ predicates = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 warden-core = { path = "../warden-core" }
+warden-gated = { path = "../warden-gated" }
+warden-tui = { path = "../warden-tui" }

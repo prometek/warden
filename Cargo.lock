@@ -3372,8 +3372,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "warden-core",
+ "warden-gated",
  "warden-policy",
  "warden-sandbox",
+ "warden-tui",
 ]
 
 [[package]]
