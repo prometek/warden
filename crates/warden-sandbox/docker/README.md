@@ -54,11 +54,15 @@ the host's `~/.claude` (read-only). No other host path is bind-mounted.
   repository metadata; host-side git commands disable repository hooks.
 - Containers drop all Linux capabilities except `CAP_DAC_OVERRIDE`, required
   to write host-owned worktree and `.git` bind mounts on Linux. They set
-  `no-new-privileges` and limit processes to 256. CPU and memory remain unbounded.
+  `no-new-privileges` and limit processes to 256. `--docker-cpus` and
+  `--docker-memory` add optional per-container limits; both remain unbounded by default.
 - Docker daemon and host kernel remain trusted. This backend is not a boundary
   against daemon compromise or container-runtime/kernel vulnerabilities.
-- No egress allowlist exists. Agent APIs require network access; deploy an
-  outbound proxy or Docker network policy when domain restriction is needed.
+- Egress remains unrestricted by default. `--docker-network` plus
+  `--docker-egress-proxy` attaches agents only to an operator-provided internal network and
+  sets HTTP(S) proxy variables. Warden verifies the network is internal but does not create
+  the proxy or manage its allowlist. The proxy must also have its own outbound connection.
+  Proxy URLs with embedded credentials are rejected.
 
 ## Crash recovery
 

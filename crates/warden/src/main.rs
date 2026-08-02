@@ -13,7 +13,10 @@ mod run_command;
 
 use cli::{isolation_as_str, tool_as_str, Cli, Commands, IsolationConfig, TrustRepoAgents};
 #[cfg(test)]
-use cli::{parse_quota_anticipation_threshold, parse_tool};
+use cli::{
+    parse_docker_cpus, parse_docker_egress_proxy, parse_docker_memory, parse_docker_network,
+    parse_quota_anticipation_threshold, parse_tool,
+};
 #[cfg(test)]
 use run_command::{parse_approval_answer, should_wait_for_spawned_tui, NoTuiApprovalGate};
 use run_command::{resolve_tui_binary, run, run_batch, BatchCommand, TuiLaunchConfig};
@@ -49,7 +52,21 @@ async fn main() -> anyhow::Result<()> {
             tui_bin,
             isolation,
             isolation_image,
+            docker_cpus,
+            docker_memory,
+            docker_network,
+            docker_egress_proxy,
         } => {
+            let isolation_config = IsolationConfig {
+                isolation,
+                image: isolation_image,
+                cpus: docker_cpus,
+                memory: docker_memory,
+                network: docker_network,
+                egress_proxy: docker_egress_proxy,
+            };
+            isolation_config.validate().map_err(anyhow::Error::msg)?;
+
             let mut intents = Vec::new();
             let mut empty_intents_file: Option<&PathBuf> = None;
             if let Some(intents_file_path) = &intents_file {
@@ -103,11 +120,6 @@ async fn main() -> anyhow::Result<()> {
                     tui_bin: resolve_tui_binary(tui_bin),
                 });
 
-                let isolation_config = IsolationConfig {
-                    isolation,
-                    image: isolation_image,
-                };
-
                 run(
                     repo,
                     intent,
@@ -149,8 +161,12 @@ async fn main() -> anyhow::Result<()> {
                     tui,
                     tui_bin,
                     tool: tool_as_str(tool),
-                    isolation: isolation_as_str(isolation),
-                    isolation_image,
+                    isolation: isolation_as_str(isolation_config.isolation),
+                    isolation_image: isolation_config.image,
+                    docker_cpus: isolation_config.cpus,
+                    docker_memory: isolation_config.memory,
+                    docker_network: isolation_config.network,
+                    docker_egress_proxy: isolation_config.egress_proxy,
                 })
                 .await
             }
@@ -264,6 +280,53 @@ mod tests {
         assert!(error.contains("claude"), "{error:?}");
         assert!(error.contains("codex"), "{error:?}");
         assert!(error.contains("mistral"), "{error:?}");
+    }
+
+    #[test]
+    fn docker_option_parsers_accept_supported_values_and_reject_unsafe_ones() {
+        assert_eq!(parse_docker_cpus("2.5"), Ok("2.5".to_string()));
+        assert!(parse_docker_cpus("0").is_err());
+        assert!(parse_docker_cpus("NaN").is_err());
+
+        assert_eq!(parse_docker_memory("4096M"), Ok("4096m".to_string()));
+        assert!(parse_docker_memory("4GiB").is_err());
+        assert!(parse_docker_memory("0g").is_err());
+
+        assert_eq!(
+            parse_docker_network("warden-egress_1"),
+            Ok("warden-egress_1".to_string())
+        );
+        assert!(parse_docker_network("warden egress").is_err());
+
+        assert_eq!(
+            parse_docker_egress_proxy("http://warden-proxy:3128"),
+            Ok("http://warden-proxy:3128".to_string())
+        );
+        assert!(parse_docker_egress_proxy("http://user:secret@proxy:3128").is_err());
+        assert!(parse_docker_egress_proxy("proxy:3128").is_err());
+    }
+
+    #[test]
+    fn docker_options_require_docker_isolation_and_a_complete_egress_pair() {
+        let worktree = IsolationConfig {
+            isolation: cli::Isolation::Worktree,
+            image: "unused".to_string(),
+            cpus: Some("2".to_string()),
+            memory: None,
+            network: None,
+            egress_proxy: None,
+        };
+        assert!(worktree.validate().is_err());
+
+        let partial_egress = IsolationConfig {
+            isolation: cli::Isolation::Docker,
+            image: "warden-agent:0.1.0".to_string(),
+            cpus: None,
+            memory: None,
+            network: Some("warden-egress".to_string()),
+            egress_proxy: None,
+        };
+        assert!(partial_egress.validate().is_err());
     }
 
     #[test]

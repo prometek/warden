@@ -32,12 +32,26 @@ const MANAGED_LABEL: &str = "io.warden.managed";
 const RUN_ID_LABEL: &str = "io.warden.run-id";
 const CONTAINER_PIDS_LIMIT: &str = "256";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerEgressConfig {
+    pub network: String,
+    pub proxy: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DockerRunOptions {
+    pub cpus: Option<String>,
+    pub memory: Option<String>,
+    pub egress: Option<DockerEgressConfig>,
+}
+
 /// What every [`DockerSandbox::execute`] call needs beyond the per-command [`Command`] itself: the
 /// image to run, and the two host paths this backend's mounts are built from.
 pub struct DockerConfig {
     pub image: String,
     pub repo_path: PathBuf,
     pub claude_config_dir: PathBuf,
+    pub run_options: DockerRunOptions,
 }
 
 pub struct DockerSandbox {
@@ -103,6 +117,7 @@ impl Sandbox for DockerSandbox {
         let entry = self.entry_for(id)?;
         let container_name = id.to_string();
 
+        validate_internal_egress_network(&self.config.run_options).await?;
         let host_worktree = canonicalize_host_path(&entry.cwd)?;
         let host_repo_git = canonicalize_host_path(&self.config.repo_path.join(".git"))?;
         let host_claude_dir = self.config.claude_config_dir.canonicalize().map_err(|_| {
@@ -117,7 +132,7 @@ impl Sandbox for DockerSandbox {
         })?;
 
         let forwarded_env = resolve_forwarded_env(&command.env_allowlist, &command.program);
-        let argv = build_docker_run_argv(
+        let argv = build_docker_run_argv_with_options(
             &container_name,
             entry.run_id.as_deref(),
             &self.config.image,
@@ -125,6 +140,7 @@ impl Sandbox for DockerSandbox {
             &host_repo_git,
             &host_claude_dir,
             CONTAINER_HOME,
+            &self.config.run_options,
             &forwarded_env,
             &command.program,
             &command.args,
@@ -173,6 +189,45 @@ impl Sandbox for DockerSandbox {
         }
         remove_container(&id.to_string()).await
     }
+}
+
+async fn validate_internal_egress_network(options: &DockerRunOptions) -> Result<()> {
+    let Some(egress) = &options.egress else {
+        return Ok(());
+    };
+    let output = tokio::process::Command::new(DOCKER_BIN)
+        .args([
+            "network",
+            "inspect",
+            "--format",
+            "{{.Internal}}",
+            &egress.network,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|source| SandboxError::Spawn {
+            program: DOCKER_BIN.to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(SandboxError::DockerUnavailable {
+            reason: format!(
+                "cannot inspect configured egress network {:?}: {}",
+                egress.network,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    if String::from_utf8_lossy(&output.stdout).trim() != "true" {
+        return Err(SandboxError::DockerUnavailable {
+            reason: format!(
+                "configured egress network {:?} is not internal; refusing direct Internet access",
+                egress.network
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn drain_and_wait_with_container_cleanup(
@@ -343,6 +398,7 @@ fn canonicalize_host_path(path: &Path) -> Result<PathBuf> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_docker_run_argv(
     container_name: &str,
     run_id: Option<&str>,
@@ -351,6 +407,35 @@ fn build_docker_run_argv(
     host_repo_git: &Path,
     host_claude_dir: &Path,
     container_home: &str,
+    forwarded_env: &[(String, String)],
+    program: &str,
+    args: &[String],
+) -> Vec<String> {
+    build_docker_run_argv_with_options(
+        container_name,
+        run_id,
+        image,
+        host_worktree,
+        host_repo_git,
+        host_claude_dir,
+        container_home,
+        &DockerRunOptions::default(),
+        forwarded_env,
+        program,
+        args,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_docker_run_argv_with_options(
+    container_name: &str,
+    run_id: Option<&str>,
+    image: &str,
+    host_worktree: &Path,
+    host_repo_git: &Path,
+    host_claude_dir: &Path,
+    container_home: &str,
+    options: &DockerRunOptions,
     forwarded_env: &[(String, String)],
     program: &str,
     args: &[String],
@@ -395,9 +480,27 @@ fn build_docker_run_argv(
         argv.push("--label".to_string());
         argv.push(format!("{RUN_ID_LABEL}={run_id}"));
     }
+    if let Some(cpus) = &options.cpus {
+        argv.push("--cpus".to_string());
+        argv.push(cpus.clone());
+    }
+    if let Some(memory) = &options.memory {
+        argv.push("--memory".to_string());
+        argv.push(memory.clone());
+    }
+    if let Some(egress) = &options.egress {
+        argv.push("--network".to_string());
+        argv.push(egress.network.clone());
+    }
     for (name, value) in forwarded_env {
         argv.push("-e".to_string());
         argv.push(format!("{name}={value}"));
+    }
+    if let Some(egress) = &options.egress {
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            argv.push("-e".to_string());
+            argv.push(format!("{name}={}", egress.proxy));
+        }
     }
     argv.push("-w".to_string());
     argv.push(worktree);
@@ -410,6 +513,7 @@ fn build_docker_run_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as SyncCommand;
     use tempfile::TempDir;
 
     const TEST_IMAGE: &str =
@@ -588,6 +692,56 @@ mod tests {
         );
 
         assert!(!argv.contains(&"--network".to_string()));
+        assert!(!argv.contains(&"--cpus".to_string()));
+        assert!(!argv.contains(&"--memory".to_string()));
+    }
+
+    #[test]
+    fn argv_applies_configured_limits_and_fail_closed_egress() {
+        let options = DockerRunOptions {
+            cpus: Some("2.5".to_string()),
+            memory: Some("4g".to_string()),
+            egress: Some(DockerEgressConfig {
+                network: "warden-egress".to_string(),
+                proxy: "http://warden-proxy:3128".to_string(),
+            }),
+        };
+        let argv = build_docker_run_argv_with_options(
+            "warden-test",
+            None,
+            TEST_AGENT_IMAGE,
+            Path::new("/host/worktrees/coder"),
+            Path::new("/host/repo/.git"),
+            Path::new("/host/home/.claude"),
+            "/root",
+            &options,
+            &[(
+                "HTTPS_PROXY".to_string(),
+                "http://untrusted-host-value:8080".to_string(),
+            )],
+            "claude",
+            &[],
+        );
+        let has_pair = |flag: &str, value: &str| {
+            argv.windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+
+        assert!(has_pair("--cpus", "2.5"));
+        assert!(has_pair("--memory", "4g"));
+        assert!(has_pair("--network", "warden-egress"));
+        let https_proxy_values: Vec<_> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-e" && pair[1].starts_with("HTTPS_PROXY="))
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(
+            https_proxy_values.last(),
+            Some(&"HTTPS_PROXY=http://warden-proxy:3128")
+        );
+        assert!(argv.contains(&"HTTP_PROXY=http://warden-proxy:3128".to_string()));
+        assert!(argv.contains(&"http_proxy=http://warden-proxy:3128".to_string()));
+        assert!(argv.contains(&"https_proxy=http://warden-proxy:3128".to_string()));
     }
 
     #[test]
@@ -715,6 +869,7 @@ mod tests {
             image: TEST_AGENT_IMAGE.to_string(),
             repo_path: dir.path().to_path_buf(),
             claude_config_dir: dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         }
     }
 
@@ -806,6 +961,26 @@ mod tests {
     }
 
     async fn docker_image_available(image: &str) -> bool {
+        if let Some((name, digest)) = image.split_once('@') {
+            let repository = name.split(':').next().unwrap_or(name);
+            return tokio::process::Command::new(DOCKER_BIN)
+                .args([
+                    "images",
+                    "--digests",
+                    "--format",
+                    "{{.Repository}}@{{.Digest}}",
+                    repository,
+                ])
+                .output()
+                .await
+                .map(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .any(|entry| entry == format!("{repository}@{digest}"))
+                })
+                .unwrap_or(false);
+        }
         tokio::process::Command::new(DOCKER_BIN)
             .args(["image", "inspect", image])
             .stdin(Stdio::null())
@@ -815,6 +990,81 @@ mod tests {
             .await
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    struct DockerFixtureGuard {
+        container: Option<String>,
+        network: Option<String>,
+    }
+
+    impl Drop for DockerFixtureGuard {
+        fn drop(&mut self) {
+            if let Some(container) = &self.container {
+                let _ = SyncCommand::new(DOCKER_BIN)
+                    .args(["rm", "--force", container])
+                    .output();
+            }
+            if let Some(network) = &self.network {
+                let _ = SyncCommand::new(DOCKER_BIN)
+                    .args(["network", "rm", network])
+                    .output();
+            }
+        }
+    }
+
+    fn create_internal_proxy_fixture() -> (DockerFixtureGuard, String, String) {
+        let suffix = uuid::Uuid::new_v4();
+        let network = format!("warden-egress-test-{suffix}");
+        let proxy = format!("warden-proxy-test-{suffix}");
+        let network_output = SyncCommand::new(DOCKER_BIN)
+            .args(["network", "create", "--internal", &network])
+            .output()
+            .unwrap();
+        assert!(
+            network_output.status.success(),
+            "failed to create internal Docker network: {}",
+            String::from_utf8_lossy(&network_output.stderr)
+        );
+        let mut guard = DockerFixtureGuard {
+            container: None,
+            network: Some(network.clone()),
+        };
+        let proxy_output = SyncCommand::new(DOCKER_BIN)
+            .args([
+                "run",
+                "--detach",
+                "--name",
+                &proxy,
+                "--network",
+                &network,
+                TEST_IMAGE,
+                "sh",
+                "-c",
+                "while true; do printf 'proxy-ok\\n' | nc -l -p 3128; done",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            proxy_output.status.success(),
+            "failed to create proxy fixture: {}",
+            String::from_utf8_lossy(&proxy_output.stderr)
+        );
+        guard.container = Some(proxy.clone());
+        let ready = (0..40).any(|_| {
+            let listening = SyncCommand::new(DOCKER_BIN)
+                .args(["exec", &proxy, "sh", "-c", "netstat -ltn | grep -q 3128"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !listening {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            listening
+        });
+        assert!(ready, "proxy fixture never listened on port 3128");
+        (guard, network, proxy)
     }
 
     fn init_repo_with_worktree_and_claude_dir() -> (TempDir, PathBuf, TempDir) {
@@ -865,6 +1115,7 @@ mod tests {
             image: "warden-agent-image-that-does-not-exist-anywhere:missing".to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let id = sandbox
             .create(SandboxSpec {
@@ -897,6 +1148,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_egress_uses_an_internal_network_and_reaches_its_proxy() {
+        if !docker_daemon_available().await || !docker_image_available(TEST_IMAGE).await {
+            eprintln!("skipping: Docker daemon or pinned test image unavailable");
+            return;
+        }
+
+        let (_fixture, network, proxy) = create_internal_proxy_fixture();
+        let proxy_url = format!("http://{proxy}:3128");
+        let (repo, worktree, claude_dir) = init_repo_with_worktree_and_claude_dir();
+        let sandbox = DockerSandbox::new(DockerConfig {
+            image: TEST_IMAGE.to_string(),
+            repo_path: repo.path().to_path_buf(),
+            claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions {
+                cpus: Some("0.5".to_string()),
+                memory: Some("64m".to_string()),
+                egress: Some(DockerEgressConfig {
+                    network,
+                    proxy: proxy_url.clone(),
+                }),
+            },
+        });
+        let id = sandbox
+            .create(SandboxSpec {
+                cwd: worktree.clone(),
+            })
+            .await
+            .unwrap();
+        let execution = sandbox
+            .execute(
+                &id,
+                Command {
+                    program: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        format!(
+                            "test \"$HTTP_PROXY\" = \"{proxy_url}\" && \
+                             test \"$HTTPS_PROXY\" = \"{proxy_url}\" && nc {proxy} 3128"
+                        ),
+                    ],
+                    env_allowlist: Vec::new(),
+                    stdin: None,
+                },
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap();
+        let outcome = execution.wait().await.unwrap();
+
+        assert_eq!(outcome.exit_code, 0, "stderr was {}", outcome.stderr);
+        assert_eq!(outcome.stdout.trim(), "proxy-ok");
+        sandbox.destroy(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_egress_rejects_a_non_internal_network() {
+        if !docker_daemon_available().await {
+            eprintln!("skipping: no Docker daemon reachable");
+            return;
+        }
+
+        let network = format!("warden-open-network-test-{}", uuid::Uuid::new_v4());
+        let network_output = SyncCommand::new(DOCKER_BIN)
+            .args(["network", "create", &network])
+            .output()
+            .unwrap();
+        assert!(
+            network_output.status.success(),
+            "failed to create non-internal Docker network: {}",
+            String::from_utf8_lossy(&network_output.stderr)
+        );
+        let _fixture = DockerFixtureGuard {
+            container: None,
+            network: Some(network.clone()),
+        };
+        let (repo, worktree, claude_dir) = init_repo_with_worktree_and_claude_dir();
+        let sandbox = DockerSandbox::new(DockerConfig {
+            image: TEST_IMAGE.to_string(),
+            repo_path: repo.path().to_path_buf(),
+            claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions {
+                cpus: None,
+                memory: None,
+                egress: Some(DockerEgressConfig {
+                    network,
+                    proxy: "http://proxy:3128".to_string(),
+                }),
+            },
+        });
+        let id = sandbox.create(SandboxSpec { cwd: worktree }).await.unwrap();
+        let result = sandbox
+            .execute(
+                &id,
+                Command {
+                    program: "true".to_string(),
+                    args: Vec::new(),
+                    env_allowlist: Vec::new(),
+                    stdin: None,
+                },
+                ExecuteOptions::default(),
+            )
+            .await;
+
+        match result {
+            Err(SandboxError::DockerUnavailable { reason }) => {
+                assert!(reason.contains("is not internal"));
+            }
+            Err(error) => panic!("expected DockerUnavailable, got {error}"),
+            Ok(_) => panic!("non-internal network must be rejected"),
+        }
+        sandbox.destroy(id.clone()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn e2e_git_push_origin_fails_inside_the_container_no_credentials_mounted() {
         if !docker_daemon_available().await {
             eprintln!("skipping: no docker daemon reachable");
@@ -908,6 +1273,7 @@ mod tests {
             image: TEST_IMAGE.to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let id = sandbox
             .create(SandboxSpec {
@@ -956,6 +1322,7 @@ mod tests {
             image: TEST_IMAGE.to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let id = sandbox
             .create(SandboxSpec {
@@ -1026,6 +1393,7 @@ mod tests {
             image: TEST_IMAGE.to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let id = sandbox
             .create(SandboxSpec {
@@ -1074,6 +1442,7 @@ mod tests {
             image: TEST_IMAGE.to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let run_id = format!("recovery-{}", uuid::Uuid::new_v4());
         let id = sandbox
@@ -1125,6 +1494,7 @@ mod tests {
             image: TEST_IMAGE.to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
+            run_options: DockerRunOptions::default(),
         });
         let id = sandbox
             .create(SandboxSpec {

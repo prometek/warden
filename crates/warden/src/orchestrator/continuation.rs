@@ -93,6 +93,14 @@ enum SandboxConfigCheckpoint {
     Docker {
         image: String,
         claude_config_dir: String,
+        #[serde(default)]
+        cpus: Option<String>,
+        #[serde(default)]
+        memory: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
+        #[serde(default)]
+        egress_proxy: Option<String>,
     },
 }
 
@@ -433,12 +441,23 @@ impl RunExecutionContextCheckpoint {
             SandboxConfig::Docker {
                 image,
                 claude_config_dir,
+                run_options,
             } => SandboxConfigCheckpoint::Docker {
                 image: image.clone(),
                 claude_config_dir: exact_path(
                     claude_config_dir,
                     "execution_context.sandbox.claude_config_dir",
                 )?,
+                cpus: run_options.cpus.clone(),
+                memory: run_options.memory.clone(),
+                network: run_options
+                    .egress
+                    .as_ref()
+                    .map(|egress| egress.network.clone()),
+                egress_proxy: run_options
+                    .egress
+                    .as_ref()
+                    .map(|egress| egress.proxy.clone()),
             },
         };
         Ok(Self {
@@ -462,9 +481,29 @@ impl RunExecutionContextCheckpoint {
             SandboxConfigCheckpoint::Docker {
                 image,
                 claude_config_dir,
+                cpus,
+                memory,
+                network,
+                egress_proxy,
             } => SandboxConfig::Docker {
                 image,
                 claude_config_dir: PathBuf::from(claude_config_dir),
+                run_options: warden_sandbox::DockerRunOptions {
+                    cpus,
+                    memory,
+                    egress: match (network, egress_proxy) {
+                        (None, None) => None,
+                        (Some(network), Some(proxy)) => {
+                            Some(warden_sandbox::DockerEgressConfig { network, proxy })
+                        }
+                        _ => {
+                            return Err(invalid(
+                                run_id,
+                                "checkpointed Docker egress requires both network and proxy",
+                            ));
+                        }
+                    },
+                },
             },
         };
         let approval = match self.approval.as_str() {
@@ -721,4 +760,82 @@ fn findings_from_checkpoints(
         .into_iter()
         .map(|finding| finding.into_finding(run_id))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use warden_sandbox::{DockerEgressConfig, DockerRunOptions};
+
+    #[test]
+    fn docker_execution_context_round_trips_limits_and_egress() {
+        let claude_dir = tempfile::TempDir::new().unwrap();
+        let context = RunExecutionContext {
+            tool: crate::tool_adapter::ToolName::Claude,
+            sandbox: SandboxConfig::Docker {
+                image: "warden-agent:0.1.0".to_string(),
+                claude_config_dir: claude_dir.path().to_path_buf(),
+                run_options: DockerRunOptions {
+                    cpus: Some("2".to_string()),
+                    memory: Some("4g".to_string()),
+                    egress: Some(DockerEgressConfig {
+                        network: "warden-egress".to_string(),
+                        proxy: "http://warden-proxy:3128".to_string(),
+                    }),
+                },
+            },
+            hooks_toml: None,
+            policy_yaml: None,
+            approval: ApprovalConfig::FailClosed,
+        };
+
+        let checkpoint = RunExecutionContextCheckpoint::from_config(&context).unwrap();
+        let encoded = serde_json::to_string(&checkpoint).unwrap();
+        let decoded: RunExecutionContextCheckpoint = serde_json::from_str(&encoded).unwrap();
+        let restored = decoded.into_config("run-1").unwrap();
+        assert_eq!(restored.sandbox, context.sandbox);
+    }
+
+    #[test]
+    fn legacy_docker_checkpoint_defaults_to_unrestricted_resources_and_network() {
+        let checkpoint: SandboxConfigCheckpoint = serde_json::from_str(
+            r#"{"kind":"docker","image":"warden-agent:0.1.0","claude_config_dir":"/tmp/claude"}"#,
+        )
+        .unwrap();
+
+        let SandboxConfigCheckpoint::Docker {
+            cpus,
+            memory,
+            network,
+            egress_proxy,
+            ..
+        } = checkpoint
+        else {
+            panic!("expected Docker checkpoint");
+        };
+        assert_eq!(cpus, None);
+        assert_eq!(memory, None);
+        assert_eq!(network, None);
+        assert_eq!(egress_proxy, None);
+    }
+
+    #[test]
+    fn partial_checkpointed_egress_is_rejected() {
+        let checkpoint = RunExecutionContextCheckpoint {
+            tool: "claude".to_string(),
+            sandbox: SandboxConfigCheckpoint::Docker {
+                image: "warden-agent:0.1.0".to_string(),
+                claude_config_dir: "/tmp/claude".to_string(),
+                cpus: None,
+                memory: None,
+                network: Some("warden-egress".to_string()),
+                egress_proxy: None,
+            },
+            hooks_toml: None,
+            policy_yaml: None,
+            approval: "fail_closed".to_string(),
+        };
+
+        assert!(checkpoint.into_config("run-1").is_err());
+    }
 }

@@ -353,20 +353,26 @@ Flags de `warden run` :
   montés en lecture-écriture (pour que git fonctionne), et `~/.claude` de l'hôte monté en
   **lecture seule** comme source d'authentification. Aucun `~/.ssh`, `~/.aws`,
   `~/.config/gh` ou `.env` hôte n'est bind-monté. `~/.claude` reste toutefois lisible et le
-  réseau n'est pas filtré : un agent malveillant peut exfiltrer credentials Claude et données
-  du dépôt. Les conteneurs conservent seulement `CAP_DAC_OVERRIDE` pour écrire dans les bind
+  réseau reste non filtré par défaut : un agent malveillant peut exfiltrer credentials Claude
+  et données du dépôt. Les conteneurs conservent seulement `CAP_DAC_OVERRIDE` pour écrire dans les bind
   mounts appartenant à l'hôte, interdisent l'escalade de privilèges, limitent les processus à
   256 et sont récupérés par label après crash. Docker daemon et kernel hôte restent dans la
   base de confiance. `git push origin` échoue sans credentials git.
   Nécessite Docker
   installé et démarré (Docker Desktop sur macOS, le démon Docker sur Linux) et l'image de
-  référence déjà construite — voir `crates/warden-sandbox/docker/README.md`. Limite acceptée
-  pour cette version : pas de filtrage d'egress (le conteneur garde un accès réseau normal
-  vers l'API Anthropic ; voir ADR-0019). Reste optionnel — `worktree` demeure le
-  comportement par défaut de tout `warden run`.
+  référence déjà construite — voir `crates/warden-sandbox/docker/README.md`. Reste optionnel —
+  `worktree` demeure le comportement par défaut de tout `warden run`.
 - `--isolation-image <name>` (défaut `warden-agent:<version Warden>`, ignoré sans
   `--isolation docker`) — surcharge l'image exécutée pour chaque invocation. Voir
   `crates/warden-sandbox/docker/README.md` pour construire l'image de référence.
+- `--docker-cpus <nombre>` et `--docker-memory <taille>` — quotas Docker optionnels par
+  conteneur (`2`, `0.5`, `512m`, `4g`). Sans ces flags, CPU et mémoire restent libres.
+- `--docker-network <nom>` et `--docker-egress-proxy <url>` — paire optionnelle pour borner
+  l'egress. Warden refuse un réseau qui n'est pas déclaré `internal`, connecte le conteneur
+  uniquement à ce réseau et configure `HTTP_PROXY`/`HTTPS_PROXY`. Le proxy doit être fourni,
+  connecté au réseau interne et configuré avec l'allowlist voulue par l'opérateur. Les URLs
+  avec credentials intégrés sont refusées. Sans cette paire, Docker conserve son réseau par
+  défaut sans filtrage d'egress.
 
 ### Mode batch (plusieurs intentions, issue #72)
 
@@ -598,8 +604,8 @@ steps:
   (`SSH_AUTH_SOCK`/`GH_TOKEN`/`AWS_*`/`ANTHROPIC_API_KEY`). Sous `--isolation docker`, cet
   allowlist ne borne que les variables d'environnement : le conteneur monte quand même le
   worktree du rôle (rw), le `.git` du repo de base (rw) et `~/.claude` de l'hôte (ro), sans
-  filtrage d'egress — exactement la même surface qu'une étape `type: agent` (le tester,
-  par exemple) a déjà sous docker aujourd'hui, ni élargie ni fermée par cet allowlist.
+  le même réglage d'egress que les étapes `type: agent` du run ; l'allowlist d'environnement
+  ne l'élargit ni ne le ferme.
   `PATH` n'a pas besoin d'être dans cet allowlist : il est toujours transmis tel quel sous
   `--isolation worktree` (le défaut), mais sous `--isolation docker` c'est le `PATH` de
   l'image du conteneur qui s'applique, jamais celui de l'hôte. Un `CARGO_HOME`/`RUSTUP_HOME`

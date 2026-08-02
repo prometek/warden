@@ -12,7 +12,9 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-pub use docker::{reclaim_run_containers, DockerConfig, DockerSandbox};
+pub use docker::{
+    reclaim_run_containers, DockerConfig, DockerEgressConfig, DockerRunOptions, DockerSandbox,
+};
 pub use error::{Result, SandboxError};
 pub use local::LocalSandbox;
 
