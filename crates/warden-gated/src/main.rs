@@ -19,7 +19,7 @@ use warden_gated::{bare_repo, ci_report, db, hook, relay, run_tail, serve};
 #[command(
     name = "warden-gated",
     version,
-    about = "Git gate daemon: sole holder of origin credentials (ADR-0002/ADR-0006)"
+    about = "Git gate daemon that verifies converged runs before pushing to origin"
 )]
 struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv).
@@ -52,8 +52,7 @@ enum Commands {
         origin_url: Option<String>,
     },
 
-    /// Runs the long-running daemon: accepts relayed `post-receive` payloads and independently re-
-    /// verifies each run against SQLite (read-only) before ever pushing to `origin`.
+    /// Accepts relayed pushes and independently verifies each run before pushing to `origin`.
     Serve {
         /// Unix socket to listen on for relayed hook notifications.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
@@ -121,8 +120,7 @@ enum Commands {
         inactivity_timeout_secs: u64,
     },
 
-    /// / runs a converged run's post-push tail (skeleton commit + `OpenDraft` + `Finalize` +
-    /// `watch_pr`) and delivers the one terminal `CiResultMessage` to `warden`'s reverse socket.
+    /// Opens or updates a converged run's PR, watches CI, and reports its terminal result.
     RunTail {
         #[arg(long)]
         run_id: String,
@@ -171,6 +169,7 @@ enum Commands {
         existing_pr_number: Option<u64>,
     },
 
+    /// Resumes CI monitoring for a run that already has an open pull request.
     ResumeWatch {
         #[arg(long)]
         run_id: String,

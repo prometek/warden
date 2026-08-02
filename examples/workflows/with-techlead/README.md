@@ -1,6 +1,6 @@
 # Example: custom workflow with a `techlead` role
 
-Issue #73 lets a repo define its own pipeline in `.warden/workflow.yaml`
+A repository can define its own pipeline in `.warden/workflow.yaml`
 instead of being stuck with the hardcoded coder -> gate review -> gate test
 sequence. This example appends a fourth role -- `techlead` -- after the
 built-in reviewer/tester pair: it runs once both have come back clean for a
@@ -44,7 +44,7 @@ declare a `gate`.
 
 Any role other than `coder`/`reviewer`/`tester` (like `techlead` here) is
 resolved from `.claude/agents/<agent>.md` -- Claude Code's own subagent file
-convention (ADR-0013) -- with no adapter default to fall back to: a missing
+convention -- with no adapter default to fall back to: a missing
 file is a hard, actionable error naming the role and the exact path
 expected, not a silently skipped step.
 
@@ -59,5 +59,5 @@ declaring `budget: extra` (or omitting the key, like `techlead` here)
 shares a single budget instead, controlled by `--max-cycles` (default 5).
 
 Similarly, `evidence: true` (set on the tester step here) declares which
-step's clean run triggers ADR-0009 evidence capture -- also a declared
+step's clean run triggers evidence capture -- also a declared
 property, not inferred from a role literally named `"tester"`.

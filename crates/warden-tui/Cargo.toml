@@ -3,7 +3,7 @@ name = "warden-tui"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Read-only run monitor (ADR-0008): subscribes to the Event Bus and replays the `events` table to observe a run live, with no action capability on the pipeline."
+description = "Read-only terminal monitor for replaying and following Warden runs."
 
 [[bin]]
 name = "warden-tui"

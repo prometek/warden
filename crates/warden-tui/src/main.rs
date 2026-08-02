@@ -21,7 +21,7 @@ use warden_tui::{capabilities, db, subscriber, ui};
 #[command(
     name = "warden-tui",
     version,
-    about = "Read-only run monitor: replays a run's history then follows it live (ADR-0008)"
+    about = "Read-only run monitor: replays a run's history then follows it live"
 )]
 struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv).
@@ -34,8 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Attaches to a run: replays its full `events` history, then follows its Event Bus live if
-    /// it's still running -- no gap between the two (Architecture.md §5.4).
+    /// Attaches to a run: replays its history, then follows it live if still running.
     Attach {
         /// The run id to attach to (as printed by `warden run`).
         #[arg(long)]

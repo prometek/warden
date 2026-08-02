@@ -1,6 +1,6 @@
 # Example: a non-agent `type: hook` step
 
-Issue #79 opens `.warden/workflow.yaml` to steps that aren't an agent at all.
+`.warden/workflow.yaml` supports steps that are not agents.
 Before this, every step spawned an LLM subprocess -- expensive and
 non-deterministic even for a check like `cargo fmt --check`, which has only
 one correct answer and needs no judgement call. This example inserts a
@@ -25,9 +25,7 @@ Then run `warden` exactly as usual -- no new flag is required to pick up
 
 ## What `type: hook` changes
 
-A step's `type` is `agent` by default (the only kind before issue #79, and
-what every step in every `workflow.yaml` written before this issue still
-means). Declaring `type: hook` instead:
+A step's `type` is `agent` by default. Declaring `type: hook` instead:
 
 - Replaces `agent: <name>` with `run: "<shell command>"` -- `agent` and
   `run` are mutually exclusive, and the wrong one for a step's declared
@@ -39,14 +37,14 @@ means). Declaring `type: hook` instead:
   just as visible to crash recovery and `warden-tui`. Unlike a `type: agent`
   step, it reports no *token* usage (`usage: None` on its `AgentFinished`
   event) -- a deterministic command consumes no LLM.
-- Is evaluated against `.warden/policy.yaml` first (issue #51, ADR-0016) --
+- Is evaluated against `.warden/policy.yaml` first --
   a `deny`-matched command is blocked before it ever reaches the sandbox,
   exactly like a `.warden/hooks.toml` lifecycle hook's own command already
   is.
 - Never the pipeline's producer (`steps[0]`): a hook authors no commit, so
   it can only gate work an earlier `type: agent` step has already written.
   Cannot capture evidence either (`evidence: true` on a `type: hook` step is
-  a parse error) -- ADR-0009 evidence records an *agent's* command session,
+  a parse error) -- evidence records an *agent's* command session,
   which a hook step has none of.
 
 **Trust model**: `run` is declared in `.warden/workflow.yaml`, a file that

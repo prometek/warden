@@ -1,8 +1,7 @@
-# Example: `gate: scoped-re-review` and `max_cycles` (issue #81)
+# Example: `gate: scoped-re-review` and `max_cycles`
 
-Issue #81 generalizes the reviewer's scoped re-review optimization (#37/
-ADR-0014) to any step, and lets a step declare its own independent cycle
-budget instead of sharing one of the three run-level buckets
+`scoped-re-review` extends focused correction review to any step. `max_cycles` gives a step
+its own independent cycle budget instead of sharing one of the three run-level buckets
 (`review`/`test`/`extra`). This example adds a `secreview` role between the
 reviewer and the tester to show both in one place:
 
@@ -64,6 +63,6 @@ column in the `runs` table, so it is not visible in `warden-tui`.
 Same as `examples/workflows/with-techlead/`: copy `workflow.yaml` to
 `.warden/workflow.yaml` in the repo you run `warden run --repo ...`
 against, and provide `.claude/agents/security-reviewer.md` for the new
-`secreview` role (resolved the same way as any custom role, ADR-0013) --
+`secreview` role (resolved the same way as any custom role) --
 `reviewer`/`tester` still resolve through Warden's built-in, role-asymmetric
 path regardless of where they sit in the pipeline.
