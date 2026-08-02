@@ -246,7 +246,7 @@ mod tests {
             tui: false,
             tui_bin: None,
             isolation: "worktree",
-            isolation_image: "warden-agent:latest",
+            isolation_image: "warden-agent:0.1.0",
             verbose: 2,
         };
 
@@ -294,7 +294,7 @@ mod tests {
                 "--isolation",
                 "worktree",
                 "--isolation-image",
-                "warden-agent:latest",
+                "warden-agent:0.1.0",
             ]
         );
     }
@@ -321,7 +321,7 @@ mod tests {
             tui: true,
             tui_bin: Some("/bin/warden-tui"),
             isolation: "docker",
-            isolation_image: "warden-agent:latest",
+            isolation_image: "warden-agent:0.1.0",
             verbose: 0,
         };
 

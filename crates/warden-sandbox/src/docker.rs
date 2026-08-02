@@ -412,14 +412,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    const TEST_IMAGE: &str = "alpine:latest";
+    const TEST_IMAGE: &str =
+        "alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+    const TEST_AGENT_IMAGE: &str = "warden-agent:0.1.0";
 
     #[test]
     fn argv_contains_the_worktree_and_repo_git_mounts_at_identical_host_paths() {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -442,7 +444,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             Some("run-123"),
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -469,7 +471,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -488,7 +490,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -508,7 +510,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -533,7 +535,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -555,7 +557,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -575,7 +577,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -593,7 +595,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -606,10 +608,7 @@ mod tests {
         let w_index = argv.iter().position(|arg| arg == "-w").unwrap();
         assert_eq!(argv[w_index + 1], "/host/worktrees/coder");
 
-        let image_index = argv
-            .iter()
-            .position(|arg| arg == "warden-agent:latest")
-            .unwrap();
+        let image_index = argv.iter().position(|arg| arg == TEST_AGENT_IMAGE).unwrap();
         assert_eq!(argv[image_index + 1], "claude");
         assert_eq!(argv[image_index + 2], "--output-format");
         assert_eq!(argv[image_index + 3], "json");
@@ -620,7 +619,7 @@ mod tests {
         let argv = build_docker_run_argv(
             "warden-test",
             None,
-            "warden-agent:latest",
+            TEST_AGENT_IMAGE,
             Path::new("/host/worktrees/coder"),
             Path::new("/host/repo/.git"),
             Path::new("/host/home/.claude"),
@@ -672,7 +671,7 @@ mod tests {
     fn classifies_exit_125_with_missing_image_stderr_as_docker_unavailable() {
         let reason = classify_docker_startup_failure(
             125,
-            "Unable to find image 'warden-agent:latest' locally\ndocker: Error response from \
+            "Unable to find image 'warden-agent:0.1.0' locally\ndocker: Error response from \
              daemon: pull access denied for warden-agent, repository does not exist or may \
              require 'docker login'",
         );
@@ -713,7 +712,7 @@ mod tests {
 
     fn config(dir: &TempDir) -> DockerConfig {
         DockerConfig {
-            image: "warden-agent:latest".to_string(),
+            image: TEST_AGENT_IMAGE.to_string(),
             repo_path: dir.path().to_path_buf(),
             claude_config_dir: dir.path().to_path_buf(),
         }
@@ -863,7 +862,7 @@ mod tests {
 
         let (repo, worktree, claude_dir) = init_repo_with_worktree_and_claude_dir();
         let sandbox = DockerSandbox::new(DockerConfig {
-            image: "warden-agent-image-that-does-not-exist-anywhere:latest".to_string(),
+            image: "warden-agent-image-that-does-not-exist-anywhere:missing".to_string(),
             repo_path: repo.path().to_path_buf(),
             claude_config_dir: claude_dir.path().to_path_buf(),
         });
