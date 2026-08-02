@@ -1108,7 +1108,7 @@ fn e2e_isolation_docker_actually_runs_the_coder_inside_a_real_container() {
     let build_dir = TempDir::new().unwrap();
     std::fs::write(
         build_dir.path().join("Dockerfile"),
-        "FROM alpine:latest\n\
+        "FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b\n\
          RUN apk add --no-cache git\n\
          COPY claude /usr/local/bin/claude\n\
          RUN chmod +x /usr/local/bin/claude\n",

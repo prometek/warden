@@ -138,7 +138,7 @@ pub(crate) fn isolation_as_str(isolation: Isolation) -> &'static str {
     }
 }
 
-const DEFAULT_DOCKER_IMAGE: &str = "warden-agent:latest";
+const DEFAULT_DOCKER_IMAGE: &str = concat!("warden-agent:", env!("CARGO_PKG_VERSION"));
 
 pub(crate) fn parse_tool(raw: &str) -> Result<ToolName, String> {
     ToolName::parse(raw).map_err(|reason| reason.replacen("unknown tool", "unknown --tool", 1))

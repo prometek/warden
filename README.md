@@ -364,10 +364,9 @@ Flags de `warden run` :
   pour cette version : pas de filtrage d'egress (le conteneur garde un accès réseau normal
   vers l'API Anthropic ; voir ADR-0019). Reste optionnel — `worktree` demeure le
   comportement par défaut de tout `warden run`.
-- `--isolation-image <name>` (défaut `warden-agent:latest`, ignoré sans `--isolation
-  docker`) — surcharge l'image que `--isolation docker` exécute pour chaque invocation.
-  Voir `crates/warden-sandbox/docker/README.md` pour construire l'image de référence sous
-  ce tag exact.
+- `--isolation-image <name>` (défaut `warden-agent:<version Warden>`, ignoré sans
+  `--isolation docker`) — surcharge l'image exécutée pour chaque invocation. Voir
+  `crates/warden-sandbox/docker/README.md` pour construire l'image de référence.
 
 ### Mode batch (plusieurs intentions, issue #72)
 

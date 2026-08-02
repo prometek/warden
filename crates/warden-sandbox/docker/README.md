@@ -9,13 +9,11 @@ is only about the image itself.
 ## Building the image
 
 ```sh
-docker build -t warden-agent:latest crates/warden-sandbox/docker
+docker build -t warden-agent:0.1.0 crates/warden-sandbox/docker
 ```
 
-`warden-agent:latest` is `--isolation docker`'s own default image
-(`DEFAULT_DOCKER_IMAGE` in `crates/warden/src/main.rs`) -- build it under
-that exact tag and no further flag is needed. `--isolation-image` overrides
-it, for a locally customized image or a different tag.
+The default tag is `warden-agent:<warden version>` (`warden-agent:0.1.0`
+today). `--isolation-image` selects a custom image.
 
 ## What the image needs to contain
 
@@ -29,7 +27,8 @@ inside the container:
   (`@anthropic-ai/claude-code`, a Node CLI) for `--tool claude`, the only
   adapter today.
 
-The provided `Dockerfile` builds exactly that, on top of `node:20-slim`.
+The provided `Dockerfile` uses a pinned Node 22 manifest and Claude Code
+version. Debian packages still follow the current Bookworm repositories.
 
 ## How `--isolation docker` finds the image
 
