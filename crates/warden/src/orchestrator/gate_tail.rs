@@ -169,15 +169,14 @@ impl Orchestrator {
         }
 
         match self.transition(run_id, RunState::Pushed).await? {
-            HookOutcome::Continue => {}
-            HookOutcome::Block { reason } => {
-                self.fail_run_on_block(run_id, HookPoint::BeforePush, &reason)
-                    .await?;
+            TransitionEffect::Continue => {}
+            TransitionEffect::Blocked { point, reason } => {
+                self.fail_run_on_block(run_id, point, &reason).await?;
                 delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
                 return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
             }
-            HookOutcome::EmitFindings(findings) => {
-                log_unrouted_findings(run_id, HookPoint::BeforePush, &findings)
+            TransitionEffect::FindingsEmitted { point, findings } => {
+                self.record_unrouted_findings(point, &findings).await?;
             }
         }
         push_converged_commit_to_bare_repo(
@@ -309,17 +308,13 @@ impl Orchestrator {
             None => RunState::Failed,
         };
         match self.transition(run_id, next_state).await? {
-            HookOutcome::Continue => {}
-            HookOutcome::Block { reason } => {
-                let point = HookPoint::on_entering(next_state)
-                    .expect("Block only fires for a hook-mapped `to`");
+            TransitionEffect::Continue => {}
+            TransitionEffect::Blocked { point, reason } => {
                 self.fail_run_on_block(run_id, point, &reason).await?;
                 return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
             }
-            HookOutcome::EmitFindings(findings) => {
-                let point = HookPoint::on_entering(next_state)
-                    .expect("EmitFindings only fires for a hook-mapped `to`");
-                log_unrouted_findings(run_id, point, &findings);
+            TransitionEffect::FindingsEmitted { point, findings } => {
+                self.record_unrouted_findings(point, &findings).await?;
             }
         }
 
@@ -334,28 +329,12 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use tempfile::TempDir;
-    use warden_core::{HookContext, HookOutcome, HookPoint};
+    use warden_core::{CiWatchOutcome, HookPoint};
 
+    use super::super::lifecycle_hook_tests::{single_command_step_workflow, BlockingHook};
     use super::*;
-    use crate::hook::{Hook, HookRegistry};
-
-    /// A [`Hook`] bound to [`HookPoint::BeforePush`] that always refuses the push.
-    struct BlockingHook;
-
-    #[async_trait]
-    impl Hook for BlockingHook {
-        fn points(&self) -> &[HookPoint] {
-            &[HookPoint::BeforePush]
-        }
-
-        async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
-            Ok(HookOutcome::Block {
-                reason: "before_push hook refuses".to_string(),
-            })
-        }
-    }
+    use crate::hook::HookRegistry;
 
     /// A [`GateTrigger`] that panics if ever called -- proves a `before_push` block short-circuits
     /// before `warden-gated` would be triggered at all.
@@ -376,21 +355,10 @@ mod tests {
         }
     }
 
-    fn minimal_command_workflow() -> Workflow {
-        Workflow::parse_yaml(
-            r#"
-name: single
-entry: build
-steps:
-  build:
-    type: command
-    run: "true"
-    on_clean: converged
-    on_blocking: build
-    on_error: failed
-"#,
-        )
-        .unwrap()
+    fn registry_blocking(point: HookPoint) -> HookRegistry {
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(BlockingHook(point)));
+        registry
     }
 
     #[tokio::test]
@@ -418,9 +386,8 @@ steps:
             .await
             .unwrap();
 
-        let mut hooks = HookRegistry::new();
-        hooks.register(Arc::new(BlockingHook));
-        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(hooks);
+        let orchestrator =
+            Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::BeforePush));
 
         let config = RunConfig {
             repo_path: dir.path().to_path_buf(),
@@ -428,7 +395,7 @@ steps:
             branch: "main".to_string(),
             intent: "test".to_string(),
             max_cycles: 3,
-            workflow: minimal_command_workflow(),
+            workflow: single_command_step_workflow(),
             step_agents: Vec::new(),
             repository_agent_definitions: false,
             evidence_tool: None,
@@ -444,6 +411,62 @@ steps:
 
         let outcome = orchestrator
             .drive_post_convergence_tail(run_id, &config, "deadbeef", &UnreachableGateTrigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// The CI-reboucle path: `apply_ci_result_message` transitions back into `RunningStep`, firing
+    /// `BeforeStep` exactly like the fresh-run and quota-resume paths -- a future refactor could
+    /// silently un-enforce this one too (the same failure mode #106 fixed), so it gets its own test.
+    #[tokio::test]
+    async fn ci_checks_failed_reboucle_before_step_block_fails_the_run() {
+        let dir = TempDir::new().unwrap();
+        let pool = db::connect(&dir.path().join("state.db")).await.unwrap();
+        let run_id = "run-1";
+        db::insert_run(
+            &pool,
+            run_id,
+            "/tmp/does-not-matter",
+            "main",
+            "intent",
+            3,
+            3,
+            1,
+            3,
+        )
+        .await
+        .unwrap();
+        db::set_run_workflow_entry(&pool, run_id, 0).await.unwrap();
+        db::update_run_state(&pool, run_id, RunState::RunningStep(0))
+            .await
+            .unwrap();
+        db::update_run_state(&pool, run_id, RunState::Converged)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, run_id, RunState::Pushed)
+            .await
+            .unwrap();
+        db::update_run_state(&pool, run_id, RunState::AwaitingCi)
+            .await
+            .unwrap();
+
+        let orchestrator =
+            Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::BeforeStep));
+        let message = CiResultMessage {
+            run_id: run_id.to_string(),
+            pr_number: None,
+            outcome: CiWatchOutcome::checks_failed(&[]),
+        };
+
+        let outcome = orchestrator
+            .apply_ci_result_message(run_id, &message)
             .await
             .unwrap();
 

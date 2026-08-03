@@ -318,6 +318,20 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
                 _ => format!("run finished: {final_state}"),
             },
         ),
+        RunEvent::HookFindingEmitted {
+            point,
+            severity,
+            source,
+            description,
+            ..
+        } => (
+            match severity.as_str() {
+                "blocking" => Style::default().fg(Color::Red),
+                "warning" => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::White),
+            },
+            format!("[{severity}] {point} hook ({source}): {description}"),
+        ),
     };
 
     ListItem::new(Line::styled(format!("{} {text}", record.created_at), style))

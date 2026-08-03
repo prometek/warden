@@ -10,7 +10,9 @@ use tempfile::TempDir;
 use super::*;
 use crate::hook::Hook;
 
-fn init_test_repo() -> TempDir {
+/// Shared with `gate_tail`'s own tests (`super::super::gate_tail::tests`) -- the same fixture repo
+/// and blocking-hook double, so both suites exercise the exact same `Block` behavior.
+pub(super) fn init_test_repo() -> TempDir {
     let dir = TempDir::new().unwrap();
     for args in [
         vec!["init", "--quiet"],
@@ -41,7 +43,7 @@ fn init_test_repo() -> TempDir {
 }
 
 /// A [`Hook`] bound to one point that always refuses to let the run proceed.
-struct BlockingHook(HookPoint);
+pub(super) struct BlockingHook(pub(super) HookPoint);
 
 #[async_trait]
 impl Hook for BlockingHook {
@@ -132,7 +134,7 @@ impl ToolAdapter for ShellAgentAdapter {
     }
 }
 
-fn single_command_step_workflow() -> Workflow {
+pub(super) fn single_command_step_workflow() -> Workflow {
     Workflow::parse_yaml(
         r#"
 name: single
@@ -193,6 +195,53 @@ async fn run_with_hooks(repo: &TempDir, warden_home: &TempDir, hooks: HookRegist
         .await
         .unwrap();
     final_state
+}
+
+#[tokio::test]
+async fn on_run_start_emit_findings_is_recorded_not_merely_counted() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator =
+        Orchestrator::new(pool.clone()).with_hooks(registry_emitting(HookPoint::OnRunStart));
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+    // `OnRunStart` has no step to route the finding through -- it does not itself reboucle.
+    assert_eq!(final_state, RunState::Converged);
+
+    let events = db::list_events_for_run(&pool, &run_id).await.unwrap();
+    let recorded = events.iter().find_map(|entry| match entry.event() {
+        Some(warden_core::RunEvent::HookFindingEmitted {
+            point,
+            source,
+            severity,
+            description,
+            ..
+        }) => Some((
+            point.clone(),
+            source.clone(),
+            severity.clone(),
+            description.clone(),
+        )),
+        _ => None,
+    });
+    assert_eq!(
+        recorded,
+        Some((
+            "on_run_start".to_string(),
+            "warden".to_string(),
+            "blocking".to_string(),
+            "hook found a problem".to_string(),
+        )),
+        "an EmitFindings hook with no step context must still be materialized (description, \
+         severity, source), not just counted"
+    );
 }
 
 #[tokio::test]
@@ -268,6 +317,88 @@ async fn on_commit_block_fails_the_run_after_a_step_produces_a_new_commit() {
         .unwrap();
 
     assert_eq!(final_state, RunState::Failed);
+}
+
+#[tokio::test]
+async fn on_run_start_block_still_publishes_run_finished() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator =
+        Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::OnRunStart));
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(final_state, RunState::Failed);
+
+    let events = db::list_events_for_run(&pool, &run_id).await.unwrap();
+    let published_run_finished = events.iter().any(|entry| {
+        matches!(
+            entry.event(),
+            Some(warden_core::RunEvent::RunFinished { final_state }) if final_state == "failed"
+        )
+    });
+    assert!(
+        published_run_finished,
+        "an early hook block must still publish RunEvent::RunFinished -- otherwise a live \
+         warden-tui would show the run as still running forever"
+    );
+}
+
+#[tokio::test]
+async fn resume_before_step_block_fails_the_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let run_id = "resumed-run-1".to_string();
+    let workflow = single_command_step_workflow();
+    db::insert_run(
+        &pool,
+        &run_id,
+        &repo.path().display().to_string(),
+        "main",
+        "intent",
+        3,
+        3,
+        workflow.steps.len() as u32,
+        3,
+    )
+    .await
+    .unwrap();
+    // A quota-suspended run is durably parked in `ResumingQuota` until its resume lease fires --
+    // exactly the state `resume_convergence_loop` is invoked against in production.
+    db::update_run_state(&pool, &run_id, RunState::ResumingQuota)
+        .await
+        .unwrap();
+
+    let orchestrator =
+        Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::BeforeStep));
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+    let continuation = ConvergenceContinuation::new("deadbeef".to_string(), &workflow);
+
+    let (_run_id, final_state) = orchestrator
+        .resume_convergence_loop(
+            run_id,
+            config,
+            &UnusedToolAdapter,
+            CancellationToken::new(),
+            continuation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::Failed,
+        "a before_step block on the quota-resume path must fail the run just like the fresh-run path"
+    );
 }
 
 #[tokio::test]

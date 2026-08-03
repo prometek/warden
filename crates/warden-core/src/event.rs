@@ -22,6 +22,11 @@ pub enum EventKind {
     UntrustedAgentDefinitionUsed,
     RateLimitStatusUpdated,
     RunFinished,
+    /// A lifecycle hook (issue #106) emitted findings at a point with no workflow step to route
+    /// them through (`OnRunStart`/`BeforeStep`/`OnConverged`/`BeforePush`) -- recorded so the
+    /// variant is never silently dropped, but distinct from [`EventKind::FindingRaised`], which is
+    /// always cycle-scoped and can drive a reboucle.
+    HookFindingEmitted,
 }
 
 impl EventKind {
@@ -37,6 +42,7 @@ impl EventKind {
             EventKind::UntrustedAgentDefinitionUsed => "untrusted_agent_definition_used",
             EventKind::RateLimitStatusUpdated => "rate_limit_status_updated",
             EventKind::RunFinished => "run_finished",
+            EventKind::HookFindingEmitted => "hook_finding_emitted",
         }
     }
 
@@ -52,6 +58,7 @@ impl EventKind {
             "untrusted_agent_definition_used" => Ok(EventKind::UntrustedAgentDefinitionUsed),
             "rate_limit_status_updated" => Ok(EventKind::RateLimitStatusUpdated),
             "run_finished" => Ok(EventKind::RunFinished),
+            "hook_finding_emitted" => Ok(EventKind::HookFindingEmitted),
             other => Err(CoreError::UnknownEventKind(other.to_string())),
         }
     }
@@ -110,6 +117,16 @@ pub enum RunEvent {
     RunFinished {
         final_state: String,
     },
+    /// See [`EventKind::HookFindingEmitted`].
+    HookFindingEmitted {
+        /// The [`crate::HookPoint::as_str`] the emitting hook fired at.
+        point: String,
+        source: String,
+        severity: String,
+        file: Option<String>,
+        description: String,
+        action: Option<String>,
+    },
 }
 
 impl RunEvent {
@@ -128,6 +145,7 @@ impl RunEvent {
             }
             RunEvent::RateLimitStatusUpdated { .. } => EventKind::RateLimitStatusUpdated,
             RunEvent::RunFinished { .. } => EventKind::RunFinished,
+            RunEvent::HookFindingEmitted { .. } => EventKind::HookFindingEmitted,
         }
     }
 }
@@ -233,6 +251,7 @@ mod tests {
             EventKind::UntrustedAgentDefinitionUsed,
             EventKind::RateLimitStatusUpdated,
             EventKind::RunFinished,
+            EventKind::HookFindingEmitted,
         ]
     }
 
@@ -303,6 +322,14 @@ mod tests {
             },
             EventKind::RunFinished => RunEvent::RunFinished {
                 final_state: "converged".to_string(),
+            },
+            EventKind::HookFindingEmitted => RunEvent::HookFindingEmitted {
+                point: "before_push".to_string(),
+                source: "warden".to_string(),
+                severity: "blocking".to_string(),
+                file: Some("src/lib.rs".to_string()),
+                description: "AWS key in diff".to_string(),
+                action: None,
             },
         }
     }
