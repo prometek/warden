@@ -85,7 +85,10 @@ impl RunState {
                     ) && !matches!(to, Self::StepCyclesExceeded(other) if other != index)
             }
             Self::Converged => matches!(to, Self::Pushed | Self::Failed),
-            Self::Pushed => to == Self::AwaitingCi,
+            // A `before_push` lifecycle hook fires *after* the write-ahead into `Pushed` (see
+            // `Orchestrator::transition`); if it blocks, the run must still be able to reach
+            // `Failed` from here.
+            Self::Pushed => matches!(to, Self::AwaitingCi | Self::Failed),
             Self::AwaitingCi => matches!(to, Self::Done | Self::Failed) || valid_step(to),
             Self::AwaitingQuotaReset { .. } => to == Self::ResumingQuota,
             Self::ResumingQuota => {
@@ -141,6 +144,19 @@ mod tests {
         assert!(RunState::AwaitingCi
             .validate_transition(RunState::RunningStep(2), 3)
             .is_ok());
+    }
+
+    #[test]
+    fn pushed_may_still_fail_a_before_push_hook_block() {
+        assert!(RunState::Pushed
+            .validate_transition(RunState::Failed, 1)
+            .is_ok());
+        assert!(RunState::Pushed
+            .validate_transition(RunState::AwaitingCi, 1)
+            .is_ok());
+        assert!(RunState::Pushed
+            .validate_transition(RunState::RunningStep(0), 1)
+            .is_err());
     }
 
     #[test]

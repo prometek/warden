@@ -37,6 +37,8 @@ mod convergence;
 mod diff;
 mod evidence_capture;
 mod gate_tail;
+#[cfg(test)]
+mod lifecycle_hook_tests;
 mod recovery;
 mod tampering;
 
@@ -322,7 +324,13 @@ impl Orchestrator {
         });
     }
 
-    async fn transition(&self, run_id: &str, to: RunState) -> Result<()> {
+    /// Writes `to` to the run's persisted state (write-ahead of intent), then dispatches whichever
+    /// lifecycle hook fires [`HookPoint::on_entering(to)`], if any, and returns its aggregated
+    /// outcome uninterpreted -- **the caller decides** what a `Block` or `EmitFindings` means at
+    /// this particular transition (fail the run, reboucle, or merge into a step's findings), since
+    /// that depends on which state is being entered and what context (step index, cycle) the
+    /// caller has in hand.
+    async fn transition(&self, run_id: &str, to: RunState) -> Result<HookOutcome> {
         let run =
             db::get_run(&self.pool, run_id)
                 .await?
@@ -332,31 +340,68 @@ impl Orchestrator {
         run.state.validate_transition(to, run.total_steps)?;
         db::update_run_state(&self.pool, run_id, to).await?;
 
-        if !self.hooks.is_empty() {
-            if let Some(point) = HookPoint::on_entering(to) {
-                let ctx = HookContext {
-                    point,
-                    run_id,
-                    state: to,
-                    repo_path: Path::new(&run.repo_path),
-                    cycle: None,
-                    worktree: None,
-                    commit: None,
-                    diff: None,
-                };
-                match self.hooks.run_hooks(point, &ctx).await? {
-                    HookOutcome::Continue => {}
-                    other => tracing::warn!(
-                        run_id,
-                        point = point.as_str(),
-                        ?other,
-                        "lifecycle hook returned a non-Continue outcome; consuming it \
-                             (Block / EmitFindings) is not wired yet (issue #51)"
-                    ),
-                }
+        if self.hooks.is_empty() {
+            return Ok(HookOutcome::Continue);
+        }
+        let Some(point) = HookPoint::on_entering(to) else {
+            return Ok(HookOutcome::Continue);
+        };
+        let ctx = HookContext {
+            point,
+            run_id,
+            state: to,
+            repo_path: Path::new(&run.repo_path),
+            cycle: None,
+            worktree: None,
+            commit: None,
+            diff: None,
+        };
+        self.hooks.run_hooks(point, &ctx).await
+    }
+
+    /// The common tail of any lifecycle-hook [`HookOutcome::Block`]: logs `reason` and forces
+    /// `run_id` into [`RunState::Failed`] -- `Block` is a barrier at every lifecycle point except
+    /// [`HookPoint::OnRunEnd`] (best-effort teardown, see [`Orchestrator::run_teardown`]).
+    async fn fail_run_on_block(&self, run_id: &str, point: HookPoint, reason: &str) -> Result<()> {
+        tracing::warn!(
+            run_id,
+            point = point.as_str(),
+            reason,
+            "lifecycle hook blocked the run"
+        );
+        self.transition(run_id, RunState::Failed).await?;
+        Ok(())
+    }
+
+    /// Transitions into `to` and, if the lifecycle hook firing on entering it blocks, tears the run
+    /// down and returns the terminal [`RunState::Failed`] for the caller to return immediately.
+    /// Only fit for **pre-loop** transitions -- points reached before the convergence loop starts
+    /// (and its own end-of-loop teardown call would run), where a block means the caller must tear
+    /// down and bail out itself. `Ok(None)` means the caller should proceed: the hook was
+    /// `Continue`, or it emitted findings that are logged (see [`log_unrouted_findings`]) but have
+    /// no workflow step to route them through at this point.
+    async fn transition_or_fail_run(
+        &self,
+        run_id: &str,
+        to: RunState,
+        repo_path: &Path,
+    ) -> Result<Option<RunState>> {
+        match self.transition(run_id, to).await? {
+            HookOutcome::Continue => Ok(None),
+            HookOutcome::Block { reason } => {
+                let point =
+                    HookPoint::on_entering(to).expect("Block only fires for a hook-mapped `to`");
+                self.fail_run_on_block(run_id, point, &reason).await?;
+                self.run_teardown(run_id, repo_path, RunState::Failed).await;
+                Ok(Some(RunState::Failed))
+            }
+            HookOutcome::EmitFindings(findings) => {
+                let point = HookPoint::on_entering(to)
+                    .expect("EmitFindings only fires for a hook-mapped `to`");
+                log_unrouted_findings(run_id, point, &findings);
+                Ok(None)
             }
         }
-        Ok(())
     }
 
     /// Dispatches the **run-level** lifecycle hooks ([`HookPoint::OnRunStart`] /
@@ -405,4 +450,18 @@ impl Orchestrator {
             ),
         }
     }
+}
+
+/// Logs that a lifecycle hook emitted findings at `point`, which -- unlike [`HookPoint::AfterStep`]
+/// / [`HookPoint::OnCommit`] -- carries no workflow step whose `on_clean`/`on_blocking` edges the
+/// findings could be routed through. Recorded here, never silently dropped, but this alone does not
+/// reboucle the run.
+fn log_unrouted_findings(run_id: &str, point: HookPoint, findings: &[Finding]) {
+    tracing::info!(
+        run_id,
+        point = point.as_str(),
+        finding_count = findings.len(),
+        "lifecycle hook emitted findings with no workflow step to route them through; recorded, \
+         not fed into a convergence decision at this point"
+    );
 }

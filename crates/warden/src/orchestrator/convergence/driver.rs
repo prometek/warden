@@ -71,7 +71,7 @@ impl Orchestrator {
             if let Some(callback) = &self.on_run_started {
                 callback(&run_id);
             }
-            if let HookOutcome::Block { reason } = self
+            match self
                 .dispatch_run_hooks(
                     &run_id,
                     &config.repo_path,
@@ -80,14 +80,28 @@ impl Orchestrator {
                 )
                 .await?
             {
-                tracing::warn!(run_id, reason, "run-start hook blocked workflow");
-                self.transition(&run_id, RunState::Failed).await?;
-                self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
-                    .await;
-                return Ok((run_id, RunState::Failed));
+                HookOutcome::Continue => {}
+                HookOutcome::Block { reason } => {
+                    self.fail_run_on_block(&run_id, HookPoint::OnRunStart, &reason)
+                        .await?;
+                    self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
+                        .await;
+                    return Ok((run_id, RunState::Failed));
+                }
+                HookOutcome::EmitFindings(findings) => {
+                    log_unrouted_findings(&run_id, HookPoint::OnRunStart, &findings)
+                }
             }
-            self.transition(&run_id, RunState::RunningStep(config.workflow.entry()))
-                .await?;
+            if let Some(final_state) = self
+                .transition_or_fail_run(
+                    &run_id,
+                    RunState::RunningStep(config.workflow.entry()),
+                    &config.repo_path,
+                )
+                .await?
+            {
+                return Ok((run_id, final_state));
+            }
         }
 
         let run_base_commit_sha = match &restored {
@@ -119,8 +133,12 @@ impl Orchestrator {
 
         if let Some((_, continuation)) = &restored {
             db::clear_run_rate_limit_status(&self.pool, &run_id).await?;
-            self.transition(&run_id, continuation.next_run_state())
-                .await?;
+            if let Some(final_state) = self
+                .transition_or_fail_run(&run_id, continuation.next_run_state(), &config.repo_path)
+                .await?
+            {
+                return Ok((run_id, final_state));
+            }
         }
         let mut continuation = restored
             .map(|(_, continuation)| continuation)
@@ -224,11 +242,13 @@ impl Orchestrator {
                 ),
             };
             db::close_cycle(&self.pool, &cycle_id).await?;
+            let mut all_findings = result.findings.clone();
+            let mut blocked = false;
             for point in [HookPoint::AfterStep]
                 .into_iter()
                 .chain(commit_changed.then_some(HookPoint::OnCommit))
             {
-                if let HookOutcome::Block { reason } = self
+                match self
                     .dispatch_run_hooks(
                         &run_id,
                         &config.repo_path,
@@ -237,10 +257,50 @@ impl Orchestrator {
                     )
                     .await?
                 {
-                    tracing::warn!(%reason, point = point.as_str(), "hook blocked workflow");
-                    next_state = RunState::Failed;
-                    break;
+                    HookOutcome::Continue => {}
+                    HookOutcome::Block { reason } => {
+                        tracing::warn!(%reason, point = point.as_str(), "hook blocked workflow");
+                        next_state = RunState::Failed;
+                        blocked = true;
+                        break;
+                    }
+                    HookOutcome::EmitFindings(findings) => {
+                        for finding in &findings {
+                            db::insert_finding(
+                                &self.pool,
+                                &Uuid::new_v4().to_string(),
+                                &cycle_id,
+                                finding,
+                            )
+                            .await?;
+                            self.publish_event(RunEvent::FindingRaised {
+                                cycle_number: continuation.cycle_number,
+                                source: finding.source.as_str().to_string(),
+                                severity: finding.severity.as_str().to_string(),
+                                file: finding.file.clone(),
+                                description: finding.description.clone(),
+                                action: finding.action.clone(),
+                            })
+                            .await?;
+                        }
+                        all_findings.extend(findings);
+                    }
                 }
+            }
+            // A hook's findings aggregate exactly like the step's own -- reboucle via the same
+            // step's `on_blocking` edge -- unless the step itself already errored (its `on_error`
+            // target stands) or a hook already blocked outright above.
+            if !blocked
+                && !matches!(result.outcome, warden_core::StepOutcome::Error)
+                && all_findings.len() != result.findings.len()
+            {
+                next_state = decide_next_state_for_step(
+                    &all_findings,
+                    &config.workflow,
+                    step_index,
+                    continuation.step_cycle_numbers[step_index as usize],
+                    config.max_cycles,
+                );
             }
             continuation.previous_cycle_id = Some(cycle_id);
             continuation.cycle_number += 1;
@@ -263,7 +323,20 @@ impl Orchestrator {
                 db::set_run_converged_commit(&self.pool, &run_id, &commit).await?;
                 converged_commit = Some(commit);
             }
-            self.transition(&run_id, next_state).await?;
+            match self.transition(&run_id, next_state).await? {
+                HookOutcome::Continue => {}
+                HookOutcome::Block { reason } => {
+                    let point = HookPoint::on_entering(next_state)
+                        .expect("Block only fires for a hook-mapped `to`");
+                    self.fail_run_on_block(&run_id, point, &reason).await?;
+                    next_state = RunState::Failed;
+                }
+                HookOutcome::EmitFindings(findings) => {
+                    let point = HookPoint::on_entering(next_state)
+                        .expect("EmitFindings only fires for a hook-mapped `to`");
+                    log_unrouted_findings(&run_id, point, &findings);
+                }
+            }
             match next_state {
                 RunState::RunningStep(next) => {
                     continuation.next_step_index = next;

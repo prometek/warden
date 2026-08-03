@@ -168,7 +168,18 @@ impl Orchestrator {
             return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
         }
 
-        self.transition(run_id, RunState::Pushed).await?;
+        match self.transition(run_id, RunState::Pushed).await? {
+            HookOutcome::Continue => {}
+            HookOutcome::Block { reason } => {
+                self.fail_run_on_block(run_id, HookPoint::BeforePush, &reason)
+                    .await?;
+                delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
+                return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
+            }
+            HookOutcome::EmitFindings(findings) => {
+                log_unrouted_findings(run_id, HookPoint::BeforePush, &findings)
+            }
+        }
         push_converged_commit_to_bare_repo(
             &config.repo_path,
             &gate_config.bare_repo_path,
@@ -297,7 +308,20 @@ impl Orchestrator {
             ),
             None => RunState::Failed,
         };
-        self.transition(run_id, next_state).await?;
+        match self.transition(run_id, next_state).await? {
+            HookOutcome::Continue => {}
+            HookOutcome::Block { reason } => {
+                let point = HookPoint::on_entering(next_state)
+                    .expect("Block only fires for a hook-mapped `to`");
+                self.fail_run_on_block(run_id, point, &reason).await?;
+                return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
+            }
+            HookOutcome::EmitFindings(findings) => {
+                let point = HookPoint::on_entering(next_state)
+                    .expect("EmitFindings only fires for a hook-mapped `to`");
+                log_unrouted_findings(run_id, point, &findings);
+            }
+        }
 
         match next_state {
             RunState::RunningStep(_) => Ok(PostConvergenceOutcome::Reboucle {
@@ -305,5 +329,129 @@ impl Orchestrator {
             }),
             terminal => Ok(PostConvergenceOutcome::Terminal(terminal)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use warden_core::{HookContext, HookOutcome, HookPoint};
+
+    use super::*;
+    use crate::hook::{Hook, HookRegistry};
+
+    /// A [`Hook`] bound to [`HookPoint::BeforePush`] that always refuses the push.
+    struct BlockingHook;
+
+    #[async_trait]
+    impl Hook for BlockingHook {
+        fn points(&self) -> &[HookPoint] {
+            &[HookPoint::BeforePush]
+        }
+
+        async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+            Ok(HookOutcome::Block {
+                reason: "before_push hook refuses".to_string(),
+            })
+        }
+    }
+
+    /// A [`GateTrigger`] that panics if ever called -- proves a `before_push` block short-circuits
+    /// before `warden-gated` would be triggered at all.
+    struct UnreachableGateTrigger;
+
+    impl GateTrigger for UnreachableGateTrigger {
+        async fn trigger_run_tail(&self, _request: &RunTailTrigger<'_>) -> Result<GateChild> {
+            panic!("a before_push block must short-circuit before triggering warden-gated");
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            _run_id: &str,
+            _pr_number: u64,
+            _ci_result_socket: &Path,
+        ) -> Result<GateChild> {
+            panic!("a before_push block must short-circuit before triggering warden-gated");
+        }
+    }
+
+    fn minimal_command_workflow() -> Workflow {
+        Workflow::parse_yaml(
+            r#"
+name: single
+entry: build
+steps:
+  build:
+    type: command
+    run: "true"
+    on_clean: converged
+    on_blocking: build
+    on_error: failed
+"#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn before_push_block_fails_the_run_before_pushing_anything() {
+        let dir = TempDir::new().unwrap();
+        let pool = db::connect(&dir.path().join("state.db")).await.unwrap();
+        let run_id = "run-1";
+        db::insert_run(
+            &pool,
+            run_id,
+            "/tmp/does-not-matter",
+            "main",
+            "intent",
+            3,
+            3,
+            1,
+            3,
+        )
+        .await
+        .unwrap();
+        db::update_run_state(&pool, run_id, RunState::RunningStep(0))
+            .await
+            .unwrap();
+        db::update_run_state(&pool, run_id, RunState::Converged)
+            .await
+            .unwrap();
+
+        let mut hooks = HookRegistry::new();
+        hooks.register(Arc::new(BlockingHook));
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(hooks);
+
+        let config = RunConfig {
+            repo_path: dir.path().to_path_buf(),
+            warden_home: dir.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "test".to_string(),
+            max_cycles: 3,
+            workflow: minimal_command_workflow(),
+            step_agents: Vec::new(),
+            repository_agent_definitions: false,
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: Some(GateConfig {
+                bare_repo_path: dir.path().join("bare.git"),
+                gated_bin: dir.path().join("does-not-exist"),
+                repo_slug: None,
+                poll_interval_secs: 1,
+                inactivity_timeout_secs: 1,
+            }),
+        };
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(run_id, &config, "deadbeef", &UnreachableGateTrigger)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PostConvergenceOutcome::Terminal(RunState::Failed)
+        ));
+        let run = db::get_run(&pool, run_id).await.unwrap().unwrap();
+        assert_eq!(run.state, RunState::Failed);
     }
 }

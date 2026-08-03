@@ -7,6 +7,53 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Fixed — Issue #106 : `HookOutcome` appliqué de façon homogène à tous les points de cycle de vie
+
+> Suivi d'ADR-0017 (hooks de cycle de vie). Le type existait et s'agrégeait
+> correctement (#55), mais seuls 3 des 6 points de cycle de vie consommaient
+> réellement `Block`, et `EmitFindings` n'était lu nulle part.
+
+- **`Block` est désormais une barrière à tous les points sauf `OnRunEnd`**
+  (teardown, explicitement best-effort) : `BeforeStep`, `OnConverged`,
+  `BeforePush` faisaient jusqu'ici échouer le run avec un simple
+  `tracing::warn!` — ils font maintenant réellement transitionner le run vers
+  `Failed`, comme `OnRunStart`/`AfterStep`/`OnCommit` déjà appliqués.
+- **`Orchestrator::transition` retourne désormais le `HookOutcome` agrégé**
+  au lieu de le journaliser lui-même : elle reste le seul point qui écrit
+  l'état en base *avant* de dispatcher le hook (write-ahead d'intention) et
+  qui a donc en main le `HookContext` complet ; c'est l'appelant (le driver de
+  convergence, `gate_tail`) qui traduit `Block`/`EmitFindings` selon son
+  contexte (étape, cycle, budget). Retire le `tracing::warn!` qui référençait
+  à tort l'issue #51 (fermée).
+- **`RunState::Pushed -> Failed` devient une transition valide** (`warden-
+  core::state`) : un `before_push` refusé doit pouvoir faire échouer le run
+  après l'écriture write-ahead de `Pushed`.
+- **`EmitFindings` consommé par la boucle de convergence** : aux points qui
+  portent un contexte d'étape (`AfterStep`/`OnCommit`), les findings émis par
+  un hook sont persistés et refondus dans `decide_next_state_for_step`,
+  capables de reboucler via l'arête `on_blocking` de l'étape, exactement
+  comme les findings de l'étape elle-même. Aux points sans étape
+  correspondante (`OnRunStart`, `BeforeStep`, `OnConverged`, `BeforePush`),
+  les findings émis sont journalisés explicitement (jamais matchés par un
+  bras générique qui les jetterait), mais ne pilotent pas de rebouclage — il
+  n'existe pas d'arête `on_blocking` à suivre à ces points, et en inventer une
+  aurait dépassé le périmètre du ticket.
+- **`warden-core` reste pur** — aucune I/O ajoutée au vocabulaire des hooks ;
+  seul l'ajout de la transition `Pushed -> Failed` touche `warden-core`, et
+  c'est de la logique d'état pure.
+- **ADR-0017 mise à jour** avec le contrat normatif (`Block` = barrière
+  partout sauf `OnRunEnd`, `EmitFindings` consommé par la boucle de
+  convergence) et son articulation avec la barrière finale de `warden-gated`
+  (ADR-0002/0006, inchangée) : un `before_push` qui bloque empêche même le
+  push vers le bare repo local relié à `warden-gated` — une gouvernance en
+  amont, pas un remplacement de la barrière mécanique finale.
+- **Tests** : un hook `Block` par point appliqué (`on_run_start`,
+  `before_step`, `after_step`, `on_commit`, `on_converged`, `before_push`)
+  fait échouer le run bout en bout via la vraie boucle de convergence (ou
+  `drive_post_convergence_tail` pour `before_push`, avec un `GateTrigger` qui
+  paniquerait s'il était jamais atteint) ; un hook `EmitFindings` sur
+  `after_step` reboucle bien via `on_blocking` plutôt que de converger.
+
 ### Added — Issue #84 : fondation quota — cartographie `rate_limit_info` + `RateLimitStatus` + seam `extract_rate_limit`
 
 > **Fondation du signal** (sous-tâche de #83) : capte, type, persiste et publie le
