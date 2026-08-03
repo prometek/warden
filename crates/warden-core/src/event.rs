@@ -104,8 +104,11 @@ pub enum RunEvent {
         max_cycles: u32,
     },
     /// See [`EventKind::WorkflowResolved`]. Carries the workflow's own resolved graph -- data only,
-    /// no I/O and no dependency on `warden_core::workflow` types themselves, so a stale reader (an
-    /// older `warden-tui` binary) can still parse it as plain JSON.
+    /// no I/O and no dependency on `warden_core::workflow` types themselves, so a non-warden reader
+    /// of the `events` table (`jq`, an external script) can still parse it as plain JSON. A
+    /// `warden-tui` built before issue #107 does *not* benefit from this: it fails
+    /// `EventKind::parse("workflow_resolved")` and tags the line `undecodable` -- a clean
+    /// degradation (exit 0), not a successful parse.
     WorkflowResolved {
         name: String,
         entry: u32,
