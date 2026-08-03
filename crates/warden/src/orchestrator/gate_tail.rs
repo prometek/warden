@@ -329,12 +329,21 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command as SyncCommand;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
     use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
     use warden_core::{CiWatchOutcome, HookPoint};
 
-    use super::super::lifecycle_hook_tests::{single_command_step_workflow, BlockingHook};
+    use super::super::lifecycle_hook_tests::{
+        init_test_repo, single_command_step_workflow, BlockingHook,
+    };
     use super::*;
-    use crate::hook::HookRegistry;
+    use crate::event_bus::EventBus;
+    use crate::hook::{Hook, HookRegistry};
 
     /// A [`GateTrigger`] that panics if ever called -- proves a `before_push` block short-circuits
     /// before `warden-gated` would be triggered at all.
@@ -476,5 +485,186 @@ mod tests {
         ));
         let run = db::get_run(&pool, run_id).await.unwrap().unwrap();
         assert_eq!(run.state, RunState::Failed);
+    }
+
+    /// A [`Hook`] on `before_push` that emits one fully-populated finding rather than refusing.
+    struct BeforePushEmitFindingsHook;
+
+    #[async_trait]
+    impl Hook for BeforePushEmitFindingsHook {
+        fn points(&self) -> &[HookPoint] {
+            &[HookPoint::BeforePush]
+        }
+
+        async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+            Ok(HookOutcome::EmitFindings(vec![Finding {
+                source: warden_core::FindingSource::Warden,
+                severity: warden_core::Severity::Warning,
+                file: Some("src/secrets.rs".to_string()),
+                description: "AWS key in diff".to_string(),
+                action: Some("rotate the key".to_string()),
+            }]))
+        }
+    }
+
+    /// A [`GateTrigger`] that records that it was reached and immediately answers with a terminal
+    /// `ChecksPassed` on the run's CI socket, so the tail completes without any real `warden-gated`.
+    struct RecordingGateTrigger {
+        triggered: Arc<AtomicBool>,
+    }
+
+    impl GateTrigger for RecordingGateTrigger {
+        async fn trigger_run_tail(&self, request: &RunTailTrigger<'_>) -> Result<GateChild> {
+            self.triggered.store(true, Ordering::SeqCst);
+            let payload = CiResultMessage {
+                run_id: request.run_id.to_string(),
+                pr_number: Some(7),
+                outcome: CiWatchOutcome::checks_passed(),
+            }
+            .to_json()
+            .unwrap();
+            let mut stream = UnixStream::connect(request.ci_result_socket).await?;
+            stream.write_all(payload.as_bytes()).await?;
+            stream.shutdown().await?;
+            Ok(GateChild::never_exiting())
+        }
+
+        async fn trigger_resume_watch(
+            &self,
+            _run_id: &str,
+            _pr_number: u64,
+            _ci_result_socket: &Path,
+        ) -> Result<GateChild> {
+            unreachable!("this test only drives the fresh tail")
+        }
+    }
+
+    /// `before_push` is one of the four step-less points: its `EmitFindings` is *recorded* as a
+    /// persisted `hook_finding_emitted` event and, unlike a `Block`, does not stop the push.
+    #[tokio::test]
+    async fn before_push_emit_findings_is_recorded_and_the_push_still_happens() {
+        let repo = init_test_repo();
+        let warden_home = TempDir::new().unwrap();
+        let bare = warden_home.path().join("bare.git");
+        assert!(SyncCommand::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success());
+        let head = String::from_utf8(
+            SyncCommand::new("git")
+                .current_dir(repo.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let head = head.trim().to_string();
+
+        let pool = db::connect(&warden_home.path().join("state.db"))
+            .await
+            .unwrap();
+        let run_id = "run-emit";
+        db::insert_run(
+            &pool,
+            run_id,
+            &repo.path().display().to_string(),
+            "main",
+            "intent",
+            3,
+            3,
+            1,
+            3,
+        )
+        .await
+        .unwrap();
+        db::set_run_workflow_entry(&pool, run_id, 0).await.unwrap();
+        db::update_run_state(&pool, run_id, RunState::RunningStep(0))
+            .await
+            .unwrap();
+        db::update_run_state(&pool, run_id, RunState::Converged)
+            .await
+            .unwrap();
+
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(BeforePushEmitFindingsHook));
+        let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+        // `drive_post_convergence_tail` is normally reached from inside `run_convergence_loop`,
+        // which is what binds the run context the event writer publishes through.
+        let event_bus = EventBus::bind(run_id, &warden_home.path().join("runs"))
+            .await
+            .unwrap();
+        orchestrator
+            .run_context
+            .set(RunContext {
+                run_id: run_id.to_string(),
+                event_bus,
+            })
+            .map_err(|_| ())
+            .unwrap();
+
+        let config = RunConfig {
+            repo_path: repo.path().to_path_buf(),
+            warden_home: warden_home.path().to_path_buf(),
+            branch: "main".to_string(),
+            intent: "test".to_string(),
+            max_cycles: 3,
+            workflow: single_command_step_workflow(),
+            step_agents: Vec::new(),
+            repository_agent_definitions: false,
+            evidence_tool: None,
+            evidence_store_in_repo: false,
+            gate: Some(GateConfig {
+                bare_repo_path: bare.clone(),
+                gated_bin: warden_home.path().join("does-not-exist"),
+                repo_slug: None,
+                poll_interval_secs: 1,
+                inactivity_timeout_secs: 1,
+            }),
+        };
+        let triggered = Arc::new(AtomicBool::new(false));
+
+        let outcome = orchestrator
+            .drive_post_convergence_tail(
+                run_id,
+                &config,
+                &head,
+                &RecordingGateTrigger {
+                    triggered: triggered.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, PostConvergenceOutcome::Terminal(RunState::Done)),
+            "emitted findings are recorded, not a refusal: {outcome:?}"
+        );
+        assert!(
+            triggered.load(Ordering::SeqCst),
+            "an EmitFindings before_push hook must not short-circuit the push"
+        );
+
+        let recorded: Vec<_> = db::list_events_for_run(&pool, run_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.event().cloned())
+            .filter(|event| matches!(event, RunEvent::HookFindingEmitted { .. }))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![RunEvent::HookFindingEmitted {
+                point: "before_push".to_string(),
+                source: "warden".to_string(),
+                severity: "warning".to_string(),
+                file: Some("src/secrets.rs".to_string()),
+                description: "AWS key in diff".to_string(),
+                action: Some("rotate the key".to_string()),
+            }],
+            "a before_push EmitFindings must be persisted verbatim in the events table"
+        );
     }
 }

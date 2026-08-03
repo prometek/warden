@@ -42,6 +42,20 @@ pub(super) fn init_test_repo() -> TempDir {
     dir
 }
 
+/// The fixture repo's `HEAD`. A quota continuation must be restored against a commit that really
+/// exists: seeded with a placeholder SHA instead, the first step's worktree creation fails, the
+/// step reports `StepOutcome::Error` and the run reaches `Failed` through `on_error` -- which would
+/// make any "the hook block failed the run" assertion on the resume path pass for the wrong reason.
+pub(super) fn head_commit(repo: &TempDir) -> String {
+    let output = SyncCommand::new("git")
+        .current_dir(repo.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 /// A [`Hook`] bound to one point that always refuses to let the run proceed.
 pub(super) struct BlockingHook(pub(super) HookPoint);
 
@@ -381,7 +395,8 @@ async fn resume_before_step_block_fails_the_run() {
     let orchestrator =
         Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::BeforeStep));
     let config = command_workflow_config(repo.path(), warden_home.path(), 3);
-    let continuation = ConvergenceContinuation::new("deadbeef".to_string(), &workflow);
+    // A real commit, so this run would otherwise converge -- see `head_commit`.
+    let continuation = ConvergenceContinuation::new(head_commit(&repo), &workflow);
 
     let (_run_id, final_state) = orchestrator
         .resume_convergence_loop(
@@ -424,4 +439,668 @@ async fn after_step_emit_findings_reboucles_via_the_step_s_on_blocking_edge() {
         RunState::StepCyclesExceeded(0),
         "a dropped EmitFindings would have converged instead (the step alone raised nothing)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Independent verification pass on issue #106.
+//
+// Everything below covers an acceptance criterion the suite above does not
+// discriminate on: the `BeforeStep` entry path that had no test (the ordinary
+// post-step loop iteration), the three step-less `EmitFindings` recording
+// points other than `OnRunStart`, `OnCommit`'s routing, `OnRunEnd`'s
+// best-effort contract, the teardown/`RunFinished` tail's exactly-once
+// property, and the aggregation/error edges.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Blocks only from its `block_from_call`-th invocation onwards -- lets a test single out *which*
+/// dispatch of a repeated point (e.g. `BeforeStep`, which fires once per loop iteration) is
+/// actually being enforced.
+struct BlockFromNthCallHook {
+    point: HookPoint,
+    block_from_call: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for BlockFromNthCallHook {
+    fn points(&self) -> &[HookPoint] {
+        std::slice::from_ref(&self.point)
+    }
+
+    async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call >= self.block_from_call {
+            Ok(HookOutcome::Block {
+                reason: format!("test hook refuses at call {call}"),
+            })
+        } else {
+            Ok(HookOutcome::Continue)
+        }
+    }
+}
+
+/// A `Continue` hook that only counts its dispatches -- for the exactly-once teardown assertions.
+struct CountingContinueHook {
+    points: Vec<HookPoint>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for CountingContinueHook {
+    fn points(&self) -> &[HookPoint] {
+        &self.points
+    }
+
+    async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(HookOutcome::Continue)
+    }
+}
+
+/// Emits one fully-populated finding (`file` *and* `action` set, unlike [`EmitFindingsHook`]) so a
+/// test can assert every field survives the round-trip into the `events` table.
+struct DetailedEmitFindingsHook {
+    point: HookPoint,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Hook for DetailedEmitFindingsHook {
+    fn points(&self) -> &[HookPoint] {
+        std::slice::from_ref(&self.point)
+    }
+
+    async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(HookOutcome::EmitFindings(vec![Finding {
+            source: warden_core::FindingSource::Warden,
+            severity: warden_core::Severity::Blocking,
+            file: Some("src/secrets.rs".to_string()),
+            description: "AWS key in diff".to_string(),
+            action: Some("rotate the key".to_string()),
+        }]))
+    }
+}
+
+/// A hook that fails outright rather than returning any [`HookOutcome`].
+struct ErroringHook(HookPoint);
+
+#[async_trait]
+impl Hook for ErroringHook {
+    fn points(&self) -> &[HookPoint] {
+        std::slice::from_ref(&self.0)
+    }
+
+    async fn run(&self, _ctx: &HookContext<'_>) -> Result<HookOutcome> {
+        Err(WardenError::HookConfig {
+            path: PathBuf::from("/tmp/hooks.toml"),
+            reason: "the hook itself failed".to_string(),
+        })
+    }
+}
+
+/// A single `type: command` step whose command always fails -- one blocking finding per cycle, so
+/// the loop reboucles onto itself through `on_blocking` and `BeforeStep` fires a second time.
+fn failing_command_step_workflow() -> Workflow {
+    Workflow::parse_yaml(
+        r#"
+name: single
+entry: build
+steps:
+  build:
+    type: command
+    run: "false"
+    on_clean: converged
+    on_blocking: build
+    on_error: failed
+"#,
+    )
+    .unwrap()
+}
+
+async fn events_for(pool: &SqlitePool, run_id: &str) -> Vec<RunEvent> {
+    db::list_events_for_run(pool, run_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.event().cloned())
+        .collect()
+}
+
+fn hook_findings_at(events: &[RunEvent], wanted_point: &str) -> Vec<RunEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, RunEvent::HookFindingEmitted { point, .. } if point == wanted_point)
+        })
+        .cloned()
+        .collect()
+}
+
+fn count_run_finished(events: &[RunEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, RunEvent::RunFinished { .. }))
+        .count()
+}
+
+fn count_cycles_started(events: &[RunEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, RunEvent::CycleStarted { .. }))
+        .count()
+}
+
+/// The fourth `BeforeStep` entry path: the ordinary post-step loop iteration. The three others
+/// (fresh entry, quota resume, CI reboucle) each have a test; this one blocks only on the *second*
+/// dispatch, so an implementation that enforced `BeforeStep` on entry alone would sail past it.
+#[tokio::test]
+async fn before_step_block_on_a_later_loop_iteration_fails_the_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(BlockFromNthCallHook {
+        point: HookPoint::BeforeStep,
+        block_from_call: 2,
+        calls: calls.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = RunConfig {
+        workflow: failing_command_step_workflow(),
+        ..command_workflow_config(repo.path(), warden_home.path(), 3)
+    };
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::Failed,
+        "the in-loop before_step dispatch must be a barrier too, not just the entry one"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the block must be the second before_step dispatch (the reboucle), not the first"
+    );
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        count_cycles_started(&events),
+        1,
+        "exactly one cycle must have run before the reboucle's before_step blocked it"
+    );
+    assert_eq!(
+        db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+        RunState::Failed
+    );
+}
+
+/// The `OnCommit` half of `EmitFindings` routing: `AfterStep` has its own test, but `OnCommit` is a
+/// distinct dispatch that could have been left out of the aggregation.
+#[tokio::test]
+async fn on_commit_emit_findings_reboucles_via_the_step_s_on_blocking_edge() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator = Orchestrator::new(pool).with_hooks(registry_emitting(HookPoint::OnCommit));
+    // As in the `AfterStep` twin: `max_cycles: 1` plus a clean step means only a routed hook
+    // finding can push the run past its budget on the first pass.
+    let config = RunConfig {
+        workflow: single_agent_step_workflow(),
+        step_agents: vec![AgentDefinition::new(None, None, None, None, "build something").unwrap()],
+        ..command_workflow_config(repo.path(), warden_home.path(), 1)
+    };
+    let runner = ShellAgentAdapter {
+        script: "echo hi > new_file.txt && git add -A && \
+                 git -c user.email=t@t -c user.name=t commit -q -m auto"
+            .to_string(),
+    };
+
+    let (_run_id, final_state) = orchestrator
+        .run_convergence_loop(config, runner, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::StepCyclesExceeded(0),
+        "a dropped on_commit EmitFindings would have converged instead"
+    );
+}
+
+/// `BeforeStep` findings: recorded with every field intact, and deliberately *not* routed.
+#[tokio::test]
+async fn before_step_emit_findings_is_recorded_with_every_field_and_never_reboucles() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(DetailedEmitFindingsHook {
+        point: HookPoint::BeforeStep,
+        calls: calls.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    // `max_cycles: 1`: had these findings been routed into the step's decision, the clean step
+    // would have blown its one-cycle budget instead of converging.
+    let config = command_workflow_config(repo.path(), warden_home.path(), 1);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::Converged,
+        "before_step findings are recorded, not routed -- they must not force a reboucle"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        hook_findings_at(&events, "before_step"),
+        vec![RunEvent::HookFindingEmitted {
+            point: "before_step".to_string(),
+            source: "warden".to_string(),
+            severity: "blocking".to_string(),
+            file: Some("src/secrets.rs".to_string()),
+            description: "AWS key in diff".to_string(),
+            action: Some("rotate the key".to_string()),
+        }],
+        "the persisted event must carry severity, description, file and source verbatim"
+    );
+}
+
+/// `OnConverged` findings: recorded, and the run still converges.
+#[tokio::test]
+async fn on_converged_emit_findings_is_recorded_and_the_run_still_converges() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(DetailedEmitFindingsHook {
+        point: HookPoint::OnConverged,
+        calls: calls.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 1);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Converged);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        hook_findings_at(&events, "on_converged").len(),
+        1,
+        "an on_converged EmitFindings must land in the events table, not just a log line"
+    );
+}
+
+/// `OnRunEnd` is best-effort teardown: a `Block` there must not rewrite the run's already-decided
+/// final state -- not in the returned value, not in the database, not in `RunFinished`.
+#[tokio::test]
+async fn on_run_end_block_does_not_change_the_final_state() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator =
+        Orchestrator::new(pool.clone()).with_hooks(registry_blocking(HookPoint::OnRunEnd));
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::Converged,
+        "on_run_end is teardown: the run is already over, a Block there decides nothing"
+    );
+    assert_eq!(
+        db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+        RunState::Converged
+    );
+    let events = events_for(&pool, &run_id).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::RunFinished { final_state } if final_state == "converged"
+    )));
+}
+
+/// Fresh-entry early exit: an `OnRunStart` block must still fire `OnRunEnd` teardown, exactly once,
+/// on its way out -- and publish exactly one `RunFinished`.
+#[tokio::test]
+async fn an_on_run_start_block_still_fires_on_run_end_teardown_once() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let teardowns = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(BlockingHook(HookPoint::OnRunStart)));
+    registry.register(Arc::new(CountingContinueHook {
+        points: vec![HookPoint::OnRunEnd],
+        calls: teardowns.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Failed);
+    assert_eq!(
+        teardowns.load(Ordering::SeqCst),
+        1,
+        "an early block must still run teardown, and exactly once"
+    );
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(count_run_finished(&events), 1);
+}
+
+/// Quota-resume early exit: same guarantees on the `resume_convergence_loop` entry, whose block
+/// happens before the loop is ever entered.
+#[tokio::test]
+async fn a_resume_path_block_still_publishes_run_finished_and_fires_teardown_once() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let run_id = "resumed-run-2".to_string();
+    let workflow = single_command_step_workflow();
+    db::insert_run(
+        &pool,
+        &run_id,
+        &repo.path().display().to_string(),
+        "main",
+        "intent",
+        3,
+        3,
+        workflow.steps.len() as u32,
+        3,
+    )
+    .await
+    .unwrap();
+    db::update_run_state(&pool, &run_id, RunState::ResumingQuota)
+        .await
+        .unwrap();
+
+    let teardowns = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(BlockingHook(HookPoint::BeforeStep)));
+    registry.register(Arc::new(CountingContinueHook {
+        points: vec![HookPoint::OnRunEnd],
+        calls: teardowns.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+    let continuation = ConvergenceContinuation::new(head_commit(&repo), &workflow);
+
+    let (run_id, final_state) = orchestrator
+        .resume_convergence_loop(
+            run_id,
+            config,
+            &UnusedToolAdapter,
+            CancellationToken::new(),
+            continuation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Failed);
+    assert_eq!(teardowns.load(Ordering::SeqCst), 1);
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        count_run_finished(&events),
+        1,
+        "an attached warden-tui keys is_finished() off RunFinished; the resume early-exit must \
+         publish it exactly once"
+    );
+}
+
+/// The no-hook baseline: the `'run:` labeled-block rewrite must not have changed the ordinary happy
+/// path at all.
+#[tokio::test]
+async fn a_run_with_no_hooks_at_all_still_converges_with_one_run_finished() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator = Orchestrator::new(pool.clone());
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Converged);
+    assert_eq!(
+        db::get_run(&pool, &run_id).await.unwrap().unwrap().state,
+        RunState::Converged
+    );
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(count_run_finished(&events), 1, "no double RunFinished");
+    assert_eq!(count_cycles_started(&events), 1);
+    assert!(
+        hook_findings_at(&events, "before_step").is_empty(),
+        "no hooks means no hook-finding events at all"
+    );
+}
+
+/// The all-`Continue` baseline: every point registered, nothing refused -- the run must converge
+/// exactly as with no hooks, with a single teardown and a single `RunFinished`.
+#[tokio::test]
+async fn a_run_whose_hooks_all_continue_converges_with_one_teardown_and_one_run_finished() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let per_point: Vec<(HookPoint, Arc<AtomicUsize>)> = HookPoint::ALL
+        .iter()
+        .map(|point| (*point, Arc::new(AtomicUsize::new(0))))
+        .collect();
+    let mut registry = HookRegistry::new();
+    for (point, calls) in &per_point {
+        registry.register(Arc::new(CountingContinueHook {
+            points: vec![*point],
+            calls: calls.clone(),
+        }));
+    }
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Converged);
+    let count = |wanted: HookPoint| {
+        per_point
+            .iter()
+            .find(|(point, _)| *point == wanted)
+            .map(|(_, calls)| calls.load(Ordering::SeqCst))
+            .unwrap()
+    };
+    assert_eq!(count(HookPoint::OnRunStart), 1);
+    assert_eq!(count(HookPoint::BeforeStep), 1);
+    assert_eq!(count(HookPoint::AfterStep), 1);
+    assert_eq!(count(HookPoint::OnConverged), 1);
+    assert_eq!(
+        count(HookPoint::OnRunEnd),
+        1,
+        "teardown fires once and only once"
+    );
+    assert_eq!(
+        count(HookPoint::OnCommit),
+        0,
+        "a `type: command` step never moves HEAD"
+    );
+    assert_eq!(
+        count(HookPoint::BeforePush),
+        0,
+        "no gate is configured, so nothing is ever pushed"
+    );
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(count_run_finished(&events), 1);
+}
+
+/// Aggregation contract, `Block` first: the first `Block` short-circuits, so a later hook on the
+/// same point never even runs.
+#[tokio::test]
+async fn a_block_short_circuits_a_later_emit_findings_hook_on_the_same_point() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(BlockingHook(HookPoint::AfterStep)));
+    registry.register(Arc::new(DetailedEmitFindingsHook {
+        point: HookPoint::AfterStep,
+        calls: emitted.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (_run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Failed);
+    assert_eq!(
+        emitted.load(Ordering::SeqCst),
+        0,
+        "the hook registered after the blocker must never run"
+    );
+}
+
+/// Aggregation contract, `EmitFindings` first: a later `Block` still wins over the reboucle the
+/// earlier findings would have caused.
+#[tokio::test]
+async fn a_block_after_an_emit_findings_hook_still_fails_the_run() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(DetailedEmitFindingsHook {
+        point: HookPoint::AfterStep,
+        calls: emitted.clone(),
+    }));
+    registry.register(Arc::new(BlockingHook(HookPoint::AfterStep)));
+    let orchestrator = Orchestrator::new(pool).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (_run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        final_state,
+        RunState::Failed,
+        "a Block anywhere on the point beats the findings emitted before it"
+    );
+    assert_eq!(emitted.load(Ordering::SeqCst), 1);
+}
+
+/// A hook that *fails* is not a hook that blocks: the error propagates as an `Err` out of the run
+/// rather than being folded into a final state.
+#[tokio::test]
+async fn a_hook_that_errors_aborts_the_run_with_an_error() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let teardowns = Arc::new(AtomicUsize::new(0));
+    let mut registry = HookRegistry::new();
+    registry.register(Arc::new(ErroringHook(HookPoint::BeforeStep)));
+    registry.register(Arc::new(CountingContinueHook {
+        points: vec![HookPoint::OnRunEnd],
+        calls: teardowns.clone(),
+    }));
+    let orchestrator = Orchestrator::new(pool.clone()).with_hooks(registry);
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let error = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .expect_err("a failing hook must surface as an error, not a silent Continue");
+
+    assert!(
+        matches!(error, WardenError::HookConfig { .. }),
+        "the hook's own error must reach the caller verbatim: {error}"
+    );
+
+    // Documented gap, not a #106 regression: `?` inside `run_convergence_continuation`'s `'run:`
+    // block returns straight out of the function, so the single teardown/`RunFinished` tail below
+    // it is skipped. A `Block` unwinds through that tail (see the tests above); an `Err` does not,
+    // which leaves the run's persisted state untouched and an attached `warden-tui` showing it as
+    // still running. Asserted so a future fix has to come here and flip these deliberately.
+    let events = events_for(&pool, &run_id_of_only_run(&pool).await).await;
+    assert_eq!(
+        count_run_finished(&events),
+        0,
+        "current behavior: a hook error skips the RunFinished tail"
+    );
+    assert_eq!(
+        teardowns.load(Ordering::SeqCst),
+        0,
+        "current behavior: a hook error skips on_run_end teardown"
+    );
+    assert_eq!(
+        db::get_run(&pool, &run_id_of_only_run(&pool).await)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        RunState::RunningStep(0),
+        "current behavior: the run is left in the write-ahead state, to be swept up later by \
+         crash recovery rather than resolved here"
+    );
+}
+
+/// The one run in a freshly-created pool (these tests never create a second).
+async fn run_id_of_only_run(pool: &SqlitePool) -> String {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM runs")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    rows[0].0.clone()
 }
