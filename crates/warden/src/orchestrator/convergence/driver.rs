@@ -80,7 +80,7 @@ impl Orchestrator {
                     max_cycles: config.max_cycles,
                 })
                 .await?;
-                self.publish_event(resolve_workflow_event(&config.workflow))
+                self.publish_event(resolve_workflow_event(&config.workflow)?)
                     .await?;
                 if let Some(callback) = &self.on_run_started {
                     callback(&run_id);

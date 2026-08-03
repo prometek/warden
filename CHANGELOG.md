@@ -7,6 +7,45 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Added — Issue #107 : événement de graphe de workflow, étapes à venir exposées à la TUI
+
+> Préalable à la refonte de `warden-tui` (brief de design, passe 1). La TUI
+> reconstruit tout son état par rejeu de `RunEvent` ; son arbre d'exécution
+> était donc purement rétrospectif, sans aucune connaissance de la structure
+> déclarée du workflow (étapes à venir, transitions, budgets par étape).
+
+- **Nouvel événement `RunEvent::WorkflowResolved { name, entry, steps:
+  Vec<WorkflowStepWire> }`** (+ `EventKind::WorkflowResolved`,
+  `"workflow_resolved"`), publié par l'orchestrateur **exactement une fois**
+  par run, juste après `RunStarted` et avant la première transition d'étape.
+  Chaque `WorkflowStepWire` porte l'identifiant de l'étape, son type (`agent`
+  / `command`), ses trois transitions (`on_clean`/`on_blocking`/`on_error`,
+  résolues vers un id d'étape ou `"converged"`/`"failed"`), son budget de
+  cycles propre et si elle capture de l'évidence. Donnée pure, aucune I/O
+  ajoutée à `warden-core`.
+- **`warden_tui::model::RunModel::workflow_graph()`** expose le graphe
+  déclaré (`WorkflowGraph::Resolved`) avec, pour chaque étape, son état
+  d'exécution courant dérivé du flux d'événements
+  (`StepRuntimeStatus::NeverReached` / `Running` / `Ran` / `Interrupted` —
+  ce dernier pour une étape encore `Running` alors que le run est déjà
+  terminé, le cas le plus courant étant un Ctrl-C ou un timeout n'ayant
+  jamais publié d'`AgentFinished`). **Repli explicite**
+  (`WorkflowGraph::Unresolved`, pas un `unwrap` ni un écran vide) pour un run
+  antérieur à cette issue, qui n'a jamais publié l'événement.
+- **Persistance acquise sans nouveau chemin de lecture** : `publish_event`
+  écrit dans `events` avant de diffuser, une attache tardive rejoue donc
+  `WorkflowResolved` comme n'importe quel autre événement, y compris pour les
+  étapes jamais exécutées.
+- **Tests** : aller-retour de sérialisation et parsing d'`EventKind` côté
+  `warden-core` ; résolution pure `Workflow -> RunEvent::WorkflowResolved`
+  (transitions, budget, entrée non nulle, index hors bornes en erreur typée
+  plutôt qu'un panic) ; garantie bout en bout côté orchestrateur qu'un run
+  publie l'événement exactement une fois, juste après `RunStarted`, et
+  qu'une reprise n'en republie pas un second ; consommation par `RunModel`
+  (graphe résolu, transition `Running -> Ran -> Running` sur rebouclage,
+  role absent du graphe déclaré, étape rétrogradée en `Interrupted` sur un
+  run déjà terminé, repli `Unresolved`).
+
 ### Fixed — Issue #106 : `HookOutcome` appliqué de façon homogène à tous les points de cycle de vie
 
 > Suivi d'ADR-0017 (hooks de cycle de vie). Le type existait et s'agrégeait

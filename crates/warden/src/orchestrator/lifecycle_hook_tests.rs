@@ -593,6 +593,13 @@ fn count_cycles_started(events: &[RunEvent]) -> usize {
         .count()
 }
 
+fn count_workflow_resolved(events: &[RunEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, RunEvent::WorkflowResolved { .. }))
+        .count()
+}
+
 /// The fourth `BeforeStep` entry path: the ordinary post-step loop iteration. The three others
 /// (fresh entry, quota resume, CI reboucle) each have a test; this one blocks only on the *second*
 /// dispatch, so an implementation that enforced `BeforeStep` on entry alone would sail past it.
@@ -1103,4 +1110,116 @@ async fn run_id_of_only_run(pool: &SqlitePool) -> String {
         .unwrap();
     assert_eq!(rows.len(), 1);
     rows[0].0.clone()
+}
+
+/// Issue #107's headline guarantee: a fresh run publishes `WorkflowResolved` exactly once, right
+/// after `RunStarted` and before the first step transition (`CycleStarted`). Pins the exact
+/// ordering so moving the `publish_event` call in `driver.rs` -- e.g. into the `restored` branch,
+/// or below `transition_or_block` -- fails loudly here instead of shipping silently.
+#[tokio::test]
+async fn workflow_resolved_is_published_exactly_once_right_after_run_started() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let orchestrator = Orchestrator::new(pool.clone());
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+
+    let (run_id, final_state) = orchestrator
+        .run_convergence_loop(config, UnusedToolAdapter, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(final_state, RunState::Converged);
+
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        count_workflow_resolved(&events),
+        1,
+        "WorkflowResolved must be published exactly once per run: {events:?}"
+    );
+    assert!(
+        matches!(events[0], RunEvent::RunStarted { .. }),
+        "expected RunStarted first: {events:?}"
+    );
+    assert!(
+        matches!(events[1], RunEvent::WorkflowResolved { .. }),
+        "WorkflowResolved must immediately follow RunStarted, before the first step transition: \
+         {events:?}"
+    );
+
+    let RunEvent::WorkflowResolved { name, entry, steps } = &events[1] else {
+        unreachable!("just matched above");
+    };
+    assert_eq!(name, "single");
+    assert_eq!(*entry, 0);
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].id, "build");
+}
+
+/// The resume path (crash/quota recovery) must not re-publish `WorkflowResolved` -- it was already
+/// published once, on the run's original start.
+#[tokio::test]
+async fn resuming_a_run_does_not_republish_workflow_resolved() {
+    let repo = init_test_repo();
+    let warden_home = TempDir::new().unwrap();
+    let pool = db::connect(&warden_home.path().join("state.db"))
+        .await
+        .unwrap();
+    let run_id = "resumed-run-workflow-resolved".to_string();
+    let workflow = single_command_step_workflow();
+    db::insert_run(
+        &pool,
+        &run_id,
+        &repo.path().display().to_string(),
+        "main",
+        "intent",
+        3,
+        3,
+        workflow.steps.len() as u32,
+        3,
+    )
+    .await
+    .unwrap();
+    db::update_run_state(&pool, &run_id, RunState::ResumingQuota)
+        .await
+        .unwrap();
+    // The original start's own `WorkflowResolved`, already persisted before the crash/suspension
+    // being resumed here.
+    db::insert_event(
+        &pool,
+        &Uuid::new_v4().to_string(),
+        &run_id,
+        &RunEvent::WorkflowResolved {
+            name: workflow.name.clone(),
+            entry: workflow.entry(),
+            steps: Vec::new(),
+        },
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    .unwrap();
+
+    let orchestrator = Orchestrator::new(pool.clone());
+    let config = command_workflow_config(repo.path(), warden_home.path(), 3);
+    let continuation = ConvergenceContinuation::new(head_commit(&repo), &workflow);
+
+    let (run_id, final_state) = orchestrator
+        .resume_convergence_loop(
+            run_id,
+            config,
+            &UnusedToolAdapter,
+            CancellationToken::new(),
+            continuation,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(final_state, RunState::Converged);
+    let events = events_for(&pool, &run_id).await;
+    assert_eq!(
+        count_workflow_resolved(&events),
+        1,
+        "resuming a run must not publish a second WorkflowResolved: {events:?}"
+    );
 }
