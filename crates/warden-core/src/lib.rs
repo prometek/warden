@@ -18,12 +18,12 @@ mod workflow;
 
 pub use agent_def::{parse_agent_definition, AgentDefinition};
 pub use agent_wire::{
-    build_finding_agent_input_json, build_producer_input_json, parse_agent_input_message,
-    AgentInputMessage, ReviewScope, AGENT_INPUT_VERSION, DIFF_TRUNCATED_MARKER,
+    build_step_input_json, parse_agent_input_message, AgentInputMessage, AGENT_INPUT_VERSION,
+    DIFF_TRUNCATED_MARKER,
 };
 pub use ci_channel::{parse_ci_result_message, CiResultMessage, CiWatchOutcome};
 pub use convergence::{
-    decide_next_state_after_ci, decide_next_state_for_step, parse_findings,
+    decide_next_state_after_ci, decide_next_state_for_step, parse_findings, state_for_target,
     validate_finding_sources_for_role, CiOutcome, Finding, FindingSource, Severity,
 };
 pub use error::{CoreError, Result};
@@ -39,6 +39,8 @@ pub use hook::{HookContext, HookOutcome, HookPoint};
 pub use pr_body::{format_evidence_section, EvidenceRow};
 pub use rate_limit::{RateLimitState, RateLimitStatus, RateLimitWindow};
 pub use socket::{resolve_ci_result_socket_path, resolve_socket_path, MAX_SOCKET_PATH_LEN};
-pub use state::{AgentRole, RunState};
+pub use state::RunState;
 pub use token_usage::TokenUsage;
-pub use workflow::{Gate, Role, StepBudget, StepKind, Workflow, WorkflowStep};
+pub use workflow::{
+    Role, StepKind, StepOutcome, StepTarget, StepTransitions, Workflow, WorkflowStep,
+};

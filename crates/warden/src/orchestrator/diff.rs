@@ -95,8 +95,37 @@ pub(super) async fn read_diff(worktree_path: &Path, base: &str, target: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::test_support::*;
     use std::process::Command as SyncCommand;
+
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "test@warden.local"],
+            vec!["config", "user.name", "warden-test"],
+        ] {
+            assert!(SyncCommand::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(dir.path().join("README.md"), "seed\n").unwrap();
+        assert!(SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(SyncCommand::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "--quiet", "-m", "seed"])
+            .status()
+            .unwrap()
+            .success());
+        dir
+    }
 
     #[test]
     fn cap_diff_returns_the_input_unchanged_when_under_the_cap() {

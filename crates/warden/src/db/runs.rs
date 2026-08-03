@@ -97,6 +97,27 @@ pub async fn update_run_state(pool: &SqlitePool, run_id: &str, new_state: RunSta
     Ok(())
 }
 
+pub async fn set_run_workflow_entry(
+    pool: &SqlitePool,
+    run_id: &str,
+    workflow_entry: u32,
+) -> Result<()> {
+    sqlx::query("UPDATE runs SET workflow_entry = ? WHERE id = ?")
+        .bind(i64::from(workflow_entry))
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_run_workflow_entry(pool: &SqlitePool, run_id: &str) -> Result<u32> {
+    let value: i64 = sqlx::query_scalar("SELECT workflow_entry FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
+    checked_u32(value, "runs.workflow_entry")
+}
+
 pub async fn fail_run_with_pending_cleanup(pool: &SqlitePool, run_id: &str) -> Result<()> {
     let now = now_rfc3339();
     let mut transaction = pool.begin().await?;
@@ -137,16 +158,12 @@ pub async fn clear_run_cleanup_pending(pool: &SqlitePool, run_id: &str) -> Resul
     Ok(())
 }
 
-pub async fn set_run_current_review_cycle(
-    pool: &SqlitePool,
-    run_id: &str,
-    review_cycle: u32,
-) -> Result<()> {
+pub async fn set_run_current_cycle(pool: &SqlitePool, run_id: &str, cycle: u32) -> Result<()> {
     let now = now_rfc3339();
-    let review_cycle = i64::from(review_cycle);
+    let cycle = i64::from(cycle);
     sqlx::query!(
         "UPDATE runs SET current_review_cycle = ?, updated_at = ? WHERE id = ?",
-        review_cycle,
+        cycle,
         now,
         run_id,
     )

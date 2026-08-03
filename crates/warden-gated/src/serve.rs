@@ -181,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn handle_payload_blocks_the_push_when_the_real_run_state_is_not_converged() {
         let (_db_dir, origin, gate_repo, db_path, commit_sha) =
-            test_fixture(RunState::CoderRunning, None).await;
+            test_fixture(RunState::RunningStep(0), None).await;
 
         let pool = db::connect_read_only(&db_path).await.unwrap();
         let config = ServeConfig {

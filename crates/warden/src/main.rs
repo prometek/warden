@@ -11,7 +11,7 @@ use warden::tool_adapter::ToolName;
 mod cli;
 mod run_command;
 
-use cli::{isolation_as_str, tool_as_str, Cli, Commands, IsolationConfig, TrustRepoAgents};
+use cli::{isolation_as_str, tool_as_str, Cli, Commands, IsolationConfig};
 #[cfg(test)]
 use cli::{
     parse_docker_cpus, parse_docker_egress_proxy, parse_docker_memory, parse_docker_network,
@@ -34,13 +34,10 @@ async fn main() -> anyhow::Result<()> {
             intents_file,
             fail_fast,
             branch,
-            max_review_cycles,
-            max_test_cycles,
             max_cycles,
             quota_anticipation_threshold,
             warden_home,
             tool,
-            trust_repo_agents,
             evidence_tool,
             evidence_store_in_repo,
             gate_bare_repo,
@@ -124,13 +121,10 @@ async fn main() -> anyhow::Result<()> {
                     repo,
                     intent,
                     branch,
-                    max_review_cycles,
-                    max_test_cycles,
                     max_cycles,
                     quota_anticipation_threshold,
                     warden_home,
                     tool,
-                    TrustRepoAgents(trust_repo_agents),
                     evidence_tool,
                     evidence_store_in_repo,
                     gate,
@@ -144,13 +138,10 @@ async fn main() -> anyhow::Result<()> {
                     intents,
                     fail_fast,
                     branch,
-                    max_review_cycles,
-                    max_test_cycles,
                     max_cycles,
                     quota_anticipation_threshold,
                     warden_home,
                     verbose,
-                    trust_repo_agents,
                     evidence_tool,
                     evidence_store_in_repo,
                     gate_bare_repo,

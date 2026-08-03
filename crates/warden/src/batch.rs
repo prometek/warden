@@ -16,13 +16,10 @@ pub fn parse_intents_file(contents: &str) -> Vec<String> {
 pub struct SingleIntentArgs<'a> {
     pub repo: &'a str,
     pub branch: &'a str,
-    pub max_review_cycles: u32,
-    pub max_test_cycles: u32,
     pub max_cycles: u32,
     pub quota_anticipation_threshold: f64,
     pub warden_home: &'a str,
     pub tool: &'a str,
-    pub trust_repo_agents: bool,
     pub evidence_tool: Option<&'a str>,
     pub evidence_store_in_repo: bool,
     pub gate_bare_repo: Option<&'a str>,
@@ -54,10 +51,6 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out.push(intent.to_string());
     out.push("--branch".to_string());
     out.push(args.branch.to_string());
-    out.push("--max-review-cycles".to_string());
-    out.push(args.max_review_cycles.to_string());
-    out.push("--max-test-cycles".to_string());
-    out.push(args.max_test_cycles.to_string());
     out.push("--max-cycles".to_string());
     out.push(args.max_cycles.to_string());
     out.push("--quota-anticipation-threshold".to_string());
@@ -66,9 +59,6 @@ pub fn build_single_intent_args(args: &SingleIntentArgs<'_>, intent: &str) -> Ve
     out.push(args.warden_home.to_string());
     out.push("--tool".to_string());
     out.push(args.tool.to_string());
-    if args.trust_repo_agents {
-        out.push("--trust-repo-agents".to_string());
-    }
     if let Some(evidence_tool) = args.evidence_tool {
         out.push("--evidence-tool".to_string());
         out.push(evidence_tool.to_string());
@@ -249,13 +239,10 @@ mod tests {
         let args = SingleIntentArgs {
             repo: "/repo",
             branch: "main",
-            max_review_cycles: 5,
-            max_test_cycles: 5,
             max_cycles: 5,
             quota_anticipation_threshold: 0.90,
             warden_home: "/home/.warden",
             tool: "claude",
-            trust_repo_agents: true,
             evidence_tool: Some("playwright"),
             evidence_store_in_repo: true,
             gate_bare_repo: Some("/bare.git"),
@@ -288,10 +275,6 @@ mod tests {
                 "fix the thing",
                 "--branch",
                 "main",
-                "--max-review-cycles",
-                "5",
-                "--max-test-cycles",
-                "5",
                 "--max-cycles",
                 "5",
                 "--quota-anticipation-threshold",
@@ -300,7 +283,6 @@ mod tests {
                 "/home/.warden",
                 "--tool",
                 "claude",
-                "--trust-repo-agents",
                 "--evidence-tool",
                 "playwright",
                 "--evidence-store-in-repo",
@@ -336,13 +318,10 @@ mod tests {
         let args = SingleIntentArgs {
             repo: "/repo",
             branch: "main",
-            max_review_cycles: 5,
-            max_test_cycles: 5,
             max_cycles: 5,
             quota_anticipation_threshold: 0.90,
             warden_home: "/home/.warden",
             tool: "claude",
-            trust_repo_agents: false,
             evidence_tool: None,
             evidence_store_in_repo: false,
             gate_bare_repo: None,

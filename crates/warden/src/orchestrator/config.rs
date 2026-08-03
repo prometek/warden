@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use warden_core::{AgentDefinition, AgentRole, EvidenceTool, Workflow};
+use warden_core::{AgentDefinition, EvidenceTool, Workflow};
 use warden_sandbox::{DockerConfig, DockerRunOptions, DockerSandbox, LocalSandbox, Sandbox};
 
 use crate::tool_adapter::ToolName;
@@ -66,34 +66,17 @@ pub struct RunConfig {
     pub warden_home: PathBuf,
     pub branch: String,
     pub intent: String,
-    pub max_review_cycles: u32,
-    /// / how many times the tester may actually run and come back with a blocking finding
-    /// (`RunState::RunningStep(2)`) before the run gives up as `RunState::StepCyclesExceeded(2)`.
-    pub max_test_cycles: u32,
-    /// the run's pipeline -- `Workflow::builtin_default()` when no `.warden/workflow.yaml` exists,
-    /// or the parsed/validated contents of that file otherwise.
+    pub max_cycles: u32,
     pub workflow: Workflow,
-    pub max_extra_step_cycles: u32,
-    /// (trio-unification follow-up): one resolved [`AgentDefinition`] per `workflow.steps`, in the
-    /// exact same order.
+    /// One resolved definition per agent step, in workflow order.
     pub step_agents: Vec<AgentDefinition>,
     /// Overrides automatic project-type detection for the Evidence Capture Adapter.
     pub evidence_tool: Option<EvidenceTool>,
     /// Whether captured evidence gets committed into `.warden/evidence/` and pushed with the
     /// converged commit.
     pub evidence_store_in_repo: bool,
-    /// /'s post-`Converged` tail (push into the local bare gate repo + PR open/finalize + CI
-    /// watch).
+    /// Optional push, PR, and CI tail.
     pub gate: Option<GateConfig>,
-    pub untrusted_repo_agent_definitions: Vec<UntrustedRepoAgentDefinition>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UntrustedRepoAgentDefinition {
-    pub role: AgentRole,
-    /// The literal, pre-canonicalization path that was actually read.
-    pub path: PathBuf,
-    pub canonical_path: PathBuf,
 }
 
 /// Configuration for post-convergence gate processing.

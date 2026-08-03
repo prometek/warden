@@ -116,7 +116,7 @@ fn render_evidence_pane(
 
 fn header_widget(model: &RunModel) -> Paragraph<'static> {
     let text = match (model.run_id(), model.run_started()) {
-        (Some(run_id), Some((intent, branch, max_review_cycles, max_test_cycles))) => {
+        (Some(run_id), Some((intent, branch, max_cycles))) => {
             let status = if let Some(resets_at) = model.quota_suspension_resets_at() {
                 format!(
                     "SUSPENDED for quota (not failed) -- resumes {} -- run total {}",
@@ -129,11 +129,8 @@ fn header_widget(model: &RunModel) -> Paragraph<'static> {
                     format_token_usage(&model.total_token_usage())
                 )
             } else {
-                // separate per-phase budgets replace the single "cycle N/max" the header used to
-                // show.
                 let cycle_status = format!(
-                    "cycle {} in progress (review {max_review_cycles}, test {max_test_cycles}) \
-                     -- run total {}",
+                    "cycle {} in progress (max {max_cycles}) -- run total {}",
                     model.current_cycle_number(),
                     format_token_usage(&model.total_token_usage())
                 );
@@ -229,14 +226,10 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         RunEvent::RunStarted {
             intent,
             branch,
-            max_review_cycles,
-            max_test_cycles,
+            max_cycles,
         } => (
             Style::default().fg(Color::Cyan),
-            format!(
-                "run started: \"{intent}\" on {branch} (max {max_review_cycles} review cycles, \
-                 max {max_test_cycles} test cycles)"
-            ),
+            format!("run started: \"{intent}\" on {branch} (max {max_cycles} cycles)"),
         ),
         RunEvent::CycleStarted { cycle_number } => (
             Style::default().fg(Color::Blue),
@@ -292,14 +285,11 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
         } => (
             Style::default().fg(Color::Yellow),
             if path == canonical_path {
-                format!(
-                    "{role} definition read from the repo under review (--trust-repo-agents): \
-                     {path} -- untrusted, coder-controllable"
-                )
+                format!("{role} definition is repository-controlled: {path}")
             } else {
                 format!(
-                    "{role} definition read from the repo under review (--trust-repo-agents): \
-                     {path} (resolves to {canonical_path}) -- untrusted, coder-controllable"
+                    "{role} definition is repository-controlled: \
+                     {path} (resolves to {canonical_path})"
                 )
             },
         ),
@@ -413,9 +403,8 @@ fn agent_node_line(rail: &str, glyph: &str, agent: &AgentNode) -> Line<'static> 
 /// The human-readable label for a [`ReloopCause`] return edge.
 fn reloop_description(cause: ReloopCause) -> &'static str {
     match cause {
-        ReloopCause::ReviewFinding => "reviewer -> coder (review reloop, scoped re-review next)",
-        ReloopCause::TestFinding => "tester -> coder -> reviewer -> tester (test reloop)",
-        ReloopCause::CiFailure => "CI checks failed -> coder (ci reloop)",
+        ReloopCause::BlockingFinding => "blocking finding followed explicit workflow edge",
+        ReloopCause::CiFailure => "CI failure restarted workflow entry",
     }
 }
 
@@ -456,8 +445,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "add email validation".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 5,
-                max_test_cycles: 5,
+                max_cycles: 5,
             },
         ));
 
@@ -480,8 +468,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
 
@@ -503,8 +490,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record(
@@ -565,8 +551,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -626,8 +611,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -668,8 +652,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -708,7 +691,7 @@ mod tests {
             "after the agent finishes: only the historical event log entry remains, the \
              header's own repetition must be gone"
         );
-        assert!(content_after_finish.contains("cycle 1 in progress (review 3, test 3)"));
+        assert!(content_after_finish.contains("cycle 1 in progress (max 3)"));
     }
 
     #[test]
@@ -756,7 +739,7 @@ mod tests {
             content.contains("/repo/.warden/agents/reviewer.md"),
             "{content}"
         );
-        assert!(content.contains("untrusted"), "{content}");
+        assert!(content.contains("repository-controlled"), "{content}");
     }
 
     #[test]
@@ -836,8 +819,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -860,8 +842,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -910,8 +891,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -974,8 +954,8 @@ mod tests {
             "{content}"
         );
         assert!(
-            content.contains("reviewer -> coder"),
-            "the return edge must name the reviewer-driven reloop: {content}"
+            content.contains("blocking finding followed explicit workflow edge"),
+            "return edge must remain role-agnostic: {content}"
         );
     }
 
@@ -987,8 +967,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -1058,12 +1037,8 @@ mod tests {
         assert!(content.contains("tester"), "{content}");
         assert!(content.contains("findings"), "{content}");
         assert!(
-            content.contains("tester -> coder -> reviewer -> tester"),
-            "the return edge must name the tester-driven reloop, not the review one: {content}"
-        );
-        assert!(
-            !content.contains("reviewer -> coder"),
-            "must not also render the review-reloop label: {content}"
+            content.contains("blocking finding followed explicit workflow edge"),
+            "return edge must remain role-agnostic: {content}"
         );
     }
 
@@ -1075,8 +1050,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
         model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
@@ -1130,8 +1104,8 @@ mod tests {
         let content = buffer_to_string(terminal.backend().buffer());
         assert!(content.contains("cycle 1"), "{content}");
         assert!(
-            content.contains("CI checks failed -> coder (ci reloop)"),
-            "the return edge must name the ci-driven reloop distinctly: {content}"
+            content.contains("CI failure restarted workflow entry"),
+            "CI return edge must restart configured entry: {content}"
         );
     }
 
@@ -1183,8 +1157,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: long_intent.clone(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             },
         ));
 

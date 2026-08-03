@@ -64,7 +64,7 @@ pub enum ProcessError {
 
     #[error(
         "refusing to spawn {role} agent program {program:?}: {reason} -- this would let the \
-         coder control what an independent role executes"
+         repository changes control what an independent agent executes"
     )]
     UntrustedAgentProgram {
         role: String,
@@ -74,7 +74,7 @@ pub enum ProcessError {
 
     #[error(
         "refusing to spawn {role} agent with argument {arg:?}: {reason} -- this would let the \
-         coder control what an independent role executes"
+         repository changes control what an independent agent executes"
     )]
     UntrustedAgentArg {
         role: String,
@@ -139,7 +139,7 @@ pub enum AgentDefinitionError {
         source: std::io::Error,
     },
 
-    /// a custom workflow step names an `agent` with no matching `.claude/agents/<agent>.md` file.
+    /// A workflow step names an agent with no matching `.warden/agents/<agent>.md` file.
     #[error(
         "no agent definition found for custom workflow role {role:?}: expected {expected_path}"
     )]
@@ -223,33 +223,11 @@ pub enum WardenError {
     #[error("invalid policy config {path}: {reason}")]
     PolicyConfig { path: PathBuf, reason: String },
 
-    #[error("run {run_id} exceeded its review cycle budget ({max_review_cycles} cycles) without converging")]
-    MaxReviewCyclesExceeded {
-        run_id: String,
-        max_review_cycles: u32,
-    },
-
-    #[error(
-        "run {run_id} exceeded its test cycle budget ({max_test_cycles} cycles) without converging"
-    )]
-    MaxTestCyclesExceeded {
-        run_id: String,
-        max_test_cycles: u32,
-    },
-
     #[error("row column `{column}` = {value} does not fit in the expected numeric type")]
     InvalidStoredValue { column: &'static str, value: i64 },
 
     #[error("run {run_id} not found")]
     RunNotFound { run_id: String },
-
-    #[error("coder for run {run_id} (cycle {cycle_id}) exited with status {exit_code}: {stderr}")]
-    CoderFailed {
-        run_id: String,
-        cycle_id: String,
-        exit_code: i32,
-        stderr: String,
-    },
 
     /// A pre-migration backup of the SQLite database file failed.
     #[error("failed to back up database to {path} before applying migrations: {source}")]

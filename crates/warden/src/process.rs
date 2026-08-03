@@ -17,9 +17,6 @@ pub use execution::{spawn, spawn_and_wait, spawn_tui_attach, wait};
 pub use lifecycle::{is_process_alive, kill_pid, process_start_time, UNKNOWN_START_TIME};
 pub use validation::validate_agent_program;
 
-#[cfg(test)]
-use execution::classify_stdin_write_error;
-
 /// A single agent invocation to run in an isolated worktree.
 #[derive(Debug, Clone)]
 pub struct AgentCommand {

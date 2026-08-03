@@ -1,0 +1,24 @@
+name: delivery
+entry: implementation
+steps:
+  implementation:
+    type: agent
+    agent: implementer
+    on_clean: test
+    on_blocking: implementation
+    on_error: failed
+
+  test:
+    type: command
+    run: cargo test --workspace
+    on_clean: review
+    on_blocking: implementation
+    on_error: failed
+
+  review:
+    type: agent
+    agent: reviewer
+    on_clean: converged
+    on_blocking: implementation
+    on_error: failed
+    max_cycles: 3

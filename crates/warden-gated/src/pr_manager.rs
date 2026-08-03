@@ -2,7 +2,7 @@ use std::path::Path;
 
 use sqlx::SqlitePool;
 use tokio::process::Command;
-use warden_core::{Finding, FindingSource};
+use warden_core::Finding;
 
 use crate::error::{GatedError, Result};
 use crate::gate::verify_and_authorize;

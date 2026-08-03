@@ -22,14 +22,13 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Run a full convergence loop against a repository: a producer step (the coder, by default)
-    /// followed by a sequence of gated steps, reboucling to the producer on a blocking finding.
+    /// Run the repository-defined workflow graph until it converges or fails.
     Run {
         /// Path to the user's existing repository.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         repo: PathBuf,
 
-        /// Task description passed to producer agent.
+        /// Task description passed to every agent step.
         #[arg(long = "intent", value_parser = parse_intent)]
         intent: Vec<String>,
 
@@ -45,14 +44,7 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "main")]
         branch: String,
 
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
-        max_review_cycles: u32,
-
-        /// Maximum tester cycles.
-        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
-        max_test_cycles: u32,
-
-        /// Shared cycle budget for extra workflow steps.
+        /// Global cycle budget; a step may declare a lower `max_cycles`.
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         max_cycles: u32,
 
@@ -67,9 +59,6 @@ pub(crate) enum Commands {
         /// Built-in tool adapter used by every role.
         #[arg(long, value_parser = parse_tool)]
         tool: ToolName,
-
-        #[arg(long)]
-        trust_repo_agents: bool,
 
         /// Override automatic evidence-tool detection.
         #[arg(long, value_parser = parse_evidence_tool)]
@@ -251,9 +240,6 @@ pub(crate) fn parse_docker_egress_proxy(raw: &str) -> Result<String, String> {
         Err("Docker egress proxy must be an HTTP(S) URL without embedded credentials".to_string())
     }
 }
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TrustRepoAgents(pub(crate) bool);
 
 pub(crate) fn parse_evidence_tool(raw: &str) -> Result<warden_core::EvidenceTool, String> {
     warden_core::EvidenceTool::parse(raw).map_err(|error| error.to_string())

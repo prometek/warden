@@ -38,21 +38,18 @@ pub struct RunView {
     pub intent: String,
     pub branch: String,
     pub state: RunState,
-    pub max_review_cycles: u32,
-    pub max_test_cycles: u32,
-    pub current_review_cycle: u32,
-    pub current_test_cycle: u32,
+    pub max_cycles: u32,
+    pub current_cycle: u32,
 }
 
+#[derive(sqlx::FromRow)]
 struct RunRow {
     id: String,
     intent: String,
     branch: String,
     state: String,
-    max_review_cycles: i64,
-    max_test_cycles: i64,
-    current_review_cycle: i64,
-    current_test_cycle: i64,
+    max_cycles: i64,
+    current_cycle: i64,
 }
 
 fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
@@ -60,11 +57,11 @@ fn checked_u32(value: i64, column: &'static str) -> Result<u32> {
 }
 
 pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<RunView>> {
-    let row = sqlx::query_as!(
-        RunRow,
-        r#"SELECT id as "id!", intent, branch, state, max_review_cycles, max_test_cycles, current_review_cycle, current_test_cycle FROM runs WHERE id = ?"#,
-        run_id,
+    let row = sqlx::query_as::<_, RunRow>(
+        "SELECT id, intent, branch, state, max_review_cycles AS max_cycles, \
+         current_review_cycle AS current_cycle FROM runs WHERE id = ?",
     )
+    .bind(run_id)
     .fetch_optional(pool)
     .await?;
 
@@ -74,10 +71,8 @@ pub async fn get_run(pool: &SqlitePool, run_id: &str) -> Result<Option<RunView>>
             intent: r.intent,
             branch: r.branch,
             state: RunState::parse(&r.state)?,
-            max_review_cycles: checked_u32(r.max_review_cycles, "runs.max_review_cycles")?,
-            max_test_cycles: checked_u32(r.max_test_cycles, "runs.max_test_cycles")?,
-            current_review_cycle: checked_u32(r.current_review_cycle, "runs.current_review_cycle")?,
-            current_test_cycle: checked_u32(r.current_test_cycle, "runs.current_test_cycle")?,
+            max_cycles: checked_u32(r.max_cycles, "runs.max_review_cycles")?,
+            current_cycle: checked_u32(r.current_cycle, "runs.current_review_cycle")?,
         })
     })
     .transpose()
@@ -223,11 +218,9 @@ mod tests {
             .unwrap()
             .expect("run-1 exists");
         assert_eq!(run.intent, "do the thing");
-        assert_eq!(run.state, RunState::CoderRunning);
-        assert_eq!(run.max_review_cycles, 5);
-        assert_eq!(run.max_test_cycles, 4);
-        assert_eq!(run.current_review_cycle, 1);
-        assert_eq!(run.current_test_cycle, 0);
+        assert_eq!(run.state, RunState::RunningStep(0));
+        assert_eq!(run.max_cycles, 5);
+        assert_eq!(run.current_cycle, 1);
     }
 
     #[tokio::test]
@@ -361,8 +354,7 @@ mod tests {
             serde_json::to_string(&RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             })
             .unwrap(),
             "2026-07-12T00:00:00+00:00",
@@ -414,8 +406,7 @@ mod tests {
             RunEventHistoryEntry::Decoded(ref record) if record.event == RunEvent::RunStarted {
                 intent: "intent".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 3,
-                max_test_cycles: 3,
+                max_cycles: 3,
             }
         ));
         assert!(matches!(
@@ -506,7 +497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_issue_43_run_started_payload_with_a_single_max_cycles_field_is_undecodable() {
+    async fn run_started_payload_with_max_cycles_is_decoded() {
         let dir = TempDir::new().unwrap();
         let (db_path, write_pool) = seed_db(dir.path()).await;
         let pre_issue_43_payload =
@@ -527,19 +518,18 @@ mod tests {
         let pool = connect_read_only(&db_path).await.unwrap();
         let events = list_events_for_run(&pool, "run-1")
             .await
-            .expect("a stale pre-issue-43 payload must never fail the whole query");
+            .expect("max_cycles payload must decode");
 
         assert_eq!(events.len(), 1);
-        match &events[0] {
-            RunEventHistoryEntry::Undecodable(event) => {
-                assert_eq!(event.id, "event-pre-43");
-                assert_eq!(event.event_type, "run_started");
-                assert_eq!(event.reason, UndecodableReason::PayloadDeserialize);
-            }
-            RunEventHistoryEntry::Decoded(record) => {
-                panic!("expected an Undecodable entry, got a decoded record: {record:?}")
-            }
-        }
+        assert!(matches!(
+            &events[0],
+            RunEventHistoryEntry::Decoded(record)
+                if record.event == RunEvent::RunStarted {
+                    intent: "do the thing".to_string(),
+                    branch: "main".to_string(),
+                    max_cycles: 5,
+                }
+        ));
     }
 
     #[tokio::test]

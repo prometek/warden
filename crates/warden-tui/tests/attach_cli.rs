@@ -124,8 +124,7 @@ async fn attach_cli_replays_full_history_then_streams_live_events_with_no_gap() 
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 5,
-            max_test_cycles: 5,
+            max_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -182,8 +181,7 @@ async fn attach_cli_to_a_finished_run_prints_history_only_and_exits() {
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 5,
-            max_test_cycles: 5,
+            max_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -220,8 +218,7 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 5,
-            max_test_cycles: 5,
+            max_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )
@@ -239,8 +236,7 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
         event: RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 5,
-            max_test_cycles: 5,
+            max_cycles: 5,
         },
         created_at: "2026-07-12T00:00:00+00:00".to_string(),
     };
@@ -286,8 +282,7 @@ async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_an
         &RunEvent::RunStarted {
             intent: "intent".to_string(),
             branch: "main".to_string(),
-            max_review_cycles: 5,
-            max_test_cycles: 5,
+            max_cycles: 5,
         },
         "2026-07-12T00:00:00+00:00",
     )

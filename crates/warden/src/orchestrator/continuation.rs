@@ -1,10 +1,10 @@
-//! Durable quota-continuation wire types.
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::*;
 
-const CHECKPOINT_VERSION: u32 = 2;
+const CHECKPOINT_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,15 +14,12 @@ struct RunConfigCheckpoint {
     warden_home: String,
     branch: String,
     intent: String,
-    max_review_cycles: u32,
-    max_test_cycles: u32,
+    max_cycles: u32,
     workflow: WorkflowCheckpoint,
-    max_extra_step_cycles: u32,
     step_agents: Vec<AgentDefinitionCheckpoint>,
     evidence_tool: Option<String>,
     evidence_store_in_repo: bool,
     gate: Option<GateConfigCheckpoint>,
-    untrusted_repo_agent_definitions: Vec<UntrustedAgentDefinitionCheckpoint>,
     execution_context: RunExecutionContextCheckpoint,
     quota_anticipation_threshold: f64,
 }
@@ -31,25 +28,29 @@ struct RunConfigCheckpoint {
 #[serde(deny_unknown_fields)]
 struct WorkflowCheckpoint {
     name: String,
-    steps: Vec<WorkflowStepCheckpoint>,
+    entry: String,
+    steps: BTreeMap<String, WorkflowStepCheckpoint>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkflowStepCheckpoint {
-    role: String,
     #[serde(rename = "type")]
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run: Option<String>,
-    gate: String,
-    budget: Option<String>,
+    on_clean: String,
+    on_blocking: String,
+    on_error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_cycles: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     evidence: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AgentDefinitionCheckpoint {
     name: Option<String>,
     description: Option<String>,
@@ -59,7 +60,6 @@ struct AgentDefinitionCheckpoint {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct GateConfigCheckpoint {
     bare_repo_path: String,
     gated_bin: String,
@@ -69,15 +69,6 @@ struct GateConfigCheckpoint {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UntrustedAgentDefinitionCheckpoint {
-    role: String,
-    path: String,
-    canonical_path: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RunExecutionContextCheckpoint {
     tool: String,
     sandbox: SandboxConfigCheckpoint,
@@ -87,71 +78,32 @@ struct RunExecutionContextCheckpoint {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 enum SandboxConfigCheckpoint {
     Worktree,
     Docker {
         image: String,
         claude_config_dir: String,
-        #[serde(default)]
         cpus: Option<String>,
-        #[serde(default)]
         memory: Option<String>,
-        #[serde(default)]
         network: Option<String>,
-        #[serde(default)]
         egress_proxy: Option<String>,
     },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ConvergenceStateCheckpoint {
     version: u32,
     run_base_commit_sha: String,
     base_commit: String,
     cycle_number: u32,
-    review_cycle_number: u32,
-    test_cycle_number: u32,
-    extra_step_cycle_number: u32,
+    step_cycle_numbers: Vec<u32>,
     pending_ci_findings: Vec<FindingCheckpoint>,
     previous_cycle_id: Option<String>,
-    step_last_reviewed_commit: Vec<Option<String>>,
-    own_step_cycle_numbers: Vec<u32>,
-    active_cycle: Option<ActiveCycleCheckpoint>,
+    next_step_index: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActiveCycleCheckpoint {
-    cycle_id: String,
-    prior_findings: Vec<FindingCheckpoint>,
-    producer_base_commit: String,
-    phase: ActiveCyclePhaseCheckpoint,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ActiveCyclePhaseCheckpoint {
-    Producer,
-    Gated {
-        producer_result: ProducerResultCheckpoint,
-        findings: Vec<FindingCheckpoint>,
-        next_step_index: u32,
-        entered_extra_budget_this_cycle: bool,
-    },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProducerResultCheckpoint {
-    commit: String,
-    diff: String,
-    definition_tampering_finding: Option<FindingCheckpoint>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FindingCheckpoint {
     source: String,
     severity: String,
@@ -172,68 +124,134 @@ pub(super) fn encode_run_config(
     execution_context: &RunExecutionContext,
     quota_anticipation_threshold: f64,
 ) -> Result<String> {
-    let checkpoint =
-        RunConfigCheckpoint::from_config(config, execution_context, quota_anticipation_threshold)?;
+    let checkpoint = RunConfigCheckpoint {
+        version: CHECKPOINT_VERSION,
+        repo_path: exact_path(&config.repo_path, "repo_path")?,
+        warden_home: exact_path(&config.warden_home, "warden_home")?,
+        branch: config.branch.clone(),
+        intent: config.intent.clone(),
+        max_cycles: config.max_cycles,
+        workflow: WorkflowCheckpoint::from(&config.workflow),
+        step_agents: config
+            .step_agents
+            .iter()
+            .map(AgentDefinitionCheckpoint::from)
+            .collect(),
+        evidence_tool: config.evidence_tool.map(|tool| tool.as_str().to_string()),
+        evidence_store_in_repo: config.evidence_store_in_repo,
+        gate: config
+            .gate
+            .as_ref()
+            .map(GateConfigCheckpoint::from_config)
+            .transpose()?,
+        execution_context: RunExecutionContextCheckpoint::from_config(execution_context)?,
+        quota_anticipation_threshold,
+    };
     serde_json::to_string(&checkpoint)
         .map_err(|source| WardenError::QuotaContinuationEncode { source })
 }
 
 pub(super) fn encode_convergence_state(continuation: &ConvergenceContinuation) -> Result<String> {
-    serde_json::to_string(&ConvergenceStateCheckpoint::from(continuation))
+    let checkpoint = ConvergenceStateCheckpoint {
+        version: CHECKPOINT_VERSION,
+        run_base_commit_sha: continuation.run_base_commit_sha.clone(),
+        base_commit: continuation.base_commit.clone(),
+        cycle_number: continuation.cycle_number,
+        step_cycle_numbers: continuation.step_cycle_numbers.clone(),
+        pending_ci_findings: continuation
+            .pending_ci_findings
+            .iter()
+            .map(FindingCheckpoint::from)
+            .collect(),
+        previous_cycle_id: continuation.previous_cycle_id.clone(),
+        next_step_index: continuation.next_step_index,
+    };
+    serde_json::to_string(&checkpoint)
         .map_err(|source| WardenError::QuotaContinuationEncode { source })
 }
 
 pub(super) fn decode_run(run_id: &str, config_json: &str, state_json: &str) -> Result<RestoredRun> {
-    let config_checkpoint: RunConfigCheckpoint =
-        serde_json::from_str(config_json).map_err(|source| {
-            WardenError::QuotaContinuationDecode {
-                run_id: run_id.to_string(),
-                source,
-            }
-        })?;
-    let state_checkpoint: ConvergenceStateCheckpoint =
-        serde_json::from_str(state_json).map_err(|source| {
-            WardenError::QuotaContinuationDecode {
-                run_id: run_id.to_string(),
-                source,
-            }
-        })?;
-
-    validate_version(run_id, "config", config_checkpoint.version)?;
-    validate_version(run_id, "state", state_checkpoint.version)?;
-
-    let quota_anticipation_threshold = config_checkpoint.quota_anticipation_threshold;
-    if !(0.0..=1.0).contains(&quota_anticipation_threshold) {
+    let config: RunConfigCheckpoint = decode(run_id, config_json)?;
+    let state: ConvergenceStateCheckpoint = decode(run_id, state_json)?;
+    validate_version(run_id, config.version)?;
+    validate_version(run_id, state.version)?;
+    if !(0.0..=1.0).contains(&config.quota_anticipation_threshold) {
         return Err(invalid(
             run_id,
-            format!(
-                "quota_anticipation_threshold must be in 0.0..=1.0, got \
-                 {quota_anticipation_threshold}"
-            ),
+            "quota anticipation threshold is outside 0..=1",
         ));
     }
 
-    let (config, execution_context) = config_checkpoint.into_config(run_id)?;
-    let continuation = state_checkpoint.into_continuation(run_id, config.workflow.steps.len())?;
-
+    let workflow_raw = serde_json::to_string(&config.workflow).map_err(|source| {
+        invalid(
+            run_id,
+            format!("cannot decode workflow checkpoint: {source}"),
+        )
+    })?;
+    let workflow = Workflow::parse_yaml(&workflow_raw)?;
+    if state.cycle_number == 0
+        || state.run_base_commit_sha.trim().is_empty()
+        || state.base_commit.trim().is_empty()
+        || state.step_cycle_numbers.len() != workflow.steps.len()
+        || state.next_step_index as usize >= workflow.steps.len()
+    {
+        return Err(invalid(run_id, "invalid generic convergence checkpoint"));
+    }
+    let step_agents = config
+        .step_agents
+        .into_iter()
+        .map(AgentDefinitionCheckpoint::into_definition)
+        .collect::<warden_core::Result<Vec<_>>>()?;
+    let execution_context = config.execution_context.into_config(run_id)?;
+    let continuation = ConvergenceContinuation {
+        run_base_commit_sha: state.run_base_commit_sha,
+        base_commit: state.base_commit,
+        cycle_number: state.cycle_number,
+        step_cycle_numbers: state.step_cycle_numbers,
+        pending_ci_findings: findings_from_checkpoints(run_id, state.pending_ci_findings)?,
+        previous_cycle_id: state.previous_cycle_id,
+        next_step_index: state.next_step_index,
+    };
+    let run_config = RunConfig {
+        repo_path: PathBuf::from(config.repo_path),
+        warden_home: PathBuf::from(config.warden_home),
+        branch: config.branch,
+        intent: config.intent,
+        max_cycles: config.max_cycles,
+        workflow,
+        step_agents,
+        evidence_tool: config
+            .evidence_tool
+            .as_deref()
+            .map(warden_core::EvidenceTool::parse)
+            .transpose()?,
+        evidence_store_in_repo: config.evidence_store_in_repo,
+        gate: config.gate.map(GateConfigCheckpoint::into_config),
+    };
     Ok(RestoredRun {
-        config,
+        config: run_config,
         execution_context,
         continuation,
-        quota_anticipation_threshold,
+        quota_anticipation_threshold: config.quota_anticipation_threshold,
     })
 }
 
-fn validate_version(run_id: &str, section: &str, version: u32) -> Result<()> {
+fn decode<T: serde::de::DeserializeOwned>(run_id: &str, raw: &str) -> Result<T> {
+    serde_json::from_str(raw).map_err(|source| WardenError::QuotaContinuationDecode {
+        run_id: run_id.to_string(),
+        source,
+    })
+}
+
+fn validate_version(run_id: &str, version: u32) -> Result<()> {
     if version == CHECKPOINT_VERSION {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(invalid(
+            run_id,
+            format!("unsupported checkpoint version {version} (expected {CHECKPOINT_VERSION})"),
+        ))
     }
-    Err(invalid(
-        run_id,
-        format!(
-            "unsupported {section} checkpoint version {version} (expected {CHECKPOINT_VERSION})"
-        ),
-    ))
 }
 
 fn invalid(run_id: &str, reason: impl Into<String>) -> WardenError {
@@ -252,126 +270,52 @@ fn exact_path(path: &Path, field: &'static str) -> Result<String> {
         })
 }
 
-impl RunConfigCheckpoint {
-    fn from_config(
-        config: &RunConfig,
-        execution_context: &RunExecutionContext,
-        quota_anticipation_threshold: f64,
-    ) -> Result<Self> {
-        Ok(Self {
-            version: CHECKPOINT_VERSION,
-            repo_path: exact_path(&config.repo_path, "repo_path")?,
-            warden_home: exact_path(&config.warden_home, "warden_home")?,
-            branch: config.branch.clone(),
-            intent: config.intent.clone(),
-            max_review_cycles: config.max_review_cycles,
-            max_test_cycles: config.max_test_cycles,
-            workflow: WorkflowCheckpoint::from(&config.workflow),
-            max_extra_step_cycles: config.max_extra_step_cycles,
-            step_agents: config
-                .step_agents
-                .iter()
-                .map(AgentDefinitionCheckpoint::from)
-                .collect(),
-            evidence_tool: config.evidence_tool.map(|tool| tool.as_str().to_string()),
-            evidence_store_in_repo: config.evidence_store_in_repo,
-            gate: config
-                .gate
-                .as_ref()
-                .map(GateConfigCheckpoint::from_config)
-                .transpose()?,
-            untrusted_repo_agent_definitions: config
-                .untrusted_repo_agent_definitions
-                .iter()
-                .map(UntrustedAgentDefinitionCheckpoint::from_config)
-                .collect::<Result<Vec<_>>>()?,
-            execution_context: RunExecutionContextCheckpoint::from_config(execution_context)?,
-            quota_anticipation_threshold,
-        })
-    }
-
-    fn into_config(self, run_id: &str) -> Result<(RunConfig, RunExecutionContext)> {
-        let workflow_json = serde_json::to_string(&self.workflow)
-            .map_err(|source| WardenError::QuotaContinuationEncode { source })?;
-        let workflow = warden_core::Workflow::parse_yaml(&workflow_json)?;
-        let step_agents = self
-            .step_agents
-            .into_iter()
-            .map(AgentDefinitionCheckpoint::into_definition)
-            .collect::<warden_core::Result<Vec<_>>>()?;
-        let evidence_tool = self
-            .evidence_tool
-            .as_deref()
-            .map(warden_core::EvidenceTool::parse)
-            .transpose()?;
-        let gate = self.gate.map(GateConfigCheckpoint::into_config);
-        let untrusted_repo_agent_definitions = self
-            .untrusted_repo_agent_definitions
-            .into_iter()
-            .map(|entry| entry.into_config(run_id))
-            .collect::<Result<Vec<_>>>()?;
-        let execution_context = self.execution_context.into_config(run_id)?;
-
-        let config = RunConfig {
-            repo_path: PathBuf::from(self.repo_path),
-            warden_home: PathBuf::from(self.warden_home),
-            branch: self.branch,
-            intent: self.intent,
-            max_review_cycles: self.max_review_cycles,
-            max_test_cycles: self.max_test_cycles,
-            workflow,
-            max_extra_step_cycles: self.max_extra_step_cycles,
-            step_agents,
-            evidence_tool,
-            evidence_store_in_repo: self.evidence_store_in_repo,
-            gate,
-            untrusted_repo_agent_definitions,
-        };
-        Ok((config, execution_context))
-    }
-}
-
 impl From<&Workflow> for WorkflowCheckpoint {
     fn from(workflow: &Workflow) -> Self {
+        let target = |target: warden_core::StepTarget| match target {
+            warden_core::StepTarget::Step(index) => {
+                workflow.steps[index as usize].role.as_str().to_string()
+            }
+            warden_core::StepTarget::Converged => "converged".to_string(),
+            warden_core::StepTarget::Failed => "failed".to_string(),
+        };
         Self {
             name: workflow.name.clone(),
+            entry: workflow.steps[workflow.entry() as usize]
+                .role
+                .as_str()
+                .to_string(),
             steps: workflow
                 .steps
                 .iter()
-                .map(WorkflowStepCheckpoint::from)
+                .map(|step| {
+                    (
+                        step.role.as_str().to_string(),
+                        WorkflowStepCheckpoint {
+                            kind: step.kind.as_str().to_string(),
+                            agent: step.agent.clone(),
+                            run: step.run.clone(),
+                            on_clean: target(step.transitions.clean),
+                            on_blocking: target(step.transitions.blocking),
+                            on_error: target(step.transitions.error),
+                            max_cycles: step.max_cycles,
+                            evidence: step.captures_evidence,
+                        },
+                    )
+                })
                 .collect(),
-        }
-    }
-}
-
-impl From<&WorkflowStep> for WorkflowStepCheckpoint {
-    fn from(step: &WorkflowStep) -> Self {
-        let (budget, max_cycles) = match step.budget {
-            Some(warden_core::StepBudget::Own(max_cycles)) => (None, Some(max_cycles)),
-            Some(budget) => (Some(budget.as_str().to_string()), None),
-            None => (None, None),
-        };
-        Self {
-            role: step.role.as_str().to_string(),
-            kind: step.kind.as_str().to_string(),
-            agent: step.agent.clone(),
-            run: step.run.clone(),
-            gate: step.gate.as_str().to_string(),
-            budget,
-            max_cycles,
-            evidence: step.captures_evidence,
         }
     }
 }
 
 impl From<&AgentDefinition> for AgentDefinitionCheckpoint {
-    fn from(definition: &AgentDefinition) -> Self {
+    fn from(value: &AgentDefinition) -> Self {
         Self {
-            name: definition.name.clone(),
-            description: definition.description.clone(),
-            tools: definition.tools.clone(),
-            model: definition.model.clone(),
-            system_prompt: definition.system_prompt.clone(),
+            name: value.name.clone(),
+            description: value.description.clone(),
+            tools: value.tools.clone(),
+            model: value.model.clone(),
+            system_prompt: value.system_prompt.clone(),
         }
     }
 }
@@ -401,36 +345,12 @@ impl GateConfigCheckpoint {
 
     fn into_config(self) -> GateConfig {
         GateConfig {
-            bare_repo_path: PathBuf::from(self.bare_repo_path),
-            gated_bin: PathBuf::from(self.gated_bin),
+            bare_repo_path: self.bare_repo_path.into(),
+            gated_bin: self.gated_bin.into(),
             repo_slug: self.repo_slug,
             poll_interval_secs: self.poll_interval_secs,
             inactivity_timeout_secs: self.inactivity_timeout_secs,
         }
-    }
-}
-
-impl UntrustedAgentDefinitionCheckpoint {
-    fn from_config(config: &UntrustedRepoAgentDefinition) -> Result<Self> {
-        Ok(Self {
-            role: config.role.as_str().to_string(),
-            path: exact_path(&config.path, "untrusted_agent.path")?,
-            canonical_path: exact_path(&config.canonical_path, "untrusted_agent.canonical_path")?,
-        })
-    }
-
-    fn into_config(self, run_id: &str) -> Result<UntrustedRepoAgentDefinition> {
-        let role = AgentRole::parse(&self.role).map_err(|error| {
-            invalid(
-                run_id,
-                format!("invalid untrusted agent role {:?}: {error}", self.role),
-            )
-        })?;
-        Ok(UntrustedRepoAgentDefinition {
-            role,
-            path: PathBuf::from(self.path),
-            canonical_path: PathBuf::from(self.canonical_path),
-        })
     }
 }
 
@@ -444,10 +364,7 @@ impl RunExecutionContextCheckpoint {
                 run_options,
             } => SandboxConfigCheckpoint::Docker {
                 image: image.clone(),
-                claude_config_dir: exact_path(
-                    claude_config_dir,
-                    "execution_context.sandbox.claude_config_dir",
-                )?,
+                claude_config_dir: exact_path(claude_config_dir, "docker.claude_config_dir")?,
                 cpus: run_options.cpus.clone(),
                 memory: run_options.memory.clone(),
                 network: run_options
@@ -487,7 +404,7 @@ impl RunExecutionContextCheckpoint {
                 egress_proxy,
             } => SandboxConfig::Docker {
                 image,
-                claude_config_dir: PathBuf::from(claude_config_dir),
+                claude_config_dir: claude_config_dir.into(),
                 run_options: warden_sandbox::DockerRunOptions {
                     cpus,
                     memory,
@@ -496,12 +413,7 @@ impl RunExecutionContextCheckpoint {
                         (Some(network), Some(proxy)) => {
                             Some(warden_sandbox::DockerEgressConfig { network, proxy })
                         }
-                        _ => {
-                            return Err(invalid(
-                                run_id,
-                                "checkpointed Docker egress requires both network and proxy",
-                            ));
-                        }
+                        _ => return Err(invalid(run_id, "incomplete Docker egress config")),
                     },
                 },
             },
@@ -509,12 +421,7 @@ impl RunExecutionContextCheckpoint {
         let approval = match self.approval.as_str() {
             "interactive_tty" => ApprovalConfig::InteractiveTty,
             "fail_closed" => ApprovalConfig::FailClosed,
-            other => {
-                return Err(invalid(
-                    run_id,
-                    format!("unknown approval context {other:?}"),
-                ));
-            }
+            other => return Err(invalid(run_id, format!("unknown approval {other:?}"))),
         };
         Ok(RunExecutionContext {
             tool,
@@ -526,229 +433,15 @@ impl RunExecutionContextCheckpoint {
     }
 }
 
-impl From<&ConvergenceContinuation> for ConvergenceStateCheckpoint {
-    fn from(continuation: &ConvergenceContinuation) -> Self {
-        Self {
-            version: CHECKPOINT_VERSION,
-            run_base_commit_sha: continuation.run_base_commit_sha.clone(),
-            base_commit: continuation.base_commit.clone(),
-            cycle_number: continuation.cycle_number,
-            review_cycle_number: continuation.review_cycle_number,
-            test_cycle_number: continuation.test_cycle_number,
-            extra_step_cycle_number: continuation.extra_step_cycle_number,
-            pending_ci_findings: continuation
-                .pending_ci_findings
-                .iter()
-                .map(FindingCheckpoint::from)
-                .collect(),
-            previous_cycle_id: continuation.previous_cycle_id.clone(),
-            step_last_reviewed_commit: continuation.step_last_reviewed_commit.clone(),
-            own_step_cycle_numbers: continuation.own_step_cycle_numbers.clone(),
-            active_cycle: continuation
-                .active_cycle
-                .as_ref()
-                .map(ActiveCycleCheckpoint::from),
-        }
-    }
-}
-
-impl ConvergenceStateCheckpoint {
-    fn into_continuation(
-        self,
-        run_id: &str,
-        total_steps: usize,
-    ) -> Result<ConvergenceContinuation> {
-        if self.cycle_number == 0 {
-            return Err(invalid(run_id, "cycle_number must be at least 1"));
-        }
-        if self.run_base_commit_sha.trim().is_empty() || self.base_commit.trim().is_empty() {
-            return Err(invalid(
-                run_id,
-                "run_base_commit_sha and base_commit must not be blank",
-            ));
-        }
-        if self.step_last_reviewed_commit.len() != total_steps
-            || self.own_step_cycle_numbers.len() != total_steps
-        {
-            return Err(invalid(
-                run_id,
-                format!(
-                    "per-step checkpoint vectors must both contain {total_steps} entries \
-                     (reviewed={}, own_cycles={})",
-                    self.step_last_reviewed_commit.len(),
-                    self.own_step_cycle_numbers.len()
-                ),
-            ));
-        }
-
-        Ok(ConvergenceContinuation {
-            run_base_commit_sha: self.run_base_commit_sha,
-            base_commit: self.base_commit,
-            cycle_number: self.cycle_number,
-            review_cycle_number: self.review_cycle_number,
-            test_cycle_number: self.test_cycle_number,
-            extra_step_cycle_number: self.extra_step_cycle_number,
-            pending_ci_findings: findings_from_checkpoints(run_id, self.pending_ci_findings)?,
-            previous_cycle_id: self.previous_cycle_id,
-            step_last_reviewed_commit: self.step_last_reviewed_commit,
-            own_step_cycle_numbers: self.own_step_cycle_numbers,
-            active_cycle: self
-                .active_cycle
-                .map(|cycle| cycle.into_continuation(run_id, total_steps))
-                .transpose()?,
-        })
-    }
-}
-
-impl From<&ActiveCycleContinuation> for ActiveCycleCheckpoint {
-    fn from(cycle: &ActiveCycleContinuation) -> Self {
-        let phase = match &cycle.phase {
-            ActiveCyclePhase::Producer => ActiveCyclePhaseCheckpoint::Producer,
-            ActiveCyclePhase::Gated {
-                producer_result,
-                findings,
-                next_step_index,
-                entered_extra_budget_this_cycle,
-            } => ActiveCyclePhaseCheckpoint::Gated {
-                producer_result: ProducerResultCheckpoint::from(producer_result),
-                findings: findings.iter().map(FindingCheckpoint::from).collect(),
-                next_step_index: *next_step_index,
-                entered_extra_budget_this_cycle: *entered_extra_budget_this_cycle,
-            },
-        };
-        Self {
-            cycle_id: cycle.cycle_id.clone(),
-            prior_findings: cycle
-                .prior_findings
-                .iter()
-                .map(FindingCheckpoint::from)
-                .collect(),
-            producer_base_commit: cycle.producer_base_commit.clone(),
-            phase,
-        }
-    }
-}
-
-impl ActiveCycleCheckpoint {
-    fn into_continuation(
-        self,
-        run_id: &str,
-        total_steps: usize,
-    ) -> Result<ActiveCycleContinuation> {
-        if self.cycle_id.trim().is_empty() || self.producer_base_commit.trim().is_empty() {
-            return Err(invalid(
-                run_id,
-                "active cycle id and producer base commit must not be blank",
-            ));
-        }
-        let phase = match self.phase {
-            ActiveCyclePhaseCheckpoint::Producer => ActiveCyclePhase::Producer,
-            ActiveCyclePhaseCheckpoint::Gated {
-                producer_result,
-                findings,
-                next_step_index,
-                entered_extra_budget_this_cycle,
-            } => {
-                let next_step = usize::try_from(next_step_index).map_err(|_| {
-                    invalid(
-                        run_id,
-                        format!("next_step_index {next_step_index} does not fit usize"),
-                    )
-                })?;
-                if next_step == 0 || next_step >= total_steps {
-                    return Err(invalid(
-                        run_id,
-                        format!(
-                            "next_step_index {next_step_index} is outside workflow steps \
-                             1..{total_steps}"
-                        ),
-                    ));
-                }
-                ActiveCyclePhase::Gated {
-                    producer_result: producer_result.into_result(run_id)?,
-                    findings: findings_from_checkpoints(run_id, findings)?,
-                    next_step_index,
-                    entered_extra_budget_this_cycle,
-                }
-            }
-        };
-        Ok(ActiveCycleContinuation {
-            cycle_id: self.cycle_id,
-            prior_findings: findings_from_checkpoints(run_id, self.prior_findings)?,
-            producer_base_commit: self.producer_base_commit,
-            phase,
-        })
-    }
-}
-
-impl From<&ProducerCycleResult> for ProducerResultCheckpoint {
-    fn from(result: &ProducerCycleResult) -> Self {
-        Self {
-            commit: result.commit.clone(),
-            diff: result.diff.clone(),
-            definition_tampering_finding: result
-                .definition_tampering_finding
-                .as_ref()
-                .map(FindingCheckpoint::from),
-        }
-    }
-}
-
-impl ProducerResultCheckpoint {
-    fn into_result(self, run_id: &str) -> Result<ProducerCycleResult> {
-        if self.commit.trim().is_empty() {
-            return Err(invalid(run_id, "checkpointed producer commit is blank"));
-        }
-        Ok(ProducerCycleResult {
-            commit: self.commit,
-            diff: self.diff,
-            definition_tampering_finding: self
-                .definition_tampering_finding
-                .map(|finding| finding.into_finding(run_id))
-                .transpose()?,
-        })
-    }
-}
-
 impl From<&Finding> for FindingCheckpoint {
-    fn from(finding: &Finding) -> Self {
+    fn from(value: &Finding) -> Self {
         Self {
-            source: finding.source.as_str().to_string(),
-            severity: finding.severity.as_str().to_string(),
-            file: finding.file.clone(),
-            description: finding.description.clone(),
-            action: finding.action.clone(),
+            source: value.source.as_str().to_string(),
+            severity: value.severity.as_str().to_string(),
+            file: value.file.clone(),
+            description: value.description.clone(),
+            action: value.action.clone(),
         }
-    }
-}
-
-impl FindingCheckpoint {
-    fn into_finding(self, run_id: &str) -> Result<Finding> {
-        let source = warden_core::FindingSource::parse(&self.source).map_err(|error| {
-            invalid(
-                run_id,
-                format!(
-                    "invalid checkpointed finding source {:?}: {error}",
-                    self.source
-                ),
-            )
-        })?;
-        let severity = warden_core::Severity::parse(&self.severity).map_err(|error| {
-            invalid(
-                run_id,
-                format!(
-                    "invalid checkpointed finding severity {:?}: {error}",
-                    self.severity
-                ),
-            )
-        })?;
-        Ok(Finding {
-            source,
-            severity,
-            file: self.file,
-            description: self.description,
-            action: self.action,
-        })
     }
 }
 
@@ -758,84 +451,16 @@ fn findings_from_checkpoints(
 ) -> Result<Vec<Finding>> {
     findings
         .into_iter()
-        .map(|finding| finding.into_finding(run_id))
+        .map(|finding| {
+            Ok(Finding {
+                source: warden_core::FindingSource::parse(&finding.source)
+                    .map_err(|error| invalid(run_id, error.to_string()))?,
+                severity: warden_core::Severity::parse(&finding.severity)
+                    .map_err(|error| invalid(run_id, error.to_string()))?,
+                file: finding.file,
+                description: finding.description,
+                action: finding.action,
+            })
+        })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use warden_sandbox::{DockerEgressConfig, DockerRunOptions};
-
-    #[test]
-    fn docker_execution_context_round_trips_limits_and_egress() {
-        let claude_dir = tempfile::TempDir::new().unwrap();
-        let context = RunExecutionContext {
-            tool: crate::tool_adapter::ToolName::Claude,
-            sandbox: SandboxConfig::Docker {
-                image: "warden-agent:0.1.0".to_string(),
-                claude_config_dir: claude_dir.path().to_path_buf(),
-                run_options: DockerRunOptions {
-                    cpus: Some("2".to_string()),
-                    memory: Some("4g".to_string()),
-                    egress: Some(DockerEgressConfig {
-                        network: "warden-egress".to_string(),
-                        proxy: "http://warden-proxy:3128".to_string(),
-                    }),
-                },
-            },
-            hooks_toml: None,
-            policy_yaml: None,
-            approval: ApprovalConfig::FailClosed,
-        };
-
-        let checkpoint = RunExecutionContextCheckpoint::from_config(&context).unwrap();
-        let encoded = serde_json::to_string(&checkpoint).unwrap();
-        let decoded: RunExecutionContextCheckpoint = serde_json::from_str(&encoded).unwrap();
-        let restored = decoded.into_config("run-1").unwrap();
-        assert_eq!(restored.sandbox, context.sandbox);
-    }
-
-    #[test]
-    fn legacy_docker_checkpoint_defaults_to_unrestricted_resources_and_network() {
-        let checkpoint: SandboxConfigCheckpoint = serde_json::from_str(
-            r#"{"kind":"docker","image":"warden-agent:0.1.0","claude_config_dir":"/tmp/claude"}"#,
-        )
-        .unwrap();
-
-        let SandboxConfigCheckpoint::Docker {
-            cpus,
-            memory,
-            network,
-            egress_proxy,
-            ..
-        } = checkpoint
-        else {
-            panic!("expected Docker checkpoint");
-        };
-        assert_eq!(cpus, None);
-        assert_eq!(memory, None);
-        assert_eq!(network, None);
-        assert_eq!(egress_proxy, None);
-    }
-
-    #[test]
-    fn partial_checkpointed_egress_is_rejected() {
-        let checkpoint = RunExecutionContextCheckpoint {
-            tool: "claude".to_string(),
-            sandbox: SandboxConfigCheckpoint::Docker {
-                image: "warden-agent:0.1.0".to_string(),
-                claude_config_dir: "/tmp/claude".to_string(),
-                cpus: None,
-                memory: None,
-                network: Some("warden-egress".to_string()),
-                egress_proxy: None,
-            },
-            hooks_toml: None,
-            policy_yaml: None,
-            approval: "fail_closed".to_string(),
-        };
-
-        assert!(checkpoint.into_config("run-1").is_err());
-    }
 }

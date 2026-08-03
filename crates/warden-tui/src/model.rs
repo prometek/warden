@@ -86,19 +86,13 @@ impl RunModel {
             .unwrap_or(0)
     }
 
-    pub fn run_started(&self) -> Option<(&str, &str, u32, u32)> {
+    pub fn run_started(&self) -> Option<(&str, &str, u32)> {
         self.events.iter().find_map(|record| match &record.event {
             RunEvent::RunStarted {
                 intent,
                 branch,
-                max_review_cycles,
-                max_test_cycles,
-            } => Some((
-                intent.as_str(),
-                branch.as_str(),
-                *max_review_cycles,
-                *max_test_cycles,
-            )),
+                max_cycles,
+            } => Some((intent.as_str(), branch.as_str(), *max_cycles)),
             _ => None,
         })
     }
@@ -215,8 +209,7 @@ impl RunModel {
             })
     }
 
-    /// Derives the run's workflow tree: one branch per cycle, each carrying its agent-invocation
-    /// nodes plus, if the cycle reboucled into another one, *why*.
+    /// Derives one branch per cycle from agent events.
     pub fn workflow_tree(&self) -> WorkflowTree {
         let mut cycles: Vec<CycleNode> = Vec::new();
         let mut findings_by_cycle: std::collections::HashMap<u32, Vec<(String, String)>> =
@@ -289,7 +282,7 @@ impl RunModel {
                 for agent in &mut cycle.agents {
                     if agent.status == NodeStatus::Clean
                         && findings.iter().any(|(source, severity)| {
-                            severity == "blocking" && role_owns_finding_source(&agent.role, source)
+                            severity == "blocking" && source == &agent.role
                         })
                     {
                         agent.status = NodeStatus::Findings;
@@ -306,20 +299,11 @@ impl RunModel {
             let this_cycle_number = cycles[i].cycle_number;
             let next_cycle_number = cycles[i + 1].cycle_number;
             let this_findings = findings_by_cycle.get(&this_cycle_number);
-            let review_blocking = this_findings.is_some_and(|findings| {
-                findings.iter().any(|(source, severity)| {
-                    severity == "blocking" && role_owns_finding_source("reviewer", source)
-                })
+            let blocking = this_findings.is_some_and(|findings| {
+                findings.iter().any(|(_, severity)| severity == "blocking")
             });
-            let test_blocking = this_findings.is_some_and(|findings| {
-                findings
-                    .iter()
-                    .any(|(source, severity)| severity == "blocking" && source == "tester")
-            });
-            cycles[i].reloop = if review_blocking {
-                Some(ReloopCause::ReviewFinding)
-            } else if test_blocking {
-                Some(ReloopCause::TestFinding)
+            cycles[i].reloop = if blocking {
+                Some(ReloopCause::BlockingFinding)
             } else {
                 let next_cycle_has_ci_finding = findings_by_cycle
                     .get(&next_cycle_number)
@@ -358,16 +342,6 @@ impl<'a> HistoryItem<'a> {
     }
 }
 
-/// `true` if a blocking finding from `source` (a raw `FindingSource::as_str` value, per
-/// `warden_core::convergence`) is charged to `role`'s gate.
-fn role_owns_finding_source(role: &str, source: &str) -> bool {
-    match role {
-        "reviewer" => source == "reviewer" || source == "warden",
-        "tester" => source == "tester",
-        _ => false,
-    }
-}
-
 /// The outcome of one agent invocation node in [`WorkflowTree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -394,9 +368,7 @@ pub struct AgentNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloopCause {
-    ReviewFinding,
-    TestFinding,
-    /// A `ChecksFailed` CI outcome reboucling a post-convergence run back to the coder.
+    BlockingFinding,
     CiFailure,
 }
 
@@ -445,14 +417,13 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 5,
-                max_test_cycles: 4,
+                max_cycles: 5,
             },
         ));
 
         assert_eq!(model.run_id(), Some("run-1"));
         assert_eq!(model.events().len(), 1);
-        assert_eq!(model.run_started(), Some(("do the thing", "main", 5, 4)));
+        assert_eq!(model.run_started(), Some(("do the thing", "main", 5)));
     }
 
     #[test]
@@ -630,8 +601,7 @@ mod tests {
             RunEvent::RunStarted {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
-                max_review_cycles: 5,
-                max_test_cycles: 5,
+                max_cycles: 5,
             },
         ));
         model.apply(record(
@@ -1063,11 +1033,11 @@ mod tests {
             "coder is never a finding source"
         );
         assert_eq!(tree.cycles[0].agents[1].status, NodeStatus::Findings);
-        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::BlockingFinding));
     }
 
     #[test]
-    fn workflow_tree_attributes_a_warden_sourced_tampering_finding_to_the_review_reloop() {
+    fn workflow_tree_keeps_system_findings_separate_from_agent_nodes() {
         let mut model = RunModel::new();
         model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
         model.apply(record("e2", agent_started("reviewer")));
@@ -1076,8 +1046,8 @@ mod tests {
         model.apply(record("e5", RunEvent::CycleStarted { cycle_number: 2 }));
 
         let tree = model.workflow_tree();
-        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Findings);
-        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::ReviewFinding));
+        assert_eq!(tree.cycles[0].agents[0].status, NodeStatus::Clean);
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::BlockingFinding));
     }
 
     #[test]
@@ -1098,7 +1068,7 @@ mod tests {
         assert_eq!(tree.cycles[0].agents[1].status, NodeStatus::Clean);
         assert_eq!(tree.cycles[0].agents[2].role, "tester");
         assert_eq!(tree.cycles[0].agents[2].status, NodeStatus::Findings);
-        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::TestFinding));
+        assert_eq!(tree.cycles[0].reloop, Some(ReloopCause::BlockingFinding));
     }
 
     #[test]

@@ -61,14 +61,13 @@ async fn gated_reads_a_run_written_through_the_migrated_writer_schema() {
 #[tokio::test]
 async fn tui_reads_a_run_and_event_written_through_the_migrated_writer_schema() {
     let (_dir, db_path, write_pool) = migrated_writer_db().await;
-    db::update_run_state(&write_pool, RUN_ID, RunState::CoderRunning)
+    db::update_run_state(&write_pool, RUN_ID, RunState::RunningStep(0))
         .await
         .unwrap();
     let event = RunEvent::RunStarted {
         intent: "verify SQLite readers".to_string(),
         branch: "main".to_string(),
-        max_review_cycles: 4,
-        max_test_cycles: 3,
+        max_cycles: 4,
     };
     db::insert_event(
         &write_pool,
@@ -88,9 +87,9 @@ async fn tui_reads_a_run_and_event_written_through_the_migrated_writer_schema() 
         .unwrap();
     assert_eq!(run.intent, "verify SQLite readers");
     assert_eq!(run.branch, "main");
-    assert_eq!(run.state, RunState::CoderRunning);
-    assert_eq!(run.max_review_cycles, 4);
-    assert_eq!(run.max_test_cycles, 3);
+    assert_eq!(run.state, RunState::RunningStep(0));
+    assert_eq!(run.max_cycles, 4);
+    assert_eq!(run.current_cycle, 0);
 
     let events = warden_tui::db::list_events_for_run(&read_pool, RUN_ID)
         .await

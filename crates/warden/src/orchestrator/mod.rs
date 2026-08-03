@@ -9,7 +9,7 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use warden_core::{
-    decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, AgentRole, CiOutcome,
+    decide_next_state_after_ci, decide_next_state_for_step, AgentDefinition, CiOutcome,
     CiResultMessage, Finding, HookContext, HookOutcome, HookPoint, Role, RunEvent, RunState,
     Workflow, WorkflowStep, DIFF_TRUNCATED_MARKER,
 };
@@ -39,13 +39,8 @@ mod evidence_capture;
 mod gate_tail;
 mod recovery;
 mod tampering;
-#[cfg(test)]
-pub(crate) mod test_support;
 
-pub use config::{
-    ApprovalConfig, GateConfig, RunConfig, RunExecutionContext, SandboxConfig,
-    UntrustedRepoAgentDefinition,
-};
+pub use config::{ApprovalConfig, GateConfig, RunConfig, RunExecutionContext, SandboxConfig};
 pub use recovery::{recover_crashed_runs, resume_awaiting_ci_runs, resume_quota_suspended_runs};
 
 use tampering::AgentDefinitionSnapshot;
@@ -59,23 +54,8 @@ struct ResolvedAgent {
     trusted_arg_values: Vec<String>,
 }
 
-fn trusted_arg_values_for_step(
-    step: &WorkflowStep,
-    definition: &AgentDefinition,
-    untrusted_repo_agent_definitions: &[UntrustedRepoAgentDefinition],
-) -> Vec<String> {
-    let role = match step.role.as_str() {
-        "reviewer" => AgentRole::Reviewer,
-        "tester" => AgentRole::Tester,
-        _ => return Vec::new(),
-    };
-    let sourced_from_the_repo_under_review = untrusted_repo_agent_definitions
-        .iter()
-        .any(|entry| entry.role == role);
-    if sourced_from_the_repo_under_review {
-        return Vec::new();
-    }
-    definition.model.iter().cloned().collect()
+fn trusted_arg_values_for_step(_step: &WorkflowStep, _definition: &AgentDefinition) -> Vec<String> {
+    Vec::new()
 }
 
 struct ResolvedAgents {
@@ -105,11 +85,7 @@ impl ResolvedAgents {
                 Ok(ResolvedAgent {
                     command: runner.build_command(definition)?,
                     system_prompt: definition.system_prompt.clone(),
-                    trusted_arg_values: trusted_arg_values_for_step(
-                        step,
-                        definition,
-                        &config.untrusted_repo_agent_definitions,
-                    ),
+                    trusted_arg_values: trusted_arg_values_for_step(step, definition),
                 })
             };
         let mut definitions = config.step_agents.iter();
@@ -122,7 +98,7 @@ impl ResolvedAgents {
                         .expect("length checked against expected_agent_steps above");
                     steps.push(Some(resolve_one(step, definition)?));
                 }
-                warden_core::StepKind::Hook => steps.push(None),
+                warden_core::StepKind::Command => steps.push(None),
             }
         }
         Ok(Self {
@@ -132,23 +108,21 @@ impl ResolvedAgents {
     }
 }
 
-/// Parameters for a single producer invocation (`workflow.steps[0]` -- the coder in the built-in
-/// default workflow).
-struct ProducerInvocation<'a> {
+struct StepInvocation<'a> {
     run_id: &'a str,
     cycle_id: &'a str,
     cycle_number: u32,
+    step_index: u32,
     config: &'a RunConfig,
-    /// The producer step's own open role (`workflow.steps[0].role`).
     role: &'a Role,
-    /// This run's producer command + system prompt.
-    agent: &'a ResolvedAgent,
-    /// This run's `--tool` adapter's env allowlist -- `ResolvedAgents::env_allowlist`.
+    kind: warden_core::StepKind,
+    agent: Option<&'a ResolvedAgent>,
+    run: Option<&'a str>,
     env_allowlist: &'static [&'static str],
     worktree_manager: &'a WorktreeManager,
-    base_commit: &'a str,
+    commit: &'a str,
+    run_base_commit: &'a str,
     run_agent_definition_snapshot: &'a AgentDefinitionSnapshot,
-    /// Findings the producer must fix during this cycle.
     prior_findings: &'a [Finding],
     cancel: CancellationToken,
 }
@@ -158,126 +132,46 @@ struct EvidenceCapture<'a> {
     cycle_id: &'a str,
     cycle_number: u32,
     config: &'a RunConfig,
-    /// The command the tester step was invoked with, mapped from its definition by this run's
-    /// `ToolAdapter` — what `asciinema rec` records as the session.
-    tester_command: &'a AgentCommand,
-    tester_worktree_path: &'a Path,
+    command: &'a AgentCommand,
+    worktree_path: &'a Path,
     cancel: CancellationToken,
 }
 
-struct GatedStepInvocation<'a> {
-    run_id: &'a str,
-    cycle_id: &'a str,
-    cycle_number: u32,
-    /// This step's 0-based index in `config.workflow.steps` -- never `0` (the producer's own
-    /// index).
-    step_index: u32,
-    role: &'a Role,
-    /// which mechanism this step runs through -- [`Orchestrator::run_gated_step`]'s own dispatch.
-    kind: warden_core::StepKind,
-    /// This step's command + system prompt.
-    agent: Option<&'a ResolvedAgent>,
-    /// the shell command a `type: hook` step runs.
-    run: Option<&'a str>,
-    /// This run's `--tool` adapter's env allowlist -- `ResolvedAgents::env_allowlist`.
-    env_allowlist: &'static [&'static str],
-    worktree_manager: &'a WorktreeManager,
-    commit: &'a str,
-    /// The diff this cycle's producer introduced against the cycle's starting commit -- fed to the
-    /// agent as `AgentInputMessage::diff`, unless `scope` narrows it to a correctif.
-    diff: &'a str,
-    /// Findings that triggered this cycle -- fed to the agent as `AgentInputMessage::findings`.
-    prior_findings: &'a [Finding],
-    /// `ReviewScope::Full` for every step except one following its own first full pass over a run's
-    /// body of work; `ReviewScope::Correctif` then -- see [`warden_core::ReviewScope`].
-    scope: warden_core::ReviewScope,
-    /// This step's own declared [`warden_core::WorkflowStep::captures_evidence`] -- whether a clean
-    /// run of *this* step triggers evidence capture.
-    captures_evidence: bool,
-    /// Consulted only when `captures_evidence` is set (evidence capture's own config:
-    /// `evidence_tool`/`evidence_store_in_repo`/`warden_home`).
-    config: &'a RunConfig,
-    cancel: CancellationToken,
-}
-
-/// Outcome of a single producer invocation within a cycle: the commit it produced, and the diff
-/// introduced against the cycle's starting commit.
 #[derive(Debug, Clone)]
-struct ProducerCycleResult {
+struct StepResult {
     commit: String,
-    diff: String,
-    definition_tampering_finding: Option<Finding>,
+    findings: Vec<Finding>,
+    outcome: warden_core::StepOutcome,
 }
 
 /// All mutable convergence-loop state that must survive a quota suspension.
 #[derive(Debug, Clone)]
 struct ConvergenceContinuation {
-    /// Fixed commit against which agent-definition tampering is checked for the lifetime of the
-    /// run.
     run_base_commit_sha: String,
-    /// Commit the next producer cycle starts from, or the commit every remaining gated step in the
-    /// active cycle inspects.
     base_commit: String,
     cycle_number: u32,
-    review_cycle_number: u32,
-    test_cycle_number: u32,
-    extra_step_cycle_number: u32,
+    step_cycle_numbers: Vec<u32>,
     pending_ci_findings: Vec<Finding>,
     previous_cycle_id: Option<String>,
-    step_last_reviewed_commit: Vec<Option<String>>,
-    own_step_cycle_numbers: Vec<u32>,
-    active_cycle: Option<ActiveCycleContinuation>,
+    next_step_index: u32,
 }
 
 impl ConvergenceContinuation {
-    fn new(run_base_commit_sha: String, total_steps: usize) -> Self {
+    fn new(run_base_commit_sha: String, workflow: &Workflow) -> Self {
         Self {
             base_commit: run_base_commit_sha.clone(),
             run_base_commit_sha,
             cycle_number: 1,
-            review_cycle_number: 0,
-            test_cycle_number: 0,
-            extra_step_cycle_number: 0,
+            step_cycle_numbers: vec![0; workflow.steps.len()],
             pending_ci_findings: Vec::new(),
             previous_cycle_id: None,
-            step_last_reviewed_commit: vec![None; total_steps],
-            own_step_cycle_numbers: vec![0; total_steps],
-            active_cycle: None,
+            next_step_index: workflow.entry(),
         }
     }
 
     fn next_run_state(&self) -> RunState {
-        match self.active_cycle.as_ref().map(|cycle| &cycle.phase) {
-            Some(ActiveCyclePhase::Gated {
-                next_step_index, ..
-            }) => RunState::RunningStep(*next_step_index),
-            Some(ActiveCyclePhase::Producer) | None => RunState::CoderRunning,
-        }
+        RunState::RunningStep(self.next_step_index)
     }
-}
-
-/// The cycle row already exists when a process suspends during an invocation or between two steps.
-#[derive(Debug, Clone)]
-struct ActiveCycleContinuation {
-    cycle_id: String,
-    prior_findings: Vec<Finding>,
-    producer_base_commit: String,
-    phase: ActiveCyclePhase,
-}
-
-#[derive(Debug, Clone)]
-enum ActiveCyclePhase {
-    /// The producer invocation did not complete successfully and must be retried from the same
-    /// cycle boundary.
-    Producer,
-    /// The producer completed and `next_step_index` is the first gated step that has not completed
-    /// in this cycle.
-    Gated {
-        producer_result: ProducerCycleResult,
-        findings: Vec<Finding>,
-        next_step_index: u32,
-        entered_extra_budget_this_cycle: bool,
-    },
 }
 
 /// The run this [`Orchestrator`] instance is currently driving, and the [`EventBus`] its events are
@@ -510,180 +404,5 @@ impl Orchestrator {
                  mask the run's final state)"
             ),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::orchestrator::test_support::*;
-    use warden_core::Gate;
-
-    fn config_with(
-        workflow: warden_core::Workflow,
-        step_agents: Vec<AgentDefinition>,
-    ) -> RunConfig {
-        RunConfig {
-            repo_path: PathBuf::from("/nonexistent/repo"),
-            warden_home: PathBuf::from("/nonexistent/warden-home"),
-            branch: "main".to_string(),
-            intent: "issue #79 review: ResolvedAgents::resolve coverage".to_string(),
-            max_review_cycles: 3,
-            max_test_cycles: 3,
-            workflow,
-            max_extra_step_cycles: 5,
-            step_agents,
-            evidence_tool: None,
-            evidence_store_in_repo: false,
-            gate: None,
-            untrusted_repo_agent_definitions: Vec::new(),
-        }
-    }
-
-    fn workflow_with_two_hook_steps() -> warden_core::Workflow {
-        warden_core::Workflow::parse_yaml(
-            r#"
-name: x
-steps:
-  - role: coder
-    agent: coder
-  - role: one
-    type: hook
-    run: "true"
-    gate: loop-until-clean
-  - role: two
-    type: hook
-    run: "true"
-    gate: loop-until-clean
-"#,
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn mismatched_step_agent_count_counts_only_agent_kind_steps() {
-        let workflow = workflow_with_two_hook_steps();
-
-        let too_many = config_with(
-            workflow.clone(),
-            vec![
-                definition(always_passing_tester()),
-                definition(always_passing_tester()),
-            ],
-        );
-        let error = match ResolvedAgents::resolve(&FakeCommandAdapter, &too_many) {
-            Err(error) => error,
-            Ok(_) => panic!("expected a mismatched-count error"),
-        };
-        assert!(
-            matches!(
-                error,
-                WardenError::MismatchedStepAgentCount {
-                    agent_steps: 1,
-                    step_agents: 2,
-                }
-            ),
-            "expected agent_steps: 1 (only the producer is type: agent), step_agents: 2: {error:?}"
-        );
-
-        let too_few = config_with(workflow, Vec::new());
-        let error = match ResolvedAgents::resolve(&FakeCommandAdapter, &too_few) {
-            Err(error) => error,
-            Ok(_) => panic!("expected a mismatched-count error"),
-        };
-        assert!(
-            matches!(
-                error,
-                WardenError::MismatchedStepAgentCount {
-                    agent_steps: 1,
-                    step_agents: 0,
-                }
-            ),
-            "expected agent_steps: 1, step_agents: 0: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn resolved_agents_are_some_only_at_a_type_agent_steps_own_index() {
-        let workflow = workflow_with_two_hook_steps();
-        let config = config_with(workflow, vec![definition(always_passing_tester())]);
-
-        let resolved = ResolvedAgents::resolve(&FakeCommandAdapter, &config).unwrap();
-
-        assert_eq!(resolved.steps.len(), 3);
-        assert!(
-            resolved.steps[0].is_some(),
-            "steps[0] (\"coder\", type: agent) must resolve to Some"
-        );
-        assert!(
-            resolved.steps[1].is_none(),
-            "steps[1] (\"one\", type: hook) must resolve to None"
-        );
-        assert!(
-            resolved.steps[2].is_none(),
-            "steps[2] (\"two\", type: hook) must resolve to None"
-        );
-    }
-
-    fn step(role_name: &str) -> WorkflowStep {
-        WorkflowStep {
-            role: Role::new(role_name).unwrap(),
-            kind: warden_core::StepKind::Agent,
-            agent: Some(role_name.to_string()),
-            run: None,
-            gate: Gate::PassThrough,
-            budget: None,
-            captures_evidence: false,
-        }
-    }
-
-    fn definition_with_model(model: &str) -> AgentDefinition {
-        AgentDefinition::new(None, None, None, Some(model.to_string()), "be an agent").unwrap()
-    }
-
-    #[test]
-    fn a_reviewer_or_tester_step_sourced_from_trusted_config_vouches_for_its_model() {
-        for role_name in ["reviewer", "tester"] {
-            let definition = definition_with_model("anthropic/claude-3-opus");
-            let trusted = trusted_arg_values_for_step(&step(role_name), &definition, &[]);
-            assert_eq!(trusted, vec!["anthropic/claude-3-opus".to_string()]);
-        }
-    }
-
-    #[test]
-    fn a_reviewer_step_sourced_from_the_repo_under_review_never_vouches_for_anything() {
-        let definition = definition_with_model("anthropic/claude-3-opus");
-        let untrusted = vec![UntrustedRepoAgentDefinition {
-            role: AgentRole::Reviewer,
-            path: PathBuf::from(".warden/agents/reviewer.md"),
-            canonical_path: PathBuf::from("/repo/.warden/agents/reviewer.md"),
-        }];
-
-        let trusted = trusted_arg_values_for_step(&step("reviewer"), &definition, &untrusted);
-        assert!(trusted.is_empty());
-
-        let tester_trusted = trusted_arg_values_for_step(&step("tester"), &definition, &untrusted);
-        assert_eq!(tester_trusted, vec!["anthropic/claude-3-opus".to_string()]);
-    }
-
-    #[test]
-    fn a_custom_step_never_vouches_for_anything() {
-        let definition = definition_with_model("anthropic/claude-3-opus");
-        let trusted = trusted_arg_values_for_step(&step("techlead"), &definition, &[]);
-        assert!(trusted.is_empty());
-    }
-
-    #[test]
-    fn the_producer_step_never_vouches_for_anything() {
-        let definition = definition_with_model("anthropic/claude-3-opus");
-        let trusted = trusted_arg_values_for_step(&step("coder"), &definition, &[]);
-        assert!(trusted.is_empty());
-    }
-
-    #[test]
-    fn a_trusted_step_with_no_model_set_vouches_for_nothing() {
-        let definition = AgentDefinition::new(None, None, None, None, "be an agent").unwrap();
-        let trusted = trusted_arg_values_for_step(&step("reviewer"), &definition, &[]);
-        assert!(trusted.is_empty());
     }
 }
