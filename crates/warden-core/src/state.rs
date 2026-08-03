@@ -85,7 +85,10 @@ impl RunState {
                     ) && !matches!(to, Self::StepCyclesExceeded(other) if other != index)
             }
             Self::Converged => matches!(to, Self::Pushed | Self::Failed),
-            Self::Pushed => to == Self::AwaitingCi,
+            // A `before_push` lifecycle hook fires *after* the write-ahead into `Pushed` (see
+            // `Orchestrator::transition`); if it blocks, the run must still be able to reach
+            // `Failed` from here.
+            Self::Pushed => matches!(to, Self::AwaitingCi | Self::Failed),
             Self::AwaitingCi => matches!(to, Self::Done | Self::Failed) || valid_step(to),
             Self::AwaitingQuotaReset { .. } => to == Self::ResumingQuota,
             Self::ResumingQuota => {
@@ -141,6 +144,53 @@ mod tests {
         assert!(RunState::AwaitingCi
             .validate_transition(RunState::RunningStep(2), 3)
             .is_ok());
+    }
+
+    #[test]
+    fn pushed_may_still_fail_a_before_push_hook_block() {
+        assert!(RunState::Pushed
+            .validate_transition(RunState::Failed, 1)
+            .is_ok());
+        assert!(RunState::Pushed
+            .validate_transition(RunState::AwaitingCi, 1)
+            .is_ok());
+        assert!(RunState::Pushed
+            .validate_transition(RunState::RunningStep(0), 1)
+            .is_err());
+    }
+
+    /// Widening `Pushed` (for a refused `before_push` hook) must widen it by exactly one edge and
+    /// no more: `Failed` is now reachable, every state other than `AwaitingCi` still is not.
+    #[test]
+    fn pushed_gains_exactly_one_new_successor_and_no_other() {
+        let allowed = [RunState::AwaitingCi, RunState::Failed];
+        for to in [
+            RunState::Pending,
+            RunState::RunningStep(0),
+            RunState::RunningStep(1),
+            RunState::Converged,
+            RunState::Pushed,
+            RunState::AwaitingCi,
+            RunState::AwaitingQuotaReset { resets_at: 42 },
+            RunState::ResumingQuota,
+            RunState::Done,
+            RunState::StepCyclesExceeded(0),
+            RunState::Failed,
+        ] {
+            assert_eq!(
+                RunState::Pushed.validate_transition(to, 2).is_ok(),
+                allowed.contains(&to),
+                "Pushed -> {to:?}"
+            );
+        }
+    }
+
+    /// `Pushed` is deliberately *not* intermediate, so `db::list_intermediate_runs` (and therefore
+    /// crash recovery, which forces every run it returns to `Failed`) can never reach the newly
+    /// allowed `Pushed -> Failed` edge behind the orchestrator's back.
+    #[test]
+    fn pushed_is_not_an_intermediate_state_crash_recovery_would_fail() {
+        assert!(!RunState::Pushed.is_intermediate());
     }
 
     #[test]

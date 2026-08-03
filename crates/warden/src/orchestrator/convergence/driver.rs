@@ -48,255 +48,335 @@ impl Orchestrator {
             })
             .map_err(|_| WardenError::RunAlreadyInProgress)?;
 
-        if restored.is_none() {
-            db::insert_run(
-                &self.pool,
-                &run_id,
-                &config.repo_path.display().to_string(),
-                &config.branch,
-                &config.intent,
-                config.max_cycles,
-                config.max_cycles,
-                config.workflow.steps.len() as u32,
-                config.max_cycles,
-            )
-            .await?;
-            db::set_run_workflow_entry(&self.pool, &run_id, config.workflow.entry()).await?;
-            self.publish_event(RunEvent::RunStarted {
-                intent: config.intent.clone(),
-                branch: config.branch.clone(),
-                max_cycles: config.max_cycles,
-            })
-            .await?;
-            if let Some(callback) = &self.on_run_started {
-                callback(&run_id);
-            }
-            if let HookOutcome::Block { reason } = self
-                .dispatch_run_hooks(
+        // Every *outcome* exit from this block -- whichever pre-loop hook blocks, whichever way the
+        // loop itself ends -- funnels through the single teardown/`RunFinished` tail right below
+        // it. No path may `return` a state out of the middle of this function; `break 'run`
+        // instead.
+        //
+        // `?` is the deliberate exception: an infrastructure error propagates straight out without
+        // teardown, leaving the run persisted in its intermediate state so crash recovery reclaims
+        // it on the next start (`RunState::is_intermediate`). That predates the #106 hook work and
+        // is unchanged by it -- see `a_hook_that_errors_aborts_the_run_with_an_error`, which pins
+        // the current behaviour.
+        let final_state = 'run: {
+            if restored.is_none() {
+                db::insert_run(
+                    &self.pool,
                     &run_id,
-                    &config.repo_path,
-                    RunState::Pending,
-                    HookPoint::OnRunStart,
+                    &config.repo_path.display().to_string(),
+                    &config.branch,
+                    &config.intent,
+                    config.max_cycles,
+                    config.max_cycles,
+                    config.workflow.steps.len() as u32,
+                    config.max_cycles,
                 )
-                .await?
-            {
-                tracing::warn!(run_id, reason, "run-start hook blocked workflow");
-                self.transition(&run_id, RunState::Failed).await?;
-                self.run_teardown(&run_id, &config.repo_path, RunState::Failed)
-                    .await;
-                return Ok((run_id, RunState::Failed));
-            }
-            self.transition(&run_id, RunState::RunningStep(config.workflow.entry()))
                 .await?;
-        }
-
-        let run_base_commit_sha = match &restored {
-            Some((_, continuation)) => continuation.run_base_commit_sha.clone(),
-            None => read_head_commit(&config.repo_path).await?,
-        };
-        let mut agent_names = config
-            .workflow
-            .steps
-            .iter()
-            .filter_map(|step| step.agent.clone())
-            .collect::<Vec<_>>();
-        agent_names.sort();
-        agent_names.dedup();
-        let definition_snapshot = if config.repository_agent_definitions {
-            Some(
-                AgentDefinitionSnapshot::capture(
-                    &worktree_manager,
-                    &run_id,
-                    SNAPSHOT_WORKTREE_ROLE,
-                    &run_base_commit_sha,
-                    &agent_names,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        if let Some((_, continuation)) = &restored {
-            db::clear_run_rate_limit_status(&self.pool, &run_id).await?;
-            self.transition(&run_id, continuation.next_run_state())
+                db::set_run_workflow_entry(&self.pool, &run_id, config.workflow.entry()).await?;
+                self.publish_event(RunEvent::RunStarted {
+                    intent: config.intent.clone(),
+                    branch: config.branch.clone(),
+                    max_cycles: config.max_cycles,
+                })
                 .await?;
-        }
-        let mut continuation = restored
-            .map(|(_, continuation)| continuation)
-            .unwrap_or_else(|| ConvergenceContinuation::new(run_base_commit_sha, &config.workflow));
-
-        let final_state = loop {
-            let step_index = continuation.next_step_index;
-            let step = &config.workflow.steps[step_index as usize];
-            if self.suspend_for_anticipated_quota(&run_id).await? {
-                let resets_at = db::get_run_rate_limit_status(&self.pool, &run_id)
+                if let Some(callback) = &self.on_run_started {
+                    callback(&run_id);
+                }
+                match self
+                    .dispatch_run_hooks(
+                        &run_id,
+                        &config.repo_path,
+                        RunState::Pending,
+                        HookPoint::OnRunStart,
+                    )
                     .await?
-                    .expect("quota suspension requires stored status")
-                    .resets_at;
-                break self
-                    .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
-                    .await?;
+                {
+                    HookOutcome::Continue => {}
+                    HookOutcome::Block { reason } => {
+                        self.fail_run_on_block(&run_id, HookPoint::OnRunStart, &reason)
+                            .await?;
+                        break 'run RunState::Failed;
+                    }
+                    HookOutcome::EmitFindings(findings) => {
+                        self.record_unrouted_findings(HookPoint::OnRunStart, &findings)
+                            .await?;
+                    }
+                }
+                if let Some(final_state) = self
+                    .transition_or_block(&run_id, RunState::RunningStep(config.workflow.entry()))
+                    .await?
+                {
+                    break 'run final_state;
+                }
             }
 
-            let cycle_id = Uuid::new_v4().to_string();
-            db::insert_cycle(&self.pool, &cycle_id, &run_id, continuation.cycle_number).await?;
-            self.publish_event(RunEvent::CycleStarted {
-                cycle_number: continuation.cycle_number,
-            })
-            .await?;
-            let seeded = std::mem::take(&mut continuation.pending_ci_findings);
-            let prior_findings = select_prior_findings(
-                &self.pool,
-                seeded,
-                continuation.previous_cycle_id.as_deref(),
-            )
-            .await?;
-
-            let invocation = StepInvocation {
-                run_id: &run_id,
-                cycle_id: &cycle_id,
-                cycle_number: continuation.cycle_number,
-                step_index,
-                config: &config,
-                role: &step.role,
-                kind: step.kind,
-                agent: agents.steps[step_index as usize].as_ref(),
-                run: step.run.as_deref(),
-                env_allowlist: agents.env_allowlist,
-                worktree_manager: &worktree_manager,
-                commit: &continuation.base_commit,
-                run_base_commit: &continuation.run_base_commit_sha,
-                run_agent_definition_snapshot: definition_snapshot.as_ref(),
-                prior_findings: &prior_findings,
-                cancel: cancel.clone(),
+            let run_base_commit_sha = match &restored {
+                Some((_, continuation)) => continuation.run_base_commit_sha.clone(),
+                None => read_head_commit(&config.repo_path).await?,
             };
-            let result = match self.run_step(runner, invocation).await {
-                Ok(result) => result,
-                Err(WardenError::QuotaSuspended { resets_at }) => {
+            let mut agent_names = config
+                .workflow
+                .steps
+                .iter()
+                .filter_map(|step| step.agent.clone())
+                .collect::<Vec<_>>();
+            agent_names.sort();
+            agent_names.dedup();
+            let definition_snapshot = if config.repository_agent_definitions {
+                Some(
+                    AgentDefinitionSnapshot::capture(
+                        &worktree_manager,
+                        &run_id,
+                        SNAPSHOT_WORKTREE_ROLE,
+                        &run_base_commit_sha,
+                        &agent_names,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            if let Some((_, continuation)) = &restored {
+                db::clear_run_rate_limit_status(&self.pool, &run_id).await?;
+                if let Some(final_state) = self
+                    .transition_or_block(&run_id, continuation.next_run_state())
+                    .await?
+                {
+                    break 'run final_state;
+                }
+            }
+            let mut continuation = restored
+                .map(|(_, continuation)| continuation)
+                .unwrap_or_else(|| {
+                    ConvergenceContinuation::new(run_base_commit_sha, &config.workflow)
+                });
+
+            loop {
+                let step_index = continuation.next_step_index;
+                let step = &config.workflow.steps[step_index as usize];
+                if self.suspend_for_anticipated_quota(&run_id).await? {
+                    let resets_at = db::get_run_rate_limit_status(&self.pool, &run_id)
+                        .await?
+                        .expect("quota suspension requires stored status")
+                        .resets_at;
                     break self
                         .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
                         .await?;
                 }
-                Err(error) => {
-                    tracing::warn!(step = %step.role, %error, "workflow step infrastructure error");
-                    StepResult {
-                        commit: continuation.base_commit.clone(),
-                        findings: vec![Finding {
-                            source: warden_core::FindingSource::Warden,
-                            severity: warden_core::Severity::Blocking,
-                            file: None,
-                            description: error.to_string(),
-                            action: None,
-                        }],
-                        outcome: warden_core::StepOutcome::Error,
-                    }
-                }
-            };
-            let commit_changed = continuation.base_commit != result.commit;
-            continuation.base_commit = result.commit;
-            for finding in &result.findings {
-                db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
-                    .await?;
-                self.publish_event(RunEvent::FindingRaised {
+
+                let cycle_id = Uuid::new_v4().to_string();
+                db::insert_cycle(&self.pool, &cycle_id, &run_id, continuation.cycle_number).await?;
+                self.publish_event(RunEvent::CycleStarted {
                     cycle_number: continuation.cycle_number,
-                    source: finding.source.as_str().to_string(),
-                    severity: finding.severity.as_str().to_string(),
-                    file: finding.file.clone(),
-                    description: finding.description.clone(),
-                    action: finding.action.clone(),
                 })
                 .await?;
-            }
-            continuation.step_cycle_numbers[step_index as usize] += 1;
-            let mut next_state = match result.outcome {
-                warden_core::StepOutcome::Error => warden_core::state_for_target(
-                    config
-                        .workflow
-                        .target_for(step_index, warden_core::StepOutcome::Error),
-                ),
-                _ => decide_next_state_for_step(
-                    &result.findings,
-                    &config.workflow,
-                    step_index,
-                    continuation.step_cycle_numbers[step_index as usize],
-                    config.max_cycles,
-                ),
-            };
-            db::close_cycle(&self.pool, &cycle_id).await?;
-            for point in [HookPoint::AfterStep]
-                .into_iter()
-                .chain(commit_changed.then_some(HookPoint::OnCommit))
-            {
-                if let HookOutcome::Block { reason } = self
-                    .dispatch_run_hooks(
-                        &run_id,
-                        &config.repo_path,
-                        RunState::RunningStep(step_index),
-                        point,
-                    )
-                    .await?
-                {
-                    tracing::warn!(%reason, point = point.as_str(), "hook blocked workflow");
-                    next_state = RunState::Failed;
-                    break;
-                }
-            }
-            continuation.previous_cycle_id = Some(cycle_id);
-            continuation.cycle_number += 1;
+                let seeded = std::mem::take(&mut continuation.pending_ci_findings);
+                let prior_findings = select_prior_findings(
+                    &self.pool,
+                    seeded,
+                    continuation.previous_cycle_id.as_deref(),
+                )
+                .await?;
 
-            let mut converged_commit = None;
-            if next_state == RunState::Converged {
-                let commit = if config.evidence_store_in_repo {
-                    let evidence = db::list_evidence_for_run(&self.pool, &run_id).await?;
-                    self.commit_evidence_for_convergence(
-                        &worktree_manager,
-                        &config,
-                        &run_id,
-                        &continuation.base_commit,
-                        &evidence,
-                    )
-                    .await
-                } else {
-                    continuation.base_commit.clone()
+                let invocation = StepInvocation {
+                    run_id: &run_id,
+                    cycle_id: &cycle_id,
+                    cycle_number: continuation.cycle_number,
+                    step_index,
+                    config: &config,
+                    role: &step.role,
+                    kind: step.kind,
+                    agent: agents.steps[step_index as usize].as_ref(),
+                    run: step.run.as_deref(),
+                    env_allowlist: agents.env_allowlist,
+                    worktree_manager: &worktree_manager,
+                    commit: &continuation.base_commit,
+                    run_base_commit: &continuation.run_base_commit_sha,
+                    run_agent_definition_snapshot: definition_snapshot.as_ref(),
+                    prior_findings: &prior_findings,
+                    cancel: cancel.clone(),
                 };
-                db::set_run_converged_commit(&self.pool, &run_id, &commit).await?;
-                converged_commit = Some(commit);
-            }
-            self.transition(&run_id, next_state).await?;
-            match next_state {
-                RunState::RunningStep(next) => {
-                    continuation.next_step_index = next;
-                }
-                RunState::Converged => match &config.gate {
-                    None => break RunState::Converged,
-                    Some(gate_config) => {
-                        let trigger = crate::gate_trigger::SubprocessGateTrigger {
-                            gated_bin: gate_config.gated_bin.clone(),
-                            db_path: config.warden_home.join("state.db"),
-                            bare_repo_path: gate_config.bare_repo_path.clone(),
-                            repo_slug: gate_config.repo_slug.clone(),
-                            poll_interval_secs: gate_config.poll_interval_secs,
-                            inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
-                        };
-                        match self
-                            .drive_post_convergence_tail(
-                                &run_id,
-                                &config,
-                                &converged_commit.expect("converged commit stored"),
-                                &trigger,
-                            )
-                            .await?
-                        {
-                            PostConvergenceOutcome::Terminal(state) => break state,
-                            PostConvergenceOutcome::Reboucle { findings } => {
-                                continuation.pending_ci_findings = findings;
-                                continuation.next_step_index = config.workflow.entry();
-                            }
+                let result = match self.run_step(runner, invocation).await {
+                    Ok(result) => result,
+                    Err(WardenError::QuotaSuspended { resets_at }) => {
+                        break self
+                            .persist_quota_suspension(&run_id, &config, &continuation, resets_at)
+                            .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(step = %step.role, %error, "workflow step infrastructure error");
+                        StepResult {
+                            commit: continuation.base_commit.clone(),
+                            findings: vec![Finding {
+                                source: warden_core::FindingSource::Warden,
+                                severity: warden_core::Severity::Blocking,
+                                file: None,
+                                description: error.to_string(),
+                                action: None,
+                            }],
+                            outcome: warden_core::StepOutcome::Error,
                         }
                     }
-                },
-                state => break state,
+                };
+                let commit_changed = continuation.base_commit != result.commit;
+                continuation.base_commit = result.commit;
+                for finding in &result.findings {
+                    db::insert_finding(&self.pool, &Uuid::new_v4().to_string(), &cycle_id, finding)
+                        .await?;
+                    self.publish_event(RunEvent::FindingRaised {
+                        cycle_number: continuation.cycle_number,
+                        source: finding.source.as_str().to_string(),
+                        severity: finding.severity.as_str().to_string(),
+                        file: finding.file.clone(),
+                        description: finding.description.clone(),
+                        action: finding.action.clone(),
+                    })
+                    .await?;
+                }
+                continuation.step_cycle_numbers[step_index as usize] += 1;
+                let mut next_state = match result.outcome {
+                    warden_core::StepOutcome::Error => warden_core::state_for_target(
+                        config
+                            .workflow
+                            .target_for(step_index, warden_core::StepOutcome::Error),
+                    ),
+                    _ => decide_next_state_for_step(
+                        &result.findings,
+                        &config.workflow,
+                        step_index,
+                        continuation.step_cycle_numbers[step_index as usize],
+                        config.max_cycles,
+                    ),
+                };
+                let mut hook_findings: Vec<Finding> = Vec::new();
+                let mut blocked = false;
+                for point in [HookPoint::AfterStep]
+                    .into_iter()
+                    .chain(commit_changed.then_some(HookPoint::OnCommit))
+                {
+                    match self
+                        .dispatch_run_hooks(
+                            &run_id,
+                            &config.repo_path,
+                            RunState::RunningStep(step_index),
+                            point,
+                        )
+                        .await?
+                    {
+                        HookOutcome::Continue => {}
+                        HookOutcome::Block { reason } => {
+                            tracing::warn!(%reason, point = point.as_str(), "hook blocked workflow");
+                            next_state = RunState::Failed;
+                            blocked = true;
+                            break;
+                        }
+                        HookOutcome::EmitFindings(findings) => {
+                            for finding in &findings {
+                                db::insert_finding(
+                                    &self.pool,
+                                    &Uuid::new_v4().to_string(),
+                                    &cycle_id,
+                                    finding,
+                                )
+                                .await?;
+                                self.publish_event(RunEvent::FindingRaised {
+                                    cycle_number: continuation.cycle_number,
+                                    source: finding.source.as_str().to_string(),
+                                    severity: finding.severity.as_str().to_string(),
+                                    file: finding.file.clone(),
+                                    description: finding.description.clone(),
+                                    action: finding.action.clone(),
+                                })
+                                .await?;
+                            }
+                            hook_findings.extend(findings);
+                        }
+                    }
+                }
+                // A hook's findings aggregate exactly like the step's own -- reboucle via the same
+                // step's `on_blocking` edge -- unless the step itself already errored (its
+                // `on_error` target stands) or a hook already blocked outright above.
+                if !blocked
+                    && !matches!(result.outcome, warden_core::StepOutcome::Error)
+                    && !hook_findings.is_empty()
+                {
+                    let mut all_findings = result.findings.clone();
+                    all_findings.extend(hook_findings);
+                    next_state = decide_next_state_for_step(
+                        &all_findings,
+                        &config.workflow,
+                        step_index,
+                        continuation.step_cycle_numbers[step_index as usize],
+                        config.max_cycles,
+                    );
+                }
+                db::close_cycle(&self.pool, &cycle_id).await?;
+                continuation.previous_cycle_id = Some(cycle_id);
+                continuation.cycle_number += 1;
+
+                let mut converged_commit = None;
+                if next_state == RunState::Converged {
+                    let commit = if config.evidence_store_in_repo {
+                        let evidence = db::list_evidence_for_run(&self.pool, &run_id).await?;
+                        self.commit_evidence_for_convergence(
+                            &worktree_manager,
+                            &config,
+                            &run_id,
+                            &continuation.base_commit,
+                            &evidence,
+                        )
+                        .await
+                    } else {
+                        continuation.base_commit.clone()
+                    };
+                    db::set_run_converged_commit(&self.pool, &run_id, &commit).await?;
+                    converged_commit = Some(commit);
+                }
+                match self.transition(&run_id, next_state).await? {
+                    TransitionEffect::Continue => {}
+                    TransitionEffect::Blocked { point, reason } => {
+                        self.fail_run_on_block(&run_id, point, &reason).await?;
+                        next_state = RunState::Failed;
+                    }
+                    TransitionEffect::FindingsEmitted { point, findings } => {
+                        self.record_unrouted_findings(point, &findings).await?;
+                    }
+                }
+                match next_state {
+                    RunState::RunningStep(next) => {
+                        continuation.next_step_index = next;
+                    }
+                    RunState::Converged => match &config.gate {
+                        None => break RunState::Converged,
+                        Some(gate_config) => {
+                            let trigger = crate::gate_trigger::SubprocessGateTrigger {
+                                gated_bin: gate_config.gated_bin.clone(),
+                                db_path: config.warden_home.join("state.db"),
+                                bare_repo_path: gate_config.bare_repo_path.clone(),
+                                repo_slug: gate_config.repo_slug.clone(),
+                                poll_interval_secs: gate_config.poll_interval_secs,
+                                inactivity_timeout_secs: gate_config.inactivity_timeout_secs,
+                            };
+                            match self
+                                .drive_post_convergence_tail(
+                                    &run_id,
+                                    &config,
+                                    &converged_commit.expect("converged commit stored"),
+                                    &trigger,
+                                )
+                                .await?
+                            {
+                                PostConvergenceOutcome::Terminal(state) => break state,
+                                PostConvergenceOutcome::Reboucle { findings } => {
+                                    continuation.pending_ci_findings = findings;
+                                    continuation.next_step_index = config.workflow.entry();
+                                }
+                            }
+                        }
+                    },
+                    state => break state,
+                }
             }
         };
 

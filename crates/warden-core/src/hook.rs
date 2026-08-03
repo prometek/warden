@@ -107,9 +107,21 @@ pub enum HookOutcome {
     /// Nothing to report -- the run proceeds unchanged.
     Continue,
     /// The hook refuses to let the run proceed past this point, with a human-readable reason.
-    Block {
-        reason: String,
-    },
+    ///
+    /// This is a real barrier at every [`HookPoint`] except [`HookPoint::OnRunEnd`]: the run
+    /// transitions to [`RunState::Failed`] and does not continue. `OnRunEnd` fires once the run's
+    /// final state is already determined (teardown), so a `Block` there is journaled and
+    /// otherwise ignored -- teardown must never mask the outcome the run already reached.
+    Block { reason: String },
+    /// The hook reports findings without necessarily blocking.
+    ///
+    /// At [`HookPoint::AfterStep`] and [`HookPoint::OnCommit`] -- the points with a step in
+    /// scope -- these findings are merged into that step's decision the same way a
+    /// reviewer/tester/CI finding is, and can drive a reboucle via the step's `on_blocking` edge.
+    /// At the step-less points ([`HookPoint::OnRunStart`], [`HookPoint::BeforeStep`],
+    /// [`HookPoint::OnConverged`], [`HookPoint::BeforePush`]), there is no step decision to route
+    /// them through: they are instead recorded as [`crate::RunEvent::HookFindingEmitted`] so the
+    /// variant is never silently dropped, but they do not drive a reboucle at those points.
     EmitFindings(Vec<Finding>),
 }
 
