@@ -318,6 +318,13 @@ fn event_list_item(record: &RunEventRecord) -> ListItem<'static> {
                 _ => format!("run finished: {final_state}"),
             },
         ),
+        RunEvent::WorkflowResolved { name, entry, steps } => (
+            Style::default().fg(Color::Cyan),
+            format!(
+                "workflow \"{name}\" resolved: {} step(s), entry step {entry}",
+                steps.len()
+            ),
+        ),
         RunEvent::HookFindingEmitted {
             point,
             severity,
