@@ -209,6 +209,78 @@ impl RunModel {
             })
     }
 
+    /// The run's declared workflow graph, derived from its `WorkflowResolved` event (issue #107)
+    /// plus every `AgentStarted`/`AgentFinished` observed since. [`WorkflowGraph::Unresolved`] for
+    /// a run that predates that event -- an explicit fallback, so a late-attaching TUI still shows
+    /// a coherent (if retrospective-only) view instead of an empty screen or a panic.
+    pub fn workflow_graph(&self) -> WorkflowGraph {
+        let Some((name, entry, wire_steps)) =
+            self.events.iter().find_map(|record| match &record.event {
+                RunEvent::WorkflowResolved { name, entry, steps } => {
+                    Some((name.clone(), *entry, steps))
+                }
+                _ => None,
+            })
+        else {
+            return WorkflowGraph::Unresolved;
+        };
+
+        let mut steps: Vec<DeclaredStep> = wire_steps
+            .iter()
+            .map(|step| DeclaredStep {
+                index: step.index,
+                id: step.id.clone(),
+                kind: step.kind.clone(),
+                on_clean: step.on_clean.clone(),
+                on_blocking: step.on_blocking.clone(),
+                on_error: step.on_error.clone(),
+                max_cycles: step.max_cycles,
+                captures_evidence: step.captures_evidence,
+                status: StepRuntimeStatus::NeverReached,
+            })
+            .collect();
+
+        for record in &self.events {
+            match &record.event {
+                RunEvent::AgentStarted { role } => {
+                    match steps.iter_mut().find(|step| &step.id == role) {
+                        Some(step) => step.status = StepRuntimeStatus::Running,
+                        None => tracing::debug!(
+                            role,
+                            "AgentStarted for a role absent from the resolved workflow graph \
+                             (stale graph after a workflow.yaml edit across a resumed run?)"
+                        ),
+                    }
+                }
+                RunEvent::AgentFinished { role, .. } => {
+                    match steps.iter_mut().find(|step| &step.id == role) {
+                        Some(step) => step.status = StepRuntimeStatus::Ran,
+                        None => tracing::debug!(
+                            role,
+                            "AgentFinished for a role absent from the resolved workflow graph \
+                             (stale graph after a workflow.yaml edit across a resumed run?)"
+                        ),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A run that ended (converged, failed, or otherwise reached `RunFinished`) can never leave
+        // a step genuinely "running" -- that would only be true of a still-live run. A step still
+        // marked `Running` at that point means its `AgentFinished` never arrived (killed, timed
+        // out, or errored before reporting) -- report that distinctly rather than as still alive.
+        if self.is_finished() {
+            for step in &mut steps {
+                if step.status == StepRuntimeStatus::Running {
+                    step.status = StepRuntimeStatus::Interrupted;
+                }
+            }
+        }
+
+        WorkflowGraph::Resolved(ResolvedWorkflow { name, entry, steps })
+    }
+
     /// Derives one branch per cycle from agent events.
     pub fn workflow_tree(&self) -> WorkflowTree {
         let mut cycles: Vec<CycleNode> = Vec::new();
@@ -385,6 +457,57 @@ pub struct CycleNode {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WorkflowTree {
     pub cycles: Vec<CycleNode>,
+}
+
+/// The run's declared workflow graph -- see [`RunModel::workflow_graph`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WorkflowGraph {
+    /// No `WorkflowResolved` event has been observed for this run: either it predates issue #107,
+    /// or history hasn't replayed that far yet.
+    #[default]
+    Unresolved,
+    Resolved(ResolvedWorkflow),
+}
+
+/// A run's workflow graph as declared at `WorkflowResolved` time, one entry per step -- including
+/// steps the run has never reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWorkflow {
+    pub name: String,
+    pub entry: u32,
+    pub steps: Vec<DeclaredStep>,
+}
+
+/// One step of the declared workflow graph, plus its current execution status derived from the
+/// event stream applied so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredStep {
+    pub index: u32,
+    pub id: String,
+    /// `"agent"` or `"command"`.
+    pub kind: String,
+    pub on_clean: String,
+    pub on_blocking: String,
+    pub on_error: String,
+    pub max_cycles: Option<u32>,
+    pub captures_evidence: bool,
+    pub status: StepRuntimeStatus,
+}
+
+/// A declared step's execution status, derived from `AgentStarted`/`AgentFinished` events matching
+/// its own id -- independent of [`NodeStatus`], which is scoped to one cycle's tree rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepRuntimeStatus {
+    /// No `AgentStarted` for this step's id has been observed in any cycle so far.
+    NeverReached,
+    /// The most recent `AgentStarted` for this step's id has no matching `AgentFinished` yet, and
+    /// the run is still live.
+    Running,
+    /// This step has finished at least once (it may still run again on a reboucle).
+    Ran,
+    /// The run reached `RunFinished` while this step still had no matching `AgentFinished` --
+    /// killed, timed out, or errored before it could report. Never rendered as still `Running`.
+    Interrupted,
 }
 
 #[cfg(test)]
@@ -1151,5 +1274,202 @@ mod tests {
         let tree = model.workflow_tree();
         assert_eq!(tree.cycles.len(), 1);
         assert_eq!(tree.cycles[0].reloop, None);
+    }
+
+    fn sample_workflow_resolved() -> RunEvent {
+        RunEvent::WorkflowResolved {
+            name: "quality-loop".to_string(),
+            entry: 0,
+            steps: vec![
+                warden_core::WorkflowStepWire {
+                    index: 0,
+                    id: "implementation".to_string(),
+                    kind: "agent".to_string(),
+                    on_clean: "review".to_string(),
+                    on_blocking: "implementation".to_string(),
+                    on_error: "failed".to_string(),
+                    max_cycles: None,
+                    captures_evidence: false,
+                },
+                warden_core::WorkflowStepWire {
+                    index: 1,
+                    id: "review".to_string(),
+                    kind: "agent".to_string(),
+                    on_clean: "converged".to_string(),
+                    on_blocking: "implementation".to_string(),
+                    on_error: "failed".to_string(),
+                    max_cycles: Some(3),
+                    captures_evidence: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn workflow_graph_is_unresolved_for_a_run_that_predates_the_workflow_resolved_event() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e2", agent_started("coder")));
+
+        assert_eq!(model.workflow_graph(), WorkflowGraph::Unresolved);
+    }
+
+    #[test]
+    fn workflow_graph_exposes_every_declared_step_never_reached_before_any_agent_event() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.name, "quality-loop");
+        assert_eq!(graph.entry, 0);
+        assert_eq!(graph.steps.len(), 2);
+
+        let implementation = &graph.steps[0];
+        assert_eq!(implementation.id, "implementation");
+        assert_eq!(implementation.kind, "agent");
+        assert_eq!(implementation.on_clean, "review");
+        assert_eq!(implementation.on_blocking, "implementation");
+        assert_eq!(implementation.on_error, "failed");
+        assert_eq!(implementation.max_cycles, None);
+        assert_eq!(implementation.status, StepRuntimeStatus::NeverReached);
+
+        let review = &graph.steps[1];
+        assert_eq!(review.max_cycles, Some(3));
+        assert!(review.captures_evidence);
+        assert_eq!(review.status, StepRuntimeStatus::NeverReached);
+    }
+
+    #[test]
+    fn workflow_graph_tracks_a_declared_step_from_running_to_ran() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e3", agent_started("implementation")));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Running);
+        assert_eq!(
+            graph.steps[1].status,
+            StepRuntimeStatus::NeverReached,
+            "review has not started yet"
+        );
+
+        model.apply(record(
+            "e4",
+            agent_finished_with_exit("implementation", 0, None),
+        ));
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Ran);
+    }
+
+    #[test]
+    fn workflow_graph_is_replayed_identically_from_a_late_attach_history_entry() {
+        let mut model = RunModel::new();
+        model.apply_history_entry(RunEventHistoryEntry::Decoded(record(
+            "e1",
+            sample_workflow_resolved(),
+        )));
+        model.apply_history_entry(RunEventHistoryEntry::Decoded(record(
+            "e2",
+            agent_started("implementation"),
+        )));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Running);
+    }
+
+    #[test]
+    fn workflow_graph_can_transition_a_step_from_ran_back_to_running_on_a_reboucle() {
+        // `StepRuntimeStatus::Ran` documents that a step "may still run again on a reboucle" --
+        // pin that a later `AgentStarted` for the same step really does move it back to `Running`
+        // rather than getting stuck at `Ran`.
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e3", agent_started("implementation")));
+        model.apply(record(
+            "e4",
+            agent_finished_with_exit("implementation", 0, None),
+        ));
+        model.apply(record("e5", finding(1, "implementation", "blocking")));
+        model.apply(record("e6", RunEvent::CycleStarted { cycle_number: 2 }));
+        model.apply(record("e7", agent_started("implementation")));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Running);
+    }
+
+    #[test]
+    fn workflow_graph_ignores_an_agent_event_for_a_role_absent_from_the_declared_graph() {
+        // Reachable via a resumed run whose workflow.yaml changed step ids after the original
+        // `WorkflowResolved` was published (`validate_restored_run_config` only compares step
+        // *count*, not ids) -- must not panic, and must not fabricate a step that was never
+        // declared.
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e3", agent_started("renamed-step")));
+        model.apply(record(
+            "e4",
+            agent_finished_with_exit("renamed-step", 0, None),
+        ));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps.len(), 2, "no fabricated step was added");
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::NeverReached);
+        assert_eq!(graph.steps[1].status, StepRuntimeStatus::NeverReached);
+    }
+
+    #[test]
+    fn workflow_graph_marks_a_step_still_running_when_the_run_finishes_as_interrupted() {
+        // The most common way a run dies: Ctrl-C, a timeout, or a sandbox error kills the agent
+        // process before it can publish `AgentFinished` (only the `Ok` branch of
+        // `orchestrator::agent_run` does). A step stuck at `Running` on an already-finished run
+        // must not be rendered as still alive.
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e3", agent_started("implementation")));
+        model.apply(record(
+            "e4",
+            RunEvent::RunFinished {
+                final_state: "failed".to_string(),
+            },
+        ));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Interrupted);
+        assert_eq!(
+            graph.steps[1].status,
+            StepRuntimeStatus::NeverReached,
+            "a step never started must stay NeverReached, not become Interrupted"
+        );
+    }
+
+    #[test]
+    fn workflow_graph_does_not_mark_a_running_step_interrupted_while_the_run_is_still_live() {
+        let mut model = RunModel::new();
+        model.apply(record("e1", sample_workflow_resolved()));
+        model.apply(record("e2", RunEvent::CycleStarted { cycle_number: 1 }));
+        model.apply(record("e3", agent_started("implementation")));
+
+        let WorkflowGraph::Resolved(graph) = model.workflow_graph() else {
+            panic!("expected a resolved workflow graph");
+        };
+        assert_eq!(graph.steps[0].status, StepRuntimeStatus::Running);
     }
 }

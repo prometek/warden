@@ -223,6 +223,36 @@ mod tests {
         assert_eq!(run.current_cycle, 1);
     }
 
+    /// ADR-0008: the TUI observes, it never acts. A pool that merely *intends* to be read-only is
+    /// not a guarantee -- pin that SQLite itself refuses a write through it, so no future feature
+    /// (issue #107's workflow graph included) can quietly gain a mutation path.
+    #[tokio::test]
+    async fn a_read_only_pool_refuses_to_write_to_the_database() {
+        let dir = TempDir::new().unwrap();
+        let (db_path, write_pool) = seed_db(dir.path()).await;
+        write_pool.close().await;
+
+        let pool = connect_read_only(&db_path).await.unwrap();
+        let error = sqlx::query(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) \
+             VALUES ('x', 'run-1', 'run_started', '{}', '2026-07-12T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("a read-only connection must reject an INSERT");
+        assert!(
+            error.to_string().to_lowercase().contains("readonly")
+                || error.to_string().to_lowercase().contains("read-only"),
+            "expected a read-only rejection, got: {error}"
+        );
+
+        let deletion = sqlx::query("DELETE FROM runs").execute(&pool).await;
+        assert!(
+            deletion.is_err(),
+            "a read-only connection must reject a DELETE"
+        );
+    }
+
     #[tokio::test]
     async fn get_run_returns_none_for_an_unknown_run() {
         let dir = TempDir::new().unwrap();

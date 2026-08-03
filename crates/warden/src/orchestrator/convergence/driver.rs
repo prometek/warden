@@ -1,6 +1,7 @@
 use super::super::diff::read_head_commit;
 use super::super::tampering::{AgentDefinitionSnapshot, SNAPSHOT_WORKTREE_ROLE};
 use super::super::*;
+use super::resolve_workflow_event;
 use super::select_prior_findings;
 
 impl Orchestrator {
@@ -79,6 +80,8 @@ impl Orchestrator {
                     max_cycles: config.max_cycles,
                 })
                 .await?;
+                self.publish_event(resolve_workflow_event(&config.workflow)?)
+                    .await?;
                 if let Some(callback) = &self.on_run_started {
                     callback(&run_id);
                 }

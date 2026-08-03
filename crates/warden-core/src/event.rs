@@ -9,6 +9,10 @@ use crate::error::{CoreError, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     RunStarted,
+    /// The workflow's resolved graph (issue #107), published exactly once per run, right after
+    /// `RunStarted` and before the first step transition -- so a late attach still learns the full
+    /// graph, including steps never reached.
+    WorkflowResolved,
     CycleStarted,
     AgentStarted,
     /// / amendment: a live-only, declarative progress signal, translated by the run's
@@ -33,6 +37,7 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::RunStarted => "run_started",
+            EventKind::WorkflowResolved => "workflow_resolved",
             EventKind::CycleStarted => "cycle_started",
             EventKind::AgentStarted => "agent_started",
             EventKind::AgentProgress => "agent_progress",
@@ -49,6 +54,7 @@ impl EventKind {
     pub fn parse(raw: &str) -> Result<Self> {
         match raw {
             "run_started" => Ok(EventKind::RunStarted),
+            "workflow_resolved" => Ok(EventKind::WorkflowResolved),
             "cycle_started" => Ok(EventKind::CycleStarted),
             "agent_started" => Ok(EventKind::AgentStarted),
             "agent_progress" => Ok(EventKind::AgentProgress),
@@ -64,6 +70,29 @@ impl EventKind {
     }
 }
 
+/// One declared step of a [`RunEvent::WorkflowResolved`] graph. Deliberately a flat, string-keyed
+/// shape independent of `warden_core::workflow` -- see [`RunEvent::WorkflowResolved`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStepWire {
+    /// This step's position in `Workflow::steps`, matched against `RunState::RunningStep`.
+    pub index: u32,
+    /// The step's own id -- `Role::as_str`, and the `role` field of `AgentStarted`/`AgentFinished`
+    /// for this step.
+    pub id: String,
+    /// `"agent"` or `"command"` (`StepKind::as_str`).
+    pub kind: String,
+    /// Transition target on a clean outcome: another step's `id`, or `"converged"` / `"failed"`.
+    pub on_clean: String,
+    /// Transition target on a blocking-finding outcome: another step's `id`, or `"converged"` /
+    /// `"failed"`.
+    pub on_blocking: String,
+    /// Transition target on an error outcome: another step's `id`, or `"converged"` / `"failed"`.
+    pub on_error: String,
+    /// This step's own cycle budget, if narrower than the run-wide `max_cycles`.
+    pub max_cycles: Option<u32>,
+    pub captures_evidence: bool,
+}
+
 /// One structured run transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -73,6 +102,17 @@ pub enum RunEvent {
         branch: String,
         #[serde(alias = "max_review_cycles")]
         max_cycles: u32,
+    },
+    /// See [`EventKind::WorkflowResolved`]. Carries the workflow's own resolved graph -- data only,
+    /// no I/O and no dependency on `warden_core::workflow` types themselves, so a non-warden reader
+    /// of the `events` table (`jq`, an external script) can still parse it as plain JSON. A
+    /// `warden-tui` built before issue #107 does *not* benefit from this: it fails
+    /// `EventKind::parse("workflow_resolved")` and tags the line `undecodable` -- a clean
+    /// degradation (exit 0), not a successful parse.
+    WorkflowResolved {
+        name: String,
+        entry: u32,
+        steps: Vec<WorkflowStepWire>,
     },
     CycleStarted {
         cycle_number: u32,
@@ -134,6 +174,7 @@ impl RunEvent {
     pub fn kind(&self) -> EventKind {
         match self {
             RunEvent::RunStarted { .. } => EventKind::RunStarted,
+            RunEvent::WorkflowResolved { .. } => EventKind::WorkflowResolved,
             RunEvent::CycleStarted { .. } => EventKind::CycleStarted,
             RunEvent::AgentStarted { .. } => EventKind::AgentStarted,
             RunEvent::AgentProgress { .. } => EventKind::AgentProgress,
@@ -242,6 +283,7 @@ mod tests {
     fn every_kind() -> Vec<EventKind> {
         vec![
             EventKind::RunStarted,
+            EventKind::WorkflowResolved,
             EventKind::CycleStarted,
             EventKind::AgentStarted,
             EventKind::AgentProgress,
@@ -276,6 +318,32 @@ mod tests {
                 intent: "do the thing".to_string(),
                 branch: "main".to_string(),
                 max_cycles: 5,
+            },
+            EventKind::WorkflowResolved => RunEvent::WorkflowResolved {
+                name: "quality-loop".to_string(),
+                entry: 0,
+                steps: vec![
+                    WorkflowStepWire {
+                        index: 0,
+                        id: "implementation".to_string(),
+                        kind: "agent".to_string(),
+                        on_clean: "review".to_string(),
+                        on_blocking: "implementation".to_string(),
+                        on_error: "failed".to_string(),
+                        max_cycles: None,
+                        captures_evidence: false,
+                    },
+                    WorkflowStepWire {
+                        index: 1,
+                        id: "review".to_string(),
+                        kind: "agent".to_string(),
+                        on_clean: "converged".to_string(),
+                        on_blocking: "implementation".to_string(),
+                        on_error: "failed".to_string(),
+                        max_cycles: Some(3),
+                        captures_evidence: true,
+                    },
+                ],
             },
             EventKind::CycleStarted => RunEvent::CycleStarted { cycle_number: 1 },
             EventKind::AgentStarted => RunEvent::AgentStarted {
@@ -455,5 +523,100 @@ mod tests {
                 usage: None,
             }
         );
+    }
+
+    #[test]
+    fn workflow_resolved_kind_round_trips_through_its_string_form() {
+        assert_eq!(
+            EventKind::parse(EventKind::WorkflowResolved.as_str()).unwrap(),
+            EventKind::WorkflowResolved
+        );
+        assert_eq!(EventKind::WorkflowResolved.as_str(), "workflow_resolved");
+    }
+
+    #[test]
+    fn workflow_resolved_round_trips_through_json_with_every_field_intact() {
+        let event = sample(EventKind::WorkflowResolved);
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.kind(), EventKind::WorkflowResolved);
+
+        let RunEvent::WorkflowResolved { name, entry, steps } = decoded else {
+            panic!("expected WorkflowResolved, got {decoded:?}");
+        };
+        assert_eq!(name, "quality-loop");
+        assert_eq!(entry, 0);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].id, "review");
+        assert_eq!(steps[1].on_clean, "converged");
+        assert_eq!(steps[1].max_cycles, Some(3));
+        assert!(steps[1].captures_evidence);
+    }
+
+    #[test]
+    fn unknown_event_type_string_never_decodes_as_workflow_resolved() {
+        assert_eq!(
+            EventKind::parse("workflow_step_added"),
+            Err(CoreError::UnknownEventKind(
+                "workflow_step_added".to_string()
+            ))
+        );
+    }
+
+    /// The variant's whole point is to carry *data*, decoupled from `crate::workflow`'s own types:
+    /// a reader that knows nothing about `StepTarget`, `Role` or `StepKind` -- an older
+    /// `warden-tui`, or anything reading the `events` table with `jq` -- must still be able to walk
+    /// every field. Pin the flat, string-keyed encoding: a transition is a bare string, never a
+    /// nested enum tag like `{"Step":1}`, and no field is dropped.
+    #[test]
+    fn workflow_resolved_encodes_as_plain_json_readable_without_any_warden_type() {
+        let json = serde_json::to_string(&sample(EventKind::WorkflowResolved)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["kind"], "workflow_resolved");
+        assert!(value["name"].is_string());
+        assert!(value["entry"].is_u64());
+
+        let steps = value["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        for step in steps {
+            let object = step.as_object().unwrap();
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "captures_evidence",
+                    "id",
+                    "index",
+                    "kind",
+                    "max_cycles",
+                    "on_blocking",
+                    "on_clean",
+                    "on_error",
+                ],
+                "the wire shape must stay flat and complete: {step}"
+            );
+            assert!(step["index"].is_u64());
+            assert!(step["id"].is_string());
+            assert!(step["kind"].is_string());
+            assert!(step["captures_evidence"].is_boolean());
+            for transition in ["on_clean", "on_blocking", "on_error"] {
+                assert!(
+                    step[transition].is_string(),
+                    "{transition} must be a bare string, not a tagged enum: {step}"
+                );
+            }
+            assert!(
+                step["max_cycles"].is_u64() || step["max_cycles"].is_null(),
+                "an absent step budget must be null, never an omitted key: {step}"
+            );
+        }
+
+        assert_eq!(steps[0]["kind"], "agent");
+        assert_eq!(steps[0]["max_cycles"], serde_json::Value::Null);
+        assert_eq!(steps[1]["on_clean"], "converged");
+        assert_eq!(steps[1]["max_cycles"], 3);
     }
 }

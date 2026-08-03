@@ -270,6 +270,132 @@ async fn attach_cli_does_not_duplicate_an_event_that_is_both_history_and_delayed
     );
 }
 
+/// Issue #107, acceptance criterion 2, through the real `warden-tui` binary: a late attach replays
+/// the recorded workflow graph as a *decoded* event, with every declared step -- including one the
+/// run never started. If `EventKind::parse` or the payload tag ever drifts, this row silently
+/// degrades to `undecodable` and the observer loses the graph; asserting on the model alone would
+/// never notice.
+#[tokio::test]
+async fn attach_cli_replays_the_recorded_workflow_graph_including_never_started_steps() {
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+    insert_event(
+        &pool,
+        "e1",
+        &RunEvent::RunStarted {
+            intent: "intent".to_string(),
+            branch: "main".to_string(),
+            max_cycles: 5,
+        },
+        "2026-07-12T00:00:00+00:00",
+    )
+    .await;
+    insert_event(
+        &pool,
+        "e2",
+        &RunEvent::WorkflowResolved {
+            name: "quality-loop".to_string(),
+            entry: 0,
+            steps: vec![
+                warden_core::WorkflowStepWire {
+                    index: 0,
+                    id: "implementation".to_string(),
+                    kind: "agent".to_string(),
+                    on_clean: "verification".to_string(),
+                    on_blocking: "implementation".to_string(),
+                    on_error: "failed".to_string(),
+                    max_cycles: None,
+                    captures_evidence: false,
+                },
+                warden_core::WorkflowStepWire {
+                    index: 1,
+                    id: "remediation".to_string(),
+                    kind: "agent".to_string(),
+                    on_clean: "verification".to_string(),
+                    on_blocking: "implementation".to_string(),
+                    on_error: "failed".to_string(),
+                    max_cycles: Some(2),
+                    captures_evidence: true,
+                },
+                warden_core::WorkflowStepWire {
+                    index: 2,
+                    id: "verification".to_string(),
+                    kind: "command".to_string(),
+                    on_clean: "converged".to_string(),
+                    on_blocking: "remediation".to_string(),
+                    on_error: "failed".to_string(),
+                    max_cycles: None,
+                    captures_evidence: false,
+                },
+            ],
+        },
+        "2026-07-12T00:00:01+00:00",
+    )
+    .await;
+    insert_event(
+        &pool,
+        "e3",
+        &RunEvent::AgentStarted {
+            role: "implementation".to_string(),
+        },
+        "2026-07-12T00:00:02+00:00",
+    )
+    .await;
+    insert_event(
+        &pool,
+        "e4",
+        &RunEvent::RunFinished {
+            final_state: "failed".to_string(),
+        },
+        "2026-07-12T00:00:03+00:00",
+    )
+    .await;
+
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+
+    let (status, lines, stderr) = run_attach_cli_raw("run-1", &db_path, &warden_home).await;
+    assert!(status.success(), "warden-tui attach must exit 0: {stderr}");
+
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        parsed.iter().all(|line| line.get("undecodable").is_none()),
+        "no row may degrade to undecodable: {parsed:?}"
+    );
+
+    let graph = &parsed[1]["event"];
+    assert_eq!(graph["kind"], "workflow_resolved");
+    assert_eq!(graph["name"], "quality-loop");
+    assert_eq!(graph["entry"], 0);
+    let steps = graph["steps"].as_array().unwrap();
+    assert_eq!(
+        steps.len(),
+        3,
+        "the whole declared graph must survive the replay: {steps:?}"
+    );
+    assert_eq!(steps[1]["id"], "remediation");
+    assert_eq!(
+        steps[1]["max_cycles"], 2,
+        "a step's own budget must survive the replay"
+    );
+    assert_eq!(steps[1]["captures_evidence"], true);
+    assert_eq!(steps[2]["kind"], "command");
+    assert_eq!(steps[2]["on_blocking"], "remediation");
+
+    // Only `implementation` ever started -- the other two are still knowable purely from the graph.
+    let started: Vec<&serde_json::Value> = parsed
+        .iter()
+        .filter(|line| line["event"]["kind"] == "agent_started")
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["event"]["role"], "implementation");
+}
+
 #[tokio::test]
 async fn attach_cli_headless_surfaces_undecodable_rows_as_tagged_ndjson_lines_and_stderr_warnings()
 {

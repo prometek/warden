@@ -289,6 +289,16 @@ pub enum WardenError {
         agent_steps: usize,
         step_agents: usize,
     },
+
+    /// Issue #107: resolving a `RunEvent::WorkflowResolved` wire event found a `StepTarget::Step`
+    /// index past the end of `Workflow::steps`. `Workflow::parse_yaml`'s own `parse_target` never
+    /// produces such an index, so this only fires for a `Workflow` built by hand, bypassing that
+    /// parser -- surfaced as a typed error rather than an out-of-bounds panic.
+    #[error(
+        "workflow step transition targets step index {index}, but the workflow only declares \
+         {declared_steps} step(s)"
+    )]
+    InvalidWorkflowStepTarget { index: u32, declared_steps: usize },
 }
 
 pub type Result<T> = std::result::Result<T, WardenError>;
