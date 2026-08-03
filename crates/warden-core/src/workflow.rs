@@ -456,6 +456,21 @@ steps:
         assert!(Workflow::parse_yaml(&path).is_err());
     }
 
+    /// A published workflow graph (issue #107) encodes each transition as either a step id or the
+    /// bare strings `"converged"` / `"failed"`. That encoding is only unambiguous because no step
+    /// may ever be *named* after a terminal -- pin it here, at the parser that guarantees it.
+    #[test]
+    fn a_step_may_never_be_named_after_a_terminal_transition_target() {
+        for terminal in ["converged", "failed"] {
+            let raw = VALID.replace("  review:\n", &format!("  {terminal}:\n"));
+            let error = Workflow::parse_yaml(&raw)
+                .expect_err("a step named after a terminal must be rejected")
+                .to_string();
+            assert!(error.contains(terminal), "{error}");
+            assert!(error.contains("reserved"), "{error}");
+        }
+    }
+
     #[test]
     fn step_transitions_cover_every_outcome() {
         let workflow = Workflow::parse_yaml(VALID).unwrap();

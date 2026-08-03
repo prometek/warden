@@ -560,4 +560,60 @@ mod tests {
             ))
         );
     }
+
+    /// The variant's whole point is to carry *data*, decoupled from `crate::workflow`'s own types:
+    /// a reader that knows nothing about `StepTarget`, `Role` or `StepKind` -- an older
+    /// `warden-tui`, or anything reading the `events` table with `jq` -- must still be able to walk
+    /// every field. Pin the flat, string-keyed encoding: a transition is a bare string, never a
+    /// nested enum tag like `{"Step":1}`, and no field is dropped.
+    #[test]
+    fn workflow_resolved_encodes_as_plain_json_readable_without_any_warden_type() {
+        let json = serde_json::to_string(&sample(EventKind::WorkflowResolved)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["kind"], "workflow_resolved");
+        assert!(value["name"].is_string());
+        assert!(value["entry"].is_u64());
+
+        let steps = value["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        for step in steps {
+            let object = step.as_object().unwrap();
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "captures_evidence",
+                    "id",
+                    "index",
+                    "kind",
+                    "max_cycles",
+                    "on_blocking",
+                    "on_clean",
+                    "on_error",
+                ],
+                "the wire shape must stay flat and complete: {step}"
+            );
+            assert!(step["index"].is_u64());
+            assert!(step["id"].is_string());
+            assert!(step["kind"].is_string());
+            assert!(step["captures_evidence"].is_boolean());
+            for transition in ["on_clean", "on_blocking", "on_error"] {
+                assert!(
+                    step[transition].is_string(),
+                    "{transition} must be a bare string, not a tagged enum: {step}"
+                );
+            }
+            assert!(
+                step["max_cycles"].is_u64() || step["max_cycles"].is_null(),
+                "an absent step budget must be null, never an omitted key: {step}"
+            );
+        }
+
+        assert_eq!(steps[0]["kind"], "agent");
+        assert_eq!(steps[0]["max_cycles"], serde_json::Value::Null);
+        assert_eq!(steps[1]["on_clean"], "converged");
+        assert_eq!(steps[1]["max_cycles"], 3);
+    }
 }
