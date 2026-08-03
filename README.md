@@ -12,7 +12,7 @@ Warden has no default workflow and no built-in `coder`, `reviewer`, or `tester` 
 - Per-step worktree isolation or Docker isolation
 - Optional CPU, memory, and proxy-controlled Docker egress
 - Durable state, crash cleanup, quota resumption, CI gating, and terminal UI
-- Repository-defined agent prompts under `.warden/agents/`
+- Agent prompts beside selected workflow
 
 ## Requirements
 
@@ -80,7 +80,7 @@ warden run \
   --max-cycles 5
 ```
 
-`.warden/workflow.yaml` is mandatory. Missing agent definitions fail with their expected path; Warden never supplies hidden prompts or tool grants.
+Warden first reads `<repo>/.warden/workflow.yaml`, then falls back to `~/.warden/workflow.yaml`. `--warden-home` replaces `~/.warden` for both state and user workflow configuration. Missing agent definitions fail with their expected path; Warden never supplies hidden prompts or tool grants.
 
 ## Workflow model
 
@@ -88,7 +88,7 @@ Every step has an arbitrary identifier. `entry` selects the first step, independ
 
 Step types:
 
-- `agent`: references `.warden/agents/<agent>.md`. Any agent step may create a commit.
+- `agent`: references `agents/<agent>.md` beside selected workflow. Any agent step may create a commit.
 - `command`: runs `run` through the selected isolation backend. Exit `0` is `clean`; non-zero is `blocking`.
 
 Every step declares all transitions:
@@ -118,6 +118,18 @@ All agent steps receive the same versioned JSON payload:
 Agent output is NDJSON. A blocking finding follows `on_blocking`; malformed output or process failure follows `on_error`.
 
 See [workflow examples](examples/workflows/).
+
+## User workflow
+
+For a reusable local workflow, keep both files under `~/.warden`:
+
+```text
+~/.warden/workflow.yaml
+~/.warden/agents/implementer.md
+~/.warden/agents/reviewer.md
+```
+
+Repository configuration always takes priority. This fallback is your configuration, never a Warden-provided workflow.
 
 ## Isolation
 

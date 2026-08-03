@@ -47,27 +47,70 @@ pub(crate) fn resolve_tui_binary(explicit: Option<PathBuf>) -> PathBuf {
     PathBuf::from(format!("warden-tui{}", std::env::consts::EXE_SUFFIX))
 }
 
-/// Relative path `.warden/workflow.yaml` resolves against a run's repo -- mirrors
-/// `agent_def::AGENTS_DIR`'s own convention of a dotfile under the repo root.
-const WORKFLOW_FILE: &str = ".warden/workflow.yaml";
+const USER_WORKFLOW_FILE: &str = "workflow.yaml";
 
-async fn load_workflow(repo: &std::path::Path) -> anyhow::Result<warden_core::Workflow> {
-    let workflow_path = repo.join(WORKFLOW_FILE);
+struct LoadedWorkflow {
+    workflow: warden_core::Workflow,
+    definitions_root: PathBuf,
+    repository_agent_definitions: bool,
+}
+
+async fn parse_workflow(
+    workflow_path: PathBuf,
+    definitions_root: PathBuf,
+    repository_agent_definitions: bool,
+) -> anyhow::Result<LoadedWorkflow> {
     match tokio::fs::read_to_string(&workflow_path).await {
-        Ok(raw) => warden_core::Workflow::parse_yaml(&raw)
-            .with_context(|| format!("invalid workflow file at {}", workflow_path.display())),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Err(source).with_context(|| {
-            format!(
-                "workflow file is required at {} (copy an example and define explicit entry/transitions)",
-                workflow_path.display()
-            )
+        Ok(raw) => Ok(LoadedWorkflow {
+            workflow: warden_core::Workflow::parse_yaml(&raw)
+                .with_context(|| format!("invalid workflow file at {}", workflow_path.display()))?,
+            definitions_root,
+            repository_agent_definitions,
         }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Err(source).with_context(|| {
+                format!(
+                    "workflow file does not exist at {}",
+                    workflow_path.display()
+                )
+            })
+        }
         Err(source) => Err(source).with_context(|| {
             format!(
                 "failed to read workflow file at {}",
                 workflow_path.display()
             )
         }),
+    }
+}
+
+async fn load_workflow(
+    repo: &std::path::Path,
+    warden_home: &std::path::Path,
+) -> anyhow::Result<LoadedWorkflow> {
+    let repository_root = repo.join(".warden");
+    let repository_workflow = repository_root.join("workflow.yaml");
+    match parse_workflow(repository_workflow.clone(), repository_root, true).await {
+        Ok(workflow) => Ok(workflow),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let user_workflow = warden_home.join(USER_WORKFLOW_FILE);
+            match parse_workflow(user_workflow.clone(), warden_home.to_path_buf(), false).await {
+                Ok(workflow) => Ok(workflow),
+                Err(user_error) if user_error.downcast_ref::<std::io::Error>().is_some_and(|source| {
+                    source.kind() == std::io::ErrorKind::NotFound
+                }) => bail!(
+                    "workflow file is required at {} or {} (copy an example and define explicit entry/transitions)",
+                    repository_workflow.display(),
+                    user_workflow.display(),
+                ),
+                Err(user_error) => Err(user_error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -286,7 +329,8 @@ async fn run_foreground(
         });
     }
 
-    let workflow = load_workflow(&repo).await?;
+    let loaded_workflow = load_workflow(&repo, &warden_home).await?;
+    let workflow = loaded_workflow.workflow;
 
     let mut step_agents = Vec::with_capacity(workflow.steps.len());
     for step in &workflow.steps {
@@ -294,15 +338,19 @@ async fn run_foreground(
             continue;
         }
         let agent_name = step.agent.as_deref().expect("validated agent step");
-        let definition = resolve_agent_definition(&repo, step.role.as_str(), agent_name)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to resolve workflow step {:?} agent {:?}",
-                    step.role.as_str(),
-                    agent_name
-                )
-            })?;
+        let definition = resolve_agent_definition(
+            &loaded_workflow.definitions_root,
+            step.role.as_str(),
+            agent_name,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resolve workflow step {:?} agent {:?}",
+                step.role.as_str(),
+                agent_name
+            )
+        })?;
         step_agents.push(definition);
     }
 
@@ -328,6 +376,7 @@ async fn run_foreground(
         max_cycles,
         workflow,
         step_agents,
+        repository_agent_definitions: loaded_workflow.repository_agent_definitions,
         evidence_tool,
         evidence_store_in_repo,
         gate,

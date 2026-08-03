@@ -4,14 +4,14 @@ use warden_core::{parse_agent_definition, AgentDefinition};
 
 use crate::error::{AgentDefinitionError, Result};
 
-pub(crate) const AGENTS_DIR: &str = ".warden/agents";
+pub(crate) const AGENTS_DIR: &str = "agents";
 
 pub async fn resolve_agent_definition(
-    repo_path: &Path,
+    definitions_root: &Path,
     role_name: &str,
     agent_name: &str,
 ) -> Result<AgentDefinition> {
-    let path = definition_path(repo_path, agent_name);
+    let path = definition_path(definitions_root, agent_name);
     match tokio::fs::read_to_string(&path).await {
         Ok(raw) => parse_agent_definition(&raw)
             .map_err(|source| AgentDefinitionError::Invalid { path, source }.into()),
@@ -26,8 +26,10 @@ pub async fn resolve_agent_definition(
     }
 }
 
-fn definition_path(repo_path: &Path, agent_name: &str) -> PathBuf {
-    repo_path.join(AGENTS_DIR).join(format!("{agent_name}.md"))
+fn definition_path(definitions_root: &Path, agent_name: &str) -> PathBuf {
+    definitions_root
+        .join(AGENTS_DIR)
+        .join(format!("{agent_name}.md"))
 }
 
 #[derive(Debug, Clone)]
@@ -55,8 +57,11 @@ impl PartialEq for RawDefinition {
 
 impl Eq for RawDefinition {}
 
-pub(crate) async fn read_raw_definition(repo_path: &Path, agent_name: &str) -> RawDefinition {
-    let path = definition_path(repo_path, agent_name);
+pub(crate) async fn read_raw_definition(
+    definitions_root: &Path,
+    agent_name: &str,
+) -> RawDefinition {
+    let path = definition_path(definitions_root, agent_name);
     match tokio::fs::read(&path).await {
         Ok(bytes) => RawDefinition::Present(bytes),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => RawDefinition::Absent,
@@ -96,6 +101,6 @@ mod tests {
         let error = resolve_agent_definition(repo.path(), "audit", "security")
             .await
             .unwrap_err();
-        assert!(error.to_string().contains(".warden/agents/security.md"));
+        assert!(error.to_string().contains("agents/security.md"));
     }
 }

@@ -122,7 +122,7 @@ struct StepInvocation<'a> {
     worktree_manager: &'a WorktreeManager,
     commit: &'a str,
     run_base_commit: &'a str,
-    run_agent_definition_snapshot: &'a AgentDefinitionSnapshot,
+    run_agent_definition_snapshot: Option<&'a AgentDefinitionSnapshot>,
     prior_findings: &'a [Finding],
     cancel: CancellationToken,
 }

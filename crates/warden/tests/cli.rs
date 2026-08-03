@@ -39,6 +39,11 @@ fn write_workflow(repo: &Path, raw: &str) {
     std::fs::write(repo.join(".warden/workflow.yaml"), raw).unwrap();
 }
 
+fn write_user_workflow(warden_home: &Path, raw: &str) {
+    std::fs::create_dir_all(warden_home).unwrap();
+    std::fs::write(warden_home.join("workflow.yaml"), raw).unwrap();
+}
+
 fn warden() -> Command {
     Command::new(env!("CARGO_BIN_EXE_warden"))
 }
@@ -120,6 +125,90 @@ steps:
         .stdout(contains("finished: Converged"));
 }
 
+#[test]
+fn user_workflow_is_used_when_repository_has_none() {
+    let repo = init_repo();
+    let home = TempDir::new().unwrap();
+    write_user_workflow(
+        home.path(),
+        r#"
+name: global-checks
+entry: check
+steps:
+  check:
+    type: command
+    run: test -f README.md
+    on_clean: converged
+    on_blocking: failed
+    on_error: failed
+"#,
+    );
+    warden()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "validate",
+            "--warden-home",
+            home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+}
+
+#[test]
+fn repository_workflow_overrides_user_workflow() {
+    let repo = init_repo();
+    let home = TempDir::new().unwrap();
+    write_user_workflow(
+        home.path(),
+        r#"
+name: global-failure
+entry: check
+steps:
+  check:
+    type: command
+    run: false
+    on_clean: converged
+    on_blocking: failed
+    on_error: failed
+"#,
+    );
+    write_workflow(
+        repo.path(),
+        r#"
+name: local-success
+entry: check
+steps:
+  check:
+    type: command
+    run: test -f README.md
+    on_clean: converged
+    on_blocking: failed
+    on_error: failed
+"#,
+    );
+    warden()
+        .args([
+            "run",
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--intent",
+            "validate",
+            "--warden-home",
+            home.path().to_str().unwrap(),
+            "--tool",
+            "claude",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("finished: Converged"));
+}
+
 #[cfg(unix)]
 #[test]
 fn arbitrary_agent_step_receives_uniform_context_and_may_create_commit() {
@@ -129,8 +218,8 @@ fn arbitrary_agent_step_receives_uniform_context_and_may_create_commit() {
     let state_home = TempDir::new().unwrap();
     let agent_home = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
-    write_workflow(
-        repo.path(),
+    write_user_workflow(
+        state_home.path(),
         r#"
 name: arbitrary
 entry: implementation
@@ -143,9 +232,9 @@ steps:
     on_error: failed
 "#,
     );
-    std::fs::create_dir_all(repo.path().join(".warden/agents")).unwrap();
+    std::fs::create_dir_all(state_home.path().join("agents")).unwrap();
     std::fs::write(
-        repo.path().join(".warden/agents/writer.md"),
+        state_home.path().join("agents/writer.md"),
         "---\ntools: Read, Write, Edit, Bash\n---\nImplement requested change.\n",
     )
     .unwrap();

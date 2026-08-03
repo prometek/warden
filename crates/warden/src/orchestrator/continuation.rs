@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 
-const CHECKPOINT_VERSION: u32 = 3;
+const CHECKPOINT_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +17,7 @@ struct RunConfigCheckpoint {
     max_cycles: u32,
     workflow: WorkflowCheckpoint,
     step_agents: Vec<AgentDefinitionCheckpoint>,
+    repository_agent_definitions: bool,
     evidence_tool: Option<String>,
     evidence_store_in_repo: bool,
     gate: Option<GateConfigCheckpoint>,
@@ -137,6 +138,7 @@ pub(super) fn encode_run_config(
             .iter()
             .map(AgentDefinitionCheckpoint::from)
             .collect(),
+        repository_agent_definitions: config.repository_agent_definitions,
         evidence_tool: config.evidence_tool.map(|tool| tool.as_str().to_string()),
         evidence_store_in_repo: config.evidence_store_in_repo,
         gate: config
@@ -220,6 +222,7 @@ pub(super) fn decode_run(run_id: &str, config_json: &str, state_json: &str) -> R
         max_cycles: config.max_cycles,
         workflow,
         step_agents,
+        repository_agent_definitions: config.repository_agent_definitions,
         evidence_tool: config
             .evidence_tool
             .as_deref()

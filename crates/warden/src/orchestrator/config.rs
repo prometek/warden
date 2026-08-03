@@ -70,6 +70,7 @@ pub struct RunConfig {
     pub workflow: Workflow,
     /// One resolved definition per agent step, in workflow order.
     pub step_agents: Vec<AgentDefinition>,
+    pub repository_agent_definitions: bool,
     /// Overrides automatic project-type detection for the Evidence Capture Adapter.
     pub evidence_tool: Option<EvidenceTool>,
     /// Whether captured evidence gets committed into `.warden/evidence/` and pushed with the

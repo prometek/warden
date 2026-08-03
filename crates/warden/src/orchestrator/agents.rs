@@ -157,16 +157,18 @@ impl Orchestrator {
         if new_commit != commit {
             protect_cycle_commit(&config.repo_path, run_id, cycle_number, &new_commit).await?;
             db::set_cycle_commit_sha(&self.pool, cycle_id, &new_commit).await?;
-            if let Some(finding) = agent_definition_tampering_finding(
-                worktree_manager,
-                run_id,
-                &new_commit,
-                run_agent_definition_snapshot,
-            )
-            .await?
-            {
-                findings.push(finding);
-                step_outcome = warden_core::StepOutcome::Blocking;
+            if let Some(snapshot) = run_agent_definition_snapshot {
+                if let Some(finding) = agent_definition_tampering_finding(
+                    worktree_manager,
+                    run_id,
+                    &new_commit,
+                    snapshot,
+                )
+                .await?
+                {
+                    findings.push(finding);
+                    step_outcome = warden_core::StepOutcome::Blocking;
+                }
             }
         }
 

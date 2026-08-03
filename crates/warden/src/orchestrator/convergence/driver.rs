@@ -102,14 +102,20 @@ impl Orchestrator {
             .collect::<Vec<_>>();
         agent_names.sort();
         agent_names.dedup();
-        let definition_snapshot = AgentDefinitionSnapshot::capture(
-            &worktree_manager,
-            &run_id,
-            SNAPSHOT_WORKTREE_ROLE,
-            &run_base_commit_sha,
-            &agent_names,
-        )
-        .await?;
+        let definition_snapshot = if config.repository_agent_definitions {
+            Some(
+                AgentDefinitionSnapshot::capture(
+                    &worktree_manager,
+                    &run_id,
+                    SNAPSHOT_WORKTREE_ROLE,
+                    &run_base_commit_sha,
+                    &agent_names,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         if let Some((_, continuation)) = &restored {
             db::clear_run_rate_limit_status(&self.pool, &run_id).await?;
@@ -161,7 +167,7 @@ impl Orchestrator {
                 worktree_manager: &worktree_manager,
                 commit: &continuation.base_commit,
                 run_base_commit: &continuation.run_base_commit_sha,
-                run_agent_definition_snapshot: &definition_snapshot,
+                run_agent_definition_snapshot: definition_snapshot.as_ref(),
                 prior_findings: &prior_findings,
                 cancel: cancel.clone(),
             };

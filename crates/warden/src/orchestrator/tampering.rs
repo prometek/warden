@@ -21,7 +21,7 @@ impl AgentDefinitionSnapshot {
         for name in agent_names {
             definitions.insert(
                 name.clone(),
-                agent_def::read_raw_definition(worktree.path(), name).await,
+                agent_def::read_raw_definition(&worktree.path().join(".warden"), name).await,
             );
         }
         let snapshot = Self { definitions };
@@ -56,7 +56,7 @@ pub(super) async fn agent_definition_tampering_finding(
     for (name, original) in &run_start_snapshot.definitions {
         let now = &resolved_now.definitions[name];
         if now != original {
-            let path = format!("{}/{name}.md", agent_def::AGENTS_DIR);
+            let path = format!(".warden/{}/{name}.md", agent_def::AGENTS_DIR);
             if let agent_def::RawDefinition::Unreadable { message, .. } = now {
                 unreadable_details.push(format!("{path} ({message})"));
             }
