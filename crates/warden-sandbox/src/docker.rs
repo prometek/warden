@@ -1469,13 +1469,7 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..20 {
-            if container_exists(&container_name).await {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(container_exists(&container_name).await);
+        wait_for_container_to_appear(&container_name).await;
 
         drop(execution);
         assert_eq!(reclaim_run_containers(&run_id).await.unwrap(), 1);
@@ -1541,6 +1535,44 @@ mod tests {
         );
 
         sandbox.destroy(id).await.unwrap();
+    }
+
+    /// Blocks until `docker run` has registered `container_name` with the daemon.
+    ///
+    /// `execute` returns as soon as the `docker` child is spawned, so the
+    /// container is not visible to `docker ps` yet. Registration is normally a
+    /// couple of hundred milliseconds, but a cold daemon has been measured at
+    /// ~1.8s, and a loaded CI runner is slower still — hence a budget generous
+    /// enough that only a genuine failure can exhaust it. The happy path still
+    /// returns on the first poll that sees the container.
+    async fn wait_for_container_to_appear(container_name: &str) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let deadline = std::time::Instant::now() + BUDGET;
+        loop {
+            if container_exists(container_name).await {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+
+        // `docker run`'s own stderr is unreachable here: the child is owned by
+        // the unpolled `Execution` future. Report what the daemon can still be
+        // asked about, so a real failure is diagnosable from the CI log alone.
+        let listing = tokio::process::Command::new(DOCKER_BIN)
+            .args(["ps", "--all", "--format", "{{.Names}}\t{{.Status}}"])
+            .output()
+            .await
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|error| format!("<`docker ps` failed: {error}>"));
+        panic!(
+            "container `{container_name}` never appeared within {BUDGET:?}; \
+             `docker ps --all` reports:\n{listing}"
+        );
     }
 
     async fn container_exists(container_name: &str) -> bool {
