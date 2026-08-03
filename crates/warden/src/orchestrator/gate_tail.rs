@@ -163,7 +163,10 @@ impl Orchestrator {
             .await
         {
             tracing::warn!(run_id, reason, "policy blocked the push; failing the run");
-            self.transition(run_id, RunState::Failed).await?;
+            // `HookPoint::on_entering(Failed)` is `None`, so no hook fires here and there is no
+            // effect to enforce.
+            let _no_hook_point: TransitionEffect =
+                self.transition(run_id, RunState::Failed).await?;
             delete_gate_staging_ref(&gate_config.bare_repo_path, run_id).await;
             return Ok(PostConvergenceOutcome::Terminal(RunState::Failed));
         }
@@ -209,7 +212,10 @@ impl Orchestrator {
             })
             .await?;
 
-        self.transition(run_id, RunState::AwaitingCi).await?;
+        // `HookPoint::on_entering(AwaitingCi)` is `None`, so no hook fires here and there is no
+        // effect to enforce.
+        let _no_hook_point: TransitionEffect =
+            self.transition(run_id, RunState::AwaitingCi).await?;
 
         let outcome = self
             .await_and_apply_ci_result(run_id, &listener, gate_child)
@@ -252,7 +258,9 @@ impl Orchestrator {
         if run.state != RunState::AwaitingCi {
             return Ok(PostConvergenceOutcome::Terminal(run.state));
         }
-        self.transition(run_id, RunState::Failed).await?;
+        // `HookPoint::on_entering(Failed)` is `None`, so no hook fires here and there is no effect
+        // to enforce.
+        let _no_hook_point: TransitionEffect = self.transition(run_id, RunState::Failed).await?;
         Ok(PostConvergenceOutcome::Terminal(RunState::Failed))
     }
 

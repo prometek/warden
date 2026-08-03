@@ -48,9 +48,16 @@ impl Orchestrator {
             })
             .map_err(|_| WardenError::RunAlreadyInProgress)?;
 
-        // Every exit from this block -- whichever pre-loop hook blocks, whichever way the loop
-        // itself ends -- funnels through the single teardown/`RunFinished` tail right below it. No
-        // path may `return` out of the middle of this function; `break 'run` instead.
+        // Every *outcome* exit from this block -- whichever pre-loop hook blocks, whichever way the
+        // loop itself ends -- funnels through the single teardown/`RunFinished` tail right below
+        // it. No path may `return` a state out of the middle of this function; `break 'run`
+        // instead.
+        //
+        // `?` is the deliberate exception: an infrastructure error propagates straight out without
+        // teardown, leaving the run persisted in its intermediate state so crash recovery reclaims
+        // it on the next start (`RunState::is_intermediate`). That predates the #106 hook work and
+        // is unchanged by it -- see `a_hook_that_errors_aborts_the_run_with_an_error`, which pins
+        // the current behaviour.
         let final_state = 'run: {
             if restored.is_none() {
                 db::insert_run(

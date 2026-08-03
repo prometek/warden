@@ -486,6 +486,10 @@ impl Orchestrator {
 
 /// One [`Orchestrator::transition`] dispatch's result: the [`HookPoint`] that fired travels bundled
 /// with its outcome, so callers never re-derive `HookPoint::on_entering(to)` and assert it `Some`.
+/// `#[must_use]` on purpose: dropping a transition's effect on the floor is exactly the bug #106
+/// fixed. A caller that genuinely has nothing to enforce -- because the target state maps to no
+/// hook point -- must say so explicitly rather than by omission.
+#[must_use]
 enum TransitionEffect {
     /// No hook returned anything but `Continue` -- either none fired, or every one that did was a
     /// no-op.
