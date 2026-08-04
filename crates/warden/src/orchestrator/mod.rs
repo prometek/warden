@@ -336,20 +336,21 @@ impl Orchestrator {
             created_at: Utc::now().to_rfc3339(),
         };
         context.event_bus.publish(&record);
-        context.progress_writer.record(&record);
+        // Moved, not cloned: publication is done with it, and this runs once per agent turn.
+        context.progress_writer.record(record);
     }
 
-    /// Opens a fresh per-step persisted-progress budget (see
-    /// [`crate::progress_writer::MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP`]).
-    fn begin_progress_step(&self) {
+    /// Opens a fresh persisted-progress budget for one agent invocation (see
+    /// [`crate::progress_writer::MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION`]).
+    fn begin_progress_invocation(&self) {
         if let Some(context) = self.run_context.get() {
-            context.progress_writer.begin_step();
+            context.progress_writer.begin_invocation();
         }
     }
 
-    /// Waits until every progress event queued so far is written. Called at the end of a step,
-    /// **before** `AgentFinished` is persisted, so a replay reads a step's progress where it
-    /// happened rather than after the step that produced it had already ended.
+    /// Waits until every progress event queued so far is written. Called at the end of an agent
+    /// invocation, **before** `AgentFinished` is persisted, so a replay reads an invocation's
+    /// progress where it happened rather than after the step that produced it had already ended.
     async fn flush_progress(&self) {
         if let Some(context) = self.run_context.get() {
             context.progress_writer.flush().await;

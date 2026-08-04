@@ -5,8 +5,8 @@
 //! Everything here drives the **real `warden` binary** against a **real SQLite database**, with a
 //! fake `claude` emitting real `stream-json` lines, and then replays that database through
 //! `warden-tui`'s own real reader. The volume scenario is deliberately louder than any unit test
-//! would be (`LOUD_LINE_COUNT` assistant turns in one step): the per-step cap only means anything
-//! against a run that actually exceeds it.
+//! would be (`LOUD_LINE_COUNT` assistant turns per invocation): the per-invocation cap only means
+//! anything against a run that actually exceeds it.
 
 #![cfg(unix)]
 
@@ -17,13 +17,13 @@ use assert_cmd::Command;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
-use warden::progress_writer::MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP;
+use warden::progress_writer::MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION;
 use warden_core::{ProgressReplay, RunEvent};
 use warden_tui::model::RunModel;
 
 /// How many assistant turns the loud agent emits per invocation -- comfortably past the cap, so the
 /// cap is really exercised rather than merely defined.
-const LOUD_LINE_COUNT: u32 = MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP + 120;
+const LOUD_LINE_COUNT: u32 = MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION + 120;
 
 const SINGLE_AGENT_WORKFLOW: &str = r#"
 name: e2e-progress
@@ -56,7 +56,7 @@ git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "$role
 printf '%s\n' '{"result":""}'
 "#;
 
-/// Same, but loud enough to blow past the per-step cap. Each turn is uniquely numbered so the
+/// Same, but loud enough to blow past the per-invocation cap. Each turn is uniquely numbered so the
 /// persisted sequence can be checked against the emitted one, position by position.
 const LOUD_AGENT: &str = r#"#!/bin/sh
 set -eu
@@ -71,6 +71,34 @@ echo "$role" > "out-$role.txt"
 git add -A
 git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "$role"
 printf '%s\n' '{"result":""}'
+"#;
+
+/// Loud on **every** invocation, and blocking on the first one only: the workflow's
+/// `on_blocking: implementation` sends the convergence loop straight back into the same step, so the
+/// same step is invoked twice in one run. The committed marker is what tells the two apart -- cycle
+/// 2's worktree is checked out at cycle 1's commit.
+const LOUD_RELOOPING_AGENT: &str = r#"#!/bin/sh
+set -eu
+payload=$(cat)
+role=$(printf '%s' "$payload" | sed -n 's/.*"role":"\([^"]*\)".*/\1/p')
+if [ -f "cycle-1-done.txt" ]; then
+  cycle=2
+else
+  cycle=1
+fi
+i=1
+while [ "$i" -le LINE_COUNT ]; do
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"cycle-%s-turn-%s"}]}}\n' "$cycle" "$i"
+  i=$(( i + 1 ))
+done
+if [ "$cycle" -eq 1 ]; then
+  echo "$role" > "cycle-1-done.txt"
+  git add -A
+  git -c user.email=test@warden.local -c user.name=warden-test commit -q -m "$role"
+  printf '%s\n' '{"result":"{\"source\":\"implementation\",\"severity\":\"blocking\",\"description\":\"one more pass\"}"}'
+else
+  printf '%s\n' '{"result":""}'
+fi
 "#;
 
 /// A converged run of the real binary, plus the temporary directories that must outlive it.
@@ -297,10 +325,10 @@ async fn a_steps_progress_is_flushed_before_its_agent_finished_row() {
 }
 
 /// Acceptance criterion 5: the volume policy applied to a run that really is loud. The cap holds,
-/// what is kept is the *beginning* of the step (its order preserved), and the run converges exactly
-/// as it would have without any of this.
+/// what is kept is the *beginning* of the invocation (its order preserved), and the run converges
+/// exactly as it would have without any of this.
 #[tokio::test]
-async fn a_loud_step_is_capped_without_changing_the_runs_outcome() {
+async fn a_loud_invocation_is_capped_without_changing_the_runs_outcome() {
     let script = LOUD_AGENT.replace("LINE_COUNT", &LOUD_LINE_COUNT.to_string());
     let run = real_converged_run(&script);
     let pool = open(&run.db_path).await;
@@ -316,15 +344,15 @@ async fn a_loud_step_is_capped_without_changing_the_runs_outcome() {
     let details = progress_details(&replayed);
     assert_eq!(
         details.len() as u32,
-        MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP,
-        "a step louder than the cap must persist exactly the cap, never more"
+        MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION,
+        "an invocation louder than the cap must persist exactly the cap, never more"
     );
-    let expected: Vec<String> = (1..=MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP)
+    let expected: Vec<String> = (1..=MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION)
         .map(|turn| format!("message: turn-{turn}"))
         .collect();
     assert_eq!(
         details, expected,
-        "what survives the cap is the head of the step, still in publication order"
+        "what survives the cap is the head of the invocation, still in publication order"
     );
 
     let model_events = {
@@ -342,7 +370,56 @@ async fn a_loud_step_is_capped_without_changing_the_runs_outcome() {
         model.events().len()
     };
     assert!(
-        model_events > MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP as usize,
+        model_events > MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION as usize,
         "the TUI model must ingest the capped history whole, not choke on it: {model_events}"
+    );
+}
+
+/// The budget is per agent *invocation*, and `run_agent` -- where it is opened -- is re-entered for
+/// the same step on every cycle the convergence loop reboucles into. So a step that loops twice may
+/// persist twice the cap, and a run's real bound is `cap * invocations`, not `cap` alone. Nothing
+/// else in this suite invokes the same step twice, so nothing else would notice if a future change
+/// made the budget per `(run, step)` -- silently halving what a reboucling run replays.
+#[tokio::test]
+async fn each_invocation_of_a_reboucling_step_gets_the_whole_cap_again() {
+    let script = LOUD_RELOOPING_AGENT.replace("LINE_COUNT", &LOUD_LINE_COUNT.to_string());
+    let run = real_converged_run(&script);
+    let pool = open(&run.db_path).await;
+    let run_id = only_run_id(&pool).await;
+
+    assert_eq!(
+        final_state(&pool, &run_id).await,
+        "converged",
+        "cycle 1 blocks, cycle 2 comes back clean"
+    );
+
+    let replayed = replay(&run.db_path, &run_id, ProgressReplay::Included).await;
+    let bracket_count = kinds(&replayed)
+        .iter()
+        .filter(|kind| **kind == "agent_started")
+        .count();
+    assert_eq!(
+        bracket_count,
+        2,
+        "precondition of this test: the same step must really have been invoked twice: {:?}",
+        kinds(&replayed)
+    );
+
+    let details = progress_details(&replayed);
+    let expected: Vec<String> = [1, 2]
+        .into_iter()
+        .flat_map(|cycle| {
+            (1..=MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION)
+                .map(move |turn| format!("message: cycle-{cycle}-turn-{turn}"))
+        })
+        .collect();
+    assert_eq!(
+        details.len() as u32,
+        2 * MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION,
+        "two loud invocations must persist two full caps, not one shared between them"
+    );
+    assert_eq!(
+        details, expected,
+        "each invocation keeps its own head, in publication order, in its own cycle"
     );
 }

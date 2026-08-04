@@ -68,6 +68,15 @@ async fn run_attach_cli_raw(
     db_path: &Path,
     warden_home: &Path,
 ) -> (std::process::ExitStatus, Vec<String>, String) {
+    run_attach_cli_raw_with_args(run_id, db_path, warden_home, &[]).await
+}
+
+async fn run_attach_cli_raw_with_args(
+    run_id: &str,
+    db_path: &Path,
+    warden_home: &Path,
+    extra_args: &[&str],
+) -> (std::process::ExitStatus, Vec<String>, String) {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_warden-tui"));
     command
         .args(["attach", "--run-id", run_id])
@@ -75,6 +84,7 @@ async fn run_attach_cli_raw(
         .arg(db_path)
         .arg("--warden-home")
         .arg(warden_home)
+        .args(extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -394,6 +404,128 @@ async fn attach_cli_replays_the_recorded_workflow_graph_including_never_started_
         .collect();
     assert_eq!(started.len(), 1, "{started:?}");
     assert_eq!(started[0]["event"]["role"], "implementation");
+}
+
+/// Seeds one finished run whose step reported progress. The three progress rows deliberately share
+/// a single `created_at` and are inserted in an order no `id` comparison would reproduce: publication
+/// order here is insertion order and nothing else (issue #108).
+async fn seed_run_with_progress(pool: &SqlitePool) {
+    insert_event(
+        pool,
+        "e1",
+        &RunEvent::AgentStarted {
+            role: "implementation".to_string(),
+        },
+        "2026-08-04T00:00:00+00:00",
+    )
+    .await;
+    let tied = "2026-08-04T00:00:01+00:00";
+    for (id, detail) in [
+        ("p-c", "message: reading src/lib.rs"),
+        ("p-a", "tool_use: Edit"),
+        ("p-b", "message: running cargo test"),
+    ] {
+        insert_event(
+            pool,
+            id,
+            &RunEvent::AgentProgress {
+                role: "implementation".to_string(),
+                detail: detail.to_string(),
+            },
+            tied,
+        )
+        .await;
+    }
+    insert_event(
+        pool,
+        "e2",
+        &RunEvent::AgentFinished {
+            role: "implementation".to_string(),
+            exit_code: 0,
+            usage: None,
+        },
+        "2026-08-04T00:00:02+00:00",
+    )
+    .await;
+    insert_event(
+        pool,
+        "e3",
+        &RunEvent::RunFinished {
+            final_state: "converged".to_string(),
+        },
+        "2026-08-04T00:00:03+00:00",
+    )
+    .await;
+}
+
+/// Issue #108: a default attach is exactly as cheap as it was before progress was persisted -- the
+/// flag has to be asked for. Pinned through the real binary, since the `bool` -> `ProgressReplay`
+/// mapping lives in `main.rs` and nothing else exercises it.
+#[tokio::test]
+async fn attach_cli_omits_agent_progress_from_the_ndjson_dump_by_default() {
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+    seed_run_with_progress(&pool).await;
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+
+    let (status, records) = run_attach_cli("run-1", &db_path, &warden_home).await;
+
+    assert!(status.success(), "warden-tui attach must exit 0");
+    let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["e1", "e2", "e3"],
+        "no agent_progress line may reach stdout without --include-progress"
+    );
+}
+
+/// The other half of the same seam: with the flag, the elapsed progress comes back interleaved where
+/// it was published -- insertion order for the tied `created_at`, never `id` order.
+#[tokio::test]
+async fn attach_cli_include_progress_emits_progress_in_publication_order() {
+    let dir = TempDir::new().unwrap();
+    let (db_path, pool) = seeded_db(dir.path()).await;
+    seed_run_with_progress(&pool).await;
+    let warden_home = dir.path().join("warden_home");
+    tokio::fs::create_dir_all(warden_home.join("runs"))
+        .await
+        .unwrap();
+
+    let (status, lines, stderr) =
+        run_attach_cli_raw_with_args("run-1", &db_path, &warden_home, &["--include-progress"])
+            .await;
+
+    assert!(status.success(), "warden-tui attach must exit 0: {stderr}");
+    let records: Vec<RunEventRecord> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["e1", "p-c", "p-a", "p-b", "e2", "e3"],
+        "--include-progress must replay progress where it was published, in insertion order"
+    );
+
+    let details: Vec<&str> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            RunEvent::AgentProgress { detail, .. } => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        details,
+        vec![
+            "message: reading src/lib.rs",
+            "tool_use: Edit",
+            "message: running cargo test",
+        ],
+        "every progress row must decode, not degrade to an undecodable line"
+    );
 }
 
 #[tokio::test]

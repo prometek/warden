@@ -11,6 +11,18 @@ pub struct RunModel {
     seen_ids: std::collections::HashSet<String>,
     events: Vec<RunEventRecord>,
     undecodable: Vec<UndecodableEvent>,
+    applied: Vec<AppliedRow>,
+}
+
+/// Where one applied row lives, recorded in application order.
+///
+/// Decoded and undecodable rows are kept in two separate vectors (`events()` hands out a
+/// `&[RunEventRecord]`), which loses their *relative* order; this is what [`RunModel::history`]
+/// merges them back by (issue #108).
+#[derive(Debug, Clone, Copy)]
+enum AppliedRow {
+    Event(usize),
+    Undecodable(usize),
 }
 
 impl RunModel {
@@ -22,6 +34,7 @@ impl RunModel {
         if !self.seen_ids.insert(record.id.clone()) {
             return false;
         }
+        self.applied.push(AppliedRow::Event(self.events.len()));
         self.events.push(record);
         true
     }
@@ -32,6 +45,8 @@ impl RunModel {
         if !self.seen_ids.insert(event.id.clone()) {
             return false;
         }
+        self.applied
+            .push(AppliedRow::Undecodable(self.undecodable.len()));
         self.undecodable.push(event);
         true
     }
@@ -63,14 +78,25 @@ impl RunModel {
         &self.undecodable
     }
 
+    /// Every applied row -- decoded and undecodable alike -- oldest first.
+    ///
+    /// Ordered on `created_at` **alone**, over a list already in application order, with a *stable*
+    /// sort: two rows sharing a `created_at` therefore keep the order they were applied in, which is
+    /// the order they were published in (`warden_tui::db::list_events_for_run` replays
+    /// `created_at ASC, rowid ASC`, and live events are applied after the replay). Tie-breaking on
+    /// `id` here would undo exactly that -- a real event id is a random UUID v4 (issue #108).
     pub fn history(&self) -> Vec<HistoryItem<'_>> {
         let mut items: Vec<HistoryItem> = self
-            .events
+            .applied
             .iter()
-            .map(HistoryItem::Event)
-            .chain(self.undecodable.iter().map(HistoryItem::Undecodable))
+            .map(|row| match *row {
+                AppliedRow::Event(index) => HistoryItem::Event(&self.events[index]),
+                AppliedRow::Undecodable(index) => {
+                    HistoryItem::Undecodable(&self.undecodable[index])
+                }
+            })
             .collect();
-        items.sort_by_key(|item| (item.created_at(), item.id()));
+        items.sort_by_key(|item| item.created_at());
         items
     }
 
@@ -406,7 +432,9 @@ impl<'a> HistoryItem<'a> {
         }
     }
 
-    fn id(self) -> &'a str {
+    /// This row's `events.id`, whichever kind of row it is. No longer part of [`RunModel::history`]'s
+    /// ordering (issue #108) -- publication order is `created_at` plus insertion order, never `id`.
+    pub fn id(self) -> &'a str {
         match self {
             HistoryItem::Event(record) => &record.id,
             HistoryItem::Undecodable(event) => &event.id,
@@ -688,6 +716,66 @@ mod tests {
 
         let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
         assert_eq!(ids, vec!["e1", "e2", "e3"]);
+    }
+
+    /// Issue #108, acceptance criterion 1 ("in the order they were published") at the only layer a
+    /// user sees: both replay paths (the NDJSON dump and the fullscreen log) render `history()`, so
+    /// a tie-break on `id` here would undo the `rowid ASC` tie-break the SQL layer applies -- a real
+    /// event id is a random UUID v4. `e2` is applied *first* on purpose: an `id`-ordered fallback
+    /// would swap the two.
+    #[test]
+    fn history_keeps_rows_sharing_a_created_at_in_the_order_they_were_applied() {
+        let tied = "2026-08-04T00:00:00+00:00";
+        let mut model = RunModel::new();
+        for id in ["e2", "e1"] {
+            model.apply(RunEventRecord {
+                id: id.to_string(),
+                run_id: "run-1".to_string(),
+                event: RunEvent::AgentProgress {
+                    role: "implementation".to_string(),
+                    detail: format!("detail of {id}"),
+                },
+                created_at: tied.to_string(),
+            });
+        }
+        // A live event landing at the very same instant belongs *after* the replayed ones.
+        model.apply(RunEventRecord {
+            id: "e0-live".to_string(),
+            run_id: "run-1".to_string(),
+            event: RunEvent::AgentFinished {
+                role: "implementation".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+            created_at: tied.to_string(),
+        });
+
+        let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
+        assert_eq!(ids, vec!["e2", "e1", "e0-live"]);
+    }
+
+    /// Same tie, spanning both stores: decoded and undecodable rows live in two separate vectors, so
+    /// an undecodable row applied *between* two decoded ones can only keep its place if the model
+    /// remembers the order they were applied in. Ids are adversarial on purpose -- neither
+    /// concatenating the two vectors nor tie-breaking on `id` yields the expected order.
+    #[test]
+    fn history_keeps_a_tied_undecodable_row_where_it_was_applied_among_decoded_ones() {
+        let tied = "2026-08-04T00:00:00+00:00";
+        let mut model = RunModel::new();
+        model.apply(record(
+            "e1-earlier",
+            RunEvent::CycleStarted { cycle_number: 1 },
+        ));
+        model.apply_undecodable(undecodable("z-undecodable", tied));
+        model.apply(RunEventRecord {
+            id: "a-decoded".to_string(),
+            run_id: "run-1".to_string(),
+            event: RunEvent::CycleStarted { cycle_number: 2 },
+            created_at: tied.to_string(),
+        });
+
+        let ids: Vec<&str> = model.history().iter().map(|item| item.id()).collect();
+        assert_eq!(ids, vec!["e1-earlier", "z-undecodable", "a-decoded"]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Issue #108 at the publication seam: `AgentProgress` is now persisted, and that must change
 //! *nothing* about how it is published.
 //!
-//! The volume policy itself (per-step cap, saturation drops, batching) is pinned in
+//! The volume policy itself (per-invocation cap, saturation drops, batching) is pinned in
 //! `crate::progress_writer`; what is pinned here is the coupling between the two paths -- or rather
 //! the absence of one.
 
@@ -67,7 +67,8 @@ async fn a_progress_event_the_writer_drops_is_still_delivered_live() {
     let dir = TempDir::new().unwrap();
     let pool = seeded_pool(&dir).await;
     let (orchestrator, socket_path) =
-        orchestrator_with_run_context(&dir, pool.clone(), ProgressWriter::disconnected()).await;
+        orchestrator_with_run_context(&dir, pool.clone(), ProgressWriter::disconnected(RUN_ID))
+            .await;
     let mut subscriber = UnixStream::connect(&socket_path).await.unwrap();
     // The bus spawns one forwarding task per accepted connection; publishing before that task has
     // subscribed to the broadcast channel would race it.
@@ -111,11 +112,14 @@ async fn a_progress_event_the_writer_drops_is_still_delivered_live() {
 async fn published_progress_is_persisted_in_publication_order_and_hidden_from_a_default_replay() {
     let dir = TempDir::new().unwrap();
     let pool = seeded_pool(&dir).await;
-    let (orchestrator, _socket_path) =
-        orchestrator_with_run_context(&dir, pool.clone(), ProgressWriter::spawn(pool.clone()))
-            .await;
+    let (orchestrator, _socket_path) = orchestrator_with_run_context(
+        &dir,
+        pool.clone(),
+        ProgressWriter::spawn(pool.clone(), RUN_ID),
+    )
+    .await;
 
-    orchestrator.begin_progress_step();
+    orchestrator.begin_progress_invocation();
     for index in 0..50 {
         orchestrator.publish_progress_event("implementation", format!("line-{index}"));
     }

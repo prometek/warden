@@ -40,16 +40,21 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   - un échec d'écriture est journalisé en `error!` et ne modifie ni l'état du run ni
     son verdict ;
   - `flush` vidange la file **avant** que `AgentFinished` ne soit persisté, à la fin
-    de chaque étape, pour que l'ordre de rejeu reste celui de la publication.
+    de chaque invocation d'agent, pour que l'ordre de rejeu reste celui de la
+    publication.
 - **Politique de volume explicite** (`parse_progress_line` émet un événement par
-  tour d'assistant, blocs `tool_use` compris — plusieurs centaines par étape contre
-  quelques dizaines pour tous les autres types réunis) :
-  - **plafond de 500 événements persistés par (run, étape)**
-    (`MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP`) : couvre une étape ordinaire de bout
-    en bout tout en bornant le pire cas d'un agent emballé à un nombre de lignes
-    connu par étape. Au-delà, la progression redevient live-only pour le reste de
-    l'étape, journalisé **une fois par étape** (pas une fois par abandon), plus un
-    récapitulatif chiffré à la vidange ;
+  tour d'assistant, blocs `tool_use` compris — plusieurs centaines par invocation
+  contre quelques dizaines pour tous les autres types réunis) :
+  - **plafond de 500 événements persistés par invocation d'agent**
+    (`MAX_PERSISTED_PROGRESS_EVENTS_PER_INVOCATION`) : couvre une invocation
+    ordinaire de bout en bout tout en bornant le pire cas d'un agent emballé à un
+    nombre de lignes connu. Le budget est ouvert à chaque entrée dans `run_agent`, or
+    la boucle de convergence y ré-entre pour la **même étape** à chaque cycle
+    reboucké : une étape qui boucle `n` fois peut donc persister jusqu'à `n × 500`
+    lignes, et la borne d'un run est `plafond × nombre d'invocations`, jamais le
+    plafond seul. Au-delà, la progression redevient live-only pour le reste de
+    l'invocation, journalisé **une fois par invocation** (pas une fois par abandon),
+    plus un récapitulatif chiffré à la vidange ;
   - **`agent_progress` est exclu du rejeu par défaut**
     (`warden_core::ProgressReplay::{Excluded, Included}`) : aucun lecteur de rejeu
     ne pagine — `RunModel` garde tout l'historique en mémoire — donc une attache par
@@ -62,13 +67,23 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   pas à l'écriture — un événement écrit plus tard par lot se replace donc au bon
   endroit), départagé par **`rowid ASC`**, c'est-à-dire l'ordre d'insertion. Remplace
   l'ancien départage `id ASC`, déterministe mais arbitraire vis-à-vis de l'ordre de
-  publication, un `id` réel étant un UUID v4.
+  publication, un `id` réel étant un UUID v4. `RunModel::history()` — la couche que
+  traversent les *deux* chemins de rejeu visibles (plein écran et NDJSON) — préserve
+  cet ordre : tri **stable** sur `created_at` seul, sur une liste déjà en ordre
+  d'application, sans départage par `id` qui annulerait le `rowid ASC` du SQL.
 - **Migration `0017_events_agent_progress_index.sql`** : l'index
   `(run_id, created_at)` devient `(run_id, created_at, event_type)`. Même préfixe de
   clé (donc pas d'index supplémentaire à maintenir sur un chemin d'insertion que
-  cette issue rend précisément plus chaud), ordre de rejeu toujours servi par
-  l'index, et le filtre d'exclusion devient un test *dans l'index* — une ligne de
-  progression est écartée sans que son `payload_json` ne soit jamais lu.
+  cette issue rend précisément plus chaud), et le filtre d'exclusion devient un test
+  *dans l'index* — une ligne de progression est écartée sans que sa ligne de table,
+  `payload_json` compris, ne soit jamais lue. **Contrepartie assumée** : SQLite
+  ajoute `rowid` à chaque clé d'index, si bien que `(run_id, created_at)` servait
+  nativement `ORDER BY created_at ASC, rowid ASC` ; intercaler `event_type` ne le
+  sert plus (mesuré sur sqlite3 3.51.0, 20 000 lignes, après `ANALYZE` :
+  `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`, avec ou sans exclusion). C'est un tri
+  *partiel*, borné à chaque groupe de `created_at` égaux — groupes d'une seule ligne
+  en pratique —, contre des lectures de table évitées sur la majorité des lignes.
+  Aucun index n'offre les deux : SQLite refuse `rowid` comme colonne d'index.
 - **Ce qui ne change pas** : la progression reste **déclarative** — ce que l'agent
   *rapporte* faire. La persister ne la promeut **pas** en élément d'audit :
   l'evidence (ADR-0009) reste la seule source qui porte une valeur de preuve. La
@@ -79,16 +94,22 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `on_stdout_line: None` et n'émettent donc toujours aucune progression.
 - **Tests** : saturation du canal → abandon compté et journalisé, sans jamais
   bloquer l'appelant ; tâche d'écriture morte → même traitement ; plafond appliqué,
-  et remis à zéro par étape ; échec d'écriture réel (violation de clé étrangère) →
-  ni erreur remontée, ni état de run modifié, et l'écrivain survit au lot suivant ;
-  exclusion par défaut et inclusion sur option, côté `warden::db` comme côté
-  `warden_tui::db` ; départage d'un `created_at` à égalité en ordre d'insertion.
-  **Bout en bout, via le vrai binaire** (`tests/agent_progress_persistence_e2e.rs`,
-  faux `claude` émettant de vraies lignes `stream-json`) : un run terminé rejoue sa
-  progression dans l'ordre de publication sur option et rien sans, chaque ligne de
-  progression d'une étape est bien persistée **avant** son `agent_finished`, et un
-  run à forte volumétrie (620 tours en une étape) est plafonné à 500 lignes sans que
-  son verdict n'en soit affecté.
+  et remis à zéro à chaque invocation ; échec d'écriture réel (violation de clé
+  étrangère) → ni erreur remontée, ni état de run modifié, et l'écrivain survit au
+  lot suivant ; exclusion par défaut et inclusion sur option, côté `warden::db` comme
+  côté `warden_tui::db` ; départage d'un `created_at` à égalité en ordre d'insertion,
+  au niveau SQL **et** au niveau `RunModel::history()` (y compris pour une ligne
+  indécodable intercalée). **Via le vrai binaire `warden-tui`**
+  (`tests/attach_cli.rs`) : une attache par défaut n'émet aucune ligne
+  `agent_progress`, `--include-progress` les émet dans l'ordre de publication.
+  **Bout en bout, via le vrai binaire `warden`**
+  (`tests/agent_progress_persistence_e2e.rs`, faux `claude` émettant de vraies lignes
+  `stream-json`) : un run terminé rejoue sa progression dans l'ordre de publication
+  sur option et rien sans, chaque ligne de progression d'une invocation est bien
+  persistée **avant** son `agent_finished`, un run à forte volumétrie (620 tours en
+  une invocation) est plafonné à 500 lignes sans que son verdict n'en soit affecté,
+  et une étape rebouclée deux fois (620 tours à chaque cycle) persiste bien
+  2 × 500 lignes — le plafond est par invocation, pas par `(run, étape)`.
 
 ### Added — Issue #107 : événement de graphe de workflow, étapes à venir exposées à la TUI
 

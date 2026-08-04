@@ -609,7 +609,7 @@ mod tests {
             .set(RunContext {
                 run_id: run_id.to_string(),
                 event_bus,
-                progress_writer: ProgressWriter::spawn(pool.clone()),
+                progress_writer: ProgressWriter::spawn(pool.clone(), run_id),
             })
             .map_err(|_| ())
             .unwrap();
