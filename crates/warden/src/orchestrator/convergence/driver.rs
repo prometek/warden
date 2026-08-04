@@ -46,6 +46,7 @@ impl Orchestrator {
             .set(RunContext {
                 run_id: run_id.clone(),
                 event_bus,
+                progress_writer: ProgressWriter::spawn(self.pool.clone()),
             })
             .map_err(|_| WardenError::RunAlreadyInProgress)?;
 

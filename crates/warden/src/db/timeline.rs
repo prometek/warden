@@ -22,6 +22,32 @@ pub async fn insert_event(
     Ok(())
 }
 
+/// Inserts a whole batch of already-published records in **one transaction** -- the batched
+/// counterpart of [`insert_event`], used by [`crate::progress_writer`] so one fsync is amortized
+/// over a burst of agent progress instead of paid per line.
+///
+/// Insertion order inside the batch is preserved, and so is the batch's `rowid` order: that is what
+/// [`list_events_for_run`] falls back on to break a tie on `created_at`.
+pub async fn insert_events(pool: &SqlitePool, records: &[RunEventRecord]) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for record in records {
+        let event_type = record.event.kind().as_str();
+        let payload_json = serde_json::to_string(&record.event)?;
+        sqlx::query!(
+            "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            record.id,
+            record.run_id,
+            event_type,
+            payload_json,
+            record.created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// A `evidence` row, with `type` already validated into [`EvidenceType`].
 #[derive(Debug, Clone)]
 pub struct Evidence {
@@ -102,22 +128,49 @@ fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
 
 /// Every event recorded for `run_id`, oldest first -- the full history a late-attaching `warden-
 /// tui` replays before switching to the live socket stream (Architecture.md §5.4).
+///
+/// `progress` decides whether `agent_progress` rows are part of that history; they are not, unless
+/// the caller opts in (issue #108, see [`warden_core::ProgressReplay`]).
+///
+/// **Ordering.** `created_at ASC` is publication order: the timestamp is stamped where the event is
+/// published, not where it is written, so a progress event batched to disk later than a lifecycle
+/// event published after it still replays in the right place. `rowid ASC` breaks a tie
+/// deterministically *in insertion order* -- a random `id` (UUID v4) would break it arbitrarily
+/// instead, and `warden` being the table's only writer makes rowid order the run's own write order.
 pub async fn list_events_for_run(
     pool: &SqlitePool,
     run_id: &str,
+    progress: ProgressReplay,
 ) -> Result<Vec<RunEventHistoryEntry>> {
-    let rows = sqlx::query_as!(
-        EventRow,
-        r#"
-        SELECT id as "id!", run_id, event_type, payload_json, created_at
-        FROM events
-        WHERE run_id = ?
-        ORDER BY created_at ASC, id ASC
-        "#,
-        run_id,
-    )
-    .fetch_all(pool)
-    .await?;
+    let excluded_kind = EventKind::AgentProgress.as_str();
+    let rows = if progress.includes_progress() {
+        sqlx::query_as!(
+            EventRow,
+            r#"
+            SELECT id as "id!", run_id, event_type, payload_json, created_at
+            FROM events
+            WHERE run_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+            run_id,
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as!(
+            EventRow,
+            r#"
+            SELECT id as "id!", run_id, event_type, payload_json, created_at
+            FROM events
+            WHERE run_id = ? AND event_type <> ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+            run_id,
+            excluded_kind,
+        )
+        .fetch_all(pool)
+        .await?
+    };
 
     Ok(rows.into_iter().map(row_to_history_entry).collect())
 }

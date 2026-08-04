@@ -6,8 +6,8 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    EventKind, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState, UndecodableEvent,
-    UndecodableReason,
+    EventKind, ProgressReplay, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState,
+    UndecodableEvent, UndecodableReason,
 };
 
 use crate::error::{Result, TuiError};
@@ -116,22 +116,51 @@ fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
 
 /// Every event recorded for `run_id`, oldest first -- the history a late attach replays before
 /// switching to the live socket stream (Architecture.md §5.4).
+///
+/// `progress` decides whether `agent_progress` rows are part of that history; they are not, unless
+/// the caller opts in (issue #108, see [`ProgressReplay`]). With
+/// [`ProgressReplay::Included`], the replayed sequence is exactly what a subscriber connected from
+/// the start saw live, in publication order -- up to the per-step persistence cap `warden` applies
+/// when writing.
+///
+/// **Ordering.** `created_at ASC` is publication order (the timestamp is stamped at publication,
+/// not at write), and `rowid ASC` breaks a tie in `warden`'s own insertion order -- deterministic,
+/// where the previous `id ASC` fallback ordered by a random UUID. Mirrors `warden::db`'s own query
+/// deliberately: this reader is an independent duplicate, never a shared code path (ADR-0006).
 pub async fn list_events_for_run(
     pool: &SqlitePool,
     run_id: &str,
+    progress: ProgressReplay,
 ) -> Result<Vec<RunEventHistoryEntry>> {
-    let rows = sqlx::query_as!(
-        EventRow,
-        r#"
-        SELECT id as "id!", run_id, event_type, payload_json, created_at
-        FROM events
-        WHERE run_id = ?
-        ORDER BY created_at ASC, id ASC
-        "#,
-        run_id,
-    )
-    .fetch_all(pool)
-    .await?;
+    let excluded_kind = EventKind::AgentProgress.as_str();
+    let rows = if progress.includes_progress() {
+        sqlx::query_as!(
+            EventRow,
+            r#"
+            SELECT id as "id!", run_id, event_type, payload_json, created_at
+            FROM events
+            WHERE run_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+            run_id,
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as!(
+            EventRow,
+            r#"
+            SELECT id as "id!", run_id, event_type, payload_json, created_at
+            FROM events
+            WHERE run_id = ? AND event_type <> ?
+            ORDER BY created_at ASC, rowid ASC
+            "#,
+            run_id,
+            excluded_kind,
+        )
+        .fetch_all(pool)
+        .await?
+    };
 
     Ok(rows.into_iter().map(row_to_history_entry).collect())
 }
@@ -308,9 +337,84 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1").await.unwrap();
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
+            .await
+            .unwrap();
         let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
         assert_eq!(ids, vec!["event-a", "event-b"]);
+    }
+
+    /// Issue #108: `agent_progress` outnumbers every other kind by an order of magnitude, so a
+    /// replay leaves it out unless the reader asks for it -- and when it does ask, gets it back
+    /// interleaved in publication order, not appended at the end.
+    #[tokio::test]
+    async fn agent_progress_is_excluded_from_replay_by_default_and_returned_on_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let (db_path, write_pool) = seed_db(dir.path()).await;
+
+        let rows = [
+            (
+                "e1",
+                RunEvent::AgentStarted {
+                    role: "implementation".to_string(),
+                },
+            ),
+            (
+                "e2",
+                RunEvent::AgentProgress {
+                    role: "implementation".to_string(),
+                    detail: "message: reading src/lib.rs".to_string(),
+                },
+            ),
+            (
+                "e3",
+                RunEvent::AgentProgress {
+                    role: "implementation".to_string(),
+                    detail: "tool: Edit".to_string(),
+                },
+            ),
+            (
+                "e4",
+                RunEvent::AgentFinished {
+                    role: "implementation".to_string(),
+                    exit_code: 0,
+                    usage: None,
+                },
+            ),
+        ];
+        for (index, (id, event)) in rows.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO events (id, run_id, event_type, payload_json, created_at) VALUES (?, 'run-1', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(event.kind().as_str())
+            .bind(serde_json::to_string(event).unwrap())
+            .bind(format!("2026-08-04T00:00:0{index}+00:00"))
+            .execute(&write_pool)
+            .await
+            .unwrap();
+        }
+        write_pool.close().await;
+
+        let pool = connect_read_only(&db_path).await.unwrap();
+
+        let default_replay = list_events_for_run(&pool, "run-1", ProgressReplay::Excluded)
+            .await
+            .unwrap();
+        assert_eq!(
+            default_replay.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            vec!["e1", "e4"],
+            "a default attach must replay the lifecycle events and nothing else"
+        );
+
+        let opted_in = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
+            .await
+            .unwrap();
+        assert_eq!(
+            opted_in.iter().map(|e| e.id()).collect::<Vec<_>>(),
+            vec!["e1", "e2", "e3", "e4"],
+            "--include-progress must replay progress where it was published"
+        );
     }
 
     #[tokio::test]
@@ -332,7 +436,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("one bad row must never fail the whole query");
         assert_eq!(events.len(), 1);
@@ -414,7 +518,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("undecodable rows must never fail the whole query");
 
@@ -472,7 +576,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("an unrecognized event_type must never fail the whole query");
 
@@ -509,7 +613,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("a stale pre-issue-26 payload must never fail the whole query");
 
@@ -546,7 +650,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("max_cycles payload must decode");
 
@@ -603,7 +707,7 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1")
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
             .await
             .expect("an all-undecodable history must never fail the whole query");
 
@@ -618,8 +722,12 @@ mod tests {
         assert_eq!(ids, vec!["event-1-unknown-kind", "event-2-malformed"]);
     }
 
+    /// Issue #108: the tie-break used to be `id ASC` -- deterministic, but arbitrary with respect
+    /// to publication order, since a real `id` is a UUID v4. `rowid ASC` breaks the same tie in
+    /// `warden`'s own insertion order, which for this append-only table *is* publication order.
+    /// `event-b` is written first on purpose: an `id ASC` fallback would invert the two.
     #[tokio::test]
-    async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by_id() {
+    async fn rows_sharing_the_same_created_at_replay_in_insertion_order_not_id_order() {
         let dir = TempDir::new().unwrap();
         let (db_path, write_pool) = seed_db(dir.path()).await;
         let same_timestamp = "2026-07-12T00:00:00+00:00";
@@ -649,14 +757,16 @@ mod tests {
         write_pool.close().await;
 
         let pool = connect_read_only(&db_path).await.unwrap();
-        let events = list_events_for_run(&pool, "run-1").await.unwrap();
+        let events = list_events_for_run(&pool, "run-1", ProgressReplay::Included)
+            .await
+            .unwrap();
         let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
         assert_eq!(
             ids,
-            vec!["event-a", "event-b"],
-            "a tied created_at must fall back to id ASC deterministically"
+            vec!["event-b", "event-a"],
+            "a tied created_at must fall back to insertion order deterministically"
         );
-        assert!(matches!(events[0], RunEventHistoryEntry::Undecodable(_)));
-        assert!(matches!(events[1], RunEventHistoryEntry::Decoded(_)));
+        assert!(matches!(events[0], RunEventHistoryEntry::Decoded(_)));
+        assert!(matches!(events[1], RunEventHistoryEntry::Undecodable(_)));
     }
 }

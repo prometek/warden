@@ -26,6 +26,7 @@ use crate::git_util::NO_HOST_HOOKS;
 use crate::hook::HookRegistry;
 use crate::policy_gate::{PolicyGate, PolicyOutcome};
 use crate::process::{self, AgentCommand, AgentOutcome};
+use crate::progress_writer::ProgressWriter;
 use crate::tool_adapter::ToolAdapter;
 use crate::worktree::{self, WorktreeManager};
 
@@ -39,6 +40,8 @@ mod evidence_capture;
 mod gate_tail;
 #[cfg(test)]
 mod lifecycle_hook_tests;
+#[cfg(test)]
+mod progress_tests;
 mod recovery;
 mod tampering;
 
@@ -181,6 +184,9 @@ impl ConvergenceContinuation {
 struct RunContext {
     run_id: String,
     event_bus: EventBus,
+    /// Persists `AgentProgress` off the synchronous publication path (issue #108) -- see
+    /// [`Orchestrator::publish_progress_event`].
+    progress_writer: ProgressWriter,
 }
 
 #[derive(Debug)]
@@ -308,12 +314,19 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Publishes one `AgentProgress` event, then hands the very same record to the run's
+    /// [`ProgressWriter`] for persistence (issue #108).
+    ///
+    /// Synchronous and infallible on purpose: its only caller is the `on_stdout_line` callback
+    /// `warden_sandbox` imposes the signature of, which can neither `await` nor fail. Publication
+    /// comes first and is **unchanged** -- a live subscriber sees every progress event, whatever
+    /// the writer then does with it (queue it, drop it over the per-step cap, fail to write it).
     fn publish_progress_event(&self, role_name: &str, detail: String) {
         let Some(context) = self.run_context.get() else {
             return;
         };
 
-        context.event_bus.publish(&warden_core::RunEventRecord {
+        let record = warden_core::RunEventRecord {
             id: Uuid::new_v4().to_string(),
             run_id: context.run_id.clone(),
             event: RunEvent::AgentProgress {
@@ -321,7 +334,26 @@ impl Orchestrator {
                 detail,
             },
             created_at: Utc::now().to_rfc3339(),
-        });
+        };
+        context.event_bus.publish(&record);
+        context.progress_writer.record(&record);
+    }
+
+    /// Opens a fresh per-step persisted-progress budget (see
+    /// [`crate::progress_writer::MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP`]).
+    fn begin_progress_step(&self) {
+        if let Some(context) = self.run_context.get() {
+            context.progress_writer.begin_step();
+        }
+    }
+
+    /// Waits until every progress event queued so far is written. Called at the end of a step,
+    /// **before** `AgentFinished` is persisted, so a replay reads a step's progress where it
+    /// happened rather than after the step that produced it had already ended.
+    async fn flush_progress(&self) {
+        if let Some(context) = self.run_context.get() {
+            context.progress_writer.flush().await;
+        }
     }
 
     /// Writes `to` to the run's persisted state (write-ahead of intent), then dispatches whichever

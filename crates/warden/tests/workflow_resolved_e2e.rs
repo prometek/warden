@@ -17,7 +17,7 @@ use assert_cmd::Command;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
-use warden_core::RunEvent;
+use warden_core::{ProgressReplay, RunEvent};
 use warden_tui::model::{
     DeclaredStep, ResolvedWorkflow, RunModel, StepRuntimeStatus, WorkflowGraph,
 };
@@ -290,7 +290,7 @@ async fn event_rows(pool: &SqlitePool, run_id: &str) -> Vec<(String, serde_json:
 /// code path a late `warden-tui attach` takes before it switches to the live socket.
 async fn replay_as_late_attach(db_path: &Path, run_id: &str) -> RunModel {
     let pool = warden_tui::db::connect_read_only(db_path).await.unwrap();
-    let history = warden_tui::db::list_events_for_run(&pool, run_id)
+    let history = warden_tui::db::list_events_for_run(&pool, run_id, ProgressReplay::Included)
         .await
         .unwrap();
     let mut model = RunModel::new();

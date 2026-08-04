@@ -8,9 +8,9 @@ use chrono::Utc;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use warden_core::{
-    EventKind, EvidenceType, Finding, FindingSource, RateLimitState, RateLimitStatus,
-    RateLimitWindow, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState, Severity,
-    TokenUsage, UndecodableEvent, UndecodableReason,
+    EventKind, EvidenceType, Finding, FindingSource, ProgressReplay, RateLimitState,
+    RateLimitStatus, RateLimitWindow, RunEvent, RunEventHistoryEntry, RunEventRecord, RunState,
+    Severity, TokenUsage, UndecodableEvent, UndecodableReason,
 };
 
 use crate::error::{Result, WardenError};

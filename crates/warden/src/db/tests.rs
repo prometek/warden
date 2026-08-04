@@ -1871,7 +1871,9 @@ async fn event_round_trips_through_insert_and_list() {
     .await
     .unwrap();
 
-    let events = list_events_for_run(&pool, "run-events").await.unwrap();
+    let events = list_events_for_run(&pool, "run-events", ProgressReplay::Included)
+        .await
+        .unwrap();
     assert_eq!(events.len(), 1);
     let record = events[0].decoded().expect("well-formed row must decode");
     assert_eq!(record.id, "event-1");
@@ -1916,7 +1918,9 @@ async fn list_events_for_run_orders_oldest_first() {
     .await
     .unwrap();
 
-    let events = list_events_for_run(&pool, "run-order").await.unwrap();
+    let events = list_events_for_run(&pool, "run-order", ProgressReplay::Included)
+        .await
+        .unwrap();
     let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
     assert_eq!(ids, vec!["event-a", "event-b"]);
 }
@@ -1938,7 +1942,9 @@ async fn list_events_for_run_is_empty_for_a_run_with_no_events() {
     .await
     .unwrap();
 
-    let events = list_events_for_run(&pool, "run-no-events").await.unwrap();
+    let events = list_events_for_run(&pool, "run-no-events", ProgressReplay::Included)
+        .await
+        .unwrap();
     assert!(events.is_empty());
 }
 
@@ -1972,7 +1978,7 @@ async fn mismatched_event_type_and_payload_kind_is_an_undecodable_entry_not_a_fa
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-corrupt")
+    let events = list_events_for_run(&pool, "run-corrupt", ProgressReplay::Included)
         .await
         .expect("one bad row must never fail the whole query");
     assert_eq!(events.len(), 1);
@@ -2060,7 +2066,7 @@ async fn history_with_a_malformed_payload_and_a_kind_mismatch_still_returns_ever
     .await
     .unwrap();
 
-    let events = list_events_for_run(&pool, "run-mixed")
+    let events = list_events_for_run(&pool, "run-mixed", ProgressReplay::Included)
         .await
         .expect("undecodable rows must never fail the whole query");
 
@@ -2129,7 +2135,7 @@ async fn unrecognized_event_type_column_is_an_unknown_event_type_undecodable_ent
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-unknown-kind")
+    let events = list_events_for_run(&pool, "run-unknown-kind", ProgressReplay::Included)
         .await
         .expect("an unrecognized event_type must never fail the whole query");
 
@@ -2177,7 +2183,7 @@ async fn pre_issue_26_untrusted_agent_definition_used_payload_missing_canonical_
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-pre-26")
+    let events = list_events_for_run(&pool, "run-pre-26", ProgressReplay::Included)
         .await
         .expect("a stale pre-issue-26 payload must never fail the whole query");
 
@@ -2225,7 +2231,7 @@ async fn run_started_payload_with_max_cycles_is_decoded() {
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-pre-43")
+    let events = list_events_for_run(&pool, "run-pre-43", ProgressReplay::Included)
         .await
         .expect("max_cycles payload must decode");
 
@@ -2294,7 +2300,7 @@ async fn history_where_every_row_is_undecodable_returns_all_of_them() {
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-all-bad")
+    let events = list_events_for_run(&pool, "run-all-bad", ProgressReplay::Included)
         .await
         .expect("an all-undecodable history must never fail the whole query");
 
@@ -2317,8 +2323,13 @@ async fn history_where_every_row_is_undecodable_returns_all_of_them() {
     );
 }
 
+/// Issue #108: the tie-break used to be `id ASC`, which is deterministic but arbitrary -- a real
+/// `id` is a UUID v4, so on a tied `created_at` the replay order was random with respect to the
+/// order the events were actually published in. `rowid ASC` breaks the same tie in `warden`'s own
+/// insertion order, which for this append-only table *is* publication order. `event-b` is inserted
+/// first here on purpose: an `id ASC` fallback would put `event-a` first and invert them.
 #[tokio::test]
-async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by_id() {
+async fn rows_sharing_the_same_created_at_replay_in_insertion_order_not_id_order() {
     let (_dir, pool) = test_pool().await;
     insert_run(&pool, "run-tie", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
         .await
@@ -2346,13 +2357,151 @@ async fn undecodable_and_decoded_rows_sharing_the_same_created_at_are_ordered_by
         .await
         .unwrap();
 
-    let events = list_events_for_run(&pool, "run-tie").await.unwrap();
+    let events = list_events_for_run(&pool, "run-tie", ProgressReplay::Included)
+        .await
+        .unwrap();
     let ids: Vec<&str> = events.iter().map(|e| e.id()).collect();
     assert_eq!(
         ids,
-        vec!["event-a", "event-b"],
-        "a tied created_at must fall back to id ASC deterministically"
+        vec!["event-b", "event-a"],
+        "a tied created_at must fall back to insertion order deterministically"
     );
-    assert!(matches!(events[0], RunEventHistoryEntry::Undecodable(_)));
-    assert!(matches!(events[1], RunEventHistoryEntry::Decoded(_)));
+    assert!(matches!(events[0], RunEventHistoryEntry::Decoded(_)));
+    assert!(matches!(events[1], RunEventHistoryEntry::Undecodable(_)));
+}
+
+#[tokio::test]
+async fn insert_events_writes_a_whole_batch_or_none_of_it() {
+    let (_dir, pool) = test_pool().await;
+    insert_run(
+        &pool,
+        "run-batch",
+        "/tmp/repo",
+        "main",
+        "intent",
+        3,
+        3,
+        3,
+        5,
+    )
+    .await
+    .unwrap();
+
+    let record = |id: &str, run_id: &str, detail: &str| RunEventRecord {
+        id: id.to_string(),
+        run_id: run_id.to_string(),
+        event: RunEvent::AgentProgress {
+            role: "implementation".to_string(),
+            detail: detail.to_string(),
+        },
+        created_at: "2026-08-04T00:00:00+00:00".to_string(),
+    };
+
+    insert_events(
+        &pool,
+        &[
+            record("b1", "run-batch", "first"),
+            record("b2", "run-batch", "second"),
+        ],
+    )
+    .await
+    .unwrap();
+    let stored = list_events_for_run(&pool, "run-batch", ProgressReplay::Included)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.iter().map(|e| e.id()).collect::<Vec<_>>(),
+        ["b1", "b2"]
+    );
+
+    // Second row violates the foreign key onto `runs`; the transaction must take the first row
+    // down with it rather than leave a half-written batch behind.
+    let error = insert_events(
+        &pool,
+        &[
+            record("b3", "run-batch", "third"),
+            record("b4", "run-that-does-not-exist", "orphan"),
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, WardenError::Database(_)), "{error:?}");
+    assert_eq!(
+        list_events_for_run(&pool, "run-batch", ProgressReplay::Included)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "a failed batch must leave no partial rows behind"
+    );
+}
+
+/// Issue #108, replay policy: `agent_progress` is persisted but excluded from replay unless the
+/// reader asks for it. Both directions, on the same rows.
+#[tokio::test]
+async fn agent_progress_is_excluded_from_replay_by_default_and_returned_on_opt_in() {
+    let (_dir, pool) = test_pool().await;
+    insert_run(&pool, "run-mix", "/tmp/repo", "main", "intent", 3, 3, 3, 5)
+        .await
+        .unwrap();
+
+    let events = [
+        (
+            "e1",
+            RunEvent::AgentStarted {
+                role: "implementation".to_string(),
+            },
+        ),
+        (
+            "e2",
+            RunEvent::AgentProgress {
+                role: "implementation".to_string(),
+                detail: "message: reading src/lib.rs".to_string(),
+            },
+        ),
+        (
+            "e3",
+            RunEvent::AgentProgress {
+                role: "implementation".to_string(),
+                detail: "tool: Edit".to_string(),
+            },
+        ),
+        (
+            "e4",
+            RunEvent::AgentFinished {
+                role: "implementation".to_string(),
+                exit_code: 0,
+                usage: None,
+            },
+        ),
+    ];
+    for (index, (id, event)) in events.iter().enumerate() {
+        insert_event(
+            &pool,
+            id,
+            "run-mix",
+            event,
+            &format!("2026-08-04T00:00:0{index}+00:00"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let default_replay = list_events_for_run(&pool, "run-mix", ProgressReplay::Excluded)
+        .await
+        .unwrap();
+    assert_eq!(
+        default_replay.iter().map(|e| e.id()).collect::<Vec<_>>(),
+        vec!["e1", "e4"],
+        "a default replay must carry the lifecycle events and nothing else"
+    );
+
+    let opted_in = list_events_for_run(&pool, "run-mix", ProgressReplay::Included)
+        .await
+        .unwrap();
+    assert_eq!(
+        opted_in.iter().map(|e| e.id()).collect::<Vec<_>>(),
+        vec!["e1", "e2", "e3", "e4"],
+        "opting in must interleave progress back in publication order"
+    );
 }

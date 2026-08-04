@@ -7,6 +7,89 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
 
 ## [Unreleased]
 
+### Changed — Issue #108 / ADR-0008 (amendement) : `AgentProgress` persisté, rejeu d'une attache tardive
+
+> **Renverse une décision explicite de l'issue #33** (amendement ADR-0008), qui
+> énonçait la progression d'agent comme *live-only, jamais persistée*. La
+> conséquence assumée à l'époque coûtait cher à l'usage : une attache tardive
+> perdait définitivement le seul segment qui explique *pourquoi* une étape a duré
+> ou sur quoi elle a buté, un run terminé était muet à ce sujet, et le flux NDJSON
+> non interactif produisait deux sorties différentes pour le même run selon
+> l'heure de l'attache (`agent_progress` en direct, aucun au rejeu).
+
+- **`RunEvent::AgentProgress` est désormais écrit dans `events`** comme tout autre
+  `RunEvent`. Une attache tardive — ou le rejeu d'un run déjà terminé — expose la
+  séquence de progression qu'un abonné en direct a vue, dans l'ordre où elle a été
+  publiée.
+- **Le chemin de publication en direct est rigoureusement inchangé.**
+  `Orchestrator::publish_progress_event` diffuse toujours d'abord sur l'Event Bus,
+  puis confie le **même** `RunEventRecord` (même `id`, même `created_at`) au
+  nouveau `warden::progress_writer::ProgressWriter`. Un abonné voit toujours tout,
+  quoi qu'il advienne ensuite de l'écriture.
+- **Écriture découplée, parce qu'elle ne peut pas ne pas l'être** : le seul
+  appelant est `on_stdout_line`, une closure **synchrone et infaillible** dont
+  `warden-sandbox` impose la signature — impossible d'y `await` une écriture SQLite
+  ni d'y remonter une erreur. Le `ProgressWriter` est un canal borné (1024) vers une
+  tâche d'écriture dédiée qui écrit **par lots de 64 en une transaction**
+  (`db::insert_events`), pour amortir un `fsync` sur une rafale au lieu d'en payer un
+  par ligne de progression.
+- **Trois garanties tenues *par construction*** (`record` et `flush` ne retournent
+  rien, une erreur d'écriture n'a donc nulle part où aller) :
+  - un canal plein **abandonne et le journalise** au lieu de mettre en pause la
+    lecture de la sortie de l'agent ;
+  - un échec d'écriture est journalisé en `error!` et ne modifie ni l'état du run ni
+    son verdict ;
+  - `flush` vidange la file **avant** que `AgentFinished` ne soit persisté, à la fin
+    de chaque étape, pour que l'ordre de rejeu reste celui de la publication.
+- **Politique de volume explicite** (`parse_progress_line` émet un événement par
+  tour d'assistant, blocs `tool_use` compris — plusieurs centaines par étape contre
+  quelques dizaines pour tous les autres types réunis) :
+  - **plafond de 500 événements persistés par (run, étape)**
+    (`MAX_PERSISTED_PROGRESS_EVENTS_PER_STEP`) : couvre une étape ordinaire de bout
+    en bout tout en bornant le pire cas d'un agent emballé à un nombre de lignes
+    connu par étape. Au-delà, la progression redevient live-only pour le reste de
+    l'étape, journalisé **une fois par étape** (pas une fois par abandon), plus un
+    récapitulatif chiffré à la vidange ;
+  - **`agent_progress` est exclu du rejeu par défaut**
+    (`warden_core::ProgressReplay::{Excluded, Included}`) : aucun lecteur de rejeu
+    ne pagine — `RunModel` garde tout l'historique en mémoire — donc une attache par
+    défaut reste exactement aussi coûteuse qu'avant.
+- **Nouveau drapeau `warden-tui attach --include-progress`** pour rejouer aussi la
+  progression écoulée, en mode plein écran comme en mode NDJSON non interactif. La
+  TUI reste **strictement en lecture seule** : elle gagne un drapeau de lecture,
+  aucun chemin d'écriture.
+- **Ordre de rejeu déterministe** : `created_at ASC` (horodaté à la *publication*,
+  pas à l'écriture — un événement écrit plus tard par lot se replace donc au bon
+  endroit), départagé par **`rowid ASC`**, c'est-à-dire l'ordre d'insertion. Remplace
+  l'ancien départage `id ASC`, déterministe mais arbitraire vis-à-vis de l'ordre de
+  publication, un `id` réel étant un UUID v4.
+- **Migration `0017_events_agent_progress_index.sql`** : l'index
+  `(run_id, created_at)` devient `(run_id, created_at, event_type)`. Même préfixe de
+  clé (donc pas d'index supplémentaire à maintenir sur un chemin d'insertion que
+  cette issue rend précisément plus chaud), ordre de rejeu toujours servi par
+  l'index, et le filtre d'exclusion devient un test *dans l'index* — une ligne de
+  progression est écartée sans que son `payload_json` ne soit jamais lu.
+- **Ce qui ne change pas** : la progression reste **déclarative** — ce que l'agent
+  *rapporte* faire. La persister ne la promeut **pas** en élément d'audit :
+  l'evidence (ADR-0009) reste la seule source qui porte une valeur de preuve. La
+  granularité reste celle de #33 (messages assistant complets et blocs `tool_use`,
+  toujours **sans** `--include-partial-messages`), et le seam
+  `ToolAdapter::parse_progress_line` est inchangé.
+- **Effet de bord connu, hors périmètre** : les étapes `type: command` passent
+  `on_stdout_line: None` et n'émettent donc toujours aucune progression.
+- **Tests** : saturation du canal → abandon compté et journalisé, sans jamais
+  bloquer l'appelant ; tâche d'écriture morte → même traitement ; plafond appliqué,
+  et remis à zéro par étape ; échec d'écriture réel (violation de clé étrangère) →
+  ni erreur remontée, ni état de run modifié, et l'écrivain survit au lot suivant ;
+  exclusion par défaut et inclusion sur option, côté `warden::db` comme côté
+  `warden_tui::db` ; départage d'un `created_at` à égalité en ordre d'insertion.
+  **Bout en bout, via le vrai binaire** (`tests/agent_progress_persistence_e2e.rs`,
+  faux `claude` émettant de vraies lignes `stream-json`) : un run terminé rejoue sa
+  progression dans l'ordre de publication sur option et rien sans, chaque ligne de
+  progression d'une étape est bien persistée **avant** son `agent_finished`, et un
+  run à forte volumétrie (620 tours en une étape) est plafonné à 500 lignes sans que
+  son verdict n'en soit affecté.
+
 ### Added — Issue #107 : événement de graphe de workflow, étapes à venir exposées à la TUI
 
 > Préalable à la refonte de `warden-tui` (brief de design, passe 1). La TUI
@@ -1254,13 +1337,17 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `warden-tui`, qui ne voient qu'une `String` déjà traduite. `process::wait_with_progress`
   remplace la lecture bloc-à-bloc de stdout par une lecture ligne par ligne, en conservant
   la même garantie anti-deadlock (drainage stdin/stdout/stderr/wait concurrent).
-- **Live-only, jamais persisté** : `Orchestrator::publish_progress_event` diffuse
-  `AgentProgress` sur l'Event Bus mais ne l'écrit jamais dans la table `events` —
-  contrairement à tout autre `RunEvent`, dont la persistance reste intégrale et inchangée.
-  C'est un signal d'observation temps réel, pas un élément d'audit : l'evidence (ADR-0009)
-  reste la seule source qui porte une valeur de preuve. Conséquence assumée : une attache
-  tardive de la TUI ne rejoue jamais la progression détaillée d'un agent déjà en cours ou
-  déjà terminé, seul un abonné connecté au moment de la publication la voit.
+- ~~**Live-only, jamais persisté**~~ — **décision renversée par l'issue #108** (voir
+  `[Unreleased]`) : `AgentProgress` est depuis persisté dans `events` comme tout autre
+  `RunEvent`, et une attache tardive rejoue bien la progression écoulée. Ce qui suit est
+  conservé pour la trace de décision et **ne décrit plus le comportement courant** :
+  `Orchestrator::publish_progress_event` diffuse `AgentProgress` sur l'Event Bus mais ne
+  l'écrit jamais dans la table `events` — contrairement à tout autre `RunEvent`, dont la
+  persistance reste intégrale et inchangée. C'est un signal d'observation temps réel, pas un
+  élément d'audit : l'evidence (ADR-0009) reste la seule source qui porte une valeur de
+  preuve. Conséquence assumée : une attache tardive de la TUI ne rejoue jamais la progression
+  détaillée d'un agent déjà en cours ou déjà terminé, seul un abonné connecté au moment de la
+  publication la voit.
 - `warden-tui` affiche cette progression en direct (rôle + dernier detail rapporté) tant
   qu'un agent est actif, et l'efface dès `AgentFinished` ; le flux NDJSON (mode non-TTY)
   et l'historique d'événements affichent aussi `AgentProgress` au même titre que les autres

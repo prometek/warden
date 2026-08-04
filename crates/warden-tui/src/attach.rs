@@ -5,7 +5,7 @@ use std::path::Path;
 
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
-use warden_core::RunEventRecord;
+use warden_core::{ProgressReplay, RunEventRecord};
 
 use crate::db;
 use crate::error::{Result, TuiError};
@@ -21,7 +21,14 @@ pub struct Attachment {
     pub live: Option<mpsc::UnboundedReceiver<RunEventRecord>>,
 }
 
-pub async fn attach(pool: &SqlitePool, run_id: &str, socket_path: &Path) -> Result<Attachment> {
+/// `progress` only governs the **replayed history**: the live stream is never filtered, so a
+/// subscriber keeps seeing every progress event exactly as before issue #108.
+pub async fn attach(
+    pool: &SqlitePool,
+    run_id: &str,
+    socket_path: &Path,
+    progress: ProgressReplay,
+) -> Result<Attachment> {
     if db::get_run(pool, run_id).await?.is_none() {
         return Err(TuiError::RunNotFound {
             run_id: run_id.to_string(),
@@ -36,7 +43,7 @@ pub async fn attach(pool: &SqlitePool, run_id: &str, socket_path: &Path) -> Resu
         }
     };
 
-    let history = db::list_events_for_run(pool, run_id).await?;
+    let history = db::list_events_for_run(pool, run_id, progress).await?;
     let mut model = RunModel::new();
     for entry in history {
         model.apply_history_entry(entry);
@@ -166,7 +173,13 @@ mod tests {
         let pool = seeded_pool(dir.path()).await;
         let socket_path = dir.path().join("no-run.sock");
 
-        let result = attach(&pool, "does-not-exist", &socket_path).await;
+        let result = attach(
+            &pool,
+            "does-not-exist",
+            &socket_path,
+            ProgressReplay::Excluded,
+        )
+        .await;
         assert!(matches!(result, Err(TuiError::RunNotFound { .. })));
     }
 
@@ -185,7 +198,9 @@ mod tests {
         .await;
         let socket_path = dir.path().join("gone.sock");
 
-        let attachment = attach(&pool, "run-1", &socket_path).await.unwrap();
+        let attachment = attach(&pool, "run-1", &socket_path, ProgressReplay::Excluded)
+            .await
+            .unwrap();
         assert!(attachment.live.is_none());
         assert!(attachment.model.is_finished());
         assert_eq!(attachment.model.final_state(), Some("converged"));
@@ -231,7 +246,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         });
 
-        let mut attachment = attach(&pool, "run-1", &socket_path).await.unwrap();
+        let mut attachment = attach(&pool, "run-1", &socket_path, ProgressReplay::Excluded)
+            .await
+            .unwrap();
         assert!(
             attachment.model.events().len() >= 2,
             "history (RunStarted, CycleStarted) must always have been replayed"

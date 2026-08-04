@@ -15,8 +15,12 @@ pub enum EventKind {
     WorkflowResolved,
     CycleStarted,
     AgentStarted,
-    /// / amendment: a live-only, declarative progress signal, translated by the run's
-    /// `warden::tool_adapter::ToolAdapter` from one line of an agent's streamed output.
+    /// A declarative progress signal, translated by the run's `warden::tool_adapter::ToolAdapter`
+    /// from one line of an agent's streamed output. Persisted like every other event since issue
+    /// #108 (it was live-only before), but *excluded from replay by default* -- see
+    /// [`ProgressReplay`] for why, and `warden::progress_writer` for how it reaches the table
+    /// without ever blocking the agent. Persisted or not, it stays declarative: what the agent
+    /// *reports* doing, never probative evidence (ADR-0009).
     AgentProgress,
     AgentFinished,
     FindingRaised,
@@ -67,6 +71,29 @@ impl EventKind {
             "hook_finding_emitted" => Ok(EventKind::HookFindingEmitted),
             other => Err(CoreError::UnknownEventKind(other.to_string())),
         }
+    }
+}
+
+/// Whether a history replay of the `events` table returns [`EventKind::AgentProgress`] rows
+/// (issue #108).
+///
+/// Progress outnumbers every other event kind by an order of magnitude -- one event per assistant
+/// turn, `tool_use` blocks included -- and no replay reader paginates: `warden-tui` holds the whole
+/// history in memory. Excluding it by default keeps an attach as cheap as it was before progress
+/// was persisted at all; a reader that actually wants the elapsed progress of a run says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProgressReplay {
+    /// Default: `agent_progress` rows are filtered out in SQL.
+    #[default]
+    Excluded,
+    /// Opt-in: `agent_progress` rows are returned inline, in publication order, exactly as a live
+    /// subscriber saw them (up to the per-step persistence cap).
+    Included,
+}
+
+impl ProgressReplay {
+    pub fn includes_progress(self) -> bool {
+        matches!(self, ProgressReplay::Included)
     }
 }
 

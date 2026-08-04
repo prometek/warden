@@ -9,6 +9,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::hook::Hook;
+use warden_core::ProgressReplay;
 
 /// Shared with `gate_tail`'s own tests (`super::super::gate_tail::tests`) -- the same fixture repo
 /// and blocking-hook double, so both suites exercise the exact same `Block` behavior.
@@ -229,7 +230,9 @@ async fn on_run_start_emit_findings_is_recorded_not_merely_counted() {
     // `OnRunStart` has no step to route the finding through -- it does not itself reboucle.
     assert_eq!(final_state, RunState::Converged);
 
-    let events = db::list_events_for_run(&pool, &run_id).await.unwrap();
+    let events = db::list_events_for_run(&pool, &run_id, ProgressReplay::Included)
+        .await
+        .unwrap();
     let recorded = events.iter().find_map(|entry| match entry.event() {
         Some(warden_core::RunEvent::HookFindingEmitted {
             point,
@@ -350,7 +353,9 @@ async fn on_run_start_block_still_publishes_run_finished() {
         .unwrap();
     assert_eq!(final_state, RunState::Failed);
 
-    let events = db::list_events_for_run(&pool, &run_id).await.unwrap();
+    let events = db::list_events_for_run(&pool, &run_id, ProgressReplay::Included)
+        .await
+        .unwrap();
     let published_run_finished = events.iter().any(|entry| {
         matches!(
             entry.event(),
@@ -561,7 +566,7 @@ steps:
 }
 
 async fn events_for(pool: &SqlitePool, run_id: &str) -> Vec<RunEvent> {
-    db::list_events_for_run(pool, run_id)
+    db::list_events_for_run(pool, run_id, ProgressReplay::Included)
         .await
         .unwrap()
         .iter()
