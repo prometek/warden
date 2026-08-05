@@ -427,13 +427,32 @@ mod tests {
             .unwrap();
         let base_sha = String::from_utf8_lossy(&base.stdout).trim().to_string();
 
-        let line = "y".repeat(120);
-        let mut content = String::with_capacity(total_mib * 1024 * 1024);
-        while content.len() < total_mib * 1024 * 1024 {
-            content.push_str(&line);
-            content.push('\n');
+        // The fixture is written in fixed-size chunks rather than built as one
+        // `total_mib`-sized `String`: this process is the one whose RSS the parent test
+        // compares across sizes, so materializing the fixture in memory would make the
+        // baseline -- and the allocator's free-list/mmap-threshold state at the moment
+        // `read_diff` runs -- a function of `total_mib`, which is exactly the variable
+        // the measurement is supposed to hold constant.
+        {
+            use std::io::Write;
+
+            let line = "y".repeat(120);
+            let mut chunk = String::with_capacity(1024 * 1024 + line.len() + 1);
+            while chunk.len() < 1024 * 1024 {
+                chunk.push_str(&line);
+                chunk.push('\n');
+            }
+
+            let mut writer = std::io::BufWriter::new(
+                std::fs::File::create(dir.path().join("huge.txt")).unwrap(),
+            );
+            let mut written = 0usize;
+            while written < total_mib * 1024 * 1024 {
+                writer.write_all(chunk.as_bytes()).unwrap();
+                written += chunk.len();
+            }
+            writer.flush().unwrap();
         }
-        std::fs::write(dir.path().join("huge.txt"), &content).unwrap();
         SyncCommand::new("git")
             .current_dir(dir.path())
             .args(["add", "huge.txt"])
@@ -484,7 +503,14 @@ mod tests {
 
     #[test]
     fn read_diff_peak_memory_growth_is_bounded_regardless_of_how_far_over_the_cap_the_diff_is() {
-        fn measure_rss_growth_kb(total_mib: usize) -> i64 {
+        /// A 10 ms RSS sampler only sometimes catches the short-lived realloc spike inside
+        /// `read_to_end`, so a single run of a given size can report anywhere from ~8 to
+        /// ~18 MiB of growth for identical work. Taking the largest of several runs
+        /// converges on the real peak instead of on sampler luck, which matters because
+        /// the assertion compares two sizes against each other.
+        const RUNS_PER_SIZE: usize = 3;
+
+        fn measure_one_rss_growth_kb(total_mib: usize) -> i64 {
             let exe = std::env::current_exe().expect("current_exe available for this test binary");
             let output = SyncCommand::new(&exe)
                 .args([
@@ -513,6 +539,13 @@ mod tests {
                 .expect("RSS_GROWTH_KB=... must be followed by an integer number of KiB")
                 .parse()
                 .expect("RSS_GROWTH_KB=... must be an integer number of KiB")
+        }
+
+        fn measure_rss_growth_kb(total_mib: usize) -> i64 {
+            (0..RUNS_PER_SIZE)
+                .map(|_| measure_one_rss_growth_kb(total_mib))
+                .max()
+                .expect("RUNS_PER_SIZE is non-zero")
         }
 
         let small_excess_growth_kb = measure_rss_growth_kb(9);
