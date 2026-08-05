@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id as \"id!\", run_id, event_type, payload_json, created_at\n        FROM events\n        WHERE run_id = ?\n        ORDER BY created_at ASC, id ASC\n        ",
+  "query": "\n            SELECT id as \"id!\", run_id, event_type, payload_json, created_at\n            FROM events\n            WHERE run_id = ? AND event_type <> ?\n            ORDER BY created_at ASC, rowid ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,7 +60,7 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 2
     },
     "nullable": [
       true,
@@ -70,5 +70,5 @@
       false
     ]
   },
-  "hash": "4d53230a110d56aece07c9cc9945b9462cc7447dc720266c1a83095c486887aa"
+  "hash": "93686cbcf4765363cf9ba49d4f1ad8172fd2189c5bfb0d48051645eef18392f3"
 }

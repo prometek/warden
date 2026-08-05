@@ -344,7 +344,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
-    use warden_core::{CiWatchOutcome, HookPoint};
+    use warden_core::{CiWatchOutcome, HookPoint, ProgressReplay};
 
     use super::super::lifecycle_hook_tests::{
         init_test_repo, single_command_step_workflow, BlockingHook,
@@ -609,6 +609,7 @@ mod tests {
             .set(RunContext {
                 run_id: run_id.to_string(),
                 event_bus,
+                progress_writer: ProgressWriter::spawn(pool.clone(), run_id),
             })
             .map_err(|_| ())
             .unwrap();
@@ -655,7 +656,7 @@ mod tests {
             "an EmitFindings before_push hook must not short-circuit the push"
         );
 
-        let recorded: Vec<_> = db::list_events_for_run(&pool, run_id)
+        let recorded: Vec<_> = db::list_events_for_run(&pool, run_id, ProgressReplay::Included)
             .await
             .unwrap()
             .iter()

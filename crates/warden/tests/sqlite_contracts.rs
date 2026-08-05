@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use warden::db;
-use warden_core::{RunEvent, RunState};
+use warden_core::{ProgressReplay, RunEvent, RunState};
 
 const RUN_ID: &str = "sqlite-contract-run";
 
@@ -91,7 +91,7 @@ async fn tui_reads_a_run_and_event_written_through_the_migrated_writer_schema() 
     assert_eq!(run.max_cycles, 4);
     assert_eq!(run.current_cycle, 0);
 
-    let events = warden_tui::db::list_events_for_run(&read_pool, RUN_ID)
+    let events = warden_tui::db::list_events_for_run(&read_pool, RUN_ID, ProgressReplay::Included)
         .await
         .unwrap();
     assert_eq!(events.len(), 1);

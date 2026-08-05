@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
-use warden_core::{RunEventRecord, UndecodableEvent};
+use warden_core::{ProgressReplay, RunEventRecord, UndecodableEvent};
 use warden_tui::attach::{attach, Attachment};
 use warden_tui::capabilities::GraphicsCapability;
 use warden_tui::model::HistoryItem;
@@ -48,6 +48,15 @@ enum Commands {
         /// Warden's state directory, used to locate the database and the run's Event Bus socket.
         #[arg(long, value_parser = clap::value_parser!(PathBuf))]
         warden_home: Option<PathBuf>,
+
+        /// Replay the elapsed agent progress too, not just the run's lifecycle events.
+        ///
+        /// Off by default: progress outnumbers every other event kind by an order of magnitude,
+        /// and the replay is held whole in memory. Turn it on to see what the agents reported
+        /// doing before this attach (issue #108). Never affects the live stream, which always
+        /// carries progress.
+        #[arg(long)]
+        include_progress: bool,
     },
 }
 
@@ -61,7 +70,15 @@ async fn main() -> anyhow::Result<()> {
             run_id,
             db,
             warden_home,
-        } => attach_cmd(run_id, db, warden_home).await,
+            include_progress,
+        } => {
+            let progress = if include_progress {
+                ProgressReplay::Included
+            } else {
+                ProgressReplay::Excluded
+            };
+            attach_cmd(run_id, db, warden_home, progress).await
+        }
     }
 }
 
@@ -69,6 +86,7 @@ async fn attach_cmd(
     run_id: String,
     db_path: Option<PathBuf>,
     warden_home: Option<PathBuf>,
+    progress: ProgressReplay,
 ) -> anyhow::Result<()> {
     let warden_home = warden_home.unwrap_or(default_warden_home()?);
     let db_path = db_path.unwrap_or_else(|| warden_home.join("state.db"));
@@ -77,7 +95,7 @@ async fn attach_cmd(
     let pool = db::connect_read_only(&db_path)
         .await
         .context("failed to open warden's database read-only")?;
-    let attachment = attach(&pool, &run_id, &socket_path)
+    let attachment = attach(&pool, &run_id, &socket_path, progress)
         .await
         .context("failed to attach to run")?;
 

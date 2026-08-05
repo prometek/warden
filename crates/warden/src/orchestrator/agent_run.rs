@@ -45,6 +45,11 @@ impl Orchestrator {
 
         let mut guard = SandboxGuard::new(Arc::clone(&self.sandbox), sandbox_id);
 
+        // Opens this invocation's persisted-progress budget before a single line can be read. The
+        // convergence loop re-enters `run_agent` for the same step on every reboucle, so each entry
+        // gets its own budget.
+        self.begin_progress_invocation();
+
         let result: Result<AgentOutcome> = async {
                 let on_stdout_line = |line: &str| {
                     if let Some(detail) = runner.parse_progress_line(line) {
@@ -97,6 +102,11 @@ impl Orchestrator {
                         stderr: result.stderr,
                     })
                     .map_err(map_sandbox_error);
+                // `wait` has returned, so every `on_stdout_line` callback has already fired: drain
+                // this invocation's queued progress *before* `AgentFinished` is persisted below, so
+                // replay order matches publication order. Infallible -- a write failure here never
+                // touches the run's outcome.
+                self.flush_progress().await;
                 let exit_code_for_db = match &outcome_result {
                     Ok(outcome) => outcome.exit_code,
                     Err(_) => -1,

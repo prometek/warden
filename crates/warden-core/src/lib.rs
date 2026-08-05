@@ -28,8 +28,8 @@ pub use convergence::{
 };
 pub use error::{CoreError, Result};
 pub use event::{
-    EventKind, RunEvent, RunEventHistoryEntry, RunEventRecord, UndecodableEvent, UndecodableReason,
-    WorkflowStepWire,
+    EventKind, ProgressReplay, RunEvent, RunEventHistoryEntry, RunEventRecord, UndecodableEvent,
+    UndecodableReason, WorkflowStepWire,
 };
 pub use evidence::{
     detect_project_type, select_evidence_tool, EvidenceTool, EvidenceType, ProjectMarkers,

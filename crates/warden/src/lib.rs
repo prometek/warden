@@ -18,5 +18,6 @@ pub mod policy_config;
 pub mod policy_gate;
 pub mod pr_summary;
 pub mod process;
+pub mod progress_writer;
 pub mod tool_adapter;
 pub mod worktree;
