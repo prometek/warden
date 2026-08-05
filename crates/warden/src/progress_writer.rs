@@ -448,21 +448,33 @@ mod tests {
     }
 
     /// The guarantee is structural -- `record`/`flush` return `()`, so a write error has nowhere to
-    /// go -- but pin it against a real failing write: an `events` row whose `run_id` violates the
-    /// foreign key onto `runs`.
+    /// go -- but pin it against a real failing write: an `events` row whose `id` is already taken
+    /// violates the primary key, and the batch's transaction rolls back whole. One writer bound to
+    /// one run throughout, as production spawns it: every record it carries is that run's.
     #[tokio::test]
     async fn a_failing_write_neither_surfaces_an_error_nor_stops_the_writer() {
         let (_dir, pool) = seeded_pool("run-1").await;
-        let writer = ProgressWriter::spawn(pool.clone(), "run-that-does-not-exist");
+        db::insert_event(
+            &pool,
+            "1",
+            "run-1",
+            &RunEvent::RunStarted {
+                intent: "intent".to_string(),
+                branch: "main".to_string(),
+                max_cycles: 3,
+            },
+            "2026-08-04T00:00:00+00:00",
+        )
+        .await
+        .unwrap();
+        let writer = ProgressWriter::spawn(pool.clone(), "run-1");
 
         writer.begin_invocation();
-        writer.record(progress_record("1", "run-that-does-not-exist", "lost"));
+        writer.record(progress_record("1", "run-1", "lost"));
         writer.flush().await;
 
         assert!(
-            persisted_details(&pool, "run-that-does-not-exist")
-                .await
-                .is_empty(),
+            persisted_details(&pool, "run-1").await.is_empty(),
             "the failing batch must not have been written"
         );
         assert_eq!(

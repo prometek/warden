@@ -84,6 +84,11 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   *partiel*, borné à chaque groupe de `created_at` égaux — groupes d'une seule ligne
   en pratique —, contre des lectures de table évitées sur la majorité des lignes.
   Aucun index n'offre les deux : SQLite refuse `rowid` comme colonne d'index.
+  L'en-tête du fichier de migration, lui, énonce encore la justification initiale
+  (« no sort added »), fausse : une migration committée est **gelée** par son
+  checksum sqlx (commentaires compris), la ré-éditer casserait au démarrage toute
+  base l'ayant déjà appliquée. L'erratum est consigné dans
+  `crates/warden/migrations/README.md`, à côté du fichier.
 - **Ce qui ne change pas** : la progression reste **déclarative** — ce que l'agent
   *rapporte* faire. La persister ne la promeut **pas** en élément d'audit :
   l'evidence (ADR-0009) reste la seule source qui porte une valeur de preuve. La

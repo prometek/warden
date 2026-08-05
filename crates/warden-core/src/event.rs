@@ -87,7 +87,7 @@ pub enum ProgressReplay {
     #[default]
     Excluded,
     /// Opt-in: `agent_progress` rows are returned inline, in publication order, exactly as a live
-    /// subscriber saw them (up to the per-step persistence cap).
+    /// subscriber saw them (up to the per-invocation persistence cap).
     Included,
 }
 

@@ -120,8 +120,8 @@ fn row_to_history_entry(row: EventRow) -> RunEventHistoryEntry {
 /// `progress` decides whether `agent_progress` rows are part of that history; they are not, unless
 /// the caller opts in (issue #108, see [`ProgressReplay`]). With
 /// [`ProgressReplay::Included`], the replayed sequence is exactly what a subscriber connected from
-/// the start saw live, in publication order -- up to the per-step persistence cap `warden` applies
-/// when writing.
+/// the start saw live, in publication order -- up to the per-invocation persistence cap `warden`
+/// applies when writing.
 ///
 /// **Ordering.** `created_at ASC` is publication order (the timestamp is stamped at publication,
 /// not at write), and `rowid ASC` breaks a tie in `warden`'s own insertion order -- deterministic,

@@ -320,7 +320,8 @@ impl Orchestrator {
     /// Synchronous and infallible on purpose: its only caller is the `on_stdout_line` callback
     /// `warden_sandbox` imposes the signature of, which can neither `await` nor fail. Publication
     /// comes first and is **unchanged** -- a live subscriber sees every progress event, whatever
-    /// the writer then does with it (queue it, drop it over the per-step cap, fail to write it).
+    /// the writer then does with it (queue it, drop it over the per-invocation cap, fail to write
+    /// it).
     fn publish_progress_event(&self, role_name: &str, detail: String) {
         let Some(context) = self.run_context.get() else {
             return;

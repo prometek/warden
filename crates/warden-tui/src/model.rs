@@ -432,9 +432,11 @@ impl<'a> HistoryItem<'a> {
         }
     }
 
-    /// This row's `events.id`, whichever kind of row it is. No longer part of [`RunModel::history`]'s
-    /// ordering (issue #108) -- publication order is `created_at` plus insertion order, never `id`.
-    pub fn id(self) -> &'a str {
+    /// This row's `events.id`, whichever kind of row it is. Test-only since issue #108 took it out
+    /// of [`RunModel::history`]'s ordering -- publication order is `created_at` plus insertion
+    /// order, never `id` -- and callers that need an id read it off the variant they matched.
+    #[cfg(test)]
+    fn id(self) -> &'a str {
         match self {
             HistoryItem::Event(record) => &record.id,
             HistoryItem::Undecodable(event) => &event.id,
