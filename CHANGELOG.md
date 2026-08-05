@@ -89,6 +89,18 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   checksum sqlx (commentaires compris), la ré-éditer casserait au démarrage toute
   base l'ayant déjà appliquée. L'erratum est consigné dans
   `crates/warden/migrations/README.md`, à côté du fichier.
+- **Nouveau couplage au verrou d'écriture SQLite, à connaître** : avant cette issue,
+  la progression d'agent ne produisait **aucun** trafic base. La tâche d'écriture
+  entre désormais en concurrence avec les écritures propres de l'orchestrateur pour
+  le verrou d'écriture SQLite. `flush` est donc porteur de plus que l'ordre de rejeu :
+  il fait *attendre* l'orchestrateur au lieu de le faire courser l'écrivain.
+  Démontré en le retirant, avec des insertions de progression ralenties
+  artificiellement : l'écriture propre de `warden` échoue alors franchement en
+  `database error: error returned from database: (code: 5) database is locked` ; le
+  même scénario passe avec la vidange en place. Risque pratique faible — un lot réel
+  de 64 lignes s'écrit en moins d'une milliseconde et `busy_timeout` vaut 5 s — mais
+  c'est une conséquence du découplage, pas un défaut, et elle n'était consignée nulle
+  part.
 - **Ce qui ne change pas** : la progression reste **déclarative** — ce que l'agent
   *rapporte* faire. La persister ne la promeut **pas** en élément d'audit :
   l'evidence (ADR-0009) reste la seule source qui porte une valeur de preuve. La
@@ -99,8 +111,8 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   `on_stdout_line: None` et n'émettent donc toujours aucune progression.
 - **Tests** : saturation du canal → abandon compté et journalisé, sans jamais
   bloquer l'appelant ; tâche d'écriture morte → même traitement ; plafond appliqué,
-  et remis à zéro à chaque invocation ; échec d'écriture réel (violation de clé
-  étrangère) → ni erreur remontée, ni état de run modifié, et l'écrivain survit au
+  et remis à zéro à chaque invocation ; échec d'écriture réel (collision d'`events.id`)
+  → ni erreur remontée, ni état de run modifié, et l'écrivain survit au
   lot suivant ; exclusion par défaut et inclusion sur option, côté `warden::db` comme
   côté `warden_tui::db` ; départage d'un `created_at` à égalité en ordre d'insertion,
   au niveau SQL **et** au niveau `RunModel::history()` (y compris pour une ligne
@@ -115,6 +127,17 @@ et ce projet suit [Semantic Versioning](https://semver.org/lang/fr/) une fois pu
   une invocation) est plafonné à 500 lignes sans que son verdict n'en soit affecté,
   et une étape rebouclée deux fois (620 tours à chaque cycle) persiste bien
   2 × 500 lignes — le plafond est par invocation, pas par `(run, étape)`.
+- **Deux limites de couverture assumées**, consignées plutôt que tues :
+  - la garantie « vidange **avant** `AgentFinished` » n'est falsifiable par aucun
+    test : supprimer l'appel à `flush_progress` laisse toute la suite verte, le rejeu
+    ordonnant sur `created_at`, horodaté à la *publication*. La seule version
+    discriminante tenait en 67 s et reposait sur une constante de temporisation
+    ajustée — le dépôt proscrit un test dont la réussite dépend d'un timing. Ce qu'un
+    test *prouve* bien, c'est l'invariant observable qui en découle : chaque ligne de
+    progression d'une invocation est persistée avant son `agent_finished` ;
+  - la journalisation de saturation n'est épinglée que par un `AtomicBool` interne,
+    pas par un événement `tracing` observable. Le mécanisme identique côté plafond,
+    lui, est prouvé observable de bout en bout.
 
 ### Added — Issue #107 : événement de graphe de workflow, étapes à venir exposées à la TUI
 

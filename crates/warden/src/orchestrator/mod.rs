@@ -352,6 +352,11 @@ impl Orchestrator {
     /// Waits until every progress event queued so far is written. Called at the end of an agent
     /// invocation, **before** `AgentFinished` is persisted, so a replay reads an invocation's
     /// progress where it happened rather than after the step that produced it had already ended.
+    ///
+    /// It also serializes the writer against the orchestrator's own writes. Progress used to cause
+    /// no database traffic at all; since issue #108 the writer task competes for SQLite's write
+    /// lock, and waiting here means the orchestrator no longer races it (with progress inserts
+    /// slowed down and this call removed, its next write fails outright with `database is locked`).
     async fn flush_progress(&self) {
         if let Some(context) = self.run_context.get() {
             context.progress_writer.flush().await;

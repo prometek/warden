@@ -18,6 +18,12 @@
 //! - **It stays ordered against lifecycle events.** [`ProgressWriter::flush`] drains the queue at
 //!   the end of an agent invocation, *before* `AgentFinished` is persisted, so a replay reads an
 //!   invocation's progress where it actually happened.
+//!
+//! One consequence of the decoupling is worth naming: progress used to cause no database traffic
+//! at all, and this task now contends for SQLite's single write lock with the orchestrator's own
+//! writes. [`ProgressWriter::flush`] therefore does more than order replay -- it makes the
+//! orchestrator wait for this task instead of racing it. Batches of [`WRITE_BATCH_SIZE`] rows are
+//! sub-millisecond and `busy_timeout` is 5 s, so contention is not expected to bite in practice.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
